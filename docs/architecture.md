@@ -173,7 +173,84 @@ DO 与 agent 之间的 WebSocket 用二进制帧，结构对齐哪吒实现：
 
 ---
 
-## 8. 实现清单（分阶段）
+## 8. 存储选型（2026-08-02 确定）
+
+### 8.1 结论
+
+| 数据分类 | 存储方案 | 理由 |
+| --- | --- | --- |
+| 面板核心数据（server / 用户 / PAT / 审计） | **D1 (SQLite)** | 关系查询、内置备份与时间点恢复、免费额度足够 |
+| 终端会话状态（streamId / 双 WS / resize） | **DO Storage（或 DO 内存）** | 瞬态、就近存放、断开即清，不入主库 |
+| 公开配置（站点设置 / 公告） | **Workers KV** | 低频写、全球高频读，最终一致无感 |
+| 监控时序（CPU / 内存 历史） | **D1 + 分钟级聚合** | D1 免费写入约 10 万行/天；量大再上外部 TSDB |
+
+### 8.2 D1 初版 Schema（草稿）
+
+```sql
+-- 服务器（agent 上报身份的归属）
+CREATE TABLE servers (
+  id             INTEGER PRIMARY KEY AUTOINCREMENT,
+  uuid           TEXT    NOT NULL UNIQUE,   -- agent 身份标识
+  name           TEXT    NOT NULL,
+  user_id        INTEGER NOT NULL,          -- 归属用户
+  hide_for_guest INTEGER NOT NULL DEFAULT 0,
+  display_index  INTEGER NOT NULL DEFAULT 0,
+  created_at     TEXT    NOT NULL DEFAULT (datetime('now'))
+);
+
+-- 用户
+CREATE TABLE users (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  username      TEXT    NOT NULL UNIQUE,
+  password_hash TEXT    NOT NULL,            -- bcrypt / argon2
+  role          INTEGER NOT NULL DEFAULT 0,  -- 0=member 1=admin
+  created_at    TEXT    NOT NULL DEFAULT (datetime('now'))
+);
+
+-- API Token（PAT，只存哈希）
+CREATE TABLE api_tokens (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id    INTEGER NOT NULL,
+  name       TEXT    NOT NULL,
+  token_hash TEXT    NOT NULL,
+  scopes     TEXT    NOT NULL,               -- JSON 数组，如 ["server:read","server:exec"]
+  server_ids TEXT,                           -- NULL=全部，否则 JSON 白名单
+  created_at TEXT    NOT NULL DEFAULT (datetime('now'))
+);
+
+-- 审计日志
+CREATE TABLE audit_logs (
+  id               INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id          INTEGER NOT NULL,
+  action           TEXT    NOT NULL,         -- terminal.open / server.update ...
+  target_server_id INTEGER,
+  detail           TEXT,
+  created_at       TEXT    NOT NULL DEFAULT (datetime('now'))
+);
+
+-- 监控时序（分钟级聚合，控制写入量 ≈ 43 行/天/机器）
+CREATE TABLE metrics_min (
+  server_id INTEGER NOT NULL,
+  ts        INTEGER NOT NULL,                -- unix 分钟戳
+  cpu       REAL,
+  mem_used  REAL,
+  net_in    REAL,
+  net_out   REAL,
+  PRIMARY KEY (server_id, ts)
+) WITHOUT ROWID;
+
+CREATE INDEX idx_metrics_min_ts ON metrics_min(ts);
+```
+
+### 8.3 设计要点
+
+- 密码与 PAT 一律**只存哈希**（token 本体只在创建时返回一次，对齐哪吒）。
+- PAT 支持 `scopes` + `server_ids` 白名单，实现最小权限（终端需 `server:exec`）。
+- 监控数据分钟级聚合：30 台机器 ≈ 1,300 行/天，远低于 D1 免费写入配额；机器多了再评估外部时序库（Timescale / ClickHouse）或 KV 滚动窗口。
+
+---
+
+## 9. 实现清单（分阶段）
 
 **阶段 0 — 最小闭环（MVP）**
 - [ ] Pages 部署前端 + `xterm.js` 终端 UI。
@@ -201,7 +278,7 @@ DO 与 agent 之间的 WebSocket 用二进制帧，结构对齐哪吒实现：
 
 ---
 
-## 9. 参考（哪吒源码关键文件）
+## 10. 参考（哪吒源码关键文件）
 
 | 仓库 | 文件 | 作用 |
 | --- | --- | --- |

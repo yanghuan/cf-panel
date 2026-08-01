@@ -7,11 +7,16 @@
 
 // ---------------- 常量 ----------------
 
-const SHARDS = 4; // DO 分片数（改大后旧会话不可达，一般不用动）
+const SHARDS = 4; // 终端 DO 分片数（改大后旧会话不可达，一般不用动）
 const SESSION_TTL_MS = 10 * 60 * 1000; // 会话两端都断开超过 10 分钟 → 回收
 const PAT_PREFIX = 'cfp_'; // PAT token 前缀
 const SCOPE_READ = 'server:read';
 const SCOPE_EXEC = 'server:exec';
+
+// 监控时序：内存 DO 热区（默认），可选 alarm 归档 D1
+const METRICS_KEEP_MIN = 720; // 内存保留最近 12 小时（分钟粒度）
+const ARCHIVE_INTERVAL_MS = 10 * 60 * 1000; // 归档周期
+const ARCHIVE_AFTER_MIN = 60; // 超过 1 小时的旧数据才归档/可淘汰
 
 // ---------------- 通用工具 ----------------
 
@@ -110,6 +115,9 @@ function shardFromStreamId(streamId) {
 }
 function doForShard(env, n) {
   return env.TERMINAL.get(env.TERMINAL.idFromName(`shard-${n}`));
+}
+function doMetrics(env) {
+  return env.METRICS.get(env.METRICS.idFromName('main'));
 }
 
 // ---------------- 鉴权（JWT 或 PAT） ----------------
@@ -269,6 +277,7 @@ async function handleApi(request, env) {
   }
 
   // POST /api/report —— agent 监控上报（uuid + key 校验，无需登录）
+  // 时序数据写入内存 DO（MetricsDO 热区）；last_seen/online 仍落 D1
   if (method === 'POST' && path === '/api/report') {
     const body = await request.json().catch(() => ({}));
     const server = await env.DB.prepare('SELECT * FROM servers WHERE uuid = ?').bind(String(body.uuid || '')).first();
@@ -278,27 +287,31 @@ async function handleApi(request, env) {
     const ts = Math.floor(Date.now() / 1000);
     const minTs = Math.floor(ts / 60);
     await env.DB.prepare('UPDATE servers SET last_seen = ?, online = 1 WHERE id = ?').bind(ts, server.id).run();
-    await env.DB.prepare(
-      `INSERT INTO metrics_min (server_id, ts, cpu, mem_used, net_in, net_out) VALUES (?,?,?,?,?,?)
-       ON CONFLICT(server_id, ts) DO UPDATE SET cpu=?, mem_used=?, net_in=?, net_out=?`
-    )
-      .bind(
-        server.id, minTs,
-        body.cpu ?? null, body.mem_used ?? null, body.net_in ?? null, body.net_out ?? null,
-        body.cpu ?? null, body.mem_used ?? null, body.net_in ?? null, body.net_out ?? null
-      )
-      .run();
+    const mdo = doMetrics(env);
+    await mdo.fetch('https://do.internal/report', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        serverId: server.id,
+        minTs,
+        cpu: body.cpu ?? null,
+        mem_used: body.mem_used ?? null,
+        net_in: body.net_in ?? null,
+        net_out: body.net_out ?? null,
+      }),
+    });
     return json({ ok: true });
   }
 
-  // GET /api/monitor?server_id= —— 监控历史（近 12 小时分钟数据）
+  // GET /api/monitor?server_id= —— 监控历史（从内存 DO 读，秒回）
   if (method === 'GET' && path === '/api/monitor') {
     const serverId = Number(url.searchParams.get('server_id')) || 0;
     const s = await env.DB.prepare('SELECT * FROM servers WHERE id = ?').bind(serverId).first();
     if (!s) return err('not found', 404);
     if (!canAccessServer(user, s)) return err('forbidden', 403);
-    const rows = await env.DB.prepare('SELECT * FROM metrics_min WHERE server_id = ? ORDER BY ts DESC LIMIT 720').bind(serverId).all();
-    return json(rows.results.reverse());
+    const mdo = doMetrics(env);
+    const resp = await mdo.fetch(`https://do.internal/query?server_id=${serverId}&limit=720`);
+    return resp;
   }
 
   // ---- PAT 管理（仅管理员）----
@@ -523,6 +536,94 @@ export class TerminalDO {
     }
     for (const [serverId, w] of this.agents) {
       if (w === ws) this.agents.delete(serverId);
+    }
+  }
+}
+
+// ---------------- Durable Object：监控时序内存热区 ----------------
+// 默认纯内存（重启丢历史）；开 ARCHIVE_TO_D1=1 后 alarm 定时把超过 1 小时的旧数据批量归档进 D1
+
+export class MetricsDO {
+  constructor(state, env) {
+    this.state = state;
+    this.env = env;
+    this.data = new Map(); // serverId -> Map(minTs -> {cpu, mem_used, net_in, net_out})
+    this.archived = new Map(); // serverId -> Set(minTs) 已归档标记（避免重复写 D1）
+  }
+
+  async fetch(request) {
+    const url = new URL(request.url);
+
+    if (url.pathname === '/report' && request.method === 'POST') {
+      const b = await request.json();
+      let m = this.data.get(b.serverId);
+      if (!m) {
+        m = new Map();
+        this.data.set(b.serverId, m);
+      }
+      m.set(b.minTs, { cpu: b.cpu, mem_used: b.mem_used, net_in: b.net_in, net_out: b.net_out });
+      this.trim(m);
+      this.scheduleArchive();
+      return json({ ok: true });
+    }
+
+    if (url.pathname === '/query' && request.method === 'GET') {
+      const serverId = Number(url.searchParams.get('server_id')) || 0;
+      const limit = Number(url.searchParams.get('limit')) || METRICS_KEEP_MIN;
+      const m = this.data.get(serverId);
+      if (!m) return json([]);
+      const arr = [...m.entries()]
+        .sort((a, b) => a[0] - b[0])
+        .slice(-limit)
+        .map(([ts, v]) => ({ ts, cpu: v.cpu, mem_used: v.mem_used, net_in: v.net_in, net_out: v.net_out }));
+      return json(arr);
+    }
+
+    return err('not found', 404);
+  }
+
+  // 内存滚动窗口：只保留最近 METRICS_KEEP_MIN 分钟
+  trim(m) {
+    const cutoff = Math.floor(Date.now() / 1000 / 60) - METRICS_KEEP_MIN;
+    for (const ts of m.keys()) {
+      if (ts < cutoff) m.delete(ts);
+    }
+  }
+
+  // 开启归档时才注册 alarm
+  scheduleArchive() {
+    if (this.env.ARCHIVE_TO_D1 === '1') {
+      this.state.storage.setAlarm(Date.now() + ARCHIVE_INTERVAL_MS);
+    }
+  }
+
+  // alarm：把超过 1 小时的数据批量 INSERT 进 D1（INSERT OR IGNORE 幂等），再从内存移除
+  async alarm() {
+    if (this.env.ARCHIVE_TO_D1 !== '1') return;
+    const cutoff = Math.floor(Date.now() / 1000 / 60) - ARCHIVE_AFTER_MIN;
+    const stmts = [];
+    for (const [serverId, m] of this.data) {
+      const done = this.archived.get(serverId) || new Set();
+      for (const [ts, v] of m) {
+        if (ts <= cutoff && !done.has(ts)) {
+          stmts.push(
+            this.env.DB.prepare(
+              'INSERT OR IGNORE INTO metrics_min (server_id, ts, cpu, mem_used, net_in, net_out) VALUES (?,?,?,?,?,?)'
+            ).bind(serverId, ts, v.cpu, v.mem_used, v.net_in, v.net_out)
+          );
+          done.add(ts);
+        }
+      }
+      if (done.size) this.archived.set(serverId, done);
+    }
+    if (stmts.length) await this.env.DB.batch(stmts);
+    for (const [, m] of this.data) {
+      for (const ts of [...m.keys()]) {
+        if (ts <= cutoff) m.delete(ts);
+      }
+    }
+    if (this.env.ARCHIVE_TO_D1 === '1') {
+      this.state.storage.setAlarm(Date.now() + ARCHIVE_INTERVAL_MS);
     }
   }
 }

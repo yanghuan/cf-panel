@@ -85,7 +85,7 @@ DO 是整个设计的心脏，对应哪吒 Dashboard 里那两个 `io.Copy` 的�
 > DO 是单实例、有并发上限；多终端会话可按 `streamId` 哈希到不同 DO，避免单点瓶颈。
 
 ### 3.4 外部 Agent
-部署在每台目标机器上（复用哪吒 agent 思路，可用 Go / Rust / Node 等实现）：
+部署在每台目标机器上（复用哪吒 agent 思路，实现选型见 3.5）：
 
 - 与 DO 之间维护一条**常驻出站 WebSocket**（用于接收"开终端"等控制指令）。
 - 收到"开终端 {streamId}"指令后：
@@ -94,7 +94,69 @@ DO 是整个设计的心脏，对应哪吒 Dashboard 里那两个 `io.Copy` 的�
   3. `pty.Start(shell)` 起一个真实 PTY；
   4. 起两个协程：`producePTYOutput`（PTY 输出 → WS 发回 DO）、`receiveInput`（WS 收字节 → 写 PTY stdin）。
 
-### 3.5 PTY（伪终端）
+### 3.5 外部 Agent 实现选型（2026-08-02 确定：纯 Shell）
+
+采用**纯 Shell 脚本**实现 agent，不依赖 Python / 编译型二进制，方便任意机器直接部署：
+
+**依赖清单**
+
+| 工具 | 职责 | 备注 |
+| --- | --- | --- |
+| `websocat` | 全双工 WebSocket 客户端 | 唯一必装（单二进制，可静态编译） |
+| `socat` | 创建 PTY 并暴露 slave 路径 | resize 能力的来源 |
+| `jq` | 解析控制 WS 的 JSON 指令 | 一般发行版自带 |
+| `bash` / `stty` | 主循环 / 改窗口尺寸 | 系统自带 |
+
+**协议简化**：每个终端会话一条独立 WS，终端数据流**纯字节透传**（§4 的多路复用帧协议为可选增强，单会话场景不需要输入/输出帧头）；`magic + streamId` 帧仅用于建连时身份鉴别；resize 改由**控制 WS** 单独下发。
+
+**进程拓扑**
+
+```
+控制循环:  websocat -b $WSS/control ──> bash + jq 循环
+             │  open_terminal {sid} → 拉起终端会话
+             │  resize {sid,rows,cols} → stty -F /tmp/cfpanle-$sid
+             ▼
+终端会话:  websocat -b $WSS/terminal?sid=<id> ⇄ socat ⇄ /tmp/cfpanle-<sid> ⇄ bash (PTY)
+```
+
+**控制循环骨架（`agent.sh`）**
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+WSS=${AGENT_WSS_URL:?}; UUID=${AGENT_UUID:?}
+
+spawn_terminal() {
+  local sid=$1
+  ( websocat -b "$WSS/terminal?sid=$sid" \
+      --exec "socat - /tmp/cfpanle-$sid" ) &
+}
+
+while true; do
+  websocat -b "$WSS/control" 2>/dev/null | while read -r line; do
+    case "$(jq -r .type <<<"$line")" in
+      open_terminal)
+        sid=$(jq -r .stream_id <<<"$line")
+        socat -d pty,link=/tmp/cfpanle-$sid,raw,echo=0 \
+              EXEC:'bash -i',pty,stderr,setsid,sigint,sighup &
+        spawn_terminal "$sid" ;;
+      resize)
+        sid=$(jq -r .stream_id <<<"$line")
+        stty -F "/tmp/cfpanle-$sid" \
+             rows "$(jq -r .rows <<<"$line")" cols "$(jq -r .cols <<<"$line")" ;;
+    esac
+  done
+  sleep 3
+done
+```
+
+**关键点**
+
+- 开终端：`socat` 创建 pty slave（`link=/tmp/cfpanle-<sid>` 暴露路径）并挂 `bash -i`；`websocat -b --exec socat` 把 WS 字节流与 slave 对接，全双工。
+- resize：控制 WS 收到 `{type:resize,...}` → `stty -F <slave路径>` 改 winsize → 内核发 `SIGWINCH`，`vim`/`top` 跟着变尺寸。
+- 权衡：零解释器依赖、部署极简；并发能力弱于编译型 agent，适合个人/小规模；协议不变，后续可无缝迁移 Go/Rust agent。
+
+### 3.6 PTY（伪终端）
 - 用 `creack/pty`（Go）或等价的 PTY 库（其它语言）在 slave 端启动 shell，`TERM=xterm`。
 - agent 持有 master 文件句柄：
   - 读 master = shell 的输出；

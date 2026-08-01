@@ -1,0 +1,29 @@
+# cf-panle agent systemd 服务模板
+# 用法：
+#   1. 把 agent.sh 放到 /opt/cf-panle-agent/agent.sh 并 chmod +x
+#   2. 创建 /etc/cf-panle-agent.env：
+#        AGENT_WSS_URL=wss://panel.example.com/ws/agent
+#        AGENT_UUID=<你的 uuid>
+#        AGENT_KEY=<你的 key>
+#   3. 复制本文件到 /etc/systemd/system/cf-panle-agent.service
+#   4. systemctl daemon-reload && systemctl enable --now cf-panle-agent
+# 监控上报 crontab（可选）：
+#   * * * * * REPORT_URL=https://panel.example.com/api/report AGENT_UUID=... AGENT_KEY=... /opt/cf-panle-agent/report.sh
+
+[Unit]
+Description=cf-panle agent (Web Terminal + Monitor)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/opt/cf-panle-agent/agent.sh
+EnvironmentFile=/etc/cf-panle-agent.env
+Restart=always
+RestartSec=3
+# 安全加固建议（按需调整）
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

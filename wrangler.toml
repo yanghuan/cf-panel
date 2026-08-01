@@ -1,0 +1,38 @@
+# cf-panle — Cloudflare Workers 配置
+# 部署步骤见 README.md
+
+name = "cf-panle"
+main = "src/index.js"
+compatibility_date = "2026-08-02"
+
+# ---------- D1 数据库（面板核心数据） ----------
+# 创建：wrangler d1 create cf-panle → 把 database_id 填进来
+[[d1_databases]]
+binding = "DB"
+database_name = "cf-panle"
+database_id = "REPLACE_WITH_D1_DATABASE_ID"
+
+# ---------- Workers KV（公开配置/公告，可选） ----------
+# 创建：wrangler kv namespace create CF_PANLE_KV → 把 id 填进来
+[[kv_namespaces]]
+binding = "KV"
+id = "REPLACE_WITH_KV_NAMESPACE_ID"
+
+# ---------- Durable Object（WebSocket 中转核心） ----------
+[[durable_objects.bindings]]
+name = "TERMINAL"
+class_name = "TerminalDO"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["TerminalDO"]
+
+# ---------- 静态资源（前端，Pages 模式零构建） ----------
+[assets]
+directory = "./public"
+not_found_handling = "single-page-application"
+
+# ---------- 运行变量 ----------
+[vars]
+# JWT_SECRET 请用 secret 设置：wrangler secret put JWT_SECRET
+# 未设置时回退为 "dev-secret"，仅限本地调试

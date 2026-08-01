@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>cf-panle · 监控面板</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.min.css" />
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <div id="app" class="hidden">
+    <header>
+      <h1>cf-panle</h1>
+      <div class="header-right">
+        <span id="whoami"></span>
+        <button id="btn-logout" class="ghost">退出</button>
+      </div>
+    </header>
+
+    <main>
+      <section class="toolbar">
+        <h2>服务器</h2>
+        <div class="toolbar-actions">
+          <input id="inp-name" type="text" placeholder="服务器名称" />
+          <button id="btn-add-server">添加服务器</button>
+          <button id="btn-refresh" class="ghost">刷新</button>
+        </div>
+      </section>
+      <section id="servers" class="grid"></section>
+      <section id="monitor-panel" class="hidden">
+        <h3 id="monitor-title"></h3>
+        <pre id="monitor-chart"></pre>
+      </section>
+    </main>
+  </div>
+
+  <!-- 登录/注册 -->
+  <div id="auth" class="auth-wrap">
+    <form id="auth-form" class="auth-card">
+      <h1>cf-panle</h1>
+      <p class="sub">在 Cloudflare 上实现带终端功能的监控面板</p>
+      <input id="auth-user" type="text" placeholder="用户名" autocomplete="username" required />
+      <input id="auth-pass" type="password" placeholder="密码" autocomplete="current-password" required />
+      <p id="auth-msg" class="msg"></p>
+      <button type="submit" id="btn-login">登录</button>
+      <button type="button" id="btn-register" class="ghost">注册（首个用户为管理员）</button>
+    </form>
+  </div>
+
+  <!-- 终端弹窗 -->
+  <div id="term-modal" class="modal hidden">
+    <div class="modal-head">
+      <span id="term-title">终端</span>
+      <button id="btn-term-close" class="ghost">关闭</button>
+    </div>
+    <div id="term" class="term"></div>
+  </div>
+
+  <div id="toast" class="toast hidden"></div>
+
+  <script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.min.js"></script>
+  <script src="/app.js"></script>
+</body>
+</html>

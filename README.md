@@ -3,7 +3,7 @@
 在 Cloudflare 上实现带终端功能的监控面板。
 
 - 前端：Cloudflare Pages（纯静态 + xterm.js，零构建）
-- 后端：Cloudflare Workers + Durable Objects（WebSocket 双向中转）+ D1（面板核心数据）+ KV（公开配置）
+- 后端：Cloudflare Workers + Durable Objects（WebSocket 双向中转）+ D1（面板核心数据 + kv_json 键值表）
 - Agent：纯 Shell 脚本（`websocat` + `socat` + `jq`），部署在每台目标机器上，与面板通过 WebSocket 通信
 
 架构设计见 [docs/architecture.md](docs/architecture.md)。
@@ -12,8 +12,8 @@
 
 ```
 cf-panle/
-├── wrangler.toml        # Worker/DO/D1/KV/静态资源配置
-├── schema.sql           # D1 数据库表
+├── wrangler.toml        # Worker/DO/D1/静态资源配置
+├── schema.sql           # D1 数据库表（含 kv_json 键值表）
 ├── src/index.js         # Worker：REST API + 鉴权 + TerminalDO 双端对拷
 ├── public/              # 前端（index.html / app.js / style.css）
 ├── agent/               # 被控机 agent（agent.sh / report.sh / systemd 模板）
@@ -28,22 +28,22 @@ cf-panle/
 # 1. 创建 D1 数据库，把返回的 database_id 填入 wrangler.toml
 wrangler d1 create cf-panle
 
-# 2. 创建 KV namespace，把返回的 id 填入 wrangler.toml
-wrangler kv namespace create CF_PANLE_KV
-
-# 3. 建表（远程库）
+# 2. 建表（远程库）
 wrangler d1 execute cf-panle --remote --file=schema.sql
 
-# 4. 设置密钥（必做，生产安全）
+# 3. 设置密钥（必做，生产安全）
 wrangler secret put JWT_SECRET        # JWT 签名密钥
 wrangler secret put PANEL_PASSWORD    # 面板登录密码（登录只填这个）
 
-# 5. 部署
+# 4. 部署
 wrangler deploy
 ```
 
-> 已部署过旧版（有 `users` 表/用户名登录）？执行分组迁移：
-> `wrangler d1 execute cf-panle --remote --command 'ALTER TABLE servers ADD COLUMN "group" TEXT NOT NULL DEFAULT "";'`
+> 已部署过旧版（无 `"group"` 列 / 无 `kv_json` 表）？执行迁移：
+> ```
+> wrangler d1 execute cf-panle --remote --command 'ALTER TABLE servers ADD COLUMN "group" TEXT NOT NULL DEFAULT "";'
+> wrangler d1 execute cf-panle --remote --command 'CREATE TABLE IF NOT EXISTS kv_json (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL DEFAULT (datetime("now")));'
+> ```
 
 部署完成后访问 `https://cf-panle.<你的子域>.workers.dev`，输入 `PANEL_PASSWORD` 密码即可登录（登录即管理员）。
 
@@ -87,7 +87,7 @@ wrangler deploy
 - **监控**：点「监控」查看近 12 小时 CPU/内存分钟数据。
 - **分组与排序**：添加服务器可填「分组」和「序号」，列表按分组展示、组内按序号排序（未填归入「未分组」）。
 - **登录**：单面板密码（`PANEL_PASSWORD`，存 CF secret），登录即管理员。
-- **公告**：设置里可改站点名/公告（存 KV），公告对所有访客可见。
+- **公告**：设置里可改站点名/公告（存 D1 `kv_json` 表），公告对所有访客可见。
 - **PAT**：设置里可创建访问令牌（scopes + server_ids 白名单），供 API 调用（`Authorization: Bearer cfp_xxx`）。
 
 ## 四、API 一览
@@ -96,7 +96,7 @@ wrangler deploy
 | --- | --- | --- |
 | POST | `/api/login` | 用面板密码（PANEL_PASSWORD）登录，返回 JWT |
 | GET | `/api/me` | 当前用户（JWT 或 PAT） |
-| GET | `/api/public/settings` | 公开配置（站点名/公告，KV，无需登录） |
+| GET | `/api/public/settings` | 公开配置（站点名/公告，D1 kv_json，无需登录） |
 | GET | `/api/servers` | 服务器列表（含分组、序号；按权限过滤） |
 | POST | `/api/servers` | 添加服务器（name + 可选 group/sort_order），返回 agent 配置 |
 | DELETE | `/api/servers/:id` | 删除服务器（仅管理员） |
@@ -109,7 +109,7 @@ wrangler deploy
 | GET | `/api/tokens` | PAT 列表（仅管理员） |
 | POST | `/api/tokens` | 创建 PAT（scopes + server_ids 白名单，明文只返回一次） |
 | DELETE | `/api/tokens/:id` | 删除 PAT（仅管理员） |
-| PUT | `/api/settings` | 更新站点名/公告（KV，仅管理员） |
+| PUT | `/api/settings` | 更新站点名/公告（D1 kv_json，仅管理员） |
 
 ## 五、安全要点（实现清单已覆盖）
 

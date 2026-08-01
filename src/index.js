@@ -83,6 +83,19 @@ async function hashSecret(value, env) {
   return bytesToHex(await hmacSha256(new TextEncoder().encode(secret(env)), new TextEncoder().encode(value)));
 }
 
+// D1 键值表（替代 Workers KV）：value 直接存 JSON 字符串
+async function kvGet(env, key, fallback) {
+  const row = await env.DB.prepare('SELECT value FROM kv_json WHERE key = ?').bind(key).first();
+  if (!row) return fallback;
+  try { return JSON.parse(row.value); } catch { return fallback; }
+}
+async function kvPut(env, key, value) {
+  await env.DB.prepare(
+    `INSERT INTO kv_json (key, value, updated_at) VALUES (?, ?, datetime('now'))
+     ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = datetime('now')`
+  ).bind(key, JSON.stringify(value)).run();
+}
+
 // ---------------- 分片路由 ----------------
 
 function shardForServerId(serverId) {
@@ -166,9 +179,9 @@ async function handleApi(request, env) {
     return json({ token, user: { id: 1, username: 'admin', role: 1 } });
   }
 
-  // GET /api/public/settings —— 公开配置（KV，无需登录）
+  // GET /api/public/settings —— 公开配置（D1 kv_json，无需登录）
   if (method === 'GET' && path === '/api/public/settings') {
-    const settings = (await env.KV.get('settings', 'json')) || {};
+    const settings = (await kvGet(env, 'settings', {})) || {};
     return json({ site_name: settings.site_name || 'cf-panle', notice: settings.notice || '' });
   }
 
@@ -319,16 +332,16 @@ async function handleApi(request, env) {
     return json({ ok: true });
   }
 
-  // ---- 面板设置（KV，仅管理员）----
+  // ---- 面板设置（D1 kv_json，仅管理员） ----
   if (method === 'PUT' && path === '/api/settings') {
     if (!isAdmin(user)) return err('forbidden', 403);
     const body = await request.json().catch(() => ({}));
-    const current = (await env.KV.get('settings', 'json')) || {};
+    const current = (await kvGet(env, 'settings', {})) || {};
     const next = {
       site_name: body.site_name !== undefined ? String(body.site_name).trim() : current.site_name,
       notice: body.notice !== undefined ? String(body.notice).trim() : current.notice,
     };
-    await env.KV.put('settings', JSON.stringify(next));
+    await kvPut(env, 'settings', next);
     return json(next);
   }
 

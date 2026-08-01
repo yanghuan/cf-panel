@@ -29,7 +29,7 @@
     return String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
   }
 
-  // ---------- 公开设置（公告/站点名，存 KV） ----------
+  // ---------- 公开设置（公告/站点名，存 D1 kv_json） ----------
   async function loadPublic() {
     try {
       const s = await api('/api/public/settings');

@@ -59,3 +59,11 @@ CREATE TABLE IF NOT EXISTS metrics_min (
 ) WITHOUT ROWID;
 
 CREATE INDEX IF NOT EXISTS idx_metrics_min_ts ON metrics_min(ts);
+
+-- 通用键值表（替代 Workers KV，value 直接存 JSON 字符串）
+-- 用途：站点设置/公告等低频键值（key = 'settings'）
+CREATE TABLE IF NOT EXISTS kv_json (
+  key        TEXT PRIMARY KEY,
+  value      TEXT NOT NULL,                  -- JSON 字符串
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);

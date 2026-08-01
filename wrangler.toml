@@ -5,18 +5,12 @@ name = "cf-panle"
 main = "src/index.js"
 compatibility_date = "2026-08-02"
 
-# ---------- D1 数据库（面板核心数据） ----------
+# ---------- D1 数据库（面板核心数据 + 键值表 kv_json） ----------
 # 创建：wrangler d1 create cf-panle → 把 database_id 填进来
 [[d1_databases]]
 binding = "DB"
 database_name = "cf-panle"
 database_id = "REPLACE_WITH_D1_DATABASE_ID"
-
-# ---------- Workers KV（公开配置/公告，可选） ----------
-# 创建：wrangler kv namespace create CF_PANLE_KV → 把 id 填进来
-[[kv_namespaces]]
-binding = "KV"
-id = "REPLACE_WITH_KV_NAMESPACE_ID"
 
 # ---------- Durable Object（WebSocket 中转核心） ----------
 [[durable_objects.bindings]]

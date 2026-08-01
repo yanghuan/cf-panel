@@ -243,7 +243,7 @@ DO 与 agent 之间的 WebSocket 用二进制帧，结构对齐哪吒实现：
 | --- | --- | --- |
 | 面板核心数据（server / 用户 / PAT / 审计） | **D1 (SQLite)** | 关系查询、内置备份与时间点恢复、免费额度足够 |
 | 终端会话状态（streamId / 双 WS / resize） | **DO Storage（或 DO 内存）** | 瞬态、就近存放、断开即清，不入主库 |
-| 公开配置（站点设置 / 公告） | **Workers KV** | 低频写、全球高频读，最终一致无感 |
+| 公开配置（站点设置 / 公告） | **D1 `kv_json` 表** | 2026-08-02 由 Workers KV 改为 D1 键值表（key/value，value 存 JSON），少一个依赖 |
 | 监控时序（CPU / 内存 历史） | **D1 + 分钟级聚合** | D1 免费写入约 10 万行/天；量大再上外部 TSDB |
 
 ### 8.2 D1 初版 Schema（草稿）
@@ -302,6 +302,13 @@ CREATE TABLE metrics_min (
 ) WITHOUT ROWID;
 
 CREATE INDEX idx_metrics_min_ts ON metrics_min(ts);
+
+-- 通用键值表（2026-08-02 起替代 Workers KV，value 直接存 JSON）
+CREATE TABLE kv_json (
+  key        TEXT PRIMARY KEY,
+  value      TEXT NOT NULL,                -- JSON 字符串
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
 ```
 
 ### 8.3 设计要点

@@ -144,6 +144,24 @@ button.danger { background: transparent; border: 1px solid var(--bad); color: va
   z-index: 20;
 }
 
+.notice {
+  background: rgba(210,153,34,.12);
+  border-bottom: 1px solid var(--border);
+  color: var(--warn);
+  padding: 8px 24px;
+  font-size: 13px;
+}
+
+.settings-body { max-width: 640px; margin: 0 auto; background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 20px; }
+.settings-body h4 { margin: 16px 0 8px; font-size: 14px; }
+.settings-body h4:first-child { margin-top: 0; }
+.settings-row { display: flex; gap: 8px; align-items: center; margin-bottom: 8px; flex-wrap: wrap; }
+.settings-row input { flex: 1; min-width: 160px; }
+.settings-row .chk { font-size: 13px; color: var(--muted); display: flex; align-items: center; gap: 4px; white-space: nowrap; }
+.token-list { list-style: none; margin: 8px 0 0; padding: 0; font-size: 13px; }
+.token-list li { display: flex; justify-content: space-between; align-items: center; padding: 6px 8px; border-bottom: 1px solid var(--border); word-break: break-all; }
+.token-list .muted { color: var(--muted); }
+
 #monitor-panel { margin-top: 24px; }
 #monitor-panel h3 { font-size: 14px; }
 #monitor-chart { font-size: 12px; color: var(--muted); white-space: pre-wrap; }

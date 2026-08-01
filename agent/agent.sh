@@ -13,6 +13,7 @@ WSS=${AGENT_WSS_URL:?}        # 例: wss://panel.example.com/ws/agent
 UUID=${AGENT_UUID:?}
 KEY=${AGENT_KEY:?}
 TMP_DIR=${AGENT_TMPDIR:-/tmp/cfpanle}
+DISABLE_EXEC=${DISABLE_EXEC:-0}   # =1 时全局禁止命令执行（终端/exec 全部忽略）
 
 mkdir -p "$TMP_DIR"
 
@@ -35,6 +36,10 @@ while true; do
     case "$(jq -r .type <<<"$line" 2>/dev/null)" in
       open_terminal)
         sid=$(jq -r .stream_id <<<"$line" 2>/dev/null)
+        if [ "$DISABLE_EXEC" = "1" ]; then
+          log "命令执行已被禁用 (DISABLE_EXEC=1)，忽略 open_terminal sid=$sid"
+          continue
+        fi
         # 创建 PTY：slave 路径通过 link 暴露，供 stty 改窗口尺寸
         socat -d pty,link="$TMP_DIR/$sid",raw,echo=0 \
               EXEC:'bash -i',pty,stderr,setsid,sigint,sighup 2>/dev/null &

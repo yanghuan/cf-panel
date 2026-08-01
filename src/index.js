@@ -1,9 +1,17 @@
 // ============================================================
 // cf-panle — Cloudflare Worker 主逻辑
-// REST API + WebSocket 中转（Durable Object: TerminalDO）
-// 依赖：D1(DB)、KV(KV)、DO(TERMINAL)、secret: JWT_SECRET
+// REST API + WebSocket 中转（Durable Object: TerminalDO，多分片）
+// 依赖：D1(DB)、KV(KV)、DO(TERMINAL)、secret: JWT_SECRET / PANEL_PASSWORD
 // 对齐 docs/architecture.md §3.2 / §3.3 / §6
 // ============================================================
+
+// ---------------- 常量 ----------------
+
+const SHARDS = 4; // DO 分片数（改大后旧会话不可达，一般不用动）
+const SESSION_TTL_MS = 10 * 60 * 1000; // 会话两端都断开超过 10 分钟 → 回收
+const PAT_PREFIX = 'cfp_'; // PAT token 前缀
+const SCOPE_READ = 'server:read';
+const SCOPE_EXEC = 'server:exec';
 
 // ---------------- 通用工具 ----------------
 
@@ -65,32 +73,80 @@ async function verifyJwt(token, env) {
     return null;
   }
 }
-async function hashPassword(password, saltHex) {
-  const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(password), 'PBKDF2', false, ['deriveBits']);
-  const bits = await crypto.subtle.deriveBits(
-    { name: 'PBKDF2', salt: hexToBytes(saltHex), iterations: 100000, hash: 'SHA-256' },
-    key,
-    256
-  );
-  return bytesToHex(new Uint8Array(bits));
-}
 function randomHex(len = 32) {
   const a = new Uint8Array(len);
   crypto.getRandomValues(a);
   return bytesToHex(a);
 }
-// agent 密钥 → 存储用哈希（与 JWT_SECRET 绑定，防止直接撞库）
-async function agentKeyHash(key, env) {
-  return bytesToHex(await hmacSha256(new TextEncoder().encode(secret(env)), new TextEncoder().encode(key)));
+// 任何秘密（agent key / PAT token）统一用 HMAC 哈希后落库
+async function hashSecret(value, env) {
+  return bytesToHex(await hmacSha256(new TextEncoder().encode(secret(env)), new TextEncoder().encode(value)));
 }
+
+// ---------------- 分片路由 ----------------
+
+function shardForServerId(serverId) {
+  return Number(serverId) % SHARDS;
+}
+function makeStreamId(serverId) {
+  return `${shardForServerId(serverId)}-${crypto.randomUUID()}`;
+}
+function shardFromStreamId(streamId) {
+  const n = parseInt(String(streamId).split('-')[0], 10);
+  return Number.isInteger(n) ? n % SHARDS : 0;
+}
+function doForShard(env, n) {
+  return env.TERMINAL.get(env.TERMINAL.idFromName(`shard-${n}`));
+}
+
+// ---------------- 鉴权（JWT 或 PAT） ----------------
 
 async function authUser(request, env) {
   const header = request.headers.get('authorization') || '';
   const token = header.startsWith('Bearer ') ? header.slice(7) : '';
+  if (!token) return null;
+
+  // 1) PAT：以 cfp_ 开头
+  if (token.startsWith(PAT_PREFIX)) {
+    const hash = await hashSecret(token, env);
+    const row = await env.DB.prepare('SELECT * FROM api_tokens WHERE token_hash = ?').bind(hash).first();
+    if (!row) return null;
+    let scopes = [];
+    try { scopes = JSON.parse(row.scopes || '[]'); } catch { /* ignore */ }
+    let serverIDs = null;
+    if (row.server_ids) {
+      try { serverIDs = JSON.parse(row.server_ids); } catch { serverIDs = null; }
+    }
+    return { id: row.user_id, username: `token:${row.name}`, role: 0, pat: { scopes, serverIDs } };
+  }
+
+  // 2) JWT（面板登录）
   const payload = await verifyJwt(token, env);
   if (!payload || !payload.uid) return null;
-  // 单管理员模式：密码在环境变量，登录即管理员
-  return { id: payload.uid, username: 'admin', role: payload.role || 1 };
+  return { id: payload.uid, username: 'admin', role: 1, pat: null };
+}
+
+// 面板管理员（JWT 登录，非 PAT）
+function isAdmin(user) {
+  return user && user.role === 1 && !user.pat;
+}
+function canAccessServer(user, server) {
+  if (!user) return false;
+  if (isAdmin(user)) return true;
+  if (user.pat) {
+    if (user.pat.serverIDs && !user.pat.serverIDs.includes(server.id)) return false;
+    return user.pat.scopes.includes(SCOPE_READ);
+  }
+  return server.user_id === user.id;
+}
+function canExec(user, server) {
+  if (!user) return false;
+  if (isAdmin(user)) return true;
+  if (user.pat) {
+    if (user.pat.serverIDs && !user.pat.serverIDs.includes(server.id)) return false;
+    return user.pat.scopes.includes(SCOPE_EXEC);
+  }
+  return server.user_id === user.id;
 }
 
 // ---------------- REST API ----------------
@@ -100,7 +156,7 @@ async function handleApi(request, env) {
   const path = url.pathname;
   const method = request.method;
 
-  // POST /api/login —— 面板单密码（配置在 CF secret: PANEL_PASSWORD）
+  // POST /api/login —— 面板单密码（CF secret: PANEL_PASSWORD）
   if (method === 'POST' && path === '/api/login') {
     const body = await request.json().catch(() => ({}));
     const password = String(body.password || '');
@@ -110,46 +166,59 @@ async function handleApi(request, env) {
     return json({ token, user: { id: 1, username: 'admin', role: 1 } });
   }
 
-  // ---- 以下全部需要登录 ----
+  // GET /api/public/settings —— 公开配置（KV，无需登录）
+  if (method === 'GET' && path === '/api/public/settings') {
+    const settings = (await env.KV.get('settings', 'json')) || {};
+    return json({ site_name: settings.site_name || 'cf-panle', notice: settings.notice || '' });
+  }
+
+  // ---- 以下全部需要登录（JWT 或 PAT）----
   const user = await authUser(request, env);
   if (!user) return err('unauthorized', 401);
 
-  // GET /api/me —— 当前用户信息
+  // GET /api/me —— 当前用户
   if (method === 'GET' && path === '/api/me') {
-    return json({ id: user.id, username: user.username, role: user.role });
+    return json({ id: user.id, username: user.username, role: user.role, is_pat: !!user.pat });
   }
 
-  // GET /api/servers —— 服务器列表（admin 全量，member 只看自己的）
+  // GET /api/servers —— 服务器列表（admin 全量；PAT 按白名单+read scope；member 看自己的）
   if (method === 'GET' && path === '/api/servers') {
-    const rows = user.role === 1
-      ? await env.DB.prepare('SELECT * FROM servers ORDER BY display_index, id').all()
-      : await env.DB.prepare('SELECT * FROM servers WHERE user_id = ? ORDER BY display_index, id').bind(user.id).all();
+    let rows;
+    if (isAdmin(user)) {
+      rows = await env.DB.prepare('SELECT * FROM servers ORDER BY "group", display_index, id').all();
+    } else if (user.pat) {
+      rows = await env.DB.prepare('SELECT * FROM servers ORDER BY "group", display_index, id').all();
+      rows.results = rows.results.filter((s) => canAccessServer(user, s));
+    } else {
+      rows = await env.DB.prepare('SELECT * FROM servers WHERE user_id = ? ORDER BY "group", display_index, id').bind(user.id).all();
+    }
     const now = Date.now();
     const list = rows.results.map((s) => ({
       id: s.id,
       name: s.name,
       group: s.group || '',
+      display_index: s.display_index || 0,
       uuid: s.uuid,
       online: s.online === 1 && now - (s.last_seen || 0) < 60000,
     }));
     return json(list);
   }
 
-  // POST /api/servers —— 注册一台服务器（name + 可选 group；生成 agent 配置，明文 key 只返回一次）
+  // POST /api/servers —— 注册一台服务器（name + 可选 group + 可选序号；仅管理员）
   if (method === 'POST' && path === '/api/servers') {
+    if (!isAdmin(user)) return err('forbidden', 403);
     const body = await request.json().catch(() => ({}));
     const name = String(body.name || '').trim();
     if (!name) return err('name required');
     const group = String(body.group || '').trim();
+    const displayIndex = Number(body.sort_order) || 0;
     const uuid = crypto.randomUUID();
     const key = randomHex(32);
-    const hash = await agentKeyHash(key, env);
-    await env.DB.prepare('INSERT INTO servers (uuid, name, "group", user_id, agent_key_hash) VALUES (?,?,?,?,?)')
-      .bind(uuid, name, group, user.id, hash)
+    const hash = await hashSecret(key, env);
+    await env.DB.prepare('INSERT INTO servers (uuid, name, "group", display_index, user_id, agent_key_hash) VALUES (?,?,?,?,?,?)')
+      .bind(uuid, name, group, displayIndex, user.id, hash)
       .run();
-    await env.DB.prepare('INSERT INTO audit_logs (user_id, action, target_server_id) VALUES (?,?,?)')
-      .bind(user.id, 'server.create', 0)
-      .run();
+    await env.DB.prepare('INSERT INTO audit_logs (user_id, action) VALUES (?,?)').bind(user.id, 'server.create').run();
     return json({
       uuid,
       agent_key: key,
@@ -158,26 +227,23 @@ async function handleApi(request, env) {
     });
   }
 
-  // DELETE /api/servers/:id —— admin 或 owner
+  // DELETE /api/servers/:id —— 仅管理员
   if (method === 'DELETE' && path.startsWith('/api/servers/')) {
+    if (!isAdmin(user)) return err('forbidden', 403);
     const id = Number(path.split('/')[3]) || 0;
-    if (user.role !== 1) {
-      const s = await env.DB.prepare('SELECT id FROM servers WHERE id = ? AND user_id = ?').bind(id, user.id).first();
-      if (!s) return err('forbidden', 403);
-    }
     await env.DB.prepare('DELETE FROM servers WHERE id = ?').bind(id).run();
     return json({ ok: true });
   }
 
-  // POST /api/terminal —— 创建终端会话（§3.3：生成 streamId 并通知 agent）
+  // POST /api/terminal —— 创建终端会话（exec 权限 + 服务器归属）
   if (method === 'POST' && path === '/api/terminal') {
     const body = await request.json().catch(() => ({}));
     const server = await env.DB.prepare('SELECT * FROM servers WHERE id = ?').bind(Number(body.server_id) || 0).first();
     if (!server) return err('server not found', 404);
-    if (user.role !== 1 && server.user_id !== user.id) return err('forbidden', 403);
-    const streamId = crypto.randomUUID();
-    const doId = env.TERMINAL.idFromName('main');
-    const resp = await env.TERMINAL.get(doId).fetch('https://do.internal/rpc', {
+    if (!canExec(user, server)) return err('forbidden', 403);
+    const streamId = makeStreamId(server.id);
+    const stub = doForShard(env, shardForServerId(server.id));
+    const resp = await stub.fetch('https://do.internal/rpc', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ op: 'create', streamId, serverId: server.id, creatorUserId: user.id }),
@@ -189,12 +255,12 @@ async function handleApi(request, env) {
     return json({ session_id: streamId, server_id: server.id, server_name: server.name });
   }
 
-  // POST /api/report —— agent 监控上报（无登录，用 uuid + key 校验）
+  // POST /api/report —— agent 监控上报（uuid + key 校验，无需登录）
   if (method === 'POST' && path === '/api/report') {
     const body = await request.json().catch(() => ({}));
     const server = await env.DB.prepare('SELECT * FROM servers WHERE uuid = ?').bind(String(body.uuid || '')).first();
     if (!server) return err('unknown agent', 401);
-    const hash = await agentKeyHash(String(body.key || ''), env);
+    const hash = await hashSecret(String(body.key || ''), env);
     if (hash !== server.agent_key_hash) return err('bad key', 401);
     const ts = Math.floor(Date.now() / 1000);
     const minTs = Math.floor(ts / 60);
@@ -217,37 +283,96 @@ async function handleApi(request, env) {
     const serverId = Number(url.searchParams.get('server_id')) || 0;
     const s = await env.DB.prepare('SELECT * FROM servers WHERE id = ?').bind(serverId).first();
     if (!s) return err('not found', 404);
-    if (user.role !== 1 && s.user_id !== user.id) return err('forbidden', 403);
+    if (!canAccessServer(user, s)) return err('forbidden', 403);
     const rows = await env.DB.prepare('SELECT * FROM metrics_min WHERE server_id = ? ORDER BY ts DESC LIMIT 720').bind(serverId).all();
     return json(rows.results.reverse());
+  }
+
+  // ---- PAT 管理（仅管理员）----
+  if (path === '/api/tokens') {
+    if (!isAdmin(user)) return err('forbidden', 403);
+    if (method === 'GET') {
+      const rows = await env.DB.prepare('SELECT id, name, scopes, server_ids, created_at FROM api_tokens ORDER BY id').all();
+      return json(rows.results);
+    }
+    if (method === 'POST') {
+      const body = await request.json().catch(() => ({}));
+      const name = String(body.name || '').trim();
+      if (!name) return err('name required');
+      let scopes = body.scopes || [SCOPE_READ];
+      if (Array.isArray(body.scopes) && body.scopes.length) scopes = body.scopes;
+      scopes = scopes.filter((s) => typeof s === 'string');
+      const serverIDs = Array.isArray(body.server_ids) ? body.server_ids.map(Number).filter((n) => n > 0) : null;
+      const token = PAT_PREFIX + randomHex(32);
+      const hash = await hashSecret(token, env);
+      await env.DB.prepare('INSERT INTO api_tokens (user_id, name, token_hash, scopes, server_ids) VALUES (?,?,?,?,?)')
+        .bind(user.id, name, hash, JSON.stringify(scopes), serverIDs ? JSON.stringify(serverIDs) : null)
+        .run();
+      return json({ token }); // 明文只返回一次
+    }
+    return err('method not allowed', 405);
+  }
+  if (method === 'DELETE' && path.startsWith('/api/tokens/')) {
+    if (!isAdmin(user)) return err('forbidden', 403);
+    const id = Number(path.split('/')[3]) || 0;
+    await env.DB.prepare('DELETE FROM api_tokens WHERE id = ?').bind(id).run();
+    return json({ ok: true });
+  }
+
+  // ---- 面板设置（KV，仅管理员）----
+  if (method === 'PUT' && path === '/api/settings') {
+    if (!isAdmin(user)) return err('forbidden', 403);
+    const body = await request.json().catch(() => ({}));
+    const current = (await env.KV.get('settings', 'json')) || {};
+    const next = {
+      site_name: body.site_name !== undefined ? String(body.site_name).trim() : current.site_name,
+      notice: body.notice !== undefined ? String(body.notice).trim() : current.notice,
+    };
+    await env.KV.put('settings', JSON.stringify(next));
+    return json(next);
   }
 
   return err('not found', 404);
 }
 
-// ---------------- WebSocket 路由（转发 DO） ----------------
+// ---------------- WebSocket 路由（按分片转发 DO） ----------------
 
 async function handleWs(request, env) {
   const url = new URL(request.url);
-  const doId = env.TERMINAL.idFromName('main');
-  const stub = env.TERMINAL.get(doId);
+  const path = url.pathname;
+  let shard = 0;
+
+  if (path.startsWith('/ws/terminal/')) {
+    shard = shardFromStreamId(path.slice('/ws/terminal/'.length));
+  } else if (path === '/ws/agent/control') {
+    const uuid = url.searchParams.get('uuid') || '';
+    const server = await env.DB.prepare('SELECT * FROM servers WHERE uuid = ?').bind(uuid).first();
+    if (!server) return new Response('unknown agent', { status: 401 });
+    shard = shardForServerId(server.id);
+  } else if (path === '/ws/agent/terminal') {
+    shard = shardFromStreamId(url.searchParams.get('sid') || '');
+  }
+
+  const stub = doForShard(env, shard);
   const target = new URL(request.url);
   target.protocol = 'https:';
   target.hostname = 'do.internal';
   return stub.fetch(target.toString(), request);
 }
 
-// ---------------- Durable Object：WebSocket 中转核心 ----------------
+// ---------------- Durable Object：WebSocket 中转核心（分片实例） ----------------
 
 export class TerminalDO {
   constructor(state, env) {
     this.state = state;
     this.env = env;
-    this.sessions = new Map(); // streamId -> {streamId, serverId, creatorUserId, userWs, agentWs}
+    this.sessions = new Map(); // streamId -> {streamId, serverId, creatorUserId, createdAt, userWs, agentWs}
     this.agents = new Map(); // serverId -> 控制 WS
+    this.lastSweep = 0;
   }
 
   async fetch(request) {
+    this.maybeSweep();
     const url = new URL(request.url);
     const path = url.pathname;
 
@@ -259,6 +384,7 @@ export class TerminalDO {
           streamId: body.streamId,
           serverId: body.serverId,
           creatorUserId: body.creatorUserId,
+          createdAt: Date.now(),
           userWs: null,
           agentWs: null,
         });
@@ -292,7 +418,7 @@ export class TerminalDO {
       const key = request.headers.get('x-agent-key') || url.searchParams.get('key') || '';
       const server = await this.env.DB.prepare('SELECT * FROM servers WHERE uuid = ?').bind(uuid).first();
       if (!server) return new Response('unknown agent', { status: 401 });
-      const hash = await agentKeyHash(key, this.env);
+      const hash = await hashSecret(key, this.env);
       if (hash !== server.agent_key_hash) return new Response('bad key', { status: 401 });
       const pair = new WebSocketPair();
       this.state.acceptWebSocket(pair[1]);
@@ -308,7 +434,7 @@ export class TerminalDO {
       if (!sess) return new Response('session not found', { status: 404 });
       const server = await this.env.DB.prepare('SELECT * FROM servers WHERE id = ?').bind(sess.serverId).first();
       if (!server) return new Response('unknown agent', { status: 401 });
-      const hash = await agentKeyHash(key, this.env);
+      const hash = await hashSecret(key, this.env);
       if (hash !== server.agent_key_hash) return new Response('bad key', { status: 401 });
       const pair = new WebSocketPair();
       this.state.acceptWebSocket(pair[1]);
@@ -317,6 +443,18 @@ export class TerminalDO {
     }
 
     return new Response('not found', { status: 404 });
+  }
+
+  // 惰性清理：两端都断开且超过 TTL 的僵尸会话（每 60s 至多扫一次）
+  maybeSweep() {
+    const now = Date.now();
+    if (now - this.lastSweep < 60 * 1000) return;
+    this.lastSweep = now;
+    for (const [sid, sess] of this.sessions) {
+      if (!sess.userWs && !sess.agentWs && now - sess.createdAt > SESSION_TTL_MS) {
+        this.sessions.delete(sid);
+      }
+    }
   }
 
   // Hibernation：消息转发（§3.3 双向对拷 + resize 走控制通道）

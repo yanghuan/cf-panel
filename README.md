@@ -67,6 +67,7 @@ wrangler deploy
    AGENT_WSS_URL=wss://<面板域名>/ws/agent
    AGENT_UUID=<你的 uuid>
    AGENT_KEY=<你的 key>
+   DISABLE_EXEC=0   # 设为 1 可全局禁止命令执行（终端不可用，仅保留监控）
    EOF
    ```
 4. 注册 systemd 服务：
@@ -82,38 +83,49 @@ wrangler deploy
 
 ## 三、使用
 
-- **终端**：面板服务器卡片点「终端」→ xterm.js 弹出 → 按键实时到达被控机 shell；窗口拉伸自动 resize（经控制通道 `stty` 下发）。
+- **终端**：面板服务器卡片点「终端」→ xterm.js 弹出 → 按键实时到达被控机 shell；窗口拉伸自动 resize（经控制通道 `stty` 下发）；断线自动重连（最多 3 次）。
 - **监控**：点「监控」查看近 12 小时 CPU/内存分钟数据。
-- **分组**：添加服务器时填分组名，列表按分组展示（未填归入「未分组」）。
+- **分组与排序**：添加服务器可填「分组」和「序号」，列表按分组展示、组内按序号排序（未填归入「未分组」）。
 - **登录**：单面板密码（`PANEL_PASSWORD`，存 CF secret），登录即管理员。
+- **公告**：设置里可改站点名/公告（存 KV），公告对所有访客可见。
+- **PAT**：设置里可创建访问令牌（scopes + server_ids 白名单），供 API 调用（`Authorization: Bearer cfp_xxx`）。
 
 ## 四、API 一览
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | POST | `/api/login` | 用面板密码（PANEL_PASSWORD）登录，返回 JWT |
-| GET | `/api/me` | 当前用户 |
-| GET | `/api/servers` | 服务器列表（含分组） |
-| POST | `/api/servers` | 添加服务器（name + 可选 group），返回 agent 配置 |
-| DELETE | `/api/servers/:id` | 删除服务器 |
-| POST | `/api/terminal` | 创建终端会话，返回 session_id |
+| GET | `/api/me` | 当前用户（JWT 或 PAT） |
+| GET | `/api/public/settings` | 公开配置（站点名/公告，KV，无需登录） |
+| GET | `/api/servers` | 服务器列表（含分组、序号；按权限过滤） |
+| POST | `/api/servers` | 添加服务器（name + 可选 group/sort_order），返回 agent 配置 |
+| DELETE | `/api/servers/:id` | 删除服务器（仅管理员） |
+| POST | `/api/terminal` | 创建终端会话（exec 权限 + 归属校验），返回 session_id |
 | GET | `/ws/terminal/{id}` | 浏览器终端 WebSocket（校验创建者/admin） |
-| GET | `/ws/agent/control` | agent 控制通道（uuid+key 校验） |
+| GET | `/ws/agent/control` | agent 控制通道（uuid+key 校验，按分片路由） |
 | GET | `/ws/agent/terminal` | agent 终端数据流（stream 归属校验） |
 | POST | `/api/report` | agent 监控上报（uuid+key 校验） |
 | GET | `/api/monitor?server_id=` | 监控历史 |
+| GET | `/api/tokens` | PAT 列表（仅管理员） |
+| POST | `/api/tokens` | 创建 PAT（scopes + server_ids 白名单，明文只返回一次） |
+| DELETE | `/api/tokens/:id` | 删除 PAT（仅管理员） |
+| PUT | `/api/settings` | 更新站点名/公告（KV，仅管理员） |
 
 ## 五、安全要点（实现清单已覆盖）
 
 - `/ws/terminal/{id}` 仅允许会话创建者或管理员连接（防 UUID 劫持，GHSA 教训）。
 - agent 建连必须提供 `X-Agent-Key`（或 query key），并与 `servers.agent_key_hash` 比对；`/ws/agent/terminal` 额外校验 stream 归属。
-- 面板登录密码存 CF secret（`PANEL_PASSWORD`），不进代码库；agent key 只存 HMAC 哈希。
+- 面板登录密码存 CF secret（`PANEL_PASSWORD`），不进代码库；agent key 与 PAT 只存 HMAC 哈希。
 - 审计日志：`terminal.open` / `server.create` 写 `audit_logs`。
+- agent 侧 `DISABLE_EXEC=1` 可全局禁止命令执行（终端任务直接忽略）。
+- 终端/监控接口按权限收敛：JWT 管理员全量；PAT 按 scopes + server_ids 白名单收窄。
 
-## 六、已知限制 / 后续
+## 六、架构要点（多 DO 分片等）
 
-- DO 会话状态在内存（MVP）：DO 实例迁移/重启会中断活跃终端，可后续迁移到 DO Storage。
-- 监控为分钟级聚合，写入量受 D1 免费配额约束（约 10 万行/天）；机器多再上外部时序库。
-- 纯 Shell agent 适合个人/小规模；并发大了可无缝换 Go/Rust agent（协议不变）。
-- PAT（`api_tokens` 表）已建表预留，未实现创建/校验接口。
-- 登录已简化为单密码（环境变量）；如后续需要多用户/用户名登录，可恢复 `users` 表逻辑。
+- **多 DO 分片**：`SHARDS = 4`，streamId 带 `shard-序号` 前缀，浏览器/agent 的 WS 请求按前缀路由到对应 DO 实例，避免单点瓶颈。
+- **会话回收**：会话两端都断开超过 10 分钟，DO 惰性清理（每 60s 扫描一次）。
+- **已知限制**：
+  - DO 会话状态仍在内存（TTL 回收兜底，但实例迁移会中断活跃终端；可后续迁 DO Storage）。
+  - 监控展示为文本列表（数据齐备，可迭代成图表）。
+  - 纯 Shell agent 适合个人/小规模；并发大了可无缝换 Go/Rust agent（协议不变）。
+  - 登录为单密码（环境变量）；如需要多用户/用户名登录，可恢复 `users` 表逻辑。

@@ -37,21 +37,15 @@
     loadServers();
   }
 
-  async function doAuth(kind) {
-    const username = $('#auth-user').value.trim();
+  async function doLogin() {
     const password = $('#auth-pass').value;
     const msg = $('#auth-msg');
     msg.textContent = '';
     try {
-      const data = await api(`/api/${kind}`, { method: 'POST', body: JSON.stringify({ username, password }) });
-      if (kind === 'login') {
-        token = data.token;
-        localStorage.setItem('cfpanle_token', token);
-        showApp(data.user);
-      } else {
-        msg.textContent = '注册成功，请登录';
-        toast('注册成功，请登录');
-      }
+      const data = await api('/api/login', { method: 'POST', body: JSON.stringify({ password }) });
+      token = data.token;
+      localStorage.setItem('cfpanle_token', token);
+      showApp(data.user);
     } catch (e) {
       msg.textContent = e.message;
     }
@@ -68,13 +62,8 @@
     }
   }
 
-  function renderServers() {
-    const box = $('#servers');
-    if (!serversCache.length) {
-      box.innerHTML = '<p style="color:var(--muted)">还没有服务器，点「添加服务器」生成 agent 配置。</p>';
-      return;
-    }
-    box.innerHTML = serversCache.map((s) => `
+  function cardHtml(s) {
+    return `
       <div class="card">
         <div class="name">${escapeHtml(s.name)}</div>
         <div class="meta">uuid: ${escapeHtml(s.uuid)}</div>
@@ -84,17 +73,36 @@
           <button data-act="mon" data-id="${s.id}" data-name="${escapeHtml(s.name)}" class="ghost">监控</button>
           <button data-act="del" data-id="${s.id}" class="danger">删除</button>
         </div>
-      </div>`).join('');
+      </div>`;
+  }
+
+  function renderServers() {
+    const box = $('#servers');
+    if (!serversCache.length) {
+      box.innerHTML = '<p style="color:var(--muted)">还没有服务器，点「添加服务器」生成 agent 配置。</p>';
+      return;
+    }
+    // 按分组渲染
+    const groups = {};
+    for (const s of serversCache) {
+      const g = s.group || '未分组';
+      (groups[g] = groups[g] || []).push(s);
+    }
+    box.innerHTML = Object.keys(groups).map((g) => `
+      <h3 class="group-title">${escapeHtml(g)}（${groups[g].length}）</h3>
+      <div class="grid">${groups[g].map(cardHtml).join('')}</div>`).join('');
   }
 
   async function addServer() {
     const name = $('#inp-name').value.trim();
+    const group = $('#inp-group').value.trim();
     if (!name) return toast('请输入服务器名称');
     try {
-      const cfg = await api('/api/servers', { method: 'POST', body: JSON.stringify({ name }) });
+      const cfg = await api('/api/servers', { method: 'POST', body: JSON.stringify({ name, group }) });
       const text = `服务器已添加，agent 配置（仅显示一次）：\n\nWSS 地址: ${cfg.wss_base}\nUUID: ${cfg.uuid}\nKEY: ${cfg.agent_key}\n\n上报地址: ${cfg.report_url}`;
       alert(text); // 一次性展示 agent 凭据
       $('#inp-name').value = '';
+      $('#inp-group').value = '';
       loadServers();
     } catch (e) {
       toast(e.message);
@@ -175,8 +183,7 @@
   }
 
   // ---------- 事件绑定 ----------
-  $('#btn-login').onclick = (e) => { e.preventDefault(); doAuth('login'); };
-  $('#btn-register').onclick = () => doAuth('register');
+  $('#btn-login').onclick = (e) => { e.preventDefault(); doLogin(); };
   $('#btn-logout').onclick = () => { token = ''; localStorage.removeItem('cfpanle_token'); showAuth(); };
   $('#btn-add-server').onclick = addServer;
   $('#btn-refresh').onclick = loadServers;

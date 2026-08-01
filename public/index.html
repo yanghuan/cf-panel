@@ -22,6 +22,7 @@
         <h2>服务器</h2>
         <div class="toolbar-actions">
           <input id="inp-name" type="text" placeholder="服务器名称" />
+          <input id="inp-group" type="text" placeholder="分组(可选)" />
           <button id="btn-add-server">添加服务器</button>
           <button id="btn-refresh" class="ghost">刷新</button>
         </div>
@@ -39,11 +40,9 @@
     <form id="auth-form" class="auth-card">
       <h1>cf-panle</h1>
       <p class="sub">在 Cloudflare 上实现带终端功能的监控面板</p>
-      <input id="auth-user" type="text" placeholder="用户名" autocomplete="username" required />
-      <input id="auth-pass" type="password" placeholder="密码" autocomplete="current-password" required />
+      <input id="auth-pass" type="password" placeholder="面板密码" autocomplete="current-password" required />
       <p id="auth-msg" class="msg"></p>
       <button type="submit" id="btn-login">登录</button>
-      <button type="button" id="btn-register" class="ghost">注册（首个用户为管理员）</button>
     </form>
   </div>
 

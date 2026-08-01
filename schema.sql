@@ -16,6 +16,7 @@ CREATE TABLE IF NOT EXISTS servers (
   id             INTEGER PRIMARY KEY AUTOINCREMENT,
   uuid           TEXT    NOT NULL UNIQUE,   -- agent 身份标识
   name           TEXT    NOT NULL,
+  "group"        TEXT    NOT NULL DEFAULT '', -- 分组（'' = 未分组）
   user_id        INTEGER NOT NULL,          -- 归属用户
   agent_key_hash TEXT    NOT NULL,          -- agent 密钥哈希（HMAC-SHA256）
   hide_for_guest INTEGER NOT NULL DEFAULT 0,

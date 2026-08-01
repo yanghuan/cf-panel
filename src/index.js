@@ -89,7 +89,8 @@ async function authUser(request, env) {
   const token = header.startsWith('Bearer ') ? header.slice(7) : '';
   const payload = await verifyJwt(token, env);
   if (!payload || !payload.uid) return null;
-  return env.DB.prepare('SELECT * FROM users WHERE id = ?').bind(payload.uid).first();
+  // 单管理员模式：密码在环境变量，登录即管理员
+  return { id: payload.uid, username: 'admin', role: payload.role || 1 };
 }
 
 // ---------------- REST API ----------------
@@ -99,33 +100,14 @@ async function handleApi(request, env) {
   const path = url.pathname;
   const method = request.method;
 
-  // POST /api/register —— 首个用户自动成为 admin，其余默认 member
-  if (method === 'POST' && path === '/api/register') {
-    const body = await request.json().catch(() => ({}));
-    const username = String(body.username || '').trim();
-    const password = String(body.password || '');
-    if (username.length < 3 || password.length < 6) return err('username >= 3 chars, password >= 6 chars');
-    const existing = await env.DB.prepare('SELECT id FROM users WHERE username = ?').bind(username).first();
-    if (existing) return err('username taken', 409);
-    const count = await env.DB.prepare('SELECT COUNT(*) AS c FROM users').first();
-    const role = count.c === 0 ? 1 : 0; // 首个用户 = admin
-    const salt = randomHex(16);
-    const hash = await hashPassword(password, salt);
-    const r = await env.DB.prepare('INSERT INTO users (username, password_hash, password_salt, role) VALUES (?,?,?,?)')
-      .bind(username, hash, salt, role)
-      .run();
-    return json({ id: r.meta.last_row_id, role });
-  }
-
-  // POST /api/login
+  // POST /api/login —— 面板单密码（配置在 CF secret: PANEL_PASSWORD）
   if (method === 'POST' && path === '/api/login') {
     const body = await request.json().catch(() => ({}));
-    const user = await env.DB.prepare('SELECT * FROM users WHERE username = ?').bind(String(body.username || '')).first();
-    if (!user) return err('bad credentials', 401);
-    const hash = await hashPassword(String(body.password || ''), user.password_salt);
-    if (hash !== user.password_hash) return err('bad credentials', 401);
-    const token = await signJwt({ uid: user.id, role: user.role, exp: Math.floor(Date.now() / 1000) + 86400 }, env);
-    return json({ token, user: { id: user.id, username: user.username, role: user.role } });
+    const password = String(body.password || '');
+    if (!env.PANEL_PASSWORD) return err('server misconfigured: PANEL_PASSWORD not set', 500);
+    if (password !== env.PANEL_PASSWORD) return err('bad password', 401);
+    const token = await signJwt({ uid: 1, role: 1, exp: Math.floor(Date.now() / 1000) + 86400 }, env);
+    return json({ token, user: { id: 1, username: 'admin', role: 1 } });
   }
 
   // ---- 以下全部需要登录 ----
@@ -146,22 +128,24 @@ async function handleApi(request, env) {
     const list = rows.results.map((s) => ({
       id: s.id,
       name: s.name,
+      group: s.group || '',
       uuid: s.uuid,
       online: s.online === 1 && now - (s.last_seen || 0) < 60000,
     }));
     return json(list);
   }
 
-  // POST /api/servers —— 注册一台服务器（生成 agent 配置，明文 key 只返回一次）
+  // POST /api/servers —— 注册一台服务器（name + 可选 group；生成 agent 配置，明文 key 只返回一次）
   if (method === 'POST' && path === '/api/servers') {
     const body = await request.json().catch(() => ({}));
     const name = String(body.name || '').trim();
     if (!name) return err('name required');
+    const group = String(body.group || '').trim();
     const uuid = crypto.randomUUID();
     const key = randomHex(32);
     const hash = await agentKeyHash(key, env);
-    await env.DB.prepare('INSERT INTO servers (uuid, name, user_id, agent_key_hash) VALUES (?,?,?,?)')
-      .bind(uuid, name, user.id, hash)
+    await env.DB.prepare('INSERT INTO servers (uuid, name, "group", user_id, agent_key_hash) VALUES (?,?,?,?,?)')
+      .bind(uuid, name, group, user.id, hash)
       .run();
     await env.DB.prepare('INSERT INTO audit_logs (user_id, action, target_server_id) VALUES (?,?,?)')
       .bind(user.id, 'server.create', 0)

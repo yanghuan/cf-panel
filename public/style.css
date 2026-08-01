@@ -74,6 +74,7 @@ button.ghost {
 button.ghost:hover { background: var(--panel-2); }
 button.danger { background: transparent; border: 1px solid var(--bad); color: var(--bad); }
 
+.group-title { font-size: 14px; font-weight: 600; margin: 20px 0 8px; color: var(--muted); }
 .grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));

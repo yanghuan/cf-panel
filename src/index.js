@@ -13,10 +13,12 @@ const PAT_PREFIX = 'cfp_'; // PAT token 前缀
 const SCOPE_READ = 'server:read';
 const SCOPE_EXEC = 'server:exec';
 
-// 监控时序：内存 DO 热区（默认），可选 alarm 归档 D1
+// 监控时序：内存 DO 热区 + alarm 归档 D1（默认开启，ARCHIVE_TO_D1=0 可关闭）
 const METRICS_KEEP_MIN = 720; // 内存保留最近 12 小时（分钟粒度）
 const ARCHIVE_INTERVAL_MS = 10 * 60 * 1000; // 归档周期
 const ARCHIVE_AFTER_MIN = 60; // 超过 1 小时的旧数据才归档/可淘汰
+const METRICS_RETENTION_DAYS = 30; // D1 历史保留期（天），过期行每日清理
+const PRUNE_INTERVAL_MS = 24 * 60 * 60 * 1000; // 保留期清理周期
 
 // ---------------- 通用工具 ----------------
 
@@ -87,6 +89,13 @@ function randomHex(len = 32) {
 async function sha256Hex(input) {
   const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(String(input)));
   return bytesToHex(new Uint8Array(digest));
+}
+// 解析监控时间范围："1h"/"12h"/"3d"/"7d"/"30d" → 小时数（非法回退 12h）
+function parseRangeHours(range) {
+  const m = String(range).match(/^(\d+)(h|d)$/);
+  if (!m) return 12;
+  const n = Number(m[1]);
+  return m[2] === 'd' ? n * 24 : n;
 }
 // 任何秘密（agent key / PAT token）统一用 HMAC 哈希后落库
 async function hashSecret(value, env) {
@@ -319,15 +328,24 @@ async function handleApi(request, env) {
     return json({ ok: true });
   }
 
-  // GET /api/monitor?server_id= —— 监控历史（从内存 DO 读，秒回）
+  // GET /api/monitor?server_id=&range= —— 监控历史
+  // range: 1h|12h|3d|7d|30d（默认 12h 走内存秒回；>12h 走 D1 归档历史）
   if (method === 'GET' && path === '/api/monitor') {
     const serverId = Number(url.searchParams.get('server_id')) || 0;
+    const range = String(url.searchParams.get('range') || '12h');
     const s = await env.DB.prepare('SELECT * FROM servers WHERE id = ?').bind(serverId).first();
     if (!s) return err('not found', 404);
     if (!canAccessServer(user, s)) return err('forbidden', 403);
-    const mdo = doMetrics(env);
-    const resp = await mdo.fetch(`https://do.internal/query?server_id=${serverId}&limit=720`);
-    return resp;
+    const hours = parseRangeHours(range);
+    if (hours <= 12) {
+      const mdo = doMetrics(env);
+      return mdo.fetch(`https://do.internal/query?server_id=${serverId}&limit=${Math.max(1, Math.round(hours * 60))}`);
+    }
+    const sinceMin = Math.floor(Date.now() / 1000 / 60) - hours * 60;
+    const rows = await env.DB.prepare(
+      'SELECT ts, cpu, mem_used, net_in, net_out FROM metrics_min WHERE server_id = ? AND ts >= ? ORDER BY ts'
+    ).bind(serverId, sinceMin).all();
+    return json(rows.results);
   }
 
   // ---- PAT 管理（仅管理员）----
@@ -584,7 +602,8 @@ export class TerminalDO {
 }
 
 // ---------------- Durable Object：监控时序内存热区 ----------------
-// 默认纯内存（重启丢历史）；开 ARCHIVE_TO_D1=1 后 alarm 定时把超过 1 小时的旧数据批量归档进 D1
+// 内存热区（12h 秒回）+ alarm 归档 D1（默认开启，ARCHIVE_TO_D1=0 可关闭）；
+// 归档时按 METRICS_RETENTION_DAYS 保留期每日清理过期历史
 
 export class MetricsDO {
   constructor(state, env) {
@@ -592,6 +611,7 @@ export class MetricsDO {
     this.env = env;
     this.data = new Map(); // serverId -> Map(minTs -> {cpu, mem_used, net_in, net_out})
     this.archived = new Map(); // serverId -> Set(minTs) 已归档标记（避免重复写 D1）
+    this.lastPrune = 0; // 上次执行保留期清理的时间
   }
 
   async fetch(request) {
@@ -633,16 +653,17 @@ export class MetricsDO {
     }
   }
 
-  // 开启归档时才注册 alarm
+  // 归档默认开启（ARCHIVE_TO_D1=0 关闭），每次上报后注册 alarm
   scheduleArchive() {
-    if (this.env.ARCHIVE_TO_D1 === '1') {
+    if (this.env.ARCHIVE_TO_D1 !== '0') {
       this.state.storage.setAlarm(Date.now() + ARCHIVE_INTERVAL_MS);
     }
   }
 
-  // alarm：把超过 1 小时的数据批量 INSERT 进 D1（INSERT OR IGNORE 幂等），再从内存移除
+  // alarm：把超过 1 小时的数据批量 INSERT 进 D1（INSERT OR IGNORE 幂等），再从内存移除；
+  // 每天顺带清理超过保留期的历史行
   async alarm() {
-    if (this.env.ARCHIVE_TO_D1 !== '1') return;
+    if (this.env.ARCHIVE_TO_D1 === '0') return;
     const cutoff = Math.floor(Date.now() / 1000 / 60) - ARCHIVE_AFTER_MIN;
     const stmts = [];
     for (const [serverId, m] of this.data) {
@@ -665,9 +686,14 @@ export class MetricsDO {
         if (ts <= cutoff) m.delete(ts);
       }
     }
-    if (this.env.ARCHIVE_TO_D1 === '1') {
-      this.state.storage.setAlarm(Date.now() + ARCHIVE_INTERVAL_MS);
+    // 保留期清理（每天一次）：删除超过 METRICS_RETENTION_DAYS 的旧数据
+    const now = Date.now();
+    if (now - this.lastPrune > PRUNE_INTERVAL_MS) {
+      this.lastPrune = now;
+      const minTs = Math.floor(now / 1000 / 60) - METRICS_RETENTION_DAYS * 1440;
+      await this.env.DB.prepare('DELETE FROM metrics_min WHERE ts < ?').bind(minTs).run();
     }
+    this.state.storage.setAlarm(Date.now() + ARCHIVE_INTERVAL_MS);
   }
 }
 

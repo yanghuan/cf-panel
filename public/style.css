@@ -164,4 +164,7 @@ button.danger { background: transparent; border: 1px solid var(--bad); color: va
 
 #monitor-panel { margin-top: 24px; }
 #monitor-panel h3 { font-size: 14px; }
+.range-btns { display: flex; gap: 6px; margin: 8px 0; flex-wrap: wrap; }
+.range-btns .range-btn { padding: 4px 10px; font-size: 12px; }
+.range-btns .range-btn.active { border-color: var(--accent); color: var(--accent-2); }
 #monitor-chart { font-size: 12px; color: var(--muted); white-space: pre-wrap; }

@@ -8,6 +8,7 @@
   let pushWs = null;       // 服务器列表实时推送 WS
   let pushTimer = null;    // 每 3 秒发一次 sync 请求的定时器
   let pushRetries = 0;     // 推送重连计数
+  let monitorState = null; // { serverId, serverName, range } 当前监控视图
   const TERM_RETRY_MAX = 3; // 终端断线自动重连次数
 
   // ---------- 基础 ----------
@@ -259,13 +260,38 @@
     connect();
   }
 
-  // ---------- 监控（简易文本图） ----------
-  async function showMonitor(serverId, serverName) {
+  // ---------- 监控（简易文本图，支持时间范围） ----------
+  const MONITOR_STEP_MAX = 240; // 长区间降采样目标点数
+  const MONITOR_RANGE_LABEL = { '1h': '近1小时', '12h': '近12小时', '3d': '近3天', '7d': '近7天', '30d': '近30天' };
+
+  // 长区间数据太多时按区间平均降采样，保证可读性
+  function downsample(rows, max = MONITOR_STEP_MAX) {
+    if (rows.length <= max) return rows;
+    const step = rows.length / max;
+    const out = [];
+    for (let i = 0; i < max; i++) {
+      const start = Math.floor(i * step);
+      const slice = rows.slice(start, Math.max(start + 1, Math.floor((i + 1) * step)));
+      const agg = { ts: slice[0].ts };
+      for (const k of ['cpu', 'mem_used', 'net_in', 'net_out']) {
+        const vals = slice.map((r) => r[k]).filter((v) => v != null);
+        agg[k] = vals.length ? vals.reduce((a, b) => a + b, 0) / vals.length : null;
+      }
+      out.push(agg);
+    }
+    return out;
+  }
+
+  async function showMonitor(serverId, serverName, range) {
+    range = range || '12h';
+    monitorState = { serverId, serverName, range };
+    document.querySelectorAll('.range-btn').forEach((b) => b.classList.toggle('active', b.dataset.range === range));
     try {
-      const rows = await api(`/api/monitor?server_id=${serverId}`);
-      $('#monitor-title').textContent = `监控 · ${serverName}（近 ${rows.length} 分钟）`;
-      const lines = rows.map((r) => {
-        const t = new Date(r.ts * 60000).toISOString().slice(11, 16);
+      const rows = await api(`/api/monitor?server_id=${serverId}&range=${range}`);
+      const label = MONITOR_RANGE_LABEL[range] || range;
+      $('#monitor-title').textContent = `监控 · ${serverName}（${label}，${rows.length} 点${rows.length > MONITOR_STEP_MAX ? '，降采样' : ''}）`;
+      const lines = downsample(rows).map((r) => {
+        const t = new Date(r.ts * 60000).toISOString().slice(5, 16).replace('T', ' ');
         const cpu = r.cpu == null ? '-' : r.cpu.toFixed(1) + '%';
         const mem = r.mem_used == null ? '-' : (r.mem_used / 1048576).toFixed(0) + 'M';
         return `${t}  cpu=${cpu}  mem=${mem}`;
@@ -367,6 +393,13 @@
       if (!confirm(`确认删除服务器「${name}」？`)) return;
       api(`/api/servers/${id}`, { method: 'DELETE' }).then(loadServers).catch((e2) => toast(e2.message));
     }
+  });
+
+  // 监控时间范围切换
+  $('#monitor-panel').addEventListener('click', (e) => {
+    const btn = e.target.closest('.range-btn');
+    if (!btn || !monitorState) return;
+    showMonitor(monitorState.serverId, monitorState.serverName, btn.dataset.range);
   });
 
   // ---------- 启动 ----------

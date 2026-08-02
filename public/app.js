@@ -9,6 +9,7 @@
   let pushTimer = null;    // 每 3 秒发一次 sync 请求的定时器
   let pushRetries = 0;     // 推送重连计数
   let monitorState = null; // { serverId, serverName, range } 当前监控视图
+  let monitorChart = null; // Chart.js 实例（切换范围时销毁重建）
   const TERM_RETRY_MAX = 3; // 终端断线自动重连次数
 
   // ---------- 基础 ----------
@@ -31,6 +32,14 @@
 
   function escapeHtml(s) {
     return String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  }
+
+  function fmtBytes(n) {
+    if (n == null) return '-';
+    const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+    let v = n, i = 0;
+    while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+    return v.toFixed(v >= 100 ? 0 : 1) + units[i];
   }
 
   // ---------- 公开设置（公告/站点名，存 D1 kv_json） ----------
@@ -90,12 +99,22 @@
   }
 
   function cardHtml(s) {
-    const info = s.info ? [s.info.os, s.info.kern, s.info.ip4, s.info.ip6].filter(Boolean).join(' · ') : '';
+    const info = s.info ? [s.info.os, s.info.ip4, s.info.ip6].filter(Boolean).join(' · ') : '';
+    const m = s.metric;
+    const metricHtml = m ? `
+        <div class="metric">
+          <span class="m-cell"><b>${m.cpu == null ? '-' : m.cpu.toFixed(1) + '%'}</b><i>CPU</i></span>
+          <span class="m-cell"><b>${fmtBytes(m.mem_used)}</b><i>内存</i></span>
+          <span class="m-cell"><b>${m.extra && m.extra.load1 != null ? m.extra.load1 : '-'}</b><i>负载</i></span>
+        </div>` : '';
     return `
       <div class="card">
-        <div class="name">${escapeHtml(s.name)}</div>
-        <div class="meta">id: ${s.id}${info ? ' · ' + escapeHtml(info) : ''}</div>
-        <div><span class="badge ${s.online ? 'on' : 'off'}">${s.online ? '在线' : '离线'}</span></div>
+        <div class="card-head">
+          <div class="name">${escapeHtml(s.name)}</div>
+          <span class="badge ${s.online ? 'on' : 'off'}"><i class="dot"></i>${s.online ? '在线' : '离线'}</span>
+        </div>
+        ${metricHtml}
+        <div class="meta">${info ? escapeHtml(info) : `id: ${s.id}`}</div>
         <div class="actions">
           <button data-act="term" data-id="${s.id}" data-name="${escapeHtml(s.name)}">终端</button>
           <button data-act="mon" data-id="${s.id}" data-name="${escapeHtml(s.name)}" class="ghost">监控</button>
@@ -104,10 +123,33 @@
       </div>`;
   }
 
+  // 顶部概览条：服务器总数/在线数/平均 CPU/平均负载/总内存
+  function renderOverview() {
+    const total = serversCache.length;
+    const onlineList = serversCache.filter((s) => s.online);
+    const mets = onlineList.map((s) => s.metric).filter(Boolean);
+    $('#ov-total').textContent = total;
+    $('#ov-online').textContent = onlineList.length;
+    $('#ov-online').style.color = onlineList.length ? '' : 'var(--muted)';
+    if (mets.length) {
+      const cpu = mets.reduce((a, m) => a + (m.cpu || 0), 0) / mets.length;
+      const load = mets.reduce((a, m) => a + ((m.extra && m.extra.load1) || 0), 0) / mets.length;
+      const mem = mets.reduce((a, m) => a + (m.mem_used || 0), 0);
+      $('#ov-cpu').textContent = cpu.toFixed(1) + '%';
+      $('#ov-load').textContent = load.toFixed(2);
+      $('#ov-mem').textContent = fmtBytes(mem);
+    } else {
+      $('#ov-cpu').textContent = '-';
+      $('#ov-load').textContent = '-';
+      $('#ov-mem').textContent = '-';
+    }
+  }
+
   function renderServers() {
     const box = $('#servers');
+    renderOverview();
     if (!serversCache.length) {
-      box.innerHTML = '<p style="color:var(--muted)">还没有服务器，点「添加服务器」生成 agent 配置。</p>';
+      box.innerHTML = '<div class="empty"><p>还没有服务器</p><p class="muted">点「添加服务器」生成 agent 配置后开始监控</p></div>';
       return;
     }
     // 组内按 display_index（序号）排序
@@ -291,27 +333,55 @@
       const rows = await api(`/api/monitor?server_id=${serverId}&range=${range}`);
       const label = MONITOR_RANGE_LABEL[range] || range;
       $('#monitor-title').textContent = `监控 · ${serverName}（${label}，${rows.length} 点${rows.length > MONITOR_STEP_MAX ? '，降采样' : ''}）`;
-      const lines = downsample(rows).map((r) => {
-        const t = new Date(r.ts * 60000).toISOString().slice(5, 16).replace('T', ' ');
-        const cpu = r.cpu == null ? '-' : r.cpu.toFixed(1) + '%';
-        const mem = r.mem_used == null ? '-' : (r.mem_used / 1048576).toFixed(0) + 'M';
-        const parts = [`${t}`, `cpu=${cpu}`, `mem=${mem}`];
-        const x = r.extra || {};
-        if (x.swap != null) parts.push(`swap=${(x.swap / 1048576).toFixed(0)}M`);
-        if (x.disk && x.disk.length) {
-          const root = x.disk.find((d) => d.m === '/') || x.disk[0];
-          if (root && root.u != null) parts.push(`disk=${Number(root.u).toFixed(0)}%`);
-        }
-        if (x.load1 != null) parts.push(`load=${x.load1}`);
-        if (x.temp != null) parts.push(`temp=${Number(x.temp).toFixed(1)}°`);
-        if (x.procs != null) parts.push(`proc=${x.procs}`);
-        return parts.join('  ');
-      });
-      $('#monitor-chart').textContent = lines.join('\n') || '暂无数据';
-      $('#monitor-panel').classList.remove('hidden');
+      $('#monitor-panel').classList.remove('hidden'); // 先显示，保证 canvas 有尺寸
+      renderMonitorChart(downsample(rows));
     } catch (e) {
       toast(e.message);
     }
+  }
+
+  function renderMonitorChart(rows) {
+    const wrap = $('#monitor-chart').parentElement;
+    if (monitorChart) { monitorChart.destroy(); monitorChart = null; }
+    // 重建 canvas（可能被上次的提示文本覆盖）
+    if (!$('#monitor-chart') || $('#monitor-chart').tagName !== 'CANVAS') {
+      wrap.innerHTML = '<canvas id="monitor-chart"></canvas>';
+    }
+    if (!window.Chart) {
+      wrap.innerHTML = '<p class="muted" style="padding:24px">图表库（Chart.js）加载失败，请检查网络。</p>';
+      return;
+    }
+    if (!rows.length) {
+      wrap.innerHTML = '<p class="muted" style="padding:24px">该时间范围暂无数据。</p>';
+      return;
+    }
+    const labels = rows.map((r) => new Date(r.ts * 60000).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }));
+    const cpus = rows.map((r) => r.cpu);
+    const mems = rows.map((r) => (r.mem_used == null ? null : +(r.mem_used / 1048576).toFixed(1)));
+    monitorChart = new Chart($('#monitor-chart'), {
+      type: 'line',
+      data: {
+        labels,
+        datasets: [
+          { label: 'CPU %', data: cpus, borderColor: '#3b82f6', backgroundColor: 'rgba(59,130,246,.12)', fill: true, tension: 0.3, pointRadius: 0, borderWidth: 2 },
+          { label: '内存 MB', data: mems, borderColor: '#f59e0b', backgroundColor: 'rgba(245,158,11,.08)', fill: true, tension: 0.3, pointRadius: 0, borderWidth: 2, yAxisID: 'y1' },
+        ],
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        interaction: { mode: 'index', intersect: false },
+        plugins: {
+          legend: { labels: { color: '#8b949e', boxWidth: 12 } },
+          tooltip: { backgroundColor: '#1c2230', borderColor: '#2d333b', borderWidth: 1, titleColor: '#e6edf3', bodyColor: '#8b949e' },
+        },
+        scales: {
+          x: { ticks: { color: '#8b949e', maxTicksLimit: 8, maxRotation: 0 }, grid: { color: 'rgba(255,255,255,.04)' } },
+          y: { position: 'left', ticks: { color: '#8b949e' }, grid: { color: 'rgba(255,255,255,.04)' } },
+          y1: { position: 'right', grid: { drawOnChartArea: false }, ticks: { color: '#8b949e' } },
+        },
+      },
+    });
   }
 
   // ---------- 设置 / PAT ----------

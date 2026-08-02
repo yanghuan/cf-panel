@@ -6,6 +6,7 @@
   <title>cf-panle · 监控面板</title>
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.min.css" />
   <link rel="stylesheet" href="/style.css" />
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
 </head>
 <body>
   <div id="app" class="hidden">
@@ -20,6 +21,13 @@
     <div id="notice-bar" class="notice hidden"></div>
 
     <main>
+      <section id="overview" class="overview">
+        <div class="ov-item"><span class="ov-num" id="ov-total">0</span><span class="ov-label">服务器</span></div>
+        <div class="ov-item"><span class="ov-num ov-online" id="ov-online">0</span><span class="ov-label">在线</span></div>
+        <div class="ov-item"><span class="ov-num" id="ov-cpu">-</span><span class="ov-label">平均CPU</span></div>
+        <div class="ov-item"><span class="ov-num" id="ov-load">-</span><span class="ov-label">平均负载</span></div>
+        <div class="ov-item"><span class="ov-num" id="ov-mem">-</span><span class="ov-label">内存占用</span></div>
+      </section>
       <section class="toolbar">
         <h2>服务器</h2>
         <div class="toolbar-actions">
@@ -40,7 +48,7 @@
           <button class="ghost range-btn" data-range="7d">7天</button>
           <button class="ghost range-btn" data-range="30d">30天</button>
         </div>
-        <pre id="monitor-chart"></pre>
+        <div class="chart-wrap"><canvas id="monitor-chart"></canvas></div>
       </section>
     </main>
   </div>

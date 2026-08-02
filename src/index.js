@@ -277,6 +277,11 @@ async function handleApi(request, env) {
     } else {
       rows = await env.DB.prepare('SELECT * FROM servers WHERE user_id = ? ORDER BY "group", display_index, id').bind(user.id).all();
     }
+    let latest = {};
+    try {
+      const lResp = await doMetrics(env).fetch('https://do.internal/latest');
+      latest = await lResp.json();
+    } catch { /* 无最新指标 */ }
     const now = Date.now();
     const list = rows.results.map((s) => ({
       id: s.id,
@@ -285,6 +290,7 @@ async function handleApi(request, env) {
       display_index: s.display_index || 0,
       online: s.online === 1 && now - (s.last_seen || 0) < 60000,
       info: safeJson(s.info_json),
+      metric: latest[s.id] || null,
     }));
     return json(list);
   }
@@ -724,6 +730,23 @@ export class MetricsDO {
       return json(arr);
     }
 
+    // 返回所有服务器的最新一条指标（面板卡片实时指标用）
+    if (url.pathname === '/latest' && request.method === 'GET') {
+      const out = {};
+      for (const [serverId, m] of this.data) {
+        if (!m.size) continue;
+        let lastTs = -1;
+        let lastV = null;
+        for (const [ts, v] of m) {
+          if (ts > lastTs) { lastTs = ts; lastV = v; }
+        }
+        if (lastV) {
+          out[serverId] = { ts: lastTs, cpu: lastV.cpu, mem_used: lastV.mem_used, net_in: lastV.net_in, net_out: lastV.net_out, extra: lastV.extra };
+        }
+      }
+      return json(out);
+    }
+
     return err('not found', 404);
   }
 
@@ -832,6 +855,12 @@ export class PanelDO {
     } catch {
       return; // D1 临时故障，下个周期再试
     }
+    // 附带每台机器的最新指标（卡片实时展示）
+    let latest = {};
+    try {
+      const lResp = await doMetrics(this.env).fetch('https://do.internal/latest');
+      latest = await lResp.json();
+    } catch { /* 无最新指标 */ }
     const now = Date.now();
     const list = [];
     for (const s of rows.results) {
@@ -842,6 +871,8 @@ export class PanelDO {
         group: s.group || '',
         display_index: s.display_index || 0,
         online: s.online === 1 && now - (s.last_seen || 0) < 60000,
+        info: safeJson(s.info_json),
+        metric: latest[s.id] || null,
       });
     }
     try { ws.send(JSON.stringify(list)); } catch { /* ignore */ }

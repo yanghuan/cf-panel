@@ -219,8 +219,7 @@ mkfifo "$CTL_IN"
 spawn_terminal() {
   local sid=$1 pty_pid=$2
   (
-    websocat -b "$WSS/terminal?sid=$sid" -H "X-Agent-Key: $KEY" \
-      --exec "socat - $TMP_DIR/$sid"
+    websocat -b "sh-c:socat - $TMP_DIR/$sid" "$WSS/terminal?sid=$sid" -H "X-Agent-Key: $KEY"
     # 会话结束（浏览器关闭 / WS 断开）→ 清理 PTY 端进程组
     local bash_pid
     bash_pid=$(pgrep -P "$pty_pid" 2>/dev/null | head -1) || true
@@ -306,8 +305,7 @@ while IFS= read -r line; do
 done
 SERVEREOF
   (
-    websocat -b "$WSS/file?sid=$sid" -H "X-Agent-Key: $KEY" \
-      --exec "bash $fs"
+    websocat -t "sh-c:bash $fs" "$WSS/file?sid=$sid" -H "X-Agent-Key: $KEY"
     rm -f "$fs"
   ) &
 }
@@ -315,7 +313,7 @@ SERVEREOF
 # ---- 控制通道常驻循环（断线自动重连；下行=控制指令，上行=监控上报） ----
 while true; do
   log "connecting control channel..."
-  websocat -b "$WSS/control" -H "X-Agent-Key: $KEY" < "$CTL_IN" 2>/dev/null | while IFS= read -r line; do
+  websocat -t "$WSS/control" -H "X-Agent-Key: $KEY" < "$CTL_IN" 2>/dev/null | while IFS= read -r line; do
     [ -z "$line" ] && continue
     case "$(jq -r .type <<<"$line" 2>/dev/null)" in
       open_terminal)

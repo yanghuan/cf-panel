@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>cf-panle · 监控面板</title>
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.min.css" />
-  <link rel="stylesheet" href="/style.css?v=9" />
+  <link rel="stylesheet" href="/style.css?v=12" />
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
 </head>
 <body>
@@ -19,6 +19,8 @@
         <button class="dd-item" data-menu="add-server">添加服务器</button>
         <button class="dd-item" data-menu="site">站点信息</button>
         <button class="dd-item" data-menu="alerts">告警</button>
+        <button class="dd-item" data-menu="custom-setup">自定义指标</button>
+        <button class="dd-item" data-menu="service-setup">服务监控</button>
         <button class="dd-item" data-menu="tokens">访问令牌</button>
         <button class="dd-item dd-danger" data-menu="logout">退出</button>
       </div>
@@ -202,6 +204,61 @@
       </div>
       <p id="tok-new" class="msg"></p>
       <ul id="token-list" class="token-list"></ul>
+    </div>
+  </div>
+
+  <!-- 自定义指标弹窗 -->
+  <div id="custom-modal" class="monitor-modal hidden">
+    <div class="modal-head">
+      <span id="custom-title">自定义指标</span>
+      <button id="btn-custom-close" class="ghost">关闭</button>
+    </div>
+    <div class="range-btns">
+      <select id="custom-server" class="custom-select"><option value="">选择服务器</option></select>
+      <button class="ghost range-btn" data-range="1h">1小时</button>
+      <button class="ghost range-btn" data-range="12h">12小时</button>
+      <button class="ghost range-btn" data-range="3d">3天</button>
+      <button class="ghost range-btn" data-range="7d">7天</button>
+      <button class="ghost range-btn" data-range="30d">30天</button>
+    </div>
+    <div class="chart-wrap"><canvas id="custom-chart"></canvas></div>
+  </div>
+
+  <!-- 自定义指标设置弹窗 -->
+  <div id="custom-setup-modal" class="modal hidden">
+    <div class="modal-head">
+      <span>自定义指标设置</span>
+      <button id="btn-custom-setup-close" class="ghost">关闭</button>
+    </div>
+    <div class="settings-body">
+      <p class="muted" style="font-size:13px">在目标机器的 <code>/etc/cf-panle-agent.env</code> 中配置 <code>CUSTOM_METRICS</code>（JSON 数组：<code>name</code> 指标名、<code>cmd</code> 采集命令），agent 会按上报周期执行命令采集数值指标；配置完成后可在该服务器卡片的「⋯ → 自定义指标」中查看曲线。</p>
+      <div class="settings-row">
+        <textarea id="custom-setup-editor" rows="5" class="custom-editor" spellcheck="false">[{"name":"cpu_temp","cmd":"cat /sys/class/thermal/thermal_zone0/temp"},{"name":"estab_conns","cmd":"ss -t state established | wc -l"}]</textarea>
+      </div>
+      <div class="settings-row">
+        <button id="btn-custom-gen">生成配置</button>
+        <button id="btn-custom-copy" class="ghost">复制</button>
+      </div>
+      <pre id="custom-setup-out" class="dialog-text mono"></pre>
+    </div>
+  </div>
+
+  <!-- 服务监控设置弹窗 -->
+  <div id="service-setup-modal" class="modal hidden">
+    <div class="modal-head">
+      <span>服务监控设置</span>
+      <button id="btn-service-setup-close" class="ghost">关闭</button>
+    </div>
+    <div class="settings-body">
+      <p class="muted" style="font-size:13px">配置 agent 的 <code>PROBES</code> 后可探测本机 HTTP/TCP 服务：探测结果会展示在服务器卡片的徽章上（绿=正常 / 红=异常），持续异常会触发 Webhook 告警。格式：<code>名称:类型:目标,...</code>，类型 <code>http</code>（URL，检查 2xx/3xx）或 <code>tcp</code>（host:port 测连通）。</p>
+      <div class="settings-row">
+        <input id="service-probes-input" type="text" placeholder='如 web:http:http://127.0.0.1/,mysql:tcp:127.0.0.1:3306' />
+      </div>
+      <div class="settings-row">
+        <button id="btn-service-gen">生成配置</button>
+        <button id="btn-service-copy" class="ghost">复制</button>
+      </div>
+      <pre id="service-setup-out" class="dialog-text mono"></pre>
     </div>
   </div>
 

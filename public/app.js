@@ -119,6 +119,7 @@
               <button data-act="term" data-id="${s.id}" data-name="${escapeHtml(s.name)}">终端</button>
               <button data-act="file" data-id="${s.id}" data-name="${escapeHtml(s.name)}">文件</button>
               <button data-act="mon" data-id="${s.id}" data-name="${escapeHtml(s.name)}">监控</button>
+              <button data-act="custom" data-id="${s.id}" data-name="${escapeHtml(s.name)}">自定义指标</button>
               <button data-act="del" data-id="${s.id}" data-name="${escapeHtml(s.name)}" class="dd-danger">删除</button>
             </div>
           </div>
@@ -592,6 +593,129 @@
     });
   }
 
+  // ---------- 自定义指标面板（agent CUSTOM_METRICS 采集，存 D1 metrics_custom） ----------
+  let customChart = null;
+  let customState = { serverId: 0, range: '12h' };
+
+  function openCustomModal(serverId, serverName) {
+    customState = { serverId: serverId || 0, range: '12h' };
+    $('#custom-title').textContent = serverName ? `自定义指标 · ${serverName}` : '自定义指标';
+    $('#custom-modal').classList.remove('hidden');
+    lockScroll();
+    document.querySelectorAll('#custom-modal .range-btn').forEach((b) => b.classList.toggle('active', b.dataset.range === customState.range));
+    api('/api/servers').then((list) => {
+      $('#custom-server').innerHTML = '<option value="">选择服务器</option>' +
+        list.map((s) => `<option value="${s.id}">${escapeHtml(s.name)}</option>`).join('');
+      if (customState.serverId) {
+        $('#custom-server').value = String(customState.serverId);
+        loadCustomMetrics();
+      }
+    }).catch((e) => toast(e.message));
+  }
+
+  async function loadCustomMetrics() {
+    const id = Number($('#custom-server').value) || 0;
+    customState.serverId = id;
+    if (!id) { renderCustomChart({}); return; }
+    try {
+      const data = await api(`/api/monitor?server_id=${id}&range=${customState.range}`);
+      renderCustomChart(data.custom || {});
+    } catch (e) {
+      toast(e.message);
+    }
+  }
+
+  function renderCustomChart(custom) {
+    const wrap = $('#custom-chart').parentElement;
+    if (customChart) { customChart.destroy(); customChart = null; }
+    if (!window.Chart) {
+      wrap.innerHTML = '<p class="muted" style="padding:24px">图表库（Chart.js）加载失败，请检查网络。</p>';
+      return;
+    }
+    const names = Object.keys(custom || {});
+    if (!names.length) {
+      wrap.innerHTML = '<p class="muted" style="padding:24px">该服务器暂无自定义指标。请在 agent 配置 CUSTOM_METRICS（JSON：name+cmd）后自动上报。</p>';
+      return;
+    }
+    const tsSet = new Set();
+    names.forEach((n) => (custom[n] || []).forEach((p) => tsSet.add(p.ts)));
+    const tsArr = [...tsSet].sort((a, b) => a - b);
+    const labels = tsArr.map((t) => new Date(t * 60000).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }));
+    const datasets = names.map((n, i) => ({
+      label: n,
+      data: tsArr.map((t) => { const p = (custom[n] || []).find((x) => x.ts === t); return p ? p.value : null; }),
+      borderColor: MONITOR_COLORS[i % MONITOR_COLORS.length],
+      backgroundColor: 'transparent',
+      tension: 0.3, pointRadius: 0, borderWidth: 1.5, spanGaps: true,
+    }));
+    customChart = new Chart($('#custom-chart'), {
+      type: 'line',
+      data: { labels, datasets },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        interaction: { mode: 'index', intersect: false },
+        plugins: {
+          legend: { labels: { color: '#8b949e', boxWidth: 12 } },
+          tooltip: { backgroundColor: '#1c2230', borderColor: '#2d333b', borderWidth: 1, titleColor: '#e6edf3', bodyColor: '#8b949e' },
+        },
+        scales: {
+          x: { ticks: { color: '#8b949e', maxTicksLimit: 8, maxRotation: 0 }, grid: { color: 'rgba(255,255,255,.04)' } },
+          y: { position: 'left', ticks: { color: '#8b949e' }, grid: { color: 'rgba(255,255,255,.04)' } },
+        },
+      },
+    });
+  }
+
+  // ---------- 自定义指标设置（生成 agent env 配置片段） ----------
+  function openCustomSetupModal() {
+    $('#custom-setup-modal').classList.remove('hidden');
+    lockScroll();
+    $('#custom-setup-out').textContent = '';
+  }
+  function genCustomCfg() {
+    const raw = $('#custom-setup-editor').value.trim();
+    try {
+      const arr = JSON.parse(raw);
+      if (!Array.isArray(arr)) throw new Error('必须是数组');
+      for (const it of arr) {
+        if (!it || typeof it !== 'object' || !it.name || !it.cmd) throw new Error('每项需包含 name 与 cmd');
+      }
+      $('#custom-setup-out').textContent = `# 追加到 /etc/cf-panle-agent.env\nCUSTOM_METRICS='${JSON.stringify(arr)}'`;
+    } catch (e) {
+      toast('JSON 格式错误：' + e.message);
+    }
+  }
+  function copyCustomCfg() {
+    const txt = $('#custom-setup-out').textContent;
+    if (!txt) return toast('请先生成配置');
+    navigator.clipboard.writeText(txt).then(() => toast('已复制')).catch(() => toast('复制失败，请手动复制'));
+  }
+
+  // ---------- 服务监控（服务探活 PROBES）设置 ----------
+  function openServiceSetupModal() {
+    $('#service-setup-modal').classList.remove('hidden');
+    lockScroll();
+    $('#service-setup-out').textContent = '';
+  }
+  function genServiceCfg() {
+    const raw = $('#service-probes-input').value.trim();
+    if (!raw) return toast('请输入探测配置');
+    const items = raw.split(',');
+    for (const it of items) {
+      const parts = it.split(':');
+      if (parts.length < 3 || !['http', 'tcp'].includes(parts[1])) {
+        return toast(`格式错误：「${it}」应为 名称:类型(http|tcp):目标`);
+      }
+    }
+    $('#service-setup-out').textContent = `# 追加到 /etc/cf-panle-agent.env\nPROBES="${raw}"`;
+  }
+  function copyServiceCfg() {
+    const txt = $('#service-setup-out').textContent;
+    if (!txt) return toast('请先生成配置');
+    navigator.clipboard.writeText(txt).then(() => toast('已复制')).catch(() => toast('复制失败，请手动复制'));
+  }
+
   // ---------- 设置 / PAT ----------
   const ALERT_PRESETS = [
     { name: 'Server酱', desc: 'GET，token 在 URL', method: 'GET', url: 'https://sctapi.ftqq.com/{token}.send?title={title}&desp={message}', body: '', ct: '', headers: '' },
@@ -763,6 +887,8 @@
     if (act === 'add-server') openAddModal();
     else if (act === 'site') openSiteModal();
     else if (act === 'alerts') openAlertsModal();
+    else     if (act === 'custom-setup') openCustomSetupModal();
+    else if (act === 'service-setup') openServiceSetupModal();
     else if (act === 'tokens') openTokensModal();
     else if (act === 'logout') { token = ''; localStorage.removeItem('cfpanle_token'); showAuth(); }
   });
@@ -779,6 +905,27 @@
   // 告警弹窗
   $('#btn-alerts-close').onclick = () => { $('#alerts-modal').classList.add('hidden'); unlockScroll(); };
   $('#btn-save-alerts').onclick = saveAlerts;
+
+  // 自定义指标查看弹窗
+  $('#btn-custom-close').onclick = () => { $('#custom-modal').classList.add('hidden'); unlockScroll(); };
+  $('#custom-server').addEventListener('change', loadCustomMetrics);
+  $('#custom-modal').addEventListener('click', (e) => {
+    const btn = e.target.closest('.range-btn');
+    if (!btn || !customState.serverId) return;
+    customState.range = btn.dataset.range;
+    document.querySelectorAll('#custom-modal .range-btn').forEach((b) => b.classList.toggle('active', b.dataset.range === customState.range));
+    loadCustomMetrics();
+  });
+
+  // 自定义指标设置弹窗
+  $('#btn-custom-setup-close').onclick = () => { $('#custom-setup-modal').classList.add('hidden'); unlockScroll(); };
+  $('#btn-custom-gen').onclick = genCustomCfg;
+  $('#btn-custom-copy').onclick = copyCustomCfg;
+
+  // 服务监控设置弹窗
+  $('#btn-service-setup-close').onclick = () => { $('#service-setup-modal').classList.add('hidden'); unlockScroll(); };
+  $('#btn-service-gen').onclick = genServiceCfg;
+  $('#btn-service-copy').onclick = copyServiceCfg;
 
   // 访问令牌弹窗
   $('#btn-tokens-close').onclick = () => { $('#tokens-modal').classList.add('hidden'); unlockScroll(); };
@@ -806,6 +953,7 @@
     if (act === 'term') openTerminal(Number(id), name);
     else if (act === 'file') openFileManager(Number(id), name);
     else if (act === 'mon') showMonitor(Number(id), name);
+    else if (act === 'custom') openCustomModal(Number(id), name);
     else if (act === 'del') {
       confirmDialog(`确认删除服务器「${name}」？`, () => {
         api(`/api/servers/${id}`, { method: 'DELETE' }).then(loadServers).catch((e2) => toast(e2.message));

@@ -1033,6 +1033,11 @@ export class TerminalDO {
           await this.env.DB.prepare('UPDATE servers SET wan_ip = ? WHERE id = ?').bind(wanIp, server.id).run();
         }
       } catch { /* 记录失败不影响连接 */ }
+      // 连接建立即标记在线（不等首次上报），避免上报延迟/丢帧导致误显示离线
+      try {
+        const now = Math.floor(Date.now() / 1000);
+        await this.env.DB.prepare('UPDATE servers SET last_seen = ?, online = 1 WHERE id = ?').bind(now, server.id).run();
+      } catch { /* 标记失败不影响连接 */ }
       // 连接建立即下发当前上报间隔（省配额：有观看者快采 3s / 无观看者慢采 120s）
       try {
         const vResp = await doPanel(this.env).fetch('https://do.internal/viewers');

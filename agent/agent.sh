@@ -27,6 +27,25 @@ CTL_IN="$TMP_DIR/control-in"  # 控制通道上行 FIFO（上报 JSON → websoc
 
 log() { echo "[cf-panle] $*" >&2; }
 
+# ---- 退出清理：终止子进程并删除临时文件，防止强杀/异常退出后残留（socat/pty、file-server、FIFO）----
+cleanup() {
+  log "cleaning up..."
+  # 1) 终止本 agent 的全部 websocat（控制通道 + 终端/文件流，按 key 精确匹配命令行）
+  pkill -f "websocat.*$KEY" 2>/dev/null || true
+  # 2) 终止终端会话的 PTY 端（socat）与文件会话进程（按临时目录特征匹配）
+  pkill -f "pty,link=$TMP_DIR/" 2>/dev/null || true
+  pkill -f "$TMP_DIR/file-server-" 2>/dev/null || true
+  # 3) 终止本脚本派生的后台子进程（上报循环、spawn 子 shell 等）
+  local j
+  for j in $(jobs -p 2>/dev/null); do kill "$j" 2>/dev/null || true; done
+  sleep 0.2
+  # 4) 删除临时目录（FIFO / pty link / file-server 脚本 / report-interval）
+  rm -rf "$TMP_DIR" 2>/dev/null || true
+  exit 0
+}
+# EXIT/INT/TERM 均触发清理（kill -9 无法捕获，属正常）
+trap cleanup EXIT INT TERM
+
 # 网络速率差分状态（上次累计值 + 采样时间，全局变量在后台子 shell 内持续）
 NET_PREV_RX=0
 NET_PREV_TX=0
@@ -311,9 +330,15 @@ SERVEREOF
 }
 
 # ---- 控制通道常驻循环（断线自动重连；下行=控制指令，上行=监控上报） ----
+# 下行指令经 FIFO 用 read 内建阻塞读取：保证 TERM/INT 能中断 read，可靠触发 cleanup
 while true; do
   log "connecting control channel..."
-  websocat -t "$WSS/control" -H "X-Agent-Key: $KEY" < "$CTL_IN" 2>/dev/null | while IFS= read -r line; do
+  CTL_OUT="$TMP_DIR/control-out"
+  rm -f "$CTL_OUT"
+  mkfifo "$CTL_OUT"
+  websocat -t "$WSS/control" -H "X-Agent-Key: $KEY" < "$CTL_IN" > "$CTL_OUT" 2>/dev/null &
+  local_ws=$!
+  while IFS= read -r line < "$CTL_OUT"; do
     [ -z "$line" ] && continue
     case "$(jq -r .type <<<"$line" 2>/dev/null)" in
       open_terminal)
@@ -350,6 +375,8 @@ while true; do
         ;;
     esac
   done
+  wait "$local_ws" 2>/dev/null || true
+  rm -f "$CTL_OUT"
   log "control channel lost, retry in 3s..."
   sleep 3
 done

@@ -20,6 +20,10 @@ const ARCHIVE_AFTER_MIN = 60; // 超过 1 小时的旧数据才归档/可淘汰
 const METRICS_RETENTION_DAYS = 30; // D1 历史保留期（天），过期行每日清理
 const PRUNE_INTERVAL_MS = 24 * 60 * 60 * 1000; // 保留期清理周期
 
+// 省配额上报策略：有前端观看者时 agent 快采，否则低频采样
+const REPORT_FAST_INTERVAL_S = 3;  // 有观看者：3 秒上报
+const REPORT_SLOW_INTERVAL_S = 120; // 无人查看：120 秒上报
+
 // ---------------- 通用工具 ----------------
 
 function json(data, status = 200) {
@@ -478,6 +482,7 @@ export class TerminalDO {
     this.env = env;
     this.sessions = new Map(); // streamId -> {streamId, serverId, creatorUserId, createdAt, userWs, agentWs}
     this.agents = new Map(); // serverId -> 控制 WS
+    this.agentInterval = new Map(); // serverId -> 当前下发的上报间隔（秒），避免重复下发
     this.lastSweep = 0;
   }
 
@@ -485,6 +490,15 @@ export class TerminalDO {
     this.maybeSweep();
     const url = new URL(request.url);
     const path = url.pathname;
+
+    // 内部 RPC：首位观看者上线，本分片所有 agent 立即切快采（省配额策略）
+    if (path === '/rpc/wakeup' && request.method === 'POST') {
+      for (const [serverId, w] of this.agents) {
+        this.agentInterval.set(serverId, REPORT_FAST_INTERVAL_S);
+        try { w.send(JSON.stringify({ type: 'set_report_interval', interval: REPORT_FAST_INTERVAL_S })); } catch { /* ignore */ }
+      }
+      return json({ ok: true });
+    }
 
     // 内部 RPC：worker 创建终端会话时调用
     if (path === '/rpc' && request.method === 'POST') {
@@ -534,6 +548,14 @@ export class TerminalDO {
       this.state.acceptWebSocket(pair[1]);
       this.agents.set(server.id, pair[1]);
       pair[1].serializeAttachment(String(server.id)); // 休眠唤醒后靠附件识别 serverId（上报用）
+      // 连接建立即下发当前上报间隔（省配额：有观看者快采 3s / 无观看者慢采 120s）
+      try {
+        const vResp = await doPanel(this.env).fetch('https://do.internal/viewers');
+        const v = await vResp.json();
+        const iv = (v.count || 0) > 0 ? REPORT_FAST_INTERVAL_S : REPORT_SLOW_INTERVAL_S;
+        this.agentInterval.set(server.id, iv);
+        pair[1].send(JSON.stringify({ type: 'set_report_interval', interval: iv }));
+      } catch { /* 查询失败则 agent 用自身默认间隔 */ }
       return new Response(null, { status: 101, webSocket: pair[0] });
     }
 
@@ -588,6 +610,7 @@ export class TerminalDO {
                 extra: j.extra,
                 info: j.info,
               });
+              await this.syncAgentInterval(ws, serverId);
             }
           }
         } catch { /* 忽略非 JSON 的控制消息 */ }
@@ -616,6 +639,19 @@ export class TerminalDO {
       // agent → DO → 浏览器（纯字节透传）
       if (sess.userWs) sess.userWs.send(message);
     }
+  }
+
+  // 省配额策略：根据当前在线观看者数决定该 agent 的上报间隔，仅变化时下发指令
+  async syncAgentInterval(ws, serverId) {
+    try {
+      const resp = await doPanel(this.env).fetch('https://do.internal/viewers');
+      const v = await resp.json();
+      const want = (v.count || 0) > 0 ? REPORT_FAST_INTERVAL_S : REPORT_SLOW_INTERVAL_S;
+      if (this.agentInterval.get(serverId) !== want) {
+        this.agentInterval.set(serverId, want);
+        ws.send(JSON.stringify({ type: 'set_report_interval', interval: want }));
+      }
+    } catch { /* 查询失败维持现状 */ }
   }
 
   async webSocketClose(ws) {
@@ -757,14 +793,32 @@ export class PanelDO {
 
   async fetch(request) {
     const url = new URL(request.url);
+    // 内部 RPC：供 TerminalDO 查询当前在线前端观看者数（省配额上报策略用）
+    if (url.pathname === '/viewers') {
+      return json({ count: this.state.getWebSockets().length });
+    }
     if (url.pathname !== '/ws/push') return new Response('not found', { status: 404 });
     const token = url.searchParams.get('token') || '';
     if (!(await authUserByToken(token, this.env))) return new Response('unauthorized', { status: 401 });
+
+    // 首位观看者上线：立即唤醒各分片 agent 切到快采（省配额策略，免等下一次上报）
+    if (this.state.getWebSockets().length === 0) {
+      this.wakeupAgents();
+    }
 
     const pair = new WebSocketPair();
     this.state.acceptWebSocket(pair[1]);
     pair[1].serializeAttachment(token);
     return new Response(null, { status: 101, webSocket: pair[0] });
+  }
+
+  // 广播唤醒：让所有分片上的 agent 立即切到快采间隔
+  async wakeupAgents() {
+    for (let i = 0; i < SHARDS; i++) {
+      try {
+        await doForShard(this.env, i).fetch('https://do.internal/rpc/wakeup', { method: 'POST' });
+      } catch { /* 分片暂不可达，后续 report 同步兜底 */ }
+    }
   }
 
   // 客户端 sync 请求 → 查库 → 按该连接的用户权限过滤后回发

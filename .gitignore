@@ -141,3 +141,6 @@ dist
 vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
 .vite/
+
+# wrangler 本地开发变量（含测试密码，勿提交）
+.dev.vars

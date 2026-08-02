@@ -5,6 +5,7 @@
 # 依赖: websocat(必装), socat(resize 需要), jq, pgrep(会话结束清理进程组), bash, stty
 # 功能: 常驻控制通道（终端 + resize）+ 内置监控上报（经控制 WS，无需 crontab）
 #       上报指标: CPU / 内存 / Swap / 磁盘 / 负载 / 温度 / 进程数 / TCP-UDP 连接数 / 网络速率 / 系统信息
+# 省配额: 有面板观看者时 3s 上报（服务端下发 set_report_interval），无人查看时 120s 低频采样
 # 用法:
 #   AGENT_WSS_URL=wss://panel.example.com/ws/agent \
 #   AGENT_KEY=<key> ./agent.sh
@@ -15,7 +16,7 @@ WSS=${AGENT_WSS_URL:?}        # 例: wss://panel.example.com/ws/agent
 KEY=${AGENT_KEY:?}            # 唯一身份 + 凭证（uuid 已废弃，仅保留这一个）
 TMP_DIR=${AGENT_TMPDIR:-/tmp/cfpanle}
 DISABLE_EXEC=${DISABLE_EXEC:-0}         # =1 时全局禁止命令执行（终端/exec 全部忽略）
-REPORT_INTERVAL=${REPORT_INTERVAL:-60}  # 监控上报间隔（秒）
+REPORT_INTERVAL=${REPORT_INTERVAL:-120} # 默认上报间隔（秒）：省配额策略下无人查看用 120s，有观看者由服务端下发 3s
 
 mkdir -p "$TMP_DIR"
 CTL_IN="$TMP_DIR/control-in"  # 控制通道上行 FIFO（上报 JSON → websocat → WS）
@@ -33,8 +34,9 @@ collect_info() {
   os=$(awk -F= '/^PRETTY_NAME=/{gsub(/["\r]/,"",$2); print $2; exit}' /etc/os-release 2>/dev/null)
   os=${os:-$(uname -s 2>/dev/null)}
   kern=$(uname -r 2>/dev/null)
-  ip4=$(hostname -I 2>/dev/null | tr ' ' '\n' | awk '/^[0-9.]+$/' | grep -v '^127\.' | head -1)
-  ip6=$(hostname -I 2>/dev/null | tr ' ' '\n' | awk '/:/' | grep -v '^::1$' | head -1)
+  # 注意：grep 无匹配返回 1，set -o pipefail 下会导致整个命令失败，必须 || true 兜底
+  ip4=$(hostname -I 2>/dev/null | tr ' ' '\n' | awk '/^[0-9.]+$/' | grep -v '^127\.' | head -1) || true
+  ip6=$(hostname -I 2>/dev/null | tr ' ' '\n' | awk '/:/' | grep -v '^::1$' | head -1) || true
   jq -nc --arg os "${os:-}" --arg kern "${kern:-}" --arg ip4 "${ip4:-}" --arg ip6 "${ip6:-}" \
     '{os:$os, kern:$kern, ip4:$ip4, ip6:$ip6}'
 }
@@ -67,9 +69,10 @@ collect_report() {
   local tcp udp
   tcp=$(( $(wc -l < /proc/net/tcp 2>/dev/null || echo 0) - 1 )); [ "$tcp" -lt 0 ] && tcp=0
   udp=$(( $(wc -l < /proc/net/udp 2>/dev/null || echo 0) - 1 )); [ "$udp" -lt 0 ] && udp=0
-  # 磁盘使用率（挂载点 + 百分比），JSON 数组
+  # 磁盘使用率（挂载点 + 百分比），JSON 数组；df 失败时兜底为 []
   local disk
-  disk="[$(df -Pk 2>/dev/null | awk 'NR>1 && $6 ~ /^\// { gsub(/%/,"",$5); printf "{\"m\":\"%s\",\"u\":%s},", $6, $5 }' | sed 's/,$//')]"
+  disk="[$(df -Pk 2>/dev/null | awk 'NR>1 && $6 ~ /^\// { gsub(/%/,"",$5); printf "{\"m\":\"%s\",\"u\":%s},", $6, $5 }' | sed 's/,$//')]" || true
+  disk=${disk:-[]}
   # 网络速率（累计差值 / 间隔，字节/秒）
   local rx tx
   read -r rx tx < <(awk 'NR>2 { rx += $2; tx += $10 } END { print rx, tx }' /proc/net/dev) || true
@@ -109,12 +112,22 @@ collect_report() {
 }
 
 # ---- 后台上报循环：JSON 写入 FIFO，控制通道 websocat 会原样发到面板 ----
+# 间隔动态可调：服务端下发 set_report_interval 写入 $TMP_DIR/report-interval（有观看者 3s / 无人 120s）
 rm -f "$CTL_IN"
 mkfifo "$CTL_IN"
 (
   exec 3<>"$CTL_IN"  # 读写方式打开 FIFO，立即成功不阻塞
+  local_iv=${REPORT_INTERVAL:-120}
   while true; do
-    sleep "$REPORT_INTERVAL"
+    sleep "$local_iv"
+    # 读取服务端下发的动态间隔
+    if [ -f "$TMP_DIR/report-interval" ]; then
+      read -r new_iv < "$TMP_DIR/report-interval" 2>/dev/null || true
+      case "$new_iv" in
+        ''|*[!0-9]*) ;;
+        *) local_iv=$new_iv ;;
+      esac
+    fi
     collect_report >&3 2>/dev/null || true
   done
 ) &
@@ -160,6 +173,13 @@ while true; do
         rows=$(jq -r .rows <<<"$line" 2>/dev/null)
         cols=$(jq -r .cols <<<"$line" 2>/dev/null)
         stty -F "$TMP_DIR/$sid" rows "$rows" cols "$cols" 2>/dev/null || true
+        ;;
+      set_report_interval)
+        iv=$(jq -r .interval <<<"$line" 2>/dev/null)
+        case "$iv" in
+          ''|*[!0-9]*) ;;  # 非数字忽略
+          *) echo "$iv" > "$TMP_DIR/report-interval" ;;
+        esac
         ;;
     esac
   done

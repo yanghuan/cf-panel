@@ -87,7 +87,7 @@ wrangler deploy
    systemctl daemon-reload && systemctl enable --now cf-panle-agent
    journalctl -u cf-panle-agent -f   # 看日志
    ```
-5. 监控上报已内置：agent.sh 每 60 秒经控制通道 WS 上报 CPU / 内存 / Swap / 磁盘 / 负载 / 温度 / 进程数 / TCP-UDP 连接数 / 网络速率 / 系统信息（无需 crontab），间隔可用 `REPORT_INTERVAL` 调整。
+5. 监控上报已内置：agent.sh 经控制通道 WS 上报 CPU / 内存 / Swap / 磁盘 / 负载 / 温度 / 进程数 / TCP-UDP 连接数 / 网络速率 / 系统信息（无需 crontab）。**省配额策略**：有面板观看者时约 3 秒上报（服务端动态下发），无人查看时 120 秒低频采样；`REPORT_INTERVAL` 可设默认值。
 
 ## 三、使用
 

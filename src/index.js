@@ -458,6 +458,7 @@ async function handleReport(env, payload) {
       minTs,
       cpu: payload.cpu ?? null,
       mem_used: payload.mem_used ?? null,
+      mem_total: payload.mem_total ?? null,
       net_in: payload.net_in ?? null,   // 网络速率（字节/秒）
       net_out: payload.net_out ?? null,
       extra: payload.extra ?? null,     // 扩展监控项对象 → 序列化存入 extra 列
@@ -1236,7 +1237,7 @@ export class MetricsDO {
         m = new Map();
         this.data.set(b.serverId, m);
       }
-      m.set(b.minTs, { cpu: b.cpu, mem_used: b.mem_used, net_in: b.net_in, net_out: b.net_out, extra: b.extra });
+      m.set(b.minTs, { cpu: b.cpu, mem_used: b.mem_used, mem_total: b.mem_total, net_in: b.net_in, net_out: b.net_out, extra: b.extra });
       this.trim(m);
       this.scheduleArchive();
       return json({ ok: true });
@@ -1250,7 +1251,7 @@ export class MetricsDO {
       const arr = [...m.entries()]
         .sort((a, b) => a[0] - b[0])
         .slice(-limit)
-        .map(([ts, v]) => ({ ts, cpu: v.cpu, mem_used: v.mem_used, net_in: v.net_in, net_out: v.net_out, extra: v.extra }));
+        .map(([ts, v]) => ({ ts, cpu: v.cpu, mem_used: v.mem_used, mem_total: v.mem_total, net_in: v.net_in, net_out: v.net_out, extra: v.extra }));
       return json(arr);
     }
 
@@ -1265,7 +1266,7 @@ export class MetricsDO {
           if (ts > lastTs) { lastTs = ts; lastV = v; }
         }
         if (lastV) {
-          out[serverId] = { ts: lastTs, cpu: lastV.cpu, mem_used: lastV.mem_used, net_in: lastV.net_in, net_out: lastV.net_out, extra: lastV.extra };
+          out[serverId] = { ts: lastTs, cpu: lastV.cpu, mem_used: lastV.mem_used, mem_total: lastV.mem_total, net_in: lastV.net_in, net_out: lastV.net_out, extra: lastV.extra };
         }
       }
       return json(out);

@@ -98,14 +98,46 @@
     }
   }
 
+  // 悬浮指标详情：展示 agent 上报的全部监控条目
+  function metricTipHtml(m) {
+    const e = m.extra || {};
+    const rows = [];
+    rows.push(['CPU', m.cpu != null ? m.cpu.toFixed(1) + '%' : '-']);
+    rows.push(['内存', m.mem_used != null
+      ? fmtBytes(m.mem_used) + (m.mem_total ? ' / ' + fmtBytes(m.mem_total) + ' (' + (m.mem_used / m.mem_total * 100).toFixed(0) + '%)' : '')
+      : '-']);
+    rows.push(['Swap', e.swap != null ? fmtBytes(e.swap) : '-']);
+    rows.push(['负载 (1/5/15)', [e.load1, e.load5, e.load15].map((v) => (v != null ? Number(v).toFixed(2) : '-')).join(' / ')]);
+    rows.push(['网络', (m.net_in != null ? '↓ ' + fmtBytes(m.net_in) + '/s' : '-') + ' · ' + (m.net_out != null ? '↑ ' + fmtBytes(m.net_out) + '/s' : '-')]);
+    if (e.procs != null) rows.push(['进程数', e.procs]);
+    if (e.tcp != null) rows.push(['TCP / UDP', e.tcp + ' / ' + (e.udp != null ? e.udp : '-')]);
+    rows.push(['温度', e.temp != null ? Number(e.temp).toFixed(1) + ' °C' : 'N/A']);
+    const items = rows.map(([k, v]) => `<div class="mt-row"><span>${k}</span><b>${v}</b></div>`).join('');
+    let diskHtml = '';
+    if (Array.isArray(e.disk) && e.disk.length) {
+      diskHtml = `<div class="mt-sub">磁盘（${e.disk.length} 个挂载点）</div><div class="mt-disk">` +
+        e.disk.map((d) => `<div><span title="${escapeHtml(d.m)}">${escapeHtml(d.m)}</span><b>${d.u}%</b></div>`).join('') + '</div>';
+    }
+    return `<div class="mt-title">实时指标</div>${items}${diskHtml}`;
+  }
+
   function cardHtml(s) {
     const info = s.info ? [s.info.os, s.info.ip4, s.info.ip6].filter(Boolean).join(' · ') : '';
     const m = s.metric;
+    // 磁盘使用率：取所有挂载点中最大
+    function diskPct() {
+      const arr = m && m.extra && m.extra.disk;
+      if (!Array.isArray(arr) || !arr.length) return '-';
+      return Math.max(...arr.map((d) => Number(d.u) || 0)) + '%';
+    }
     const metricHtml = m ? `
-        <div class="metric">
+        <div class="metric" data-metric="${escapeHtml(JSON.stringify(m))}">
           <span class="m-cell"><b>${m.cpu == null ? '-' : m.cpu.toFixed(1) + '%'}</b><i>CPU</i></span>
           <span class="m-cell"><b>${fmtBytes(m.mem_used)}</b><i>内存</i></span>
           <span class="m-cell"><b>${m.extra && m.extra.load1 != null ? Number(m.extra.load1).toFixed(2) : '-'}</b><i>负载</i></span>
+          <span class="m-cell"><b>${m.net_in != null ? fmtBytes(m.net_in) + '/s' : '-'}</b><i>网络↓</i></span>
+          <span class="m-cell"><b>${m.extra && m.extra.swap != null ? fmtBytes(m.extra.swap) : '-'}</b><i>Swap</i></span>
+          <span class="m-cell"><b>${diskPct()}</b><i>磁盘</i></span>
         </div>` : '';
     const probes = Array.isArray(s.probes) && s.probes.length ? `
         <div class="probes">${s.probes.map((p) => `<span class="probe ${p.ok ? 'ok' : 'down'}" title="${escapeHtml(p.name)}${p.code ? ` · HTTP ${p.code}` : ''}"><i class="dot"></i>${escapeHtml(p.name)}</span>`).join('')}</div>` : '';
@@ -561,9 +593,13 @@
     const labels = rows.map((r) => new Date(r.ts * 60000).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }));
     const cpus = rows.map((r) => r.cpu);
     const mems = rows.map((r) => (r.mem_used == null ? null : +(r.mem_used / 1048576).toFixed(1)));
+    const netIns = rows.map((r) => (r.net_in == null ? null : +(r.net_in / 1024).toFixed(1)));
+    const netOuts = rows.map((r) => (r.net_out == null ? null : +(r.net_out / 1024).toFixed(1)));
     const datasets = [
       { label: 'CPU %', data: cpus, borderColor: '#3b82f6', backgroundColor: 'rgba(59,130,246,.12)', fill: true, tension: 0.3, pointRadius: 0, borderWidth: 2 },
       { label: '内存 MB', data: mems, borderColor: '#f59e0b', backgroundColor: 'rgba(245,158,11,.08)', fill: true, tension: 0.3, pointRadius: 0, borderWidth: 2, yAxisID: 'y1' },
+      { label: '网络↓ KB/s', data: netIns, borderColor: '#22d3ee', backgroundColor: 'transparent', tension: 0.3, pointRadius: 0, borderWidth: 1.5, yAxisID: 'y1', spanGaps: true },
+      { label: '网络↑ KB/s', data: netOuts, borderColor: '#f472b6', backgroundColor: 'transparent', tension: 0.3, pointRadius: 0, borderWidth: 1.5, yAxisID: 'y1', spanGaps: true },
     ];
     // 自定义指标（按 ts 对齐系统时间轴，共用右轴；量纲差异仅看趋势）
     Object.entries(custom || {}).forEach(([name, points]) => {
@@ -874,6 +910,47 @@
 
   // ---------- 事件绑定 ----------
   $('#btn-login').onclick = (e) => { e.preventDefault(); doLogin(); };
+
+  // 卡片指标悬浮详情：全局 tooltip（挂 body 下，避免 .card:hover transform 包含块破坏 fixed 定位）
+  const metricTip = document.createElement('div');
+  metricTip.className = 'm-tip';
+  document.body.appendChild(metricTip);
+  let tipSource = null; // 当前 tooltip 对应的指标区元素
+  // 定位到指标区正下方（下方放不下则显示在指标区上方）
+  function positionTipForMetric(tip, metricEl) {
+    const r = metricEl.getBoundingClientRect();
+    const w = tip.offsetWidth;
+    const h = tip.offsetHeight;
+    let x = r.left;
+    let y = r.bottom + 8;
+    if (x + w > window.innerWidth - 8) x = Math.max(8, window.innerWidth - w - 8);
+    if (y + h > window.innerHeight - 8) y = Math.max(8, r.top - h - 8);
+    tip.style.left = x + 'px';
+    tip.style.top = y + 'px';
+  }
+  // 点击指标区弹出（固定在指标下方）；再次点击同一指标区/点击外部关闭
+  document.addEventListener('click', (e) => {
+    const metricEl = e.target.closest('.metric');
+    if (metricEl) {
+      if (tipSource === metricEl && metricTip.classList.contains('show')) {
+        metricTip.classList.remove('show');
+        tipSource = null;
+        return;
+      }
+      const raw = metricEl.dataset.metric;
+      if (!raw) return;
+      let m;
+      try { m = JSON.parse(raw); } catch { return; }
+      tipSource = metricEl;
+      metricTip.innerHTML = metricTipHtml(m);
+      metricTip.classList.add('show');
+      positionTipForMetric(metricTip, metricEl);
+      return;
+    }
+    if (e.target.closest('.m-tip')) return; // 点击 tooltip 内部不关闭（可滚动）
+    metricTip.classList.remove('show');
+    tipSource = null;
+  });
 
   // 下拉菜单：切换 / 点击外部关闭 / 菜单项路由
   $('#btn-menu').onclick = (e) => { e.stopPropagation(); $('#dropdown').classList.toggle('hidden'); };

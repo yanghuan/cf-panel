@@ -186,6 +186,9 @@ button.danger:hover { background: rgba(248, 113, 113, .12); }
 @keyframes breathe { 0%,100% { opacity: 1; } 50% { opacity: .35; } }
 .card .actions { display: flex; gap: 8px; }
 
+.card .actions { flex-wrap: nowrap; }
+.card .actions button { flex: 1; padding: 8px 6px; font-size: 12px; white-space: nowrap; }
+
 /* 空状态 */
 .empty { text-align: center; padding: 60px 0; color: var(--muted); }
 .empty p { margin: 4px 0; font-size: 15px; }
@@ -367,11 +370,10 @@ button.danger:hover { background: rgba(248, 113, 113, .12); }
   .toolbar-actions button { width: 100%; min-height: 40px; }
   #inp-name { grid-column: 1 / -1; }
 
-  /* 卡片单列，操作按钮换行 */
-  .grid { grid-template-columns: 1fr; }
+  /* 中等宽度：卡片两列，操作按钮保持单行紧凑 */
+  .grid { grid-template-columns: repeat(2, 1fr); }
   .card { padding: 12px 14px; }
-  .card .actions { flex-wrap: wrap; }
-  .card .actions button { flex: 1; min-height: 38px; }
+  .card .actions button { min-height: 34px; padding: 6px 4px; font-size: 11px; }
   .probes { gap: 4px; }
 
   /* 弹窗：占满屏（终端/文件/设置） */
@@ -389,4 +391,12 @@ button.danger:hover { background: rgba(248, 113, 113, .12); }
   .settings-body { padding: 14px; }
   .settings-row { flex-direction: column; align-items: stretch; }
   .settings-row input { min-width: 0; }
+}
+
+/* ---------- 手机窄屏（≤420px）：卡片单列 ---------- */
+@media (max-width: 420px) {
+  .grid { grid-template-columns: 1fr; }
+  .overview { grid-template-columns: repeat(2, 1fr); }
+  .card .actions { flex-wrap: wrap; }
+  .card .actions button { min-height: 36px; }
 }

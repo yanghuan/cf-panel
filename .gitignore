@@ -144,3 +144,4 @@ vite.config.ts.timestamp-*
 
 # wrangler 本地开发变量（含测试密码，勿提交）
 .dev.vars
+.wrangler/

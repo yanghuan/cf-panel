@@ -105,7 +105,7 @@
         <div class="metric">
           <span class="m-cell"><b>${m.cpu == null ? '-' : m.cpu.toFixed(1) + '%'}</b><i>CPU</i></span>
           <span class="m-cell"><b>${fmtBytes(m.mem_used)}</b><i>内存</i></span>
-          <span class="m-cell"><b>${m.extra && m.extra.load1 != null ? m.extra.load1 : '-'}</b><i>负载</i></span>
+          <span class="m-cell"><b>${m.extra && m.extra.load1 != null ? Number(m.extra.load1).toFixed(2) : '-'}</b><i>负载</i></span>
         </div>` : '';
     const probes = Array.isArray(s.probes) && s.probes.length ? `
         <div class="probes">${s.probes.map((p) => `<span class="probe ${p.ok ? 'ok' : 'down'}" title="${escapeHtml(p.name)}${p.code ? ` · HTTP ${p.code}` : ''}"><i class="dot"></i>${escapeHtml(p.name)}</span>`).join('')}</div>` : '';

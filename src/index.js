@@ -442,7 +442,7 @@ async function handleReport(env, payload) {
     const infoJson = JSON.stringify(payload.info);
     if (server.info_json !== infoJson) {
       await env.DB.prepare('UPDATE servers SET last_seen = ?, online = 1, info_json = ? WHERE id = ?')
-        .bind(ts, payload.serverId, infoJson, payload.serverId).run();
+        .bind(ts, infoJson, payload.serverId).run();
     } else {
       await env.DB.prepare('UPDATE servers SET last_seen = ?, online = 1 WHERE id = ?').bind(ts, payload.serverId).run();
     }
@@ -559,6 +559,30 @@ async function handleApi(request, env) {
     return json({ site_name: settings.site_name || 'cf-panle', notice: settings.notice || '' });
   }
 
+  // POST /api/report —— agent 监控上报（key 指纹定位 + hash 校验，无需登录）
+  // 时序数据写入内存 DO（MetricsDO 热区）；last_seen/online 仍落 D1
+  if (method === 'POST' && path === '/api/report') {
+    const body = await request.json().catch(() => ({}));
+    const keyId = await sha256Hex(String(body.key || ''));
+    const server = await env.DB.prepare('SELECT * FROM servers WHERE agent_key_id = ?').bind(keyId).first();
+    if (!server) return err('unknown agent', 401);
+    const hash = await hashSecret(String(body.key || ''), env);
+    if (hash !== server.agent_key_hash) return err('bad key', 401);
+    await handleReport(env, {
+      serverId: server.id,
+      cpu: body.cpu,
+      mem_used: body.mem_used,
+      mem_total: body.mem_total,
+      net_in: body.net_in,
+      net_out: body.net_out,
+      extra: body.extra,
+      info: body.info,
+      probes: body.probes,
+      custom: body.custom,
+    });
+    return json({ ok: true });
+  }
+
   // ---- 以下全部需要登录（JWT 或 PAT）----
   const user = await authUser(request, env);
   if (!user) return err('unauthorized', 401);
@@ -584,7 +608,7 @@ async function handleApi(request, env) {
       const lResp = await doMetrics(env).fetch('https://do.internal/latest');
       latest = await lResp.json();
     } catch { /* 无最新指标 */ }
-    const now = Date.now();
+    const now = Math.floor(Date.now() / 1000);
     const list = rows.results.map((s) => ({
       id: s.id,
       name: s.name,
@@ -666,30 +690,6 @@ async function handleApi(request, env) {
       .bind(user.id, 'file.open', server.id)
       .run();
     return json({ session_id: streamId, server_id: server.id, server_name: server.name });
-  }
-
-  // POST /api/report —— agent 监控上报（key 指纹定位 + hash 校验，无需登录）
-  // 时序数据写入内存 DO（MetricsDO 热区）；last_seen/online 仍落 D1
-  if (method === 'POST' && path === '/api/report') {
-    const body = await request.json().catch(() => ({}));
-    const keyId = await sha256Hex(String(body.key || ''));
-    const server = await env.DB.prepare('SELECT * FROM servers WHERE agent_key_id = ?').bind(keyId).first();
-    if (!server) return err('unknown agent', 401);
-    const hash = await hashSecret(String(body.key || ''), env);
-    if (hash !== server.agent_key_hash) return err('bad key', 401);
-    await handleReport(env, {
-      serverId: server.id,
-      cpu: body.cpu,
-      mem_used: body.mem_used,
-      mem_total: body.mem_total,
-      net_in: body.net_in,
-      net_out: body.net_out,
-      extra: body.extra,
-      info: body.info,
-      probes: body.probes,
-      custom: body.custom,
-    });
-    return json({ ok: true });
   }
 
   // GET /api/monitor?server_id=&range= —— 监控历史
@@ -783,7 +783,7 @@ async function mcpListServers(user, env) {
     const lResp = await doMetrics(env).fetch('https://do.internal/latest');
     latest = await lResp.json();
   } catch { /* 无最新指标 */ }
-  const now = Date.now();
+  const now = Math.floor(Date.now() / 1000);
   const list = [];
   for (const s of rows.results) {
     if (!canAccessServer(user, s)) continue;
@@ -1365,7 +1365,7 @@ export class PanelDO {
       const lResp = await doMetrics(this.env).fetch('https://do.internal/latest');
       latest = await lResp.json();
     } catch { /* 无最新指标 */ }
-    const now = Date.now();
+    const now = Math.floor(Date.now() / 1000);
     const list = [];
     for (const s of rows.results) {
       if (!canAccessServer(user, s)) continue;

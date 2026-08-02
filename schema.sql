@@ -63,6 +63,15 @@ CREATE TABLE IF NOT EXISTS metrics_min (
 
 CREATE INDEX IF NOT EXISTS idx_metrics_min_ts ON metrics_min(ts);
 
+-- 自定义监控项（用户定义命令采集，分钟级低频直写 D1，不走内存热区）
+CREATE TABLE IF NOT EXISTS metrics_custom (
+  server_id INTEGER NOT NULL,
+  name      TEXT    NOT NULL,                -- 指标名
+  ts        INTEGER NOT NULL,                -- unix 分钟戳
+  value     REAL,
+  PRIMARY KEY (server_id, name, ts)
+) WITHOUT ROWID;
+
 -- 通用键值表（替代 Workers KV，value 直接存 JSON 字符串）
 -- 用途：站点设置/公告等低频键值（key = 'settings'）
 CREATE TABLE IF NOT EXISTS kv_json (

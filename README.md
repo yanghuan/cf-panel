@@ -56,11 +56,12 @@ wrangler deploy
 > # 再执行 wrangler d1 execute cf-panle --remote --file=schema.sql 重建
 > ```
 >
-> 已有旧表缺新列？执行增量迁移（可空列，无需回填）：
+> 已有旧表缺新列/新表？执行增量迁移（可空列，无需回填）：
 > ```
 > wrangler d1 execute cf-panle --remote --command 'ALTER TABLE servers ADD COLUMN info_json TEXT;'
 > wrangler d1 execute cf-panle --remote --command 'ALTER TABLE servers ADD COLUMN probe_json TEXT;'
 > wrangler d1 execute cf-panle --remote --command 'ALTER TABLE metrics_min ADD COLUMN extra TEXT;'
+> wrangler d1 execute cf-panle --remote --command 'CREATE TABLE IF NOT EXISTS metrics_custom (server_id INTEGER NOT NULL, name TEXT NOT NULL, ts INTEGER NOT NULL, value REAL, PRIMARY KEY (server_id, name, ts)) WITHOUT ROWID;'
 > ```
 
 部署完成后访问 `https://cf-panle.<你的子域>.workers.dev`，输入配置的密码即可登录（登录即管理员）。
@@ -126,11 +127,18 @@ wrangler deploy
    PROBES="web:http:http://127.0.0.1/,mysql:tcp:127.0.0.1:3306"
    ```
    `PROBES` 格式：`名称:类型:目标,...`；类型 `http`（目标为 URL，检查 2xx/3xx）或 `tcp`（目标为 `host:port`，测连通）。
+7. 可选：自定义监控项（agent 上配置 `CUSTOM_METRICS`，执行任意命令采集数值指标，随上报存入 D1 并可看历史曲线）：
+   ```bash
+   # 追加到 /etc/cf-panle-agent.env
+   CUSTOM_METRICS='[{"name":"cpu_temp","cmd":"cat /sys/class/thermal/thermal_zone0/temp"},{"name":"estab_conns","cmd":"ss -t state established | wc -l"}]'
+   ```
+   `CUSTOM_METRICS` 为 JSON 数组：`name` 指标名、`cmd` 采集命令（输出第一行数值）、`cycle` 采样周期（当前随上报周期）。命令执行带 5 秒超时；非数值输出自动跳过。
 
 ## 三、使用
 
 - **概览与实时指标**：顶部概览条显示服务器总数/在线数/平均 CPU/负载/总内存；每张服务器卡片实时显示 CPU / 内存 / 负载（经 `/ws/push` 每 3 秒随列表推送，PanelDO 从 MetricsDO 取最新值）。
 - **服务探活**：agent 配置 `PROBES` 后，卡片显示每个服务的状态徽章（绿=正常/红=异常，悬停显示 HTTP 码）；探测失败持续超冷却会触发 Webhook（`event: probe_down`，恢复发 `probe_recovered`）。
+- **自定义监控项**：agent 配置 `CUSTOM_METRICS`（JSON：`name`+`cmd`）后，执行任意命令采集数值指标；监控图中以独立曲线展示（按 ts 对齐系统时间轴，共用右轴看趋势），数据直写 D1 `metrics_custom` 表（30 天保留）。
 - **实时列表**：登录后前端与 `/ws/push` 保持 WebSocket，客户端每 3 秒发一次 sync 请求，服务端（PanelDO，Hibernation 休眠态，费用趋近普通 Worker）按权限返回服务器列表（在线状态自动更新），无需手动刷新。
 - **终端**：面板服务器卡片点「终端」→ xterm.js 弹出 → 按键实时到达被控机 shell；窗口拉伸自动 resize（经控制通道 `stty` 下发）；断线自动重连（最多 3 次）。
 - **文件管理**：面板服务器卡片点「文件」→ 弹出文件管理器，可浏览目录（点击进入/上级/路径跳转）、**上传**（本地文件写入 agent）、**下载**（agent 文件回传浏览器）；文件经独立 WS 会话**分段传输**（1MB/段，base64），**单文件上限 500MB**（需 GNU coreutils 的 `find -printf`/`tail -c`/`base64 -w0`）。

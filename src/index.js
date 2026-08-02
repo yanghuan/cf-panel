@@ -200,6 +200,25 @@ async function queryMonitorRows(env, serverId, hours) {
   return r.results.map((x) => ({ ...x, extra: safeJson(x.extra) }));
 }
 
+// 自定义监控项查询：按时间段读 D1（低频直写，无需热区），超长区间 SQL 抽样
+async function queryCustomMetrics(env, serverId, hours) {
+  const minutes = hours * 60;
+  const sinceMin = Math.floor(Date.now() / 1000 / 60) - minutes;
+  const custom = {};
+  const MAX = 1500;
+  let r;
+  if (minutes > MAX) {
+    const step = Math.ceil(minutes / MAX);
+    r = await env.DB.prepare('SELECT name, ts, value FROM metrics_custom WHERE server_id = ? AND ts >= ? AND ts % ? = 0 ORDER BY ts').bind(serverId, sinceMin, step).all();
+  } else {
+    r = await env.DB.prepare('SELECT name, ts, value FROM metrics_custom WHERE server_id = ? AND ts >= ? ORDER BY ts').bind(serverId, sinceMin).all();
+  }
+  for (const row of r.results) {
+    (custom[row.name] = custom[row.name] || []).push({ ts: row.ts, value: row.value });
+  }
+  return custom;
+}
+
 // 指标告警冷却状态（serverId:kind -> 上次触发时间，Worker 实例内存，重启清零）
 const ALERT_LAST = new Map();
 // 服务探活状态（serverId:probeName -> {ok, lastFail}，Worker 实例内存，重启清零）
@@ -317,6 +336,15 @@ async function handleReport(env, payload) {
       await env.DB.prepare('UPDATE servers SET probe_json = ? WHERE id = ?').bind(probeJson, payload.serverId).run();
     }
     await checkProbeAlerts(env, payload.serverId, server.name, payload.probes);
+  }
+  // 自定义监控项：低频直写 D1（分钟级，无需内存热区）
+  if (Array.isArray(payload.custom)) {
+    const stmts = payload.custom
+      .filter((c) => c && c.name && c.value != null)
+      .map((c) => env.DB.prepare(
+        'INSERT OR IGNORE INTO metrics_custom (server_id, name, ts, value) VALUES (?,?,?,?)'
+      ).bind(payload.serverId, String(c.name), minTs, Number(c.value)));
+    if (stmts.length) await env.DB.batch(stmts);
   }
   if (payload.info) {
     const infoJson = JSON.stringify(payload.info);
@@ -567,6 +595,7 @@ async function handleApi(request, env) {
       extra: body.extra,
       info: body.info,
       probes: body.probes,
+      custom: body.custom,
     });
     return json({ ok: true });
   }
@@ -580,7 +609,11 @@ async function handleApi(request, env) {
     if (!s) return err('not found', 404);
     if (!canAccessServer(user, s)) return err('forbidden', 403);
     const hours = parseRangeHours(range);
-    return json(await queryMonitorRows(env, serverId, hours));
+    const [system, custom] = await Promise.all([
+      queryMonitorRows(env, serverId, hours),
+      queryCustomMetrics(env, serverId, hours),
+    ]);
+    return json({ system, custom });
   }
 
   // ---- PAT 管理（仅管理员）----
@@ -692,8 +725,12 @@ async function mcpGetMonitor(user, env, args) {
   }
   if (!server) throw new Error('server not found（请先用 list_servers 确认 id 或名称）');
   if (!canAccessServer(user, server)) throw new Error('forbidden');
-  const rows = await queryMonitorRows(env, server.id, parseRangeHours(range));
-  return { server: { id: server.id, name: server.name }, range, count: rows.length, points: rows };
+  const hours = parseRangeHours(range);
+  const [system, custom] = await Promise.all([
+    queryMonitorRows(env, server.id, hours),
+    queryCustomMetrics(env, server.id, hours),
+  ]);
+  return { server: { id: server.id, name: server.name }, range, count: system.length, points: system, custom };
 }
 
 // /mcp 主入口（无状态 Streamable HTTP）
@@ -940,6 +977,7 @@ export class TerminalDO {
                 extra: j.extra,
                 info: j.info,
                 probes: j.probes,
+                custom: j.custom,
               });
               await this.syncAgentInterval(ws, serverId);
             }
@@ -1160,7 +1198,10 @@ export class MetricsDO {
     if (now - this.lastPrune > PRUNE_INTERVAL_MS) {
       this.lastPrune = now;
       const minTs = Math.floor(now / 1000 / 60) - METRICS_RETENTION_DAYS * 1440;
-      await this.env.DB.prepare('DELETE FROM metrics_min WHERE ts < ?').bind(minTs).run();
+      await this.env.DB.batch([
+        this.env.DB.prepare('DELETE FROM metrics_min WHERE ts < ?').bind(minTs),
+        this.env.DB.prepare('DELETE FROM metrics_custom WHERE ts < ?').bind(minTs),
+      ]);
     }
     this.state.storage.setAlarm(Date.now() + ARCHIVE_INTERVAL_MS);
   }

@@ -20,6 +20,7 @@ TMP_DIR=${AGENT_TMPDIR:-/tmp/cfpanle}
 DISABLE_EXEC=${DISABLE_EXEC:-0}         # =1 时全局禁止命令执行（终端/exec 全部忽略）
 REPORT_INTERVAL=${REPORT_INTERVAL:-120} # 默认上报间隔（秒）：省配额策略下无人查看用 120s，有观看者由服务端下发 3s
 PROBES=${PROBES:-}              # 服务探活配置："name:http:URL,name:tcp:host:port,..."（空则不启用）
+CUSTOM_METRICS=${CUSTOM_METRICS:-} # 自定义监控项 JSON：[{"name":"x","cmd":"...","cycle":60}]（空则不启用）
 
 mkdir -p "$TMP_DIR"
 CTL_IN="$TMP_DIR/control-in"  # 控制通道上行 FIFO（上报 JSON → websocat → WS）
@@ -90,7 +91,28 @@ collect_probes() {
   echo "[$joined]"
 }
 
-# ---- 监控采集：输出 JSON（固定列 + extra 扩展项 + 系统信息 + 探活）----
+# ---- 自定义监控项采集：执行用户命令，取输出第一行数值 → [{name, value}] ----
+collect_custom() {
+  [ -z "${CUSTOM_METRICS:-}" ] && { echo '[]'; return; }
+  jq -e . >/dev/null 2>&1 <<<"$CUSTOM_METRICS" || { echo '[]'; return; }
+  local out=() row name cmd val
+  while IFS= read -r row; do
+    [ -z "$row" ] && continue
+    name=$(jq -r '.name' <<<"$row")
+    cmd=$(jq -r '.cmd' <<<"$row")
+    [ -z "$name" ] || [ -z "$cmd" ] && continue
+    val=$(timeout 5 bash -c "$cmd" 2>/dev/null | head -1 | tr -d '[:space:]')
+    case "$val" in
+      ''|*[!0-9.eE+-]*) ;;  # 空/非数字跳过
+      *) out+=("{\"name\":\"$name\",\"value\":$val}") ;;
+    esac
+  done < <(jq -c '.[]' <<<"$CUSTOM_METRICS")
+  local joined
+  joined=$(IFS=,; echo "${out[*]}")
+  echo "[$joined]"
+}
+
+# ---- 监控采集：输出 JSON（固定列 + extra 扩展项 + 系统信息 + 探活 + 自定义）----
 collect_report() {
   # CPU 使用率（两次采样求差值，抵消瞬时误差）
   read -r _ c0u c0n c0s c0i < <(awk '/^cpu /{print}' /proc/stat)
@@ -140,10 +162,12 @@ collect_report() {
   fi
   NET_PREV_RX=$rx; NET_PREV_TX=$tx; NET_PREV_TS=$now_s
 
-  local info probes
+  local info probes custom
   info=$(collect_info)
   probes=$(collect_probes)
   probes=$(jq -e . <<<"$probes" 2>/dev/null || echo '[]')
+  custom=$(collect_custom)
+  custom=$(jq -e . <<<"$custom" 2>/dev/null || echo '[]')
 
   jq -nc \
     --argjson cpu "${cpu:-0}" \
@@ -162,9 +186,10 @@ collect_report() {
     --argjson nout "${n_out_rate:-0}" \
     --argjson info "$info" \
     --argjson probes "$probes" \
+    --argjson custom "$custom" \
     '{type:"report", cpu:$cpu, mem_used:$mem, mem_total:$mt, net_in:$nin, net_out:$nout,
       extra:{swap:$swap, disk:$disk, load1:$load1, load5:$load5, load15:$load15, temp:$temp, procs:$procs, tcp:$tcp, udp:$udp},
-      info:$info, probes:$probes}'
+      info:$info, probes:$probes, custom:$custom}'
 }
 
 # ---- 后台上报循环：JSON 写入 FIFO，控制通道 websocat 会原样发到面板 ----

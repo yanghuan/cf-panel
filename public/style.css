@@ -339,3 +339,46 @@ button.danger:hover { background: rgba(248, 113, 113, .12); }
   padding: 12px;
 }
 #monitor-chart { width: 100% !important; height: 100% !important; }
+
+/* ---------- 移动端适配（≤640px） ---------- */
+@media (max-width: 640px) {
+  header { padding: 10px 14px; }
+  header h1 { font-size: 16px; }
+  .header-right { gap: 8px; }
+  main { margin: 14px auto; padding: 0 12px; }
+
+  /* 概览条：5 项改 3 列网格 */
+  .overview { display: grid; grid-template-columns: repeat(3, 1fr); padding: 12px 14px; gap: 10px; }
+  .ov-item { min-width: 0; }
+  .ov-num { font-size: 17px; }
+
+  /* 工具栏：输入/按钮两列，名称占整行 */
+  .toolbar { flex-direction: column; align-items: stretch; gap: 10px; }
+  .toolbar-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  .toolbar-actions input,
+  .toolbar-actions button { width: 100%; min-height: 40px; }
+  #inp-name { grid-column: 1 / -1; }
+
+  /* 卡片单列，操作按钮换行 */
+  .grid { grid-template-columns: 1fr; }
+  .card { padding: 12px 14px; }
+  .card .actions { flex-wrap: wrap; }
+  .card .actions button { flex: 1; min-height: 38px; }
+  .probes { gap: 4px; }
+
+  /* 弹窗：占满屏（终端/文件/设置） */
+  .modal { padding: 12px; }
+  .file-body { padding: 12px; }
+  .file-toolbar { gap: 6px; }
+  .file-toolbar input { flex: 1; min-width: 0; }
+  /* 文件表：隐藏"修改时间"列，省横向空间 */
+  .file-table th:nth-child(3),
+  .file-table td:nth-child(3) { display: none; }
+
+  .chart-wrap { height: 240px; padding: 8px; }
+
+  .auth-card { width: calc(100vw - 40px); max-width: 320px; }
+  .settings-body { padding: 14px; }
+  .settings-row { flex-direction: column; align-items: stretch; }
+  .settings-row input { min-width: 0; }
+}

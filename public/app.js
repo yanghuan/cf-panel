@@ -452,6 +452,7 @@
   // ---------- 监控（简易文本图，支持时间范围） ----------
   const MONITOR_STEP_MAX = 240; // 长区间降采样目标点数
   const MONITOR_RANGE_LABEL = { '1h': '近1小时', '12h': '近12小时', '3d': '近3天', '7d': '近7天', '30d': '近30天' };
+  const MONITOR_COLORS = ['#8b5cf6', '#22d3ee', '#f472b6', '#34d399', '#fbbf24', '#a78bfa'];
 
   // 长区间数据太多时按区间平均降采样，保证可读性
   function downsample(rows, max = MONITOR_STEP_MAX) {
@@ -476,17 +477,20 @@
     monitorState = { serverId, serverName, range };
     document.querySelectorAll('.range-btn').forEach((b) => b.classList.toggle('active', b.dataset.range === range));
     try {
-      const rows = await api(`/api/monitor?server_id=${serverId}&range=${range}`);
+      const data = await api(`/api/monitor?server_id=${serverId}&range=${range}`);
+      const rows = data.system || data; // 兼容：新结构 {system, custom}
+      const custom = data.custom || {};
       const label = MONITOR_RANGE_LABEL[range] || range;
-      $('#monitor-title').textContent = `监控 · ${serverName}（${label}，${rows.length} 点${rows.length > MONITOR_STEP_MAX ? '，降采样' : ''}）`;
+      const cCount = Object.keys(custom).length;
+      $('#monitor-title').textContent = `监控 · ${serverName}（${label}，${rows.length} 点${rows.length > MONITOR_STEP_MAX ? '，降采样' : ''}${cCount ? ` +${cCount} 自定义` : ''}）`;
       $('#monitor-panel').classList.remove('hidden'); // 先显示，保证 canvas 有尺寸
-      renderMonitorChart(downsample(rows));
+      renderMonitorChart(downsample(rows), custom);
     } catch (e) {
       toast(e.message);
     }
   }
 
-  function renderMonitorChart(rows) {
+  function renderMonitorChart(rows, custom) {
     const wrap = $('#monitor-chart').parentElement;
     if (monitorChart) { monitorChart.destroy(); monitorChart = null; }
     // 重建 canvas（可能被上次的提示文本覆盖）
@@ -504,15 +508,25 @@
     const labels = rows.map((r) => new Date(r.ts * 60000).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }));
     const cpus = rows.map((r) => r.cpu);
     const mems = rows.map((r) => (r.mem_used == null ? null : +(r.mem_used / 1048576).toFixed(1)));
+    const datasets = [
+      { label: 'CPU %', data: cpus, borderColor: '#3b82f6', backgroundColor: 'rgba(59,130,246,.12)', fill: true, tension: 0.3, pointRadius: 0, borderWidth: 2 },
+      { label: '内存 MB', data: mems, borderColor: '#f59e0b', backgroundColor: 'rgba(245,158,11,.08)', fill: true, tension: 0.3, pointRadius: 0, borderWidth: 2, yAxisID: 'y1' },
+    ];
+    // 自定义指标（按 ts 对齐系统时间轴，共用右轴；量纲差异仅看趋势）
+    Object.entries(custom || {}).forEach(([name, points]) => {
+      if (!Array.isArray(points) || !points.length) return;
+      const cMap = new Map(points.map((p) => [p.ts, p.value]));
+      datasets.push({
+        label: name,
+        data: rows.map((r) => (cMap.has(r.ts) ? cMap.get(r.ts) : null)),
+        borderColor: MONITOR_COLORS[datasets.length % MONITOR_COLORS.length],
+        backgroundColor: 'transparent',
+        tension: 0.3, pointRadius: 0, borderWidth: 1.5, yAxisID: 'y1',
+      });
+    });
     monitorChart = new Chart($('#monitor-chart'), {
       type: 'line',
-      data: {
-        labels,
-        datasets: [
-          { label: 'CPU %', data: cpus, borderColor: '#3b82f6', backgroundColor: 'rgba(59,130,246,.12)', fill: true, tension: 0.3, pointRadius: 0, borderWidth: 2 },
-          { label: '内存 MB', data: mems, borderColor: '#f59e0b', backgroundColor: 'rgba(245,158,11,.08)', fill: true, tension: 0.3, pointRadius: 0, borderWidth: 2, yAxisID: 'y1' },
-        ],
-      },
+      data: { labels, datasets },
       options: {
         responsive: true,
         maintainAspectRatio: false,

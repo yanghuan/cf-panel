@@ -614,7 +614,7 @@ async function handleApi(request, env) {
       name: s.name,
       group: s.group || '',
       display_index: s.display_index || 0,
-      online: s.online === 1 && now - (s.last_seen || 0) < 60000,
+      online: s.online === 1 && now - (s.last_seen || 0) < 60, // now/last_seen 均为 unix 秒，60 秒内上报算在线
       info: safeJson(s.info_json),
       probes: safeJson(s.probe_json),
       metric: latest[s.id] || null,
@@ -792,7 +792,7 @@ async function mcpListServers(user, env) {
       id: s.id,
       name: s.name,
       group: s.group || '',
-      online: s.online === 1 && now - (s.last_seen || 0) < 60000,
+      online: s.online === 1 && now - (s.last_seen || 0) < 60, // now/last_seen 均为 unix 秒，60 秒内上报算在线
       info: safeJson(s.info_json),
       metrics: m ? {
         cpu_pct: m.cpu,
@@ -1437,7 +1437,7 @@ export class PanelDO {
         name: s.name,
         group: s.group || '',
         display_index: s.display_index || 0,
-        online: s.online === 1 && now - (s.last_seen || 0) < 60000,
+        online: s.online === 1 && now - (s.last_seen || 0) < 60, // now/last_seen 均为 unix 秒，60 秒内上报算在线
         info: safeJson(s.info_json),
         probes: safeJson(s.probe_json),
         metric: latest[s.id] || null,

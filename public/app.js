@@ -325,10 +325,13 @@
     let ws = null;
     let closed = false;
     let retries = 0;
+    let noDataTimer = null;  // 连接后无数据超时（open_terminal 可能丢失）
+    let rebuilding = false;  // 无响应重建中，避免与 onclose 重连重复
 
     const close = () => {
       if (closed) return;
       closed = true;
+      if (noDataTimer) { clearTimeout(noDataTimer); noDataTimer = null; }
       try { ws && ws.close(); } catch { /* ignore */ }
       term.dispose();
       $('#term-modal').classList.add('hidden');
@@ -340,21 +343,36 @@
       api('/api/terminal', { method: 'POST', body: JSON.stringify({ server_id: serverId }) })
         .then((res) => {
           const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-          ws = new WebSocket(`${proto}://${location.host}/ws/terminal/${res.session_id}?token=${encodeURIComponent(token)}`);
-          ws.binaryType = 'arraybuffer';
+          const w = new WebSocket(`${proto}://${location.host}/ws/terminal/${res.session_id}?token=${encodeURIComponent(token)}`);
+          ws = w;
+          w.binaryType = 'arraybuffer';
 
-          ws.onopen = () => {
+          w.onopen = () => {
             retries = 0;
+            rebuilding = false;
             fit.fit();
             term.focus();
-            ws.send(JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows }));
+            w.send(JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows }));
+            // 自愈：连接后长时间无数据（open_terminal 在 agent 重连窗口丢失）→ 重建会话
+            if (noDataTimer) clearTimeout(noDataTimer);
+            noDataTimer = setTimeout(() => {
+              noDataTimer = null;
+              if (closed || rebuilding) return;
+              term.write('\r\n\x1b[90m[会话无响应，正在重建...]\x1b[0m\r\n');
+              rebuilding = true;
+              try { w.close(); } catch { /* ignore */ }
+              connect();
+            }, 8000);
           };
-          ws.onmessage = (ev) => {
+          w.onmessage = (ev) => {
+            if (noDataTimer) { clearTimeout(noDataTimer); noDataTimer = null; } // 有数据即会话正常
             if (typeof ev.data === 'string') term.write(ev.data);
             else term.write(new Uint8Array(ev.data));
           };
-          ws.onclose = () => {
+          w.onclose = () => {
             if (closed) return;
+            if (rebuilding) return; // 重建已由无响应分支的 connect() 接管
+            if (noDataTimer) { clearTimeout(noDataTimer); noDataTimer = null; }
             if (retries < TERM_RETRY_MAX) {
               retries += 1;
               term.write(`\r\n\x1b[90m[连接断开，${retries}s 后自动重连...]\x1b[0m\r\n`);
@@ -363,7 +381,7 @@
               term.write('\r\n\x1b[90m[连接已关闭]\x1b[0m\r\n');
             }
           };
-          ws.onerror = () => { try { ws.close(); } catch { /* ignore */ } };
+          w.onerror = () => { try { w.close(); } catch { /* ignore */ } };
         })
         .catch((e) => {
           if (closed) return;

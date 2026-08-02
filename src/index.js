@@ -946,6 +946,7 @@ export class TerminalDO {
     this.sessions = new Map(); // streamId -> {streamId, serverId, creatorUserId, createdAt, userWs, agentWs}
     this.agents = new Map(); // serverId -> 控制 WS
     this.agentInterval = new Map(); // serverId -> 当前下发的上报间隔（秒），避免重复下发
+    this.pendingTerm = new Map(); // streamId -> {tries, timer} open_terminal 确认重发
     this.lastSweep = 0;
   }
 
@@ -981,6 +982,9 @@ export class TerminalDO {
         const agentWs = this.agents.get(body.serverId);
         if (!agentWs) return json({ error: 'agent offline' }, 502);
         agentWs.send(JSON.stringify({ type: isFile ? 'open_file' : 'open_terminal', stream_id: body.streamId }));
+        // 终端会话：确认重发机制——agent 收到并 spawn 后回 terminal_ready，
+        // 未确认则定时重发（最多 3 次），避免控制通道重连窗口丢指令
+        if (!isFile) this.scheduleTermAck(agentWs, body.streamId);
         return json({ ok: true });
       }
       return err('bad op');
@@ -1067,6 +1071,25 @@ export class TerminalDO {
     }
   }
 
+  // open_terminal 确认重发：下发后 5s 未收到 agent 的 terminal_ready 则重发，最多 3 次
+  // 解决 agent 控制通道重连窗口内指令丢失导致的终端"打不开"
+  scheduleTermAck(agentWs, streamId) {
+    if (this.pendingTerm.has(streamId)) return;
+    const rec = { tries: 0, timer: null };
+    this.pendingTerm.set(streamId, rec);
+    const retry = () => {
+      const r = this.pendingTerm.get(streamId);
+      if (!r) return; // 已确认（terminal_ready）或已清理
+      if (agentWs.readyState === 1) {
+        try { agentWs.send(JSON.stringify({ type: 'open_terminal', stream_id: streamId })); } catch { /* ignore */ }
+      }
+      r.tries += 1;
+      if (r.tries < 3) r.timer = setTimeout(retry, 5000);
+      else this.pendingTerm.delete(streamId); // 3 次后放弃（前端有自愈兜底）
+    };
+    rec.timer = setTimeout(retry, 5000);
+  }
+
   // Hibernation：DO 实例空闲冻结后，WebSocket 连接由 workerd 托管持久，但本类
   // 实例的 sessions/agents 内存 Map 会随冻结全部丢失。附件（serializeAttachment）
   // 随连接持久化，唤醒后据此惰性重建索引，避免误判 "agent offline" / "session not found"。
@@ -1118,12 +1141,19 @@ export class TerminalDO {
   // Hibernation：消息转发（§3.3 双向对拷 + resize 走控制通道）
   async webSocketMessage(ws, message) {
     this.rebuildIndex(); // 休眠唤醒后索引可能已丢，先按附件重建
-    // agent 控制通道（不在任何 session）：仅处理监控上报 {type:"report"}
+    // agent 控制通道（不在任何 session）：处理监控上报 {type:"report"} 与终端确认 {type:"terminal_ready"}
     const sess = [...this.sessions.values()].find((s) => s.userWs === ws || s.agentWs === ws);
     if (!sess) {
       if (typeof message === 'string') {
         try {
           const j = JSON.parse(message);
+          if (j && j.type === 'terminal_ready') {
+            // agent 已收到 open_terminal 并开始 spawn → 停止确认重发
+            const r = this.pendingTerm.get(j.stream_id);
+            if (r && r.timer) clearTimeout(r.timer);
+            this.pendingTerm.delete(j.stream_id);
+            return;
+          }
           if (j && j.type === 'report') {
             const serverId = this.wsServerId(ws);
             if (serverId) {
@@ -1211,6 +1241,11 @@ export class TerminalDO {
     for (const [serverId, w] of this.agents) {
       if (w === ws) this.agents.delete(serverId);
     }
+    // 控制通道断开：清除该 agent 的 open_terminal 待确认（定时器停止，重连后前端自愈兜底）
+    for (const [, r] of this.pendingTerm) {
+      if (r.timer) clearTimeout(r.timer);
+    }
+    this.pendingTerm.clear();
   }
 }
 

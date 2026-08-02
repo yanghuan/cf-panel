@@ -17,6 +17,7 @@ set -euo pipefail
 WSS=${AGENT_WSS_URL:?}        # 例: wss://panel.example.com/ws/agent
 KEY=${AGENT_KEY:?}            # 唯一身份 + 凭证（uuid 已废弃，仅保留这一个）
 TMP_DIR=${AGENT_TMPDIR:-/tmp/cfpanle}
+WS_BUF=${WS_BUF:-3145728}     # websocat -B buffer 大小（字节）。前端文件块 1MB，base64 后约 1.4MB，3MB 留约 2 倍余量
 DISABLE_EXEC=${DISABLE_EXEC:-0}         # =1 时全局禁止命令执行（终端/exec 全部忽略）
 REPORT_INTERVAL=${REPORT_INTERVAL:-120} # 默认上报间隔（秒）：省配额策略下无人查看用 120s，有观看者由服务端下发 3s
 PROBES=${PROBES:-}              # 服务探活配置："name:http:URL,name:tcp:host:port,..."（空则不启用）
@@ -238,12 +239,16 @@ mkfifo "$CTL_IN"
 spawn_terminal() {
   local sid=$1 pty_pid=$2
   (
-    websocat -b "sh-c:socat - $TMP_DIR/$sid" "$WSS/terminal?sid=$sid" -H "X-Agent-Key: $KEY"
+    log "TERM-DBG spawn_terminal sid=$sid pty_pid=$pty_pid"
+    websocat -b -B "$WS_BUF" "sh-c:socat - $TMP_DIR/$sid" "$WSS/terminal?sid=$sid" -H "X-Agent-Key: $KEY"
+    log "TERM-DBG terminal ws ended sid=$sid (exit=$?)"
     # 会话结束（浏览器关闭 / WS 断开）→ 清理 PTY 端进程组
     local bash_pid
     bash_pid=$(pgrep -P "$pty_pid" 2>/dev/null | head -1) || true
+    log "TERM-DBG cleanup pty_pid=$pty_pid alive=$(kill -0 $pty_pid 2>/dev/null && echo yes || echo no) bash_pid=$bash_pid"
     if [ -n "$bash_pid" ]; then
       kill -- -"$bash_pid" 2>/dev/null || true  # bash 为 setsid 会话首进程，整组 SIGHUP/TERM
+      log "TERM-DBG killed group -$bash_pid"
     fi
     kill "$pty_pid" 2>/dev/null || true
     rm -f "$TMP_DIR/$sid"
@@ -265,9 +270,10 @@ set -euo pipefail
 ls_entries() {
   local path=$1
   [ -d "$path" ] || { echo '[]'; return 0; }
-  find "$path" -maxdepth 1 -mindepth 1 -printf '%f|%y|%s|%T@\n' 2>/dev/null | while IFS='|' read -r name typ size mt; do
+  # drvfs（Windows 盘）上 find 可能因访问部分条目返回非0（输出正常），用 || true 忽略退出码
+  { find "$path" -maxdepth 1 -mindepth 1 -printf '%f|%y|%s|%T@\n' 2>/dev/null || true; } | while IFS='|' read -r name typ size mt; do
     jq -nc --arg n "$name" --arg t "$typ" --argjson s "${size:-0}" --argjson m "${mt:-0}" \
-      '{name:$n, type:($t=="d"?"dir":"file"), size:$s, mtime:$m}'
+      '{name:$n, type:(if $t=="d" then "dir" else "file" end), size:$s, mtime:$m}'
   done | jq -s '.'
 }
 
@@ -291,9 +297,12 @@ while IFS= read -r line; do
           continue
         fi
         [ "${limit:-0}" -le 0 ] && limit=$size
-        data=$(tail -c +$((offset + 1)) "$path" 2>/dev/null | head -c "$limit" | base64 -w0 2>/dev/null) || data=''
+        # 注意：tail 输出超出 head 读取量时 tail 会 SIGPIPE（141），pipefail 下必须 || true
+        # 保留 head 已读到的完整数据（命令替换的输出不会被丢弃，只是退出码非 0）
+        data=$(tail -c +$((offset + 1)) "$path" 2>/dev/null | head -c "$limit" | base64 -w0 2>/dev/null) || true
         got=$(printf '%s' "$data" | base64 -d 2>/dev/null | wc -c) || got=0
-        jq -nc --arg p "$path" --arg d "$data" --argjson o "$offset" --argjson g "$got" --argjson s "$size" \
+        # 大数据不能走 --arg（单参数 >128KB 会 "Argument list too long"），改用 --rawfile 从进程替换读
+        jq -nc --rawfile d <(printf '%s' "$data") --arg p "$path" --argjson o "$offset" --argjson g "$got" --argjson s "$size" \
           '{type:"read_result", ok:true, path:$p, offset:$o, data:$d, got:$g, size:$s}'
       else
         jq -nc --arg p "$path" '{type:"error", ok:false, message:"not a file or unreadable"}'
@@ -324,7 +333,7 @@ while IFS= read -r line; do
 done
 SERVEREOF
   (
-    websocat -t "sh-c:bash $fs" "$WSS/file?sid=$sid" -H "X-Agent-Key: $KEY"
+    websocat -t -B "$WS_BUF" "sh-c:bash $fs" "$WSS/file?sid=$sid" -H "X-Agent-Key: $KEY"
     rm -f "$fs"
   ) &
 }
@@ -338,11 +347,23 @@ while true; do
   mkfifo "$CTL_OUT"
   websocat -t "$WSS/control" -H "X-Agent-Key: $KEY" < "$CTL_IN" > "$CTL_OUT" 2>/dev/null &
   local_ws=$!
-  while IFS= read -r line < "$CTL_OUT"; do
-    [ -z "$line" ] && continue
-    case "$(jq -r .type <<<"$line" 2>/dev/null)" in
+  log "CTL-DBG control ws started pid=$local_ws"
+  # 等待 websocat 建立连接（打开 FIFO 写端）；若连接失败快速退出则直接重连
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    if ! kill -0 "$local_ws" 2>/dev/null; then break; fi
+    sleep 0.3
+  done
+  if kill -0 "$local_ws" 2>/dev/null; then
+    # 一次性打开读端（避免每次 read 重新 open 在无 writer 时阻塞卡死）
+    exec 3<"$CTL_OUT" 2>/dev/null || true
+    # read -t：长时间无下行（半开连接）时超时重连，自愈卡死状态
+    while IFS= read -t 180 -r line <&3; do
+      [ -z "$line" ] && continue
+      log "CTL-DBG recv: $(jq -r .type <<<"$line" 2>/dev/null)"
+      case "$(jq -r .type <<<"$line" 2>/dev/null)" in
       open_terminal)
         sid=$(jq -r .stream_id <<<"$line" 2>/dev/null)
+        log "CTL-DBG open_terminal sid=$sid"
         if [ "$DISABLE_EXEC" = "1" ]; then
           log "命令执行已被禁用 (DISABLE_EXEC=1)，忽略 open_terminal sid=$sid"
           continue
@@ -373,9 +394,17 @@ while true; do
           *) echo "$iv" > "$TMP_DIR/report-interval" ;;
         esac
         ;;
-    esac
-  done
-  wait "$local_ws" 2>/dev/null || true
+      esac
+    done
+    exec 3<&- 2>/dev/null || true
+  fi
+  log "CTL-DBG read loop ended (ws=$local_ws)"
+  # read 超时（半开）时 websocat 仍存活，主动断开以触发重连；正常 EOF 则已退出
+  if kill -0 "$local_ws" 2>/dev/null; then
+    log "CTL-DBG killing stale ctl ws $local_ws"
+    kill "$local_ws" 2>/dev/null || true
+    wait "$local_ws" 2>/dev/null || true
+  fi
   rm -f "$CTL_OUT"
   log "control channel lost, retry in 3s..."
   sleep 3

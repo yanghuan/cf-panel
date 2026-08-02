@@ -399,8 +399,12 @@
     }
   }
 
-  function closeFileModal() {
+  function closeFileWs() {
     if (fileWs) { try { fileWs.close(); } catch { /* ignore */ } fileWs = null; }
+  }
+
+  function closeFileModal() {
+    closeFileWs();
     $('#file-modal').classList.add('hidden');
     unlockScroll();
   }

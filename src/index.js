@@ -140,6 +140,26 @@ function safeJson(s) {
   if (s == null) return null;
   try { return JSON.parse(s); } catch { return null; }
 }
+// 清洗告警配置（PUT /api/settings 用）：只保留合法字段，空 webhook_url 即禁用
+function sanitizeAlerts(a) {
+  if (!a || typeof a !== 'object') return undefined;
+  const out = {};
+  const num = (v, def) => {
+    const n = Number(v);
+    return Number.isFinite(n) && n > 0 ? n : def;
+  };
+  const url = String(a.webhook_url || '').trim();
+  if (url) out.webhook_url = url;
+  const token = String(a.webhook_token || '').trim();
+  if (token) out.webhook_token = token;
+  if (a.cpu_pct !== undefined) out.cpu_pct = num(a.cpu_pct, 90);
+  if (a.mem_pct !== undefined) out.mem_pct = num(a.mem_pct, 90);
+  if (a.disk_pct !== undefined) out.disk_pct = num(a.disk_pct, 90);
+  if (a.load !== undefined) out.load = num(a.load, 0);
+  if (a.cooldown_min !== undefined) out.cooldown_min = num(a.cooldown_min, 30);
+  if (a.offline_after_s !== undefined) out.offline_after_s = num(a.offline_after_s, 180);
+  return out;
+}
 // 任何秘密（agent key / PAT token）统一用 HMAC 哈希后落库
 async function hashSecret(value, env) {
   return bytesToHex(await hmacSha256(new TextEncoder().encode(secret(env)), new TextEncoder().encode(value)));
@@ -224,14 +244,45 @@ const ALERT_LAST = new Map();
 // 服务探活状态（serverId:probeName -> {ok, lastFail}，Worker 实例内存，重启清零）
 const PROBE_STATE = new Map();
 
-// 发送告警 Webhook：POST JSON 到 ALERT_WEBHOOK_URL（可选 ALERT_WEBHOOK_TOKEN 作为 Bearer 鉴权）。
+// 设置缓存（避免告警检查每次上报读 D1），TTL 60s，保存设置时清除
+const SETTINGS_CACHE = new Map();
+const SETTINGS_TTL_MS = 60 * 1000;
+async function kvGetCached(env, key, fallback) {
+  const c = SETTINGS_CACHE.get(key);
+  if (c && Date.now() - c.ts < SETTINGS_TTL_MS) return c.value;
+  const v = await kvGet(env, key, fallback);
+  SETTINGS_CACHE.set(key, { value: v, ts: Date.now() });
+  return v;
+}
+function kvClearCache(key) {
+  SETTINGS_CACHE.delete(key);
+}
+
+// 告警配置：从 D1 settings.alerts 读取（网页设置弹窗配置，不再用 ALERT_* 环境变量）
+async function getAlertCfg(env) {
+  const settings = (await kvGetCached(env, 'settings', {})) || {};
+  const a = settings.alerts || {};
+  return {
+    enabled: !!a.webhook_url,
+    webhook_url: String(a.webhook_url || ''),
+    webhook_token: String(a.webhook_token || ''),
+    cpu_pct: Number(a.cpu_pct) || 90,
+    mem_pct: Number(a.mem_pct) || 90,
+    disk_pct: Number(a.disk_pct) || 90,
+    load: Number(a.load) || 0,
+    cooldown_min: Number(a.cooldown_min) || 30,
+    offline_after_s: Number(a.offline_after_s) || 180,
+  };
+}
+
+// 发送告警 Webhook：POST JSON 到配置的地址（可选 token 作 Bearer 鉴权）。
 // 任意渠道（企业微信/钉钉/Server酱/Telegram/Slack/邮件网关/自建）由用户侧对接该地址。
-async function sendWebhook(env, payload) {
-  if (!env.ALERT_WEBHOOK_URL) return;
+async function sendWebhook(cfg, payload) {
+  if (!cfg.enabled || !cfg.webhook_url) return;
   const headers = { 'content-type': 'application/json' };
-  if (env.ALERT_WEBHOOK_TOKEN) headers.authorization = `Bearer ${env.ALERT_WEBHOOK_TOKEN}`;
+  if (cfg.webhook_token) headers.authorization = `Bearer ${cfg.webhook_token}`;
   try {
-    await fetch(String(env.ALERT_WEBHOOK_URL), {
+    await fetch(cfg.webhook_url, {
       method: 'POST',
       headers,
       body: JSON.stringify(payload),
@@ -241,9 +292,10 @@ async function sendWebhook(env, payload) {
 
 // 指标阈值告警（CPU/内存/磁盘/负载），带冷却去抖；在 handleReport 中调用
 async function checkAlerts(env, payload, serverName) {
-  if (!env.ALERT_WEBHOOK_URL) return;
+  const cfg = await getAlertCfg(env);
+  if (!cfg.enabled) return;
   const now = Date.now();
-  const cooldown = (Number(env.ALERT_COOLDOWN_MIN) || 30) * 60 * 1000;
+  const cooldown = cfg.cooldown_min * 60 * 1000;
   const cooled = (key) => {
     const last = ALERT_LAST.get(key);
     if (last && now - last < cooldown) return false;
@@ -252,31 +304,27 @@ async function checkAlerts(env, payload, serverName) {
   };
   const alerts = [];
   // CPU
-  const cpuTh = Number(env.ALERT_CPU_PCT) || 90;
-  if (payload.cpu != null && payload.cpu >= cpuTh && cooled(`${payload.serverId}:cpu`)) {
-    alerts.push(`CPU ${payload.cpu.toFixed(1)}% >= ${cpuTh}%`);
+  if (payload.cpu != null && payload.cpu >= cfg.cpu_pct && cooled(`${payload.serverId}:cpu`)) {
+    alerts.push(`CPU ${payload.cpu.toFixed(1)}% >= ${cfg.cpu_pct}%`);
   }
   // 内存（需要 agent 上报 mem_total）
-  const memTh = Number(env.ALERT_MEM_PCT) || 90;
   if (payload.mem_used != null && payload.mem_total != null && payload.mem_total > 0) {
     const memPct = (payload.mem_used / payload.mem_total) * 100;
-    if (memPct >= memTh && cooled(`${payload.serverId}:mem`)) {
-      alerts.push(`内存 ${memPct.toFixed(1)}% >= ${memTh}%`);
+    if (memPct >= cfg.mem_pct && cooled(`${payload.serverId}:mem`)) {
+      alerts.push(`内存 ${memPct.toFixed(1)}% >= ${cfg.mem_pct}%`);
     }
   }
   // 磁盘（根分区）
-  const diskTh = Number(env.ALERT_DISK_PCT) || 90;
   const rootDisk = payload.extra && payload.extra.disk && payload.extra.disk.find((d) => d.m === '/');
-  if (rootDisk && rootDisk.u != null && rootDisk.u >= diskTh && cooled(`${payload.serverId}:disk`)) {
-    alerts.push(`磁盘 / ${rootDisk.u}% >= ${diskTh}%`);
+  if (rootDisk && rootDisk.u != null && rootDisk.u >= cfg.disk_pct && cooled(`${payload.serverId}:disk`)) {
+    alerts.push(`磁盘 / ${rootDisk.u}% >= ${cfg.disk_pct}%`);
   }
-  // 负载（可选，ALERT_LOAD 未设置则不启用）
-  const loadTh = Number(env.ALERT_LOAD);
-  if (loadTh > 0 && payload.extra && payload.extra.load1 != null && payload.extra.load1 >= loadTh && cooled(`${payload.serverId}:load`)) {
-    alerts.push(`负载 ${payload.extra.load1} >= ${loadTh}`);
+  // 负载（可选，未设置则不启用）
+  if (cfg.load > 0 && payload.extra && payload.extra.load1 != null && payload.extra.load1 >= cfg.load && cooled(`${payload.serverId}:load`)) {
+    alerts.push(`负载 ${payload.extra.load1} >= ${cfg.load}`);
   }
   if (alerts.length) {
-    await sendWebhook(env, {
+    await sendWebhook(cfg, {
       event: 'alert',
       title: `[cf-panle] ${serverName} 指标告警`,
       server: { id: payload.serverId, name: serverName },
@@ -289,9 +337,10 @@ async function checkAlerts(env, payload, serverName) {
 
 // 服务探活告警：失败持续超冷却 → probe_down；恢复 → probe_recovered
 async function checkProbeAlerts(env, serverId, serverName, probes) {
-  if (!env.ALERT_WEBHOOK_URL || !Array.isArray(probes)) return;
+  const cfg = await getAlertCfg(env);
+  if (!cfg.enabled || !Array.isArray(probes)) return;
   const now = Date.now();
-  const cooldown = (Number(env.ALERT_COOLDOWN_MIN) || 30) * 60 * 1000;
+  const cooldown = cfg.cooldown_min * 60 * 1000;
   for (const p of probes) {
     if (!p || !p.name) continue;
     const key = `${serverId}:${p.name}`;
@@ -299,7 +348,7 @@ async function checkProbeAlerts(env, serverId, serverName, probes) {
     if (p.ok) {
       if (!st.ok) {
         PROBE_STATE.set(key, { ok: true, lastFail: 0 });
-        await sendWebhook(env, {
+        await sendWebhook(cfg, {
           event: 'probe_recovered',
           title: `[cf-panle] ${serverName} 服务恢复：${p.name}`,
           server: { id: serverId, name: serverName },
@@ -309,7 +358,7 @@ async function checkProbeAlerts(env, serverId, serverName, probes) {
       }
     } else if (st.ok || now - st.lastFail >= cooldown) {
       PROBE_STATE.set(key, { ok: false, lastFail: now });
-      await sendWebhook(env, {
+      await sendWebhook(cfg, {
         event: 'probe_down',
         title: `[cf-panle] ${serverName} 服务异常：${p.name}`,
         server: { id: serverId, name: serverName },
@@ -648,6 +697,10 @@ async function handleApi(request, env) {
   }
 
   // ---- 面板设置（D1 kv_json，仅管理员） ----
+  if (method === 'GET' && path === '/api/settings') {
+    if (!isAdmin(user)) return err('forbidden', 403);
+    return json((await kvGet(env, 'settings', {})) || {});
+  }
   if (method === 'PUT' && path === '/api/settings') {
     if (!isAdmin(user)) return err('forbidden', 403);
     const body = await request.json().catch(() => ({}));
@@ -655,8 +708,10 @@ async function handleApi(request, env) {
     const next = {
       site_name: body.site_name !== undefined ? String(body.site_name).trim() : current.site_name,
       notice: body.notice !== undefined ? String(body.notice).trim() : current.notice,
+      alerts: body.alerts !== undefined ? sanitizeAlerts(body.alerts) : current.alerts,
     };
     await kvPut(env, 'settings', next);
+    kvClearCache('settings'); // 告警配置立即生效
     return json(next);
   }
 
@@ -1122,9 +1177,9 @@ export class MetricsDO {
   }
 
   // 归档默认开启（ARCHIVE_TO_D1=0 关闭）或告警启用时，注册 alarm
-  scheduleArchive() {
+  async scheduleArchive() {
     const archiveOn = this.env.ARCHIVE_TO_D1 !== '0';
-    const alertOn = !!this.env.ALERT_WEBHOOK_URL;
+    const alertOn = (await getAlertCfg(this.env)).enabled;
     if (archiveOn || alertOn) {
       this.state.storage.setAlarm(Date.now() + ARCHIVE_INTERVAL_MS);
     }
@@ -1132,9 +1187,10 @@ export class MetricsDO {
 
   // 离线/恢复告警：状态存 DO Storage（重启不丢，避免重复告警）
   async checkOfflineAlerts() {
-    if (!this.env.ALERT_WEBHOOK_URL) return;
+    const cfg = await getAlertCfg(this.env);
+    if (!cfg.enabled) return;
     const now = Math.floor(Date.now() / 1000);
-    const offlineAfter = Number(this.env.ALERT_OFFLINE_AFTER_S) || 180;
+    const offlineAfter = cfg.offline_after_s;
     const rows = await this.env.DB.prepare('SELECT id, name, online, last_seen FROM servers').all();
     for (const s of rows.results) {
       const isOnline = s.online === 1 && (s.last_seen || 0) > now - offlineAfter;
@@ -1142,7 +1198,7 @@ export class MetricsDO {
       const last = (await this.state.storage.get(key)) || 'on';
       if (!isOnline && last !== 'off') {
         await this.state.storage.put(key, 'off');
-        await sendWebhook(this.env, {
+        await sendWebhook(cfg, {
           event: 'offline',
           title: `[cf-panle] ${s.name} 离线`,
           server: { id: s.id, name: s.name },
@@ -1151,7 +1207,7 @@ export class MetricsDO {
         });
       } else if (isOnline && last === 'off') {
         await this.state.storage.put(key, 'on');
-        await sendWebhook(this.env, {
+        await sendWebhook(cfg, {
           event: 'recovered',
           title: `[cf-panle] ${s.name} 恢复在线`,
           server: { id: s.id, name: s.name },
@@ -1165,7 +1221,7 @@ export class MetricsDO {
   // alarm：归档（超过 1 小时数据批量落 D1 + 每天清理保留期）+ 离线/恢复告警
   async alarm() {
     const archiveOn = this.env.ARCHIVE_TO_D1 !== '0';
-    const alertOn = !!this.env.ALERT_WEBHOOK_URL;
+    const alertOn = (await getAlertCfg(this.env)).enabled;
     if (alertOn) await this.checkOfflineAlerts();
     if (!archiveOn) {
       if (alertOn) this.state.storage.setAlarm(Date.now() + ARCHIVE_INTERVAL_MS);

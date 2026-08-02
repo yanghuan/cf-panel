@@ -29,8 +29,9 @@ cf-panle/
 1. **创建 D1 数据库（网页端）**：Dashboard → Workers & Pages → **D1** → Create database，名称 `cf-panle`；把 Overview 页的 **database_id** 填入 `wrangler.toml` 的 `[[d1_databases]]`（当前为占位符 `REPLACE_WITH_D1_DATABASE_ID`），提交并推送。
 2. **建表（网页端）**：在该 D1 数据库页 → **Console** 粘贴执行 `schema.sql` 全部内容（或 **Import** 上传该文件）。
 3. **连接 GitHub 自动部署**：Workers & Pages → Create application → **Import a repository** → Get started → 授权 GitHub 并选择仓库。项目名须与 `wrangler.toml` 的 `name = "cf-panle"` **完全一致**，根目录 `/`，Save and Deploy。之后每次 `git push` 自动重新部署，可在 Worker 的 **Deployments** 页查看构建历史。
-4. **配置密钥（网页端）**：该 Worker → Settings → Variables and Secrets → 添加 `JWT_SECRET`（必）、`PANEL_USERS` 或 `PANEL_PASSWORD`（必）、`ALERT_WEBHOOK_URL` 等（可选，见下方告警配置）。
+4. **配置密钥（网页端）**：该 Worker → Settings → Variables and Secrets → 添加 `JWT_SECRET`（必）、`PANEL_USERS` 或 `PANEL_PASSWORD`（必）。
    > ⚠️ Cloudflare 规则：Worker 配置过 dashboard secret 后，`wrangler deploy` 会被拒绝，只能走 Builds/CI 部署——因此本方式同时是配密钥后的**唯一部署路径**。
+   > 告警配置**不需要环境变量**：登录面板 → 设置弹窗 → 「告警」区直接填 Webhook 地址与阈值（存 D1，见下方告警配置）。
 5. 部署完成后访问 `https://cf-panle.<你的子域>.workers.dev`，输入配置的密码即可登录。
 
 ### 方式二：CLI 部署（wrangler，备选）
@@ -48,10 +49,6 @@ wrangler d1 execute cf-panle --remote --file=schema.sql
 wrangler secret put JWT_SECRET        # JWT 签名密钥
 wrangler secret put PANEL_USERS       # 多用户（与 PANEL_PASSWORD 二选一，优先级更高）："alice:pass1,bob:pass2"
 wrangler secret put PANEL_PASSWORD    # 单管理员密码（未配置 PANEL_USERS 时使用）
-
-# 可选：Webhook 告警（阈值/离线，见下方告警配置）
-wrangler secret put ALERT_WEBHOOK_URL    # 告警回调 HTTP 地址（企业微信/钉钉/Server酱/Telegram/邮件网关等任意渠道）
-wrangler secret put ALERT_WEBHOOK_TOKEN  # 可选：回调鉴权 token（作为 Bearer 发送）
 
 # 4. 部署
 wrangler deploy
@@ -79,16 +76,61 @@ wrangler deploy
 
 部署完成后访问 `https://cf-panle.<你的子域>.workers.dev`，输入配置的密码即可登录（登录即管理员）。
 
-**Webhook 告警配置**（可选）：配置 `ALERT_WEBHOOK_URL` 即启用——触发时面板会 **POST JSON** 到该地址，**任意渠道由用户侧对接**（企业微信/钉钉/Server酱/Telegram Bot/Slack/邮件网关/自建服务等）。可用环境变量覆盖阈值：
+### 密钥配置详解（Secrets）
 
-| 变量 | 默认 | 说明 |
+| 变量 | 是否必配 | 作用 |
 | --- | --- | --- |
-| `ALERT_WEBHOOK_URL` | 无 | 告警回调地址（必配才启用告警） |
-| `ALERT_WEBHOOK_TOKEN` | 无 | 可选，作为 `Authorization: Bearer` 发送 |
-| `ALERT_CPU_PCT` / `ALERT_MEM_PCT` / `ALERT_DISK_PCT` | `90` | 指标告警阈值（%） |
-| `ALERT_LOAD` | 不启用 | 负载告警阈值（load1） |
-| `ALERT_COOLDOWN_MIN` | `30` | 同类告警冷却间隔（分钟） |
-| `ALERT_OFFLINE_AFTER_S` | `180` | 离线判定秒数（超过未上报） |
+| `JWT_SECRET` | ✅ 必 | JWT 签名密钥：签发/验证登录令牌，泄露可伪造任意用户登录 |
+| `PANEL_USERS` | ✅（与 PANEL_PASSWORD 二选一） | 多用户列表：`用户名:密码,用户名:密码` |
+| `PANEL_PASSWORD` | 二选一 | 单管理员密码（未配置 PANEL_USERS 时使用） |
+
+**`JWT_SECRET`** —— 格式：任意字符串，建议 32 字节以上随机串。
+
+```bash
+openssl rand -hex 32   # 例如：xk3f9M2c...（64 位十六进制）
+```
+
+- 不配置时回退 `dev-secret`，**仅限本地调试**，生产必须覆盖
+- 修改它会让所有已登录用户 token 失效（需重新登录）
+
+**`PANEL_USERS`** —— 格式：`用户名:密码,用户名:密码`（逗号分隔用户，冒号分隔用户名与密码）。
+
+```
+alice:pass1,bob:pass2
+```
+
+- 用户名不能含 `:` 和 `,`
+- 密码可含 `:`（按第一个冒号分割），建议不含 `,`
+- 配置了它则**忽略** `PANEL_PASSWORD`
+- 所有用户同权限（登录即管理员）
+
+**`PANEL_PASSWORD`** —— 格式：任意密码字符串（仅在未配置 `PANEL_USERS` 时生效）。
+
+```
+MyS3cret!Pass
+```
+
+**配置位置（推荐网页端）**：该 Worker → Settings → **Variables and Secrets** → Add → 类型选 **Secret** → Name 填变量名、Value 填值。
+
+或 CLI：
+
+```bash
+wrangler secret put JWT_SECRET       # 回车后粘贴值
+wrangler secret put PANEL_USERS      # 回车后粘贴值，如 alice:pass1,bob:pass2
+```
+
+> ⚠️ 配置过 dashboard secret 的 Worker 只能通过 Builds/CI 部署（`wrangler deploy` 会被拒绝），参见方式一第 4 步说明。
+
+**Webhook 告警配置**（可选）：登录面板 → **设置**弹窗 → 「告警」区填写即启用（存 D1 `settings.alerts`，**无需环境变量**）。触发时面板会 **POST JSON** 到 Webhook 地址，**任意渠道由用户侧对接**（企业微信/钉钉/Server酱/Telegram Bot/Slack/邮件网关/自建服务等）。
+
+| 配置项 | 默认 | 说明 |
+| --- | --- | --- |
+| Webhook 地址 | 无 | 告警回调地址（留空禁用告警） |
+| Token | 无 | 可选，作为 `Authorization: Bearer` 发送 |
+| CPU / 内存 / 磁盘阈值 | `90` | 指标告警阈值（%） |
+| 负载阈值 | 不启用 | 负载告警阈值（load1） |
+| 冷却（分钟） | `30` | 同类告警冷却间隔 |
+| 离线（秒） | `180` | 离线判定秒数（超过未上报） |
 
 **Webhook payload 结构**（`event` 区分 `alert` / `offline` / `recovered`）：
 
@@ -185,7 +227,8 @@ wrangler deploy
 | GET | `/api/tokens` | PAT 列表（仅管理员） |
 | POST | `/api/tokens` | 创建 PAT（scopes + server_ids 白名单，明文只返回一次） |
 | DELETE | `/api/tokens/:id` | 删除 PAT（仅管理员） |
-| PUT | `/api/settings` | 更新站点名/公告（D1 kv_json，仅管理员） |
+| GET | `/api/settings` | 读取全部设置（含告警配置，仅管理员） |
+| PUT | `/api/settings` | 更新站点名/公告/告警配置（D1 kv_json，仅管理员） |
 
 ### MCP（AI 接入）
 

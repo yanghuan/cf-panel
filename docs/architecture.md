@@ -77,7 +77,7 @@
 
 #### 3.2.2 告警通知与多用户
 
-- **Webhook 告警**：`handleReport` 每次上报后做阈值检查（CPU/内存/磁盘根分区/负载），同类告警带冷却去抖（内存 Map）；**离线/恢复告警**在 MetricsDO 的 alarm 中扫描 `servers.last_seen`，状态存 DO Storage（重启不重复告警）。触发时 **POST JSON** 到 `ALERT_WEBHOOK_URL`（结构化 `event/title/server/message/details/time`），任意渠道（企业微信/钉钉/Telegram/邮件网关等）由用户侧对接；可选 `ALERT_WEBHOOK_TOKEN` 作 Bearer 鉴权。
+- **Webhook 告警**：`handleReport` 每次上报后做阈值检查（CPU/内存/磁盘根分区/负载），同类告警带冷却去抖（内存 Map）；**离线/恢复告警**在 MetricsDO 的 alarm 中扫描 `servers.last_seen`，状态存 DO Storage（重启不重复告警）。触发时 **POST JSON**（结构化 `event/title/server/message/details/time`）到配置的 Webhook 地址，任意渠道（企业微信/钉钉/Telegram/邮件网关等）由用户侧对接。**告警配置存 D1 `settings.alerts`**（网页设置弹窗填写，`getAlertCfg` 带 60s 缓存读取，保存时清缓存即时生效），不使用环境变量。
 - **多用户**：`PANEL_USERS="user:pass,user:pass"` 环境变量，登录匹配签发 JWT（`uid`+`username`）；未配置时回退 `PANEL_PASSWORD` 单管理员。所有用户同权限（管理员），按用户分配服务器可后续恢复 `users` 表逻辑。
 
 ### 3.3 Durable Object — WebSocket 中转核心

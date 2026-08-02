@@ -551,14 +551,39 @@
       $('#set-site-name').value = s.site_name === 'cf-panle' ? '' : s.site_name;
       $('#set-notice').value = s.notice || '';
     }).catch(() => { /* ignore */ });
+    api('/api/settings').then((s) => {
+      const a = s.alerts || {};
+      $('#set-alert-url').value = a.webhook_url || '';
+      $('#set-alert-token').value = a.webhook_token || '';
+      $('#set-alert-cpu').value = a.cpu_pct || '';
+      $('#set-alert-mem').value = a.mem_pct || '';
+      $('#set-alert-disk').value = a.disk_pct || '';
+      $('#set-alert-load').value = a.load || '';
+      $('#set-alert-cooldown').value = a.cooldown_min || '';
+      $('#set-alert-offline').value = a.offline_after_s || '';
+    }).catch(() => { /* ignore */ });
     loadTokens();
   }
 
   async function saveSettings() {
+    const num = (v) => (v.trim() ? Number(v) : 0);
     try {
       await api('/api/settings', {
         method: 'PUT',
-        body: JSON.stringify({ site_name: $('#set-site-name').value, notice: $('#set-notice').value }),
+        body: JSON.stringify({
+          site_name: $('#set-site-name').value,
+          notice: $('#set-notice').value,
+          alerts: {
+            webhook_url: $('#set-alert-url').value.trim(),
+            webhook_token: $('#set-alert-token').value.trim(),
+            cpu_pct: num($('#set-alert-cpu').value),
+            mem_pct: num($('#set-alert-mem').value),
+            disk_pct: num($('#set-alert-disk').value),
+            load: num($('#set-alert-load').value),
+            cooldown_min: num($('#set-alert-cooldown').value),
+            offline_after_s: num($('#set-alert-offline').value),
+          },
+        }),
       });
       toast('设置已保存');
       loadPublic();

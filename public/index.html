@@ -113,6 +113,22 @@
         <button id="btn-save-settings">保存站点信息</button>
       </div>
 
+      <h4>告警（Webhook）</h4>
+      <div class="settings-row">
+        <input id="set-alert-url" type="text" placeholder="Webhook 地址（留空禁用告警）" />
+        <input id="set-alert-token" type="text" placeholder="Token（可选，Bearer 鉴权）" />
+      </div>
+      <div class="settings-row">
+        <input id="set-alert-cpu" type="number" placeholder="CPU阈值%" />
+        <input id="set-alert-mem" type="number" placeholder="内存阈值%" />
+        <input id="set-alert-disk" type="number" placeholder="磁盘阈值%" />
+        <input id="set-alert-load" type="number" placeholder="负载阈值(可选)" />
+      </div>
+      <div class="settings-row">
+        <input id="set-alert-cooldown" type="number" placeholder="冷却(分钟)" />
+        <input id="set-alert-offline" type="number" placeholder="离线(秒)" />
+      </div>
+
       <h4>访问令牌（PAT）</h4>
       <div class="settings-row">
         <input id="tok-name" type="text" placeholder="令牌名称" />

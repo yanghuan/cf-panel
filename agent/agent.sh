@@ -169,6 +169,9 @@ collect_report() {
   # 温度（第一个热区，无传感器则缺省）
   local temp
   temp=$(awk '{print $1/1000; exit}' /sys/class/thermal/thermal_zone*/temp 2>/dev/null) || true
+  # 开机时间（秒，/proc/uptime 第一列）
+  local uptime
+  uptime=$(awk '{printf "%.0f", $1}' /proc/uptime 2>/dev/null) || uptime=0
   # TCP/UDP 连接数（行数-1 跳过表头）
   local tcp udp
   tcp=$(( $(wc -l < /proc/net/tcp 2>/dev/null || echo 0) - 1 )); [ "$tcp" -lt 0 ] && tcp=0
@@ -211,6 +214,7 @@ collect_report() {
     --argjson procs "${procs:-0}" \
     --argjson tcp "${tcp:-0}" \
     --argjson udp "${udp:-0}" \
+    --argjson uptime "${uptime:-0}" \
     --argjson disk "$disk" \
     --argjson nin "${n_in_rate:-0}" \
     --argjson nout "${n_out_rate:-0}" \
@@ -218,7 +222,7 @@ collect_report() {
     --argjson probes "$probes" \
     --argjson custom "$custom" \
     '{type:"report", cpu:$cpu, mem_used:$mem, mem_total:$mt, net_in:$nin, net_out:$nout,
-      extra:{swap:$swap, disk:$disk, load1:$load1, load5:$load5, load15:$load15, temp:$temp, procs:$procs, tcp:$tcp, udp:$udp},
+      extra:{swap:$swap, disk:$disk, load1:$load1, load5:$load5, load15:$load15, temp:$temp, procs:$procs, tcp:$tcp, udp:$udp, uptime:$uptime},
       info:$info, probes:$probes, custom:$custom}'
 }
 

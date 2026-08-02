@@ -98,8 +98,8 @@
     }
   }
 
-  // 悬浮指标详情：展示 agent 上报的全部监控条目
-  function metricTipHtml(m) {
+  // 悬浮指标详情：展示 agent 上报的全部监控条目 + 系统信息
+  function metricTipHtml(m, info) {
     const e = m.extra || {};
     const rows = [];
     rows.push(['CPU', m.cpu != null ? m.cpu.toFixed(1) + '%' : '-']);
@@ -113,17 +113,33 @@
     if (e.tcp != null) rows.push(['TCP / UDP', e.tcp + ' / ' + (e.udp != null ? e.udp : '-')]);
     rows.push(['温度', e.temp != null ? Number(e.temp).toFixed(1) + ' °C' : 'N/A']);
     const items = rows.map(([k, v]) => `<div class="mt-row"><span>${k}</span><b>${v}</b></div>`).join('');
+    // 系统信息：内核 / IP 等（info 仅在 info_json 变更时更新）
+    let sysHtml = '';
+    if (info) {
+      const sys = [
+        ['系统', info.os],
+        ['内核', info.kern],
+        ['IPv4', info.ip4],
+        ['IPv6', info.ip6],
+      ].filter(([, v]) => v);
+      if (sys.length) {
+        sysHtml = `<div class="mt-sub">系统信息</div>` + sys.map(([k, v]) =>
+          `<div class="mt-row"><span>${k}</span><b>${escapeHtml(v)}</b></div>`).join('');
+      }
+    }
     let diskHtml = '';
     if (Array.isArray(e.disk) && e.disk.length) {
       diskHtml = `<div class="mt-sub">磁盘（${e.disk.length} 个挂载点）</div><div class="mt-disk">` +
         e.disk.map((d) => `<div><span title="${escapeHtml(d.m)}">${escapeHtml(d.m)}</span><b>${d.u}%</b></div>`).join('') + '</div>';
     }
-    return `<div class="mt-title">实时指标</div>${items}${diskHtml}`;
+    return `<div class="mt-title">实时指标</div>${items}${sysHtml}${diskHtml}`;
   }
 
   function cardHtml(s) {
-    const info = s.info ? [s.info.os, s.info.ip4, s.info.ip6].filter(Boolean).join(' · ') : '';
     const m = s.metric;
+    // 开机时间（秒 → 天）
+    const up = m && m.extra && m.extra.uptime ? `开机 ${(m.extra.uptime / 86400).toFixed(1)}天` : '';
+    const info = s.info ? [s.info.os, up, s.info.ip4, s.info.ip6].filter(Boolean).join(' · ') : up;
     // 磁盘使用率：取所有挂载点中最大
     function diskPct() {
       const arr = m && m.extra && m.extra.disk;
@@ -131,7 +147,7 @@
       return Math.max(...arr.map((d) => Number(d.u) || 0)) + '%';
     }
     const metricHtml = m ? `
-        <div class="metric" data-metric="${escapeHtml(JSON.stringify(m))}">
+        <div class="metric" data-metric="${escapeHtml(JSON.stringify({ metric: m, info: s.info || null }))}">
           <span class="m-cell"><b>${m.cpu == null ? '-' : m.cpu.toFixed(1) + '%'}</b><i>CPU</i></span>
           <span class="m-cell"><b>${fmtBytes(m.mem_used)}</b><i>内存</i></span>
           <span class="m-cell"><b>${m.extra && m.extra.load1 != null ? Number(m.extra.load1).toFixed(2) : '-'}</b><i>负载</i></span>
@@ -957,10 +973,13 @@
       }
       const raw = metricEl.dataset.metric;
       if (!raw) return;
-      let m;
-      try { m = JSON.parse(raw); } catch { return; }
+      let d;
+      try { d = JSON.parse(raw); } catch { return; }
+      // 兼容新结构 {metric, info} 与旧结构（直接 metric 对象）
+      const mm = d && d.metric ? d.metric : d;
+      const ii = d && d.metric ? d.info : null;
       tipSource = metricEl;
-      metricTip.innerHTML = metricTipHtml(m);
+      metricTip.innerHTML = metricTipHtml(mm, ii);
       metricTip.classList.add('show');
       positionTipForMetric(metricTip, metricEl);
       return;

@@ -616,6 +616,7 @@ async function handleApi(request, env) {
       group: s.group || '',
       display_index: s.display_index || 0,
       online: s.online === 1 && now - (s.last_seen || 0) < 60, // now/last_seen 均为 unix 秒，60 秒内上报算在线
+      wan_ip: s.wan_ip || '',
       info: safeJson(s.info_json),
       probes: safeJson(s.probe_json),
       metric: latest[s.id] || null,
@@ -794,6 +795,7 @@ async function mcpListServers(user, env) {
       name: s.name,
       group: s.group || '',
       online: s.online === 1 && now - (s.last_seen || 0) < 60, // now/last_seen 均为 unix 秒，60 秒内上报算在线
+      wan_ip: s.wan_ip || '',
       info: safeJson(s.info_json),
       metrics: m ? {
         cpu_pct: m.cpu,
@@ -1024,6 +1026,13 @@ export class TerminalDO {
       this.agents.set(server.id, pair[1]);
       // 附件随连接持久化：休眠唤醒后靠它重建 agents 索引（role 区分控制通道与会话流）
       pair[1].serializeAttachment({ role: 'control', serverId: server.id });
+      // 记录节点公网出口 IP（CF-Connecting-IP，Cloudflare 注入；本地 dev 回退 X-Forwarded-For）
+      try {
+        const wanIp = request.headers.get('cf-connecting-ip') || (request.headers.get('x-forwarded-for') || '').split(',')[0].trim();
+        if (wanIp && wanIp !== server.wan_ip) {
+          await this.env.DB.prepare('UPDATE servers SET wan_ip = ? WHERE id = ?').bind(wanIp, server.id).run();
+        }
+      } catch { /* 记录失败不影响连接 */ }
       // 连接建立即下发当前上报间隔（省配额：有观看者快采 3s / 无观看者慢采 120s）
       try {
         const vResp = await doPanel(this.env).fetch('https://do.internal/viewers');
@@ -1474,6 +1483,7 @@ export class PanelDO {
         group: s.group || '',
         display_index: s.display_index || 0,
         online: s.online === 1 && now - (s.last_seen || 0) < 60, // now/last_seen 均为 unix 秒，60 秒内上报算在线
+        wan_ip: s.wan_ip || '',
         info: safeJson(s.info_json),
         probes: safeJson(s.probe_json),
         metric: latest[s.id] || null,

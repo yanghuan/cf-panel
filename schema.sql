@@ -23,6 +23,7 @@ CREATE TABLE IF NOT EXISTS servers (
   display_index  INTEGER NOT NULL DEFAULT 0,
   last_seen      INTEGER,                   -- unix 秒，最近上报时间
   online         INTEGER NOT NULL DEFAULT 0,
+  wan_ip         TEXT,                      -- 节点公网出口 IP（agent 控制 WS 的 CF-Connecting-IP）
   info_json      TEXT,                      -- 系统信息 JSON（OS/内核/IP，变更时更新）
   probe_json     TEXT,                      -- 服务探活结果 JSON（[{name,ok,code,ms}]，变更时更新）
   created_at     TEXT    NOT NULL DEFAULT (datetime('now'))

@@ -139,7 +139,10 @@
     const m = s.metric;
     // 开机时间（秒 → 天）
     const up = m && m.extra && m.extra.uptime ? `开机 ${(m.extra.uptime / 86400).toFixed(1)}天` : '';
-    const info = s.info ? [s.info.os, up, s.info.ip4, s.info.ip6].filter(Boolean).join(' · ') : up;
+    // 归属地优先用节点公网出口 IP（wan_ip，仅非私网才使用，能查到地理位置），回退 agent 上报的网卡 IP
+    const wan = (s.wan_ip && !GEO_PRIVATE.test(s.wan_ip)) ? s.wan_ip : '';
+    const ip = (wan || (s.info && s.info.ip4) || '').trim();
+    const info = s.info ? [s.info.os, up, ip].filter(Boolean).join(' · ') : up;
     // 磁盘使用率：取所有挂载点中最大
     function diskPct() {
       const arr = m && m.extra && m.extra.disk;
@@ -175,8 +178,52 @@
         </div>
         ${metricHtml}
         ${probes}
-        <div class="meta">${info ? escapeHtml(info) : `id: ${s.id}`}</div>
+        <div class="meta" data-ip="${escapeHtml(ip)}">${info ? escapeHtml(info) : `id: ${s.id}`}</div>
       </div>`;
+  }
+
+  // ---------- IP 归属地（免费接口，前端查询；内网 IP 跳过） ----------
+  const geoCache = new Map(); // ip -> 归属地标签（国家城市）
+  // 私网/保留地址不查询：10.x 172.16-31.x 192.168.x 127.x 169.254.x 0.x 100.64-127.x
+  const GEO_PRIVATE = /^(0\.|10\.|127\.|169\.254\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.|100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.)/;
+  async function geoLookup(ip) {
+    if (!ip || GEO_PRIVATE.test(ip)) return '';
+    if (geoCache.has(ip)) return geoCache.get(ip) || '';
+    let label = '';
+    // 主：ip-api.com 免费（中文），仅 http；备：ipapi.co（https，英文）
+    try {
+      const ctl = new AbortController();
+      const t = setTimeout(() => ctl.abort(), 5000);
+      const r = await fetch(`http://ip-api.com/json/${encodeURIComponent(ip)}?lang=zh-CN&fields=status,country,city`, { signal: ctl.signal });
+      clearTimeout(t);
+      const j = await r.json();
+      if (j && j.status === 'success') label = (j.country || '') + (j.city || '');
+    } catch { /* 换备选 */ }
+    if (!label) {
+      try {
+        const ctl = new AbortController();
+        const t = setTimeout(() => ctl.abort(), 5000);
+        const r = await fetch(`https://ipapi.co/${encodeURIComponent(ip)}/json/`, { signal: ctl.signal });
+        clearTimeout(t);
+        const j = await r.json();
+        if (j && j.country_name) label = j.country_name + (j.city ? ' ' + j.city : '');
+      } catch { /* 查询失败则不显示 */ }
+    }
+    geoCache.set(ip, label);
+    return label;
+  }
+  // 渲染后异步补充卡片 IP 归属地
+  async function lookupGeo() {
+    const els = [...document.querySelectorAll('#servers .card .meta[data-ip]')];
+    for (const el of els) {
+      const ip = el.dataset.ip;
+      if (!ip || el.dataset.geoDone) continue;
+      const label = await geoLookup(ip);
+      if (label && el.isConnected) {
+        el.dataset.geoDone = '1';
+        el.textContent = `${el.textContent} （${label}）`;
+      }
+    }
   }
 
   // 顶部概览条：服务器总数/在线数/平均 CPU/平均负载/总内存
@@ -222,6 +269,7 @@
     box.innerHTML = groupOrder.map((g) => `
       <h3 class="group-title">${escapeHtml(g)}（${groups[g].length}）</h3>
       <div class="grid">${groups[g].map(cardHtml).join('')}</div>`).join('');
+    lookupGeo(); // 异步补充各卡片 IP 归属地
   }
 
   async function addServer() {

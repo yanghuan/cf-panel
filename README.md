@@ -117,10 +117,50 @@ wrangler deploy
 | GET | `/ws/agent/terminal` | agent 终端数据流（key 校验 + stream 归属校验） |
 | POST | `/api/report` | agent 监控上报 HTTP 备用入口（key 指纹定位 + 校验） |
 | GET | `/api/monitor?server_id=&range=` | 监控历史（range: 1h/12h/3d/7d/30d，默认 12h 走内存，更早走 D1） |
+| POST | `/mcp` | MCP 端点（无状态 Streamable HTTP，JSON-RPC 2.0；Bearer 鉴权，只读工具） |
 | GET | `/api/tokens` | PAT 列表（仅管理员） |
 | POST | `/api/tokens` | 创建 PAT（scopes + server_ids 白名单，明文只返回一次） |
 | DELETE | `/api/tokens/:id` | 删除 PAT（仅管理员） |
 | PUT | `/api/settings` | 更新站点名/公告（D1 kv_json，仅管理员） |
+
+### MCP（AI 接入）
+
+`/mcp` 实现标准 [Model Context Protocol](https://modelcontextprotocol.io) **无状态 Streamable HTTP**（2026-07-28 修订版：单 POST 端点、无会话、每请求独立鉴权）。鉴权复用现有 `Authorization: Bearer <JWT 或 PAT>`。
+
+**工具**（只读）：
+
+| 工具 | 说明 |
+| --- | --- |
+| `list_servers` | 服务器列表 + 实时状态（CPU/内存/负载/在线）+ 系统信息 |
+| `get_monitor` | 监控历史（`server_id`/`server_name` + `range`：1h/12h/3d/7d/30d） |
+
+**客户端配置示例**（Claude Desktop / 支持 MCP 的客户端，`claude_desktop_config.json`）：
+
+```json
+{
+  "mcpServers": {
+    "cf-panle": {
+      "type": "http",
+      "url": "https://<面板域名>/mcp",
+      "headers": { "Authorization": "Bearer <JWT 或 PAT>" }
+    }
+  }
+}
+```
+
+命令行冒烟测试：
+
+```bash
+# initialize
+curl -X POST https://<面板域名>/mcp -H "Authorization: Bearer <token>" \
+  -H 'content-type: application/json' -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}'
+# 调工具
+curl -X POST https://<面板域名>/mcp -H "Authorization: Bearer <token>" \
+  -H 'content-type: application/json' \
+  -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"list_servers","arguments":{}}}'
+```
+
+> 客户端若带 `MCP-Protocol-Version` 头，需与 body `_meta` 中版本一致；缺失时服务端按 `2025-03-26` 兼容。
 
 ## 五、安全要点（实现清单已覆盖）
 

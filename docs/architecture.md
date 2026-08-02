@@ -71,6 +71,10 @@
 - 终端功能需要独立的权限 scope（哪吒用 `nezha:server:exec`），与"只读监控"分离。
 - 做限流、审计入口。
 
+#### 3.2.1 MCP（AI 接入端点）
+
+`/mcp` 实现标准 MCP **无状态 Streamable HTTP**（2026-07-28 修订版）：单一 POST 端点、无 `Mcp-Session-Id` 会话、每请求独立 `Authorization: Bearer` 鉴权（复用 JWT/PAT），服务端不返回 session-id 即天然无状态且兼容所有版本客户端。暴露只读工具 `list_servers`（服务器状态 + 系统信息）、`get_monitor`（监控历史，复用内存热区/D1 归档查询与权限过滤）。JSON-RPC 2.0：`initialize` / `tools/list` / `tools/call` / `ping`；通知返回 202；校验 `Origin` 防 DNS rebinding。
+
 ### 3.3 Durable Object — WebSocket 中转核心
 DO 是整个设计的心脏，对应哪吒 Dashboard 里那两个 `io.Copy` 的活儿：
 

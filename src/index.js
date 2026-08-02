@@ -24,6 +24,30 @@ const PRUNE_INTERVAL_MS = 24 * 60 * 60 * 1000; // 保留期清理周期
 const REPORT_FAST_INTERVAL_S = 3;  // 有观看者：3 秒上报
 const REPORT_SLOW_INTERVAL_S = 120; // 无人查看：120 秒上报
 
+// MCP（Model Context Protocol）标准 AI 接入：无状态 Streamable HTTP（2026-07-28 修订版）
+// 端点 /mcp 仅接受 POST；每请求独立用 Authorization: Bearer 鉴权（JWT 或 PAT），无会话状态
+const MCP_VERSION = '2025-11-25'; // 服务器声明支持的协议版本（缺失头时客户端按 2025-03-26 兼容）
+const MCP_TOOLS = [
+  {
+    name: 'list_servers',
+    description: '列出面板中所有可访问的服务器，返回每台的状态：在线与否、实时 CPU%/内存/负载，以及系统信息（OS/内核/IP）。',
+    inputSchema: { type: 'object', properties: {}, required: [] },
+  },
+  {
+    name: 'get_monitor',
+    description: '查询某台服务器的监控历史（分钟序列）：CPU、内存、网络速率及扩展项（Swap/负载/温度/进程数/TCP-UDP 连接数）。提供 server_id 或 server_name 之一；range 可选 1h/12h/3d/7d/30d，默认 12h。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        server_id: { type: 'integer', description: '服务器 ID（见 list_servers 返回值中的 id）' },
+        server_name: { type: 'string', description: '服务器名称（与 server_id 二选一）' },
+        range: { type: 'string', enum: ['1h', '12h', '3d', '7d', '30d'], description: '查询时间范围，默认 12h' },
+      },
+      required: [],
+    },
+  },
+];
+
 // ---------------- 通用工具 ----------------
 
 function json(data, status = 200) {
@@ -441,6 +465,150 @@ async function handleApi(request, env) {
   }
 
   return err('not found', 404);
+}
+
+// ---------------- MCP（Model Context Protocol）----------------
+// 无状态 Streamable HTTP：/mcp 仅 POST，每请求独立 Bearer 鉴权（JWT/PAT），复用现有数据查询
+
+function mcpResult(id, result, error) {
+  const payload = { jsonrpc: '2.0' };
+  if (error) payload.error = error;
+  else payload.result = result;
+  if (id !== null && id !== undefined) payload.id = id;
+  return new Response(JSON.stringify(payload), {
+    status: error && !result ? 400 : 200,
+    headers: { 'content-type': 'application/json', 'access-control-allow-origin': '*' },
+  });
+}
+
+// 工具：服务器列表 + 实时状态 + 系统信息
+async function mcpListServers(user, env) {
+  const rows = await env.DB.prepare('SELECT * FROM servers ORDER BY "group", display_index, id').all();
+  let latest = {};
+  try {
+    const lResp = await doMetrics(env).fetch('https://do.internal/latest');
+    latest = await lResp.json();
+  } catch { /* 无最新指标 */ }
+  const now = Date.now();
+  const list = [];
+  for (const s of rows.results) {
+    if (!canAccessServer(user, s)) continue;
+    const m = latest[s.id] || null;
+    list.push({
+      id: s.id,
+      name: s.name,
+      group: s.group || '',
+      online: s.online === 1 && now - (s.last_seen || 0) < 60000,
+      info: safeJson(s.info_json),
+      metrics: m ? {
+        cpu_pct: m.cpu,
+        mem_used_bytes: m.mem_used,
+        net_in_rate_bps: m.net_in,
+        net_out_rate_bps: m.net_out,
+        load1: m.extra && m.extra.load1,
+        swap_bytes: m.extra && m.extra.swap,
+        temp_c: m.extra && m.extra.temp,
+        procs: m.extra && m.extra.procs,
+        tcp_conns: m.extra && m.extra.tcp,
+        udp_conns: m.extra && m.extra.udp,
+      } : null,
+    });
+  }
+  return list;
+}
+
+// 工具：监控历史（内存热区 ≤12h，D1 归档更长；长区间 SQL 抽样）
+async function mcpGetMonitor(user, env, args) {
+  const serverId = Number(args.server_id) || 0;
+  const range = ['1h', '12h', '3d', '7d', '30d'].includes(args.range) ? args.range : '12h';
+  let server = null;
+  if (serverId) {
+    server = await env.DB.prepare('SELECT * FROM servers WHERE id = ?').bind(serverId).first();
+  } else if (args.server_name) {
+    server = await env.DB.prepare('SELECT * FROM servers WHERE name = ?').bind(String(args.server_name)).first();
+  }
+  if (!server) throw new Error('server not found（请先用 list_servers 确认 id 或名称）');
+  if (!canAccessServer(user, server)) throw new Error('forbidden');
+  const hours = parseRangeHours(range);
+  let rows;
+  if (hours <= 12) {
+    const resp = await doMetrics(env).fetch(`https://do.internal/query?server_id=${server.id}&limit=${Math.max(1, Math.round(hours * 60))}`);
+    rows = await resp.json();
+  } else {
+    const minutes = hours * 60;
+    const sinceMin = Math.floor(Date.now() / 1000 / 60) - minutes;
+    const MONITOR_D1_MAX_ROWS = 1500;
+    const q = 'SELECT ts, cpu, mem_used, net_in, net_out, extra FROM metrics_min WHERE server_id = ? AND ts >= ?';
+    let r;
+    if (minutes > MONITOR_D1_MAX_ROWS) {
+      const step = Math.ceil(minutes / MONITOR_D1_MAX_ROWS);
+      r = await env.DB.prepare(`${q} AND ts % ? = 0 ORDER BY ts`).bind(server.id, sinceMin, step).all();
+    } else {
+      r = await env.DB.prepare(`${q} ORDER BY ts`).bind(server.id, sinceMin).all();
+    }
+    rows = r.results.map((x) => ({ ...x, extra: safeJson(x.extra) }));
+  }
+  return { server: { id: server.id, name: server.name }, range, count: rows.length, points: rows };
+}
+
+// /mcp 主入口（无状态 Streamable HTTP）
+async function handleMcp(request, env) {
+  const url = new URL(request.url);
+  if (request.method !== 'POST') return new Response(null, { status: 405 });
+
+  // Origin 校验（防 DNS rebinding，2026-07-28 修订要求）
+  const origin = request.headers.get('origin');
+  if (origin) {
+    try {
+      if (new URL(origin).host !== url.host) return new Response('forbidden', { status: 403 });
+    } catch {
+      return new Response('forbidden', { status: 403 });
+    }
+  }
+
+  // 每请求独立鉴权（与现有 API 一致：Bearer JWT 或 PAT）
+  const user = await authUser(request, env);
+  if (!user) return mcpResult(null, null, { code: -32001, message: 'unauthorized' });
+
+  let body;
+  try { body = await request.json(); } catch {
+    return mcpResult(null, null, { code: -32700, message: 'Parse error' });
+  }
+  const id = body.id;
+  const isNotification = id === undefined || id === null;
+
+  switch (body.method) {
+    case 'initialize':
+      return mcpResult(id, {
+        protocolVersion: MCP_VERSION,
+        capabilities: { tools: {} },
+        serverInfo: { name: 'cf-panle', version: '0.1.0' },
+        instructions: 'cf-panle 面板只读查询。可用工具：list_servers（服务器状态）、get_monitor（监控历史）。认证：Authorization: Bearer <JWT 或 PAT>',
+      });
+    case 'notifications/initialized':
+    case 'notifications/cancelled':
+      return new Response(null, { status: 202 }); // 通知：接受无 body
+    case 'ping':
+      return mcpResult(id, {});
+    case 'tools/list':
+      return mcpResult(id, { tools: MCP_TOOLS });
+    case 'tools/call': {
+      const params = body.params || {};
+      const tool = MCP_TOOLS.find((t) => t.name === params.name);
+      if (!tool) return mcpResult(id, null, { code: -32602, message: `Unknown tool: ${params.name}` });
+      try {
+        let content;
+        if (params.name === 'list_servers') content = await mcpListServers(user, env);
+        else if (params.name === 'get_monitor') content = await mcpGetMonitor(user, env, params.arguments || {});
+        return mcpResult(id, { content: [{ type: 'text', text: JSON.stringify(content) }], isError: false });
+      } catch (e) {
+        // 工具执行错误作为 isError 结果返回（MCP 客户端可读）
+        return mcpResult(id, { content: [{ type: 'text', text: String(e.message || e) }], isError: true });
+      }
+    }
+    default:
+      return mcpResult(id, null, { code: -32601, message: `Method not found: ${body.method}` });
+  }
 }
 
 // ---------------- WebSocket 路由（按分片转发 DO） ----------------
@@ -885,6 +1053,7 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
     if (url.pathname.startsWith('/ws/')) return handleWs(request, env);
+    if (url.pathname === '/mcp') return handleMcp(request, env);
     return handleApi(request, env);
   },
 };

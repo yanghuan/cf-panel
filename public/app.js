@@ -500,9 +500,10 @@
   }
 
   // 分段上传：1MB 一段，首段清空写、后续追加
+  // sent = 已发送字节（连续发送不等确认）；acked = 已确认写入字节（按 write_result 累计）
   function uploadFile(file) {
     if (file.size > FILE_MAX) { $('#file-msg').textContent = '文件超过 500MB 限制'; return; }
-    fileUpload = { size: file.size, sent: 0 };
+    fileUpload = { size: file.size, sent: 0, acked: 0 };
     const reader = new FileReader();
     const readNext = () => {
       const chunk = file.slice(fileUpload.sent, Math.min(fileUpload.sent + FILE_CHUNK, file.size));
@@ -511,25 +512,24 @@
         fileSend({ type: 'write', path: fileJoin(fileCwd, file.name), offset: fileUpload.sent, data: b64 });
         fileUpload.sent += chunk.size;
         if (fileUpload.sent < file.size) readNext();
-        else $('#file-msg').textContent = '上传完成，等待确认...';
+        else $('#file-msg').textContent = '已全部发送，等待写入确认...';
       };
       reader.readAsDataURL(chunk);
     };
     readNext();
   }
 
-  function onWriteResult() {
-    if (fileUpload) {
-      if (fileUpload.sent >= fileUpload.size) {
-        fileUpload = null;
-        $('#file-msg').textContent = '上传完成';
-        fileSend({ type: 'list', path: fileCwd }); // 刷新列表
-      } else {
-        $('#file-msg').textContent = `上传中：${Math.min(fileUpload.sent, fileUpload.size) / 1048576 | 0}/${fileUpload.size / 1048576 | 0} MB`;
-      }
+  // 只有所有块都收到 write_result 确认后才算完成，避免"已发送"误报成功
+  function onWriteResult(j) {
+    if (!fileUpload) return; // 无进行中的上传任务，忽略
+    const acked = Math.min(fileUpload.size, (Number(j.offset) || 0) + FILE_CHUNK);
+    fileUpload.acked = Math.max(fileUpload.acked || 0, acked);
+    if (fileUpload.acked >= fileUpload.size) {
+      fileUpload = null;
+      $('#file-msg').textContent = '上传完成';
+      fileSend({ type: 'list', path: fileCwd }); // 刷新列表（此时文件已完整写入）
     } else {
-      $('#file-msg').textContent = '写入成功';
-      fileSend({ type: 'list', path: fileCwd });
+      $('#file-msg').textContent = `上传中：${Math.round((fileUpload.acked / fileUpload.size) * 100)}%`;
     }
   }
 

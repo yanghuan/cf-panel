@@ -1,7 +1,7 @@
 // ============================================================
 // cf-panle — Cloudflare Worker 主逻辑
 // REST API + WebSocket 中转（Durable Object: TerminalDO，多分片）
-// 依赖：D1(DB)、KV(KV)、DO(TERMINAL)、secret: JWT_SECRET / PANEL_PASSWORD
+// 依赖：D1(DB)、DO(TERMINAL/METRICS/PANEL)、secret: JWT_SECRET / PANEL_PASSWORD
 // 对齐 docs/architecture.md §3.2 / §3.3 / §6
 // ============================================================
 
@@ -27,6 +27,9 @@ const REPORT_SLOW_INTERVAL_S = 120; // 无人查看：120 秒上报
 // MCP（Model Context Protocol）标准 AI 接入：无状态 Streamable HTTP（2026-07-28 修订版）
 // 端点 /mcp 仅接受 POST；每请求独立用 Authorization: Bearer 鉴权（JWT 或 PAT），无会话状态
 const MCP_VERSION = '2025-11-25'; // 服务器声明支持的协议版本（缺失头时客户端按 2025-03-26 兼容）
+
+// 简单登录限流：同一 IP 60 秒内最多 5 次失败（Worker 实例内存，重启清零）
+const LOGIN_FAILS = new Map();
 const MCP_TOOLS = [
   {
     name: 'list_servers',
@@ -79,11 +82,6 @@ function b64uDecode(s) {
 }
 function bytesToHex(bytes) {
   return [...bytes].map((b) => b.toString(16).padStart(2, '0')).join('');
-}
-function hexToBytes(hex) {
-  const out = new Uint8Array(hex.length / 2);
-  for (let i = 0; i < out.length; i++) out[i] = parseInt(hex.substr(i * 2, 2), 16);
-  return out;
 }
 async function hmacSha256(keyBytes, dataBytes) {
   const key = await crypto.subtle.importKey('raw', keyBytes, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
@@ -168,6 +166,26 @@ function doMetrics(env) {
 }
 function doPanel(env) {
   return env.PANEL.get(env.PANEL.idFromName('main')); // 单实例：服务器列表实时推送
+}
+
+// 监控历史查询（/api/monitor 与 MCP 共用）：≤12h 走内存热区秒回，更长走 D1 归档（超长 SQL 抽样）
+async function queryMonitorRows(env, serverId, hours) {
+  if (hours <= 12) {
+    const resp = await doMetrics(env).fetch(`https://do.internal/query?server_id=${serverId}&limit=${Math.max(1, Math.round(hours * 60))}`);
+    return resp.json();
+  }
+  const minutes = hours * 60;
+  const sinceMin = Math.floor(Date.now() / 1000 / 60) - minutes;
+  const MONITOR_D1_MAX_ROWS = 1500; // 长区间 SQL 抽样上限，防响应/解析放大
+  const q = 'SELECT ts, cpu, mem_used, net_in, net_out, extra FROM metrics_min WHERE server_id = ? AND ts >= ?';
+  let r;
+  if (minutes > MONITOR_D1_MAX_ROWS) {
+    const step = Math.ceil(minutes / MONITOR_D1_MAX_ROWS);
+    r = await env.DB.prepare(`${q} AND ts % ? = 0 ORDER BY ts`).bind(serverId, sinceMin, step).all();
+  } else {
+    r = await env.DB.prepare(`${q} ORDER BY ts`).bind(serverId, sinceMin).all();
+  }
+  return r.results.map((x) => ({ ...x, extra: safeJson(x.extra) }));
 }
 
 // agent 监控上报落库：更新 last_seen/online（系统信息变更才写 info_json），
@@ -265,12 +283,25 @@ async function handleApi(request, env) {
   const path = url.pathname;
   const method = request.method;
 
-  // POST /api/login —— 面板单密码（CF secret: PANEL_PASSWORD）
+  // POST /api/login —— 面板单密码（CF secret: PANEL_PASSWORD，同 IP 60s 内 5 次失败限流）
   if (method === 'POST' && path === '/api/login') {
     const body = await request.json().catch(() => ({}));
     const password = String(body.password || '');
     if (!env.PANEL_PASSWORD) return err('server misconfigured: PANEL_PASSWORD not set', 500);
-    if (password !== env.PANEL_PASSWORD) return err('bad password', 401);
+    const ip = request.headers.get('cf-connecting-ip') || 'unknown';
+    const nowMs = Date.now();
+    const rec = LOGIN_FAILS.get(ip);
+    if (rec && nowMs - rec.ts < 60000 && rec.count >= 5) {
+      return err('too many attempts, try again later', 429);
+    }
+    if (password !== env.PANEL_PASSWORD) {
+      const cur = rec && nowMs - rec.ts < 60000 ? rec : { count: 0, ts: nowMs };
+      cur.count += 1;
+      cur.ts = nowMs;
+      LOGIN_FAILS.set(ip, cur);
+      return err('bad password', 401);
+    }
+    LOGIN_FAILS.delete(ip);
     const token = await signJwt({ uid: 1, role: 1, exp: Math.floor(Date.now() / 1000) + 86400 }, env);
     return json({ token, user: { id: 1, username: 'admin', role: 1 } });
   }
@@ -419,25 +450,7 @@ async function handleApi(request, env) {
     if (!s) return err('not found', 404);
     if (!canAccessServer(user, s)) return err('forbidden', 403);
     const hours = parseRangeHours(range);
-    if (hours <= 12) {
-      const mdo = doMetrics(env);
-      return mdo.fetch(`https://do.internal/query?server_id=${serverId}&limit=${Math.max(1, Math.round(hours * 60))}`);
-    }
-    const minutes = hours * 60;
-    const sinceMin = Math.floor(Date.now() / 1000 / 60) - minutes;
-    const MONITOR_D1_MAX_ROWS = 1500; // 长区间 SQL 抽样上限，防响应/解析放大
-    let rows;
-    if (minutes > MONITOR_D1_MAX_ROWS) {
-      const step = Math.ceil(minutes / MONITOR_D1_MAX_ROWS);
-      rows = await env.DB.prepare(
-        'SELECT ts, cpu, mem_used, net_in, net_out, extra FROM metrics_min WHERE server_id = ? AND ts >= ? AND ts % ? = 0 ORDER BY ts'
-      ).bind(serverId, sinceMin, step).all();
-    } else {
-      rows = await env.DB.prepare(
-        'SELECT ts, cpu, mem_used, net_in, net_out, extra FROM metrics_min WHERE server_id = ? AND ts >= ? ORDER BY ts'
-      ).bind(serverId, sinceMin).all();
-    }
-    return json(rows.results.map((r) => ({ ...r, extra: safeJson(r.extra) })));
+    return json(await queryMonitorRows(env, serverId, hours));
   }
 
   // ---- PAT 管理（仅管理员）----
@@ -549,25 +562,7 @@ async function mcpGetMonitor(user, env, args) {
   }
   if (!server) throw new Error('server not found（请先用 list_servers 确认 id 或名称）');
   if (!canAccessServer(user, server)) throw new Error('forbidden');
-  const hours = parseRangeHours(range);
-  let rows;
-  if (hours <= 12) {
-    const resp = await doMetrics(env).fetch(`https://do.internal/query?server_id=${server.id}&limit=${Math.max(1, Math.round(hours * 60))}`);
-    rows = await resp.json();
-  } else {
-    const minutes = hours * 60;
-    const sinceMin = Math.floor(Date.now() / 1000 / 60) - minutes;
-    const MONITOR_D1_MAX_ROWS = 1500;
-    const q = 'SELECT ts, cpu, mem_used, net_in, net_out, extra FROM metrics_min WHERE server_id = ? AND ts >= ?';
-    let r;
-    if (minutes > MONITOR_D1_MAX_ROWS) {
-      const step = Math.ceil(minutes / MONITOR_D1_MAX_ROWS);
-      r = await env.DB.prepare(`${q} AND ts % ? = 0 ORDER BY ts`).bind(server.id, sinceMin, step).all();
-    } else {
-      r = await env.DB.prepare(`${q} ORDER BY ts`).bind(server.id, sinceMin).all();
-    }
-    rows = r.results.map((x) => ({ ...x, extra: safeJson(x.extra) }));
-  }
+  const rows = await queryMonitorRows(env, server.id, parseRangeHours(range));
   return { server: { id: server.id, name: server.name }, range, count: rows.length, points: rows };
 }
 
@@ -595,7 +590,13 @@ async function handleMcp(request, env) {
     return mcpResult(null, null, { code: -32700, message: 'Parse error' });
   }
   const id = body.id;
-  const isNotification = id === undefined || id === null;
+
+  // 协议版本协商：MCP-Protocol-Version 头须与 body _meta 一致（缺失头时按 2025-03-26 兼容）
+  const headerVersion = request.headers.get('mcp-protocol-version') || '2025-03-26';
+  const metaVersion = body._meta && body._meta['io.modelcontextprotocol/protocolVersion'];
+  if (metaVersion && metaVersion !== headerVersion) {
+    return mcpResult(id, null, { code: -32020, message: 'HeaderMismatch: MCP-Protocol-Version 与 body _meta 不一致' });
+  }
 
   switch (body.method) {
     case 'initialize':

@@ -3,6 +3,7 @@
 # cf-panle agent —— 纯 Shell 实现（websocat + socat + jq）
 # 对齐 docs/architecture.md §3.5
 # 依赖: websocat(必装), socat(resize 需要), jq, pgrep(会话结束清理进程组), bash, stty
+#       文件管理另需 GNU coreutils（find -printf / tail -c / base64 -w0，busybox 精简环境不支持）
 # 功能: 常驻控制通道（终端 + resize + 文件管理）+ 内置监控上报（经控制 WS，无需 crontab）
 #       上报指标: CPU / 内存 / Swap / 磁盘 / 负载 / 温度 / 进程数 / TCP-UDP 连接数 / 网络速率 / 系统信息
 #       文件管理: 目录浏览 / 上传 / 下载（独立 WS 会话，JSON 行协议 + base64）
@@ -49,11 +50,13 @@ collect_report() {
   sleep 0.2
   read -r _ c1u c1n c1s c1i < <(awk '/^cpu /{print}' /proc/stat)
   local cpu
-  cpu=$(awk -v u1="$c1u" -v n1="$c1n" -v s1="$c1s" -v u0="$c0u" -v n0="$c0n" -v s0="$c0s" \
+  cpu=$(awk -v u1="$c1u" -v n1="$c1n" -v s1="$c1s" -v i1="$c1i" \
+          -v u0="$c0u" -v n0="$c0n" -v s0="$c0s" -v i0="$c0i" \
     'BEGIN {
-      d = (u1 + n1 + s1) - (u0 + n0 + s0);
-      if (d <= 0) { print 0; exit }
-      printf "%.2f", 100 * (1 - d / (d + (u1 - u0)))
+      total = (u1 + n1 + s1 + i1) - (u0 + n0 + s0 + i0);
+      idle  = i1 - i0;
+      if (total <= 0) { print 0; exit }
+      printf "%.2f", 100 * (1 - idle / total)
     }')
   # 内存已用 / Swap 已用（字节）
   local mem swap
@@ -161,6 +164,7 @@ spawn_file() {
   local fs="$TMP_DIR/file-server-$sid.sh"
   cat > "$fs" <<'SERVEREOF'
 #!/usr/bin/env bash
+# 文件服务（需 GNU coreutils：find -printf / tail -c / base64 -w0）
 set -euo pipefail
 
 ls_entries() {
@@ -183,10 +187,19 @@ while IFS= read -r line; do
       ;;
     read)
       path=$(jq -r .path <<<"$line")
+      offset=$(jq -r '.offset // 0' <<<"$line")
+      limit=$(jq -r '.limit // 0' <<<"$line")
       if [ -f "$path" ]; then
         size=$(wc -c < "$path" 2>/dev/null || echo 0)
-        data=$(base64 -w0 < "$path" 2>/dev/null) || data=''
-        jq -nc --arg p "$path" --arg d "$data" --argjson s "$size" '{type:"read_result", ok:true, path:$p, data:$d, size:$s}'
+        if [ "$size" -gt 524288000 ]; then   # 500MB 上限
+          jq -nc --arg p "$path" '{type:"error", ok:false, message:"file exceeds 500MB limit"}'
+          continue
+        fi
+        [ "${limit:-0}" -le 0 ] && limit=$size
+        data=$(tail -c +$((offset + 1)) "$path" 2>/dev/null | head -c "$limit" | base64 -w0 2>/dev/null) || data=''
+        got=$(printf '%s' "$data" | base64 -d 2>/dev/null | wc -c) || got=0
+        jq -nc --arg p "$path" --arg d "$data" --argjson o "$offset" --argjson g "$got" --argjson s "$size" \
+          '{type:"read_result", ok:true, path:$p, offset:$o, data:$d, got:$g, size:$s}'
       else
         jq -nc --arg p "$path" '{type:"error", ok:false, message:"not a file or unreadable"}'
       fi
@@ -194,11 +207,23 @@ while IFS= read -r line; do
     write)
       path=$(jq -r .path <<<"$line")
       data=$(jq -r .data <<<"$line")
-      if mkdir -p "$(dirname "$path" 2>/dev/null)" 2>/dev/null && printf '%s' "$data" | base64 -d > "$path" 2>/dev/null; then
-        jq -nc --arg p "$path" '{type:"write_result", ok:true, path:$p}'
-      else
-        jq -nc --arg p "$path" '{type:"error", ok:false, message:"write failed"}'
+      offset=$(jq -r '.offset // 0' <<<"$line")
+      if ! mkdir -p "$(dirname "$path" 2>/dev/null)" 2>/dev/null; then
+        jq -nc --arg p "$path" '{type:"error", ok:false, message:"mkdir failed"}'
+        continue
       fi
+      if [ "$offset" -eq 0 ]; then
+        printf '%s' "$data" | base64 -d > "$path" 2>/dev/null || { jq -nc '{type:"error", ok:false, message:"write failed"}'; continue; }
+      else
+        printf '%s' "$data" | base64 -d >> "$path" 2>/dev/null || { jq -nc '{type:"error", ok:false, message:"write failed"}'; continue; }
+      fi
+      cur=$(wc -c < "$path" 2>/dev/null || echo 0)
+      if [ "$cur" -gt 524288000 ]; then   # 500MB 上限，超限删除
+        rm -f "$path" 2>/dev/null
+        jq -nc '{type:"error", ok:false, message:"file exceeds 500MB limit, aborted"}'
+        continue
+      fi
+      jq -nc --arg p "$path" --argjson o "$offset" '{type:"write_result", ok:true, path:$p, offset:$o}'
       ;;
   esac
 done

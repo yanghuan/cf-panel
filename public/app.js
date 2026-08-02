@@ -307,6 +307,10 @@
   // ---------- 文件管理（目录浏览 / 上传 / 下载） ----------
   let fileWs = null;
   let fileCwd = '/';
+  const FILE_CHUNK = 1024 * 1024;      // 分段传输块大小 1MB
+  const FILE_MAX = 500 * 1024 * 1024;  // 单文件大小上限 500MB
+  let fileUpload = null;               // { size, sent } 上传进度
+  let fileDownload = null;             // { path, size, parts, received } 下载进度
 
   function fileParent(p) {
     const t = String(p || '/').replace(/\/+$/, '');
@@ -334,8 +338,8 @@
       ws.onmessage = (ev) => {
         let j; try { j = JSON.parse(ev.data); } catch { return; }
         if (j.type === 'list_result' && j.ok) renderFileList(j.entries);
-        else if (j.type === 'read_result' && j.ok) downloadFile(j.path, j.data);
-        else if (j.type === 'write_result' && j.ok) { $('#file-msg').textContent = '上传成功'; fileSend({ type: 'list', path: fileCwd }); }
+        else if (j.type === 'read_result' && j.ok) onReadResult(j);
+        else if (j.type === 'write_result' && j.ok) onWriteResult(j);
         else if (j.type === 'error') $('#file-msg').textContent = `错误：${j.message}`;
       };
       ws.onclose = () => { if (fileWs === ws) fileWs = null; };
@@ -361,38 +365,85 @@
       const nameCell = e.type === 'dir'
         ? `<a class="f-dir" data-path="${escapeHtml(fileJoin(fileCwd, e.name))}">📁 ${escapeHtml(e.name)}</a>`
         : `<span class="f-file">📄 ${escapeHtml(e.name)}</span>`;
-      const dl = e.type === 'file' ? `<button class="ghost f-dl" data-path="${escapeHtml(fileJoin(fileCwd, e.name))}">下载</button>` : '';
+      const dl = e.type === 'file' ? `<button class="ghost f-dl" data-path="${escapeHtml(fileJoin(fileCwd, e.name))}" data-size="${e.size}">下载</button>` : '';
       return `<tr><td>${nameCell}</td><td>${size}</td><td>${escapeHtml(time)}</td><td>${dl}</td></tr>`;
     });
     $('#file-list').innerHTML = rows.join('') || '<tr><td colspan="4" class="muted">空目录</td></tr>';
   }
 
-  function downloadFile(path, b64) {
-    try {
-      const bin = atob(b64);
-      const bytes = new Uint8Array(bin.length);
-      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-      const a = document.createElement('a');
-      a.href = URL.createObjectURL(new Blob([bytes]));
-      a.download = path.split('/').pop() || 'download';
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
-      URL.revokeObjectURL(a.href);
-      $('#file-msg').textContent = `已下载：${path}`;
-    } catch {
-      $('#file-msg').textContent = '下载失败';
+  // 分段下载：按 1MB 逐段拉取，累计到文件大小后组装 Blob 下载
+  function downloadFile(path, size) {
+    if (size > FILE_MAX) { $('#file-msg').textContent = '文件超过 500MB 限制'; return; }
+    if (size <= 0) { $('#file-msg').textContent = '空文件，无需下载'; return; }
+    fileDownload = { path, size, parts: [], received: 0 };
+    $('#file-msg').textContent = '开始下载...';
+    fileSend({ type: 'read', path, offset: 0, limit: FILE_CHUNK });
+  }
+
+  function onReadResult(j) {
+    if (!fileDownload || j.path !== fileDownload.path) {
+      $('#file-msg').textContent = '下载状态异常，请重试';
+      fileDownload = null;
+      return;
+    }
+    fileDownload.parts.push(atob(j.data));
+    fileDownload.received += j.got;
+    const pct = fileDownload.size ? Math.min(100, Math.round((fileDownload.received / fileDownload.size) * 100)) : 0;
+    $('#file-msg').textContent = `下载中：${pct}%`;
+    if (fileDownload.received >= fileDownload.size) {
+      try {
+        const full = fileDownload.parts.join('');
+        const bytes = new Uint8Array(full.length);
+        for (let i = 0; i < full.length; i++) bytes[i] = full.charCodeAt(i);
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(new Blob([bytes]));
+        a.download = fileDownload.path.split('/').pop() || 'download';
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        URL.revokeObjectURL(a.href);
+        $('#file-msg').textContent = `已下载：${fileDownload.path}`;
+      } catch {
+        $('#file-msg').textContent = '下载失败';
+      }
+      fileDownload = null;
+    } else {
+      fileSend({ type: 'read', path: j.path, offset: fileDownload.received, limit: FILE_CHUNK });
     }
   }
 
+  // 分段上传：1MB 一段，首段清空写、后续追加
   function uploadFile(file) {
+    if (file.size > FILE_MAX) { $('#file-msg').textContent = '文件超过 500MB 限制'; return; }
+    fileUpload = { size: file.size, sent: 0 };
     const reader = new FileReader();
-    reader.onload = () => {
-      const b64 = String(reader.result).split(',')[1] || '';
-      fileSend({ type: 'write', path: fileJoin(fileCwd, file.name), data: b64 });
-      $('#file-msg').textContent = `上传中：${file.name}（${fmtBytes(file.size)}）...`;
+    const readNext = () => {
+      const chunk = file.slice(fileUpload.sent, Math.min(fileUpload.sent + FILE_CHUNK, file.size));
+      reader.onload = () => {
+        const b64 = String(reader.result).split(',')[1] || '';
+        fileSend({ type: 'write', path: fileJoin(fileCwd, file.name), offset: fileUpload.sent, data: b64 });
+        fileUpload.sent += chunk.size;
+        if (fileUpload.sent < file.size) readNext();
+        else $('#file-msg').textContent = '上传完成，等待确认...';
+      };
+      reader.readAsDataURL(chunk);
     };
-    reader.readAsDataURL(file);
+    readNext();
+  }
+
+  function onWriteResult() {
+    if (fileUpload) {
+      if (fileUpload.sent >= fileUpload.size) {
+        fileUpload = null;
+        $('#file-msg').textContent = '上传完成';
+        fileSend({ type: 'list', path: fileCwd }); // 刷新列表
+      } else {
+        $('#file-msg').textContent = `上传中：${Math.min(fileUpload.sent, fileUpload.size) / 1048576 | 0}/${fileUpload.size / 1048576 | 0} MB`;
+      }
+    } else {
+      $('#file-msg').textContent = '写入成功';
+      fileSend({ type: 'list', path: fileCwd });
+    }
   }
 
   // ---------- 监控（简易文本图，支持时间范围） ----------
@@ -587,7 +638,7 @@
     const dir = e.target.closest('.f-dir');
     if (dir) { fileCwd = dir.dataset.path; $('#file-path').value = fileCwd; fileSend({ type: 'list', path: fileCwd }); return; }
     const dl = e.target.closest('.f-dl');
-    if (dl) fileSend({ type: 'read', path: dl.dataset.path });
+    if (dl) downloadFile(dl.dataset.path, Number(dl.dataset.size) || 0);
   });
 
   // ---------- 启动 ----------

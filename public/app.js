@@ -112,18 +112,21 @@
     return `
       <div class="card">
         <div class="card-head">
-          <div class="name">${escapeHtml(s.name)}</div>
+          <div class="card-title">
+            <span class="name">${escapeHtml(s.name)}</span>
+            <button class="more-btn" title="节点操作">⋯</button>
+            <div class="card-menu hidden">
+              <button data-act="term" data-id="${s.id}" data-name="${escapeHtml(s.name)}">终端</button>
+              <button data-act="file" data-id="${s.id}" data-name="${escapeHtml(s.name)}">文件</button>
+              <button data-act="mon" data-id="${s.id}" data-name="${escapeHtml(s.name)}">监控</button>
+              <button data-act="del" data-id="${s.id}" data-name="${escapeHtml(s.name)}" class="dd-danger">删除</button>
+            </div>
+          </div>
           <span class="badge ${s.online ? 'on' : 'off'}"><i class="dot"></i>${s.online ? '在线' : '离线'}</span>
         </div>
         ${metricHtml}
         ${probes}
         <div class="meta">${info ? escapeHtml(info) : `id: ${s.id}`}</div>
-        <div class="actions">
-          <button data-act="term" data-id="${s.id}" data-name="${escapeHtml(s.name)}">终端</button>
-          <button data-act="file" data-id="${s.id}" data-name="${escapeHtml(s.name)}" class="ghost">文件</button>
-          <button data-act="mon" data-id="${s.id}" data-name="${escapeHtml(s.name)}" class="ghost">监控</button>
-          <button data-act="del" data-id="${s.id}" class="danger">删除</button>
-        </div>
       </div>`;
   }
 
@@ -163,7 +166,11 @@
       const g = s.group || '未分组';
       (groups[g] = groups[g] || []).push(s);
     }
-    box.innerHTML = Object.keys(groups).map((g) => `
+    // 分组展示顺序：按名称排序，「未分组」始终排最后
+    const groupOrder = Object.keys(groups).sort(
+      (a, b) => (a === '未分组') - (b === '未分组') || a.localeCompare(b, 'zh')
+    );
+    box.innerHTML = groupOrder.map((g) => `
       <h3 class="group-title">${escapeHtml(g)}（${groups[g].length}）</h3>
       <div class="grid">${groups[g].map(cardHtml).join('')}</div>`).join('');
   }
@@ -175,11 +182,12 @@
     if (!name) return toast('请输入服务器名称');
     try {
       const cfg = await api('/api/servers', { method: 'POST', body: JSON.stringify({ name, group, sort_order: sortOrder }) });
-      const text = `服务器已添加，agent 配置（仅显示一次）：\n\nWSS 地址: ${cfg.wss_base}\nKEY: ${cfg.agent_key}\n\n上报地址: ${cfg.report_url}`;
-      alert(text); // 一次性展示 agent 凭据
-      $('#inp-name').value = '';
-      $('#inp-group').value = '';
-      $('#inp-order').value = '';
+      const text = `服务器已添加，agent 配置（仅显示一次）：\n\nWSS 地址: ${cfg.wss_base}\nKEY: ${cfg.agent_key}`;
+      $('#add-modal').classList.add('hidden');
+      unlockScroll();
+      infoDialog('服务器已添加 · agent 配置（仅显示一次）', text);
+      loadServers();
+      unlockScroll();
       loadServers();
     } catch (e) {
       toast(e.message);
@@ -232,10 +240,46 @@
     try { w.close(); } catch { /* ignore */ }
   }
 
+  // ---------- 弹窗滚动锁定：打开时锁住页面滚动，避免滚动穿透到背景 ----------
+  function lockScroll() { document.body.style.overflow = 'hidden'; }
+  function unlockScroll() { document.body.style.overflow = ''; }
+
+  // ---------- 通用对话框（替代系统 alert/confirm） ----------
+  function closeDialog() {
+    $('#dialog').classList.add('hidden');
+    unlockScroll();
+  }
+  function infoDialog(title, text, mono = true) {
+    $('#dialog-title').textContent = title;
+    $('#dialog-text').textContent = text;
+    $('#dialog-text').classList.toggle('mono', !!mono);
+    $('#btn-dialog-ok').classList.add('hidden');
+    $('#btn-dialog-cancel').textContent = '知道了';
+    $('#btn-dialog-cancel').classList.remove('hidden');
+    $('#dialog').classList.remove('hidden');
+    lockScroll();
+    $('#btn-dialog-close').onclick = closeDialog;
+    $('#btn-dialog-cancel').onclick = closeDialog;
+  }
+  function confirmDialog(message, onOk) {
+    $('#dialog-title').textContent = '确认';
+    $('#dialog-text').textContent = message;
+    $('#dialog-text').classList.remove('mono');
+    $('#btn-dialog-ok').classList.remove('hidden');
+    $('#btn-dialog-cancel').textContent = '取消';
+    $('#btn-dialog-cancel').classList.remove('hidden');
+    $('#dialog').classList.remove('hidden');
+    lockScroll();
+    $('#btn-dialog-close').onclick = closeDialog;
+    $('#btn-dialog-cancel').onclick = closeDialog;
+    $('#btn-dialog-ok').onclick = () => { closeDialog(); onOk && onOk(); };
+  }
+
   // ---------- 终端（断线自动重连） ----------
   function openTerminal(serverId, serverName) {
     $('#term-title').textContent = `终端 · ${serverName}`;
     $('#term-modal').classList.remove('hidden');
+    lockScroll();
     $('#term').innerHTML = '';
 
     const Term = window.Terminal;
@@ -255,6 +299,7 @@
       try { ws && ws.close(); } catch { /* ignore */ }
       term.dispose();
       $('#term-modal').classList.add('hidden');
+      unlockScroll();
     };
     $('#btn-term-close').onclick = close;
 
@@ -333,6 +378,7 @@
       $('#file-msg').textContent = '';
       $('#file-list').innerHTML = '<tr><td colspan="4" class="muted">连接中...</td></tr>';
       $('#file-modal').classList.remove('hidden');
+      lockScroll();
       closeFileWs();
       const proto = location.protocol === 'https:' ? 'wss' : 'ws';
       const ws = new WebSocket(`${proto}://${location.host}/ws/file/${res.session_id}?token=${encodeURIComponent(token)}`);
@@ -355,6 +401,7 @@
   function closeFileModal() {
     if (fileWs) { try { fileWs.close(); } catch { /* ignore */ } fileWs = null; }
     $('#file-modal').classList.add('hidden');
+    unlockScroll();
   }
 
   function fileSend(obj) {
@@ -483,7 +530,8 @@
       const label = MONITOR_RANGE_LABEL[range] || range;
       const cCount = Object.keys(custom).length;
       $('#monitor-title').textContent = `监控 · ${serverName}（${label}，${rows.length} 点${rows.length > MONITOR_STEP_MAX ? '，降采样' : ''}${cCount ? ` +${cCount} 自定义` : ''}）`;
-      $('#monitor-panel').classList.remove('hidden'); // 先显示，保证 canvas 有尺寸
+      $('#monitor-modal').classList.remove('hidden'); // 先显示，保证 canvas 有尺寸
+      lockScroll();
       renderMonitorChart(downsample(rows), custom);
     } catch (e) {
       toast(e.message);
@@ -565,13 +613,29 @@
       </div>`).join('');
   }
 
-  function openSettings() {
-    $('#settings-modal').classList.remove('hidden');
-    renderAlertPresets();
+  // ---------- 下拉菜单各功能入口 ----------
+  function openAddModal() {
+    $('#inp-name').value = '';
+    $('#inp-group').value = '';
+    $('#inp-order').value = '';
+    $('#add-modal').classList.remove('hidden');
+    lockScroll();
+    setTimeout(() => $('#inp-name').focus(), 50);
+  }
+
+  function openSiteModal() {
+    $('#site-modal').classList.remove('hidden');
+    lockScroll();
     api('/api/public/settings').then((s) => {
       $('#set-site-name').value = s.site_name === 'cf-panle' ? '' : s.site_name;
       $('#set-notice').value = s.notice || '';
     }).catch(() => { /* ignore */ });
+  }
+
+  function openAlertsModal() {
+    $('#alerts-modal').classList.remove('hidden');
+    lockScroll();
+    renderAlertPresets();
     api('/api/settings').then((s) => {
       const a = s.alerts || {};
       $('#set-alert-method').value = a.method || 'POST';
@@ -587,17 +651,33 @@
       $('#set-alert-cooldown').value = a.cooldown_min || '';
       $('#set-alert-offline').value = a.offline_after_s || '';
     }).catch(() => { /* ignore */ });
+  }
+
+  function openTokensModal() {
+    $('#tokens-modal').classList.remove('hidden');
+    lockScroll();
     loadTokens();
   }
 
-  async function saveSettings() {
+  async function saveSite() {
+    try {
+      await api('/api/settings', {
+        method: 'PUT',
+        body: JSON.stringify({ site_name: $('#set-site-name').value, notice: $('#set-notice').value }),
+      });
+      toast('站点信息已保存');
+      loadPublic();
+    } catch (e) {
+      toast(e.message);
+    }
+  }
+
+  async function saveAlerts() {
     const num = (v) => (v.trim() ? Number(v) : 0);
     try {
       await api('/api/settings', {
         method: 'PUT',
         body: JSON.stringify({
-          site_name: $('#set-site-name').value,
-          notice: $('#set-notice').value,
           alerts: {
             webhook_url: $('#set-alert-url').value.trim(),
             webhook_token: $('#set-alert-token').value.trim(),
@@ -614,8 +694,7 @@
           },
         }),
       });
-      toast('设置已保存');
-      loadPublic();
+      toast('告警配置已保存');
     } catch (e) {
       toast(e.message);
     }
@@ -645,7 +724,7 @@
         method: 'POST',
         body: JSON.stringify({ name: $('#tok-name').value.trim(), scopes, server_ids: serverIDs.length ? serverIDs : null }),
       });
-      alert(`令牌已创建（仅显示一次）：\n\n${res.token}\n\n用法：Authorization: Bearer ${res.token}`);
+      infoDialog('令牌已创建（仅显示一次）', `令牌：\n${res.token}\n\n用法：Authorization: Bearer ${res.token}`);
       $('#tok-name').value = '';
       $('#tok-servers').value = '';
       loadTokens();
@@ -654,24 +733,55 @@
     }
   }
 
-  async function deleteToken(id) {
-    if (!confirm('确认删除该令牌？')) return;
-    try {
-      await api(`/api/tokens/${id}`, { method: 'DELETE' });
-      loadTokens();
-    } catch (e) {
-      toast(e.message);
-    }
+  function deleteToken(id) {
+    confirmDialog('确认删除该令牌？', async () => {
+      try {
+        await api(`/api/tokens/${id}`, { method: 'DELETE' });
+        loadTokens();
+      } catch (e) {
+        toast(e.message);
+      }
+    });
   }
 
   // ---------- 事件绑定 ----------
   $('#btn-login').onclick = (e) => { e.preventDefault(); doLogin(); };
-  $('#btn-logout').onclick = () => { token = ''; localStorage.removeItem('cfpanle_token'); showAuth(); };
+
+  // 下拉菜单：切换 / 点击外部关闭 / 菜单项路由
+  $('#btn-menu').onclick = (e) => { e.stopPropagation(); $('#dropdown').classList.toggle('hidden'); };
+  document.addEventListener('click', (e) => {
+    if (!e.target.closest('#dropdown') && !e.target.closest('#btn-menu')) $('#dropdown').classList.add('hidden');
+    if (!e.target.closest('.card-menu')) {
+      document.querySelectorAll('#servers .card-menu').forEach((m) => m.classList.add('hidden'));
+    }
+  });
+  $('#dropdown').addEventListener('click', (e) => {
+    const item = e.target.closest('.dd-item');
+    if (!item) return;
+    $('#dropdown').classList.add('hidden');
+    const act = item.dataset.menu;
+    if (act === 'add-server') openAddModal();
+    else if (act === 'site') openSiteModal();
+    else if (act === 'alerts') openAlertsModal();
+    else if (act === 'tokens') openTokensModal();
+    else if (act === 'logout') { token = ''; localStorage.removeItem('cfpanle_token'); showAuth(); }
+  });
+
+  // 添加服务器弹窗
   $('#btn-add-server').onclick = addServer;
-  $('#btn-refresh').onclick = loadServers;
-  $('#btn-settings').onclick = openSettings;
-  $('#btn-settings-close').onclick = () => $('#settings-modal').classList.add('hidden');
-  $('#btn-save-settings').onclick = saveSettings;
+  $('#btn-add-close').onclick = () => { $('#add-modal').classList.add('hidden'); unlockScroll(); };
+  $('#inp-name').addEventListener('keydown', (e) => { if (e.key === 'Enter') addServer(); });
+
+  // 站点信息弹窗
+  $('#btn-site-close').onclick = () => { $('#site-modal').classList.add('hidden'); unlockScroll(); };
+  $('#btn-save-site').onclick = saveSite;
+
+  // 告警弹窗
+  $('#btn-alerts-close').onclick = () => { $('#alerts-modal').classList.add('hidden'); unlockScroll(); };
+  $('#btn-save-alerts').onclick = saveAlerts;
+
+  // 访问令牌弹窗
+  $('#btn-tokens-close').onclick = () => { $('#tokens-modal').classList.add('hidden'); unlockScroll(); };
   $('#btn-create-token').onclick = createToken;
   $('#token-list').addEventListener('click', (e) => {
     const btn = e.target.closest('button[data-tok-del]');
@@ -679,24 +789,36 @@
   });
 
   $('#servers').addEventListener('click', (e) => {
+    // 卡片 ⋯ 按钮：切换本卡操作菜单，并收起其他卡片菜单
+    const more = e.target.closest('.more-btn');
+    if (more) {
+      e.stopPropagation();
+      const menu = more.parentElement.querySelector('.card-menu');
+      document.querySelectorAll('#servers .card-menu').forEach((m) => { if (m !== menu) m.classList.add('hidden'); });
+      menu.classList.toggle('hidden');
+      return;
+    }
     const btn = e.target.closest('button[data-act]');
     if (!btn) return;
+    const card = btn.closest('.card');
+    if (card) card.querySelector('.card-menu').classList.add('hidden');
     const { act, id, name } = btn.dataset;
     if (act === 'term') openTerminal(Number(id), name);
     else if (act === 'file') openFileManager(Number(id), name);
     else if (act === 'mon') showMonitor(Number(id), name);
     else if (act === 'del') {
-      if (!confirm(`确认删除服务器「${name}」？`)) return;
-      api(`/api/servers/${id}`, { method: 'DELETE' }).then(loadServers).catch((e2) => toast(e2.message));
+      confirmDialog(`确认删除服务器「${name}」？`, () => {
+        api(`/api/servers/${id}`, { method: 'DELETE' }).then(loadServers).catch((e2) => toast(e2.message));
+      });
     }
   });
 
-  // 监控时间范围切换
-  $('#monitor-panel').addEventListener('click', (e) => {
+  // 监控时间范围切换 + 关闭
+  $('#monitor-modal').addEventListener('click', (e) => {
     const btn = e.target.closest('.range-btn');
-    if (!btn || !monitorState) return;
-    showMonitor(monitorState.serverId, monitorState.serverName, btn.dataset.range);
+    if (btn && monitorState) showMonitor(monitorState.serverId, monitorState.serverName, btn.dataset.range);
   });
+  $('#btn-monitor-close').onclick = () => { $('#monitor-modal').classList.add('hidden'); unlockScroll(); };
 
   // 告警渠道预设：点击「使用」填入表单模板
   $('#alert-preset-list').addEventListener('click', (e) => {

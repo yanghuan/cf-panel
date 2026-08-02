@@ -5,17 +5,22 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>cf-panle · 监控面板</title>
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.min.css" />
-  <link rel="stylesheet" href="/style.css?v=4" />
+  <link rel="stylesheet" href="/style.css?v=9" />
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
 </head>
 <body>
   <div id="app" class="hidden">
     <header>
-      <h1>cf-panle</h1>
-      <div class="header-right">
+      <div class="header-left">
+        <button id="btn-menu" class="menu-btn" aria-label="菜单" title="菜单">☰</button>
         <span id="whoami"></span>
-        <button id="btn-settings" class="ghost">设置</button>
-        <button id="btn-logout" class="ghost">退出</button>
+      </div>
+      <div id="dropdown" class="dropdown hidden">
+        <button class="dd-item" data-menu="add-server">添加服务器</button>
+        <button class="dd-item" data-menu="site">站点信息</button>
+        <button class="dd-item" data-menu="alerts">告警</button>
+        <button class="dd-item" data-menu="tokens">访问令牌</button>
+        <button class="dd-item dd-danger" data-menu="logout">退出</button>
       </div>
     </header>
     <div id="notice-bar" class="notice hidden"></div>
@@ -30,27 +35,25 @@
       </section>
       <section class="toolbar">
         <h2>服务器</h2>
-        <div class="toolbar-actions">
-          <input id="inp-name" type="text" placeholder="服务器名称" />
-          <input id="inp-group" type="text" placeholder="分组(可选)" />
-          <input id="inp-order" type="number" placeholder="序号(可选)" />
-          <button id="btn-add-server">添加服务器</button>
-          <button id="btn-refresh" class="ghost">刷新</button>
-        </div>
       </section>
       <section id="servers" class="servers-list"></section>
-      <section id="monitor-panel" class="hidden">
-        <h3 id="monitor-title"></h3>
-        <div class="range-btns">
-          <button class="ghost range-btn" data-range="1h">1小时</button>
-          <button class="ghost range-btn" data-range="12h">12小时</button>
-          <button class="ghost range-btn" data-range="3d">3天</button>
-          <button class="ghost range-btn" data-range="7d">7天</button>
-          <button class="ghost range-btn" data-range="30d">30天</button>
-        </div>
-        <div class="chart-wrap"><canvas id="monitor-chart"></canvas></div>
-      </section>
     </main>
+  </div>
+
+  <!-- 监控弹窗 -->
+  <div id="monitor-modal" class="monitor-modal hidden">
+    <div class="modal-head">
+      <span id="monitor-title"></span>
+      <button id="btn-monitor-close" class="ghost">关闭</button>
+    </div>
+    <div class="range-btns">
+      <button class="ghost range-btn" data-range="1h">1小时</button>
+      <button class="ghost range-btn" data-range="12h">12小时</button>
+      <button class="ghost range-btn" data-range="3d">3天</button>
+      <button class="ghost range-btn" data-range="7d">7天</button>
+      <button class="ghost range-btn" data-range="30d">30天</button>
+    </div>
+    <div class="chart-wrap"><canvas id="monitor-chart"></canvas></div>
   </div>
 
   <!-- 登录/注册 -->
@@ -95,14 +98,35 @@
     </div>
   </div>
 
-  <!-- 设置弹窗：站点信息 + PAT 管理 -->
-  <div id="settings-modal" class="modal hidden">
+  <!-- 添加服务器弹窗 -->
+  <div id="add-modal" class="modal hidden">
     <div class="modal-head">
-      <span>设置</span>
-      <button id="btn-settings-close" class="ghost">关闭</button>
+      <span>添加服务器</span>
+      <button id="btn-add-close" class="ghost">关闭</button>
     </div>
     <div class="settings-body">
-      <h4>站点信息（存 D1 kv_json，公告对所有访客可见）</h4>
+      <div class="settings-row">
+        <input id="inp-name" type="text" placeholder="服务器名称" />
+      </div>
+      <div class="settings-row">
+        <input id="inp-group" type="text" placeholder="分组(可选)" />
+      </div>
+      <div class="settings-row">
+        <input id="inp-order" type="number" placeholder="序号(可选)" />
+      </div>
+      <div class="settings-row">
+        <button id="btn-add-server">添加服务器</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 站点信息弹窗 -->
+  <div id="site-modal" class="modal hidden">
+    <div class="modal-head">
+      <span>站点信息（公告对所有访客可见）</span>
+      <button id="btn-site-close" class="ghost">关闭</button>
+    </div>
+    <div class="settings-body">
       <div class="settings-row">
         <input id="set-site-name" type="text" placeholder="站点名称（留空用默认）" />
       </div>
@@ -110,10 +134,18 @@
         <input id="set-notice" type="text" placeholder="公告（留空隐藏）" />
       </div>
       <div class="settings-row">
-        <button id="btn-save-settings">保存站点信息</button>
+        <button id="btn-save-site">保存站点信息</button>
       </div>
+    </div>
+  </div>
 
-      <h4>告警（Webhook，模板化）</h4>
+  <!-- 告警弹窗 -->
+  <div id="alerts-modal" class="modal hidden">
+    <div class="modal-head">
+      <span>告警（Webhook，模板化）</span>
+      <button id="btn-alerts-close" class="ghost">关闭</button>
+    </div>
+    <div class="settings-body">
       <div class="settings-row">
         <select id="set-alert-method" style="padding:8px 12px;border-radius:10px;background:rgba(20,25,40,.6);border:1px solid var(--border);color:var(--text)">
           <option value="POST">POST</option>
@@ -146,8 +178,19 @@
         <summary>常见渠道示例（点击「使用」自动填入，再填 Token 即可）</summary>
         <div id="alert-preset-list"></div>
       </details>
+      <div class="settings-row">
+        <button id="btn-save-alerts">保存告警配置</button>
+      </div>
+    </div>
+  </div>
 
-      <h4>访问令牌（PAT）</h4>
+  <!-- 访问令牌弹窗 -->
+  <div id="tokens-modal" class="modal hidden">
+    <div class="modal-head">
+      <span>访问令牌（PAT）</span>
+      <button id="btn-tokens-close" class="ghost">关闭</button>
+    </div>
+    <div class="settings-body">
       <div class="settings-row">
         <input id="tok-name" type="text" placeholder="令牌名称" />
         <label class="chk"><input type="checkbox" id="tok-read" checked /> server:read</label>
@@ -159,6 +202,21 @@
       </div>
       <p id="tok-new" class="msg"></p>
       <ul id="token-list" class="token-list"></ul>
+    </div>
+  </div>
+
+  <!-- 通用对话框（替代系统 alert/confirm） -->
+  <div id="dialog" class="modal hidden">
+    <div class="modal-head">
+      <span id="dialog-title"></span>
+      <button id="btn-dialog-close" class="ghost">关闭</button>
+    </div>
+    <div class="settings-body dialog-body">
+      <pre id="dialog-text" class="dialog-text"></pre>
+      <div class="dialog-actions">
+        <button id="btn-dialog-ok" class="hidden">确认</button>
+        <button id="btn-dialog-cancel" class="ghost">取消</button>
+      </div>
     </div>
   </div>
 

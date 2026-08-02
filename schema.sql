@@ -14,7 +14,7 @@ CREATE TABLE IF NOT EXISTS users (
 -- 服务器（agent 身份归属）
 CREATE TABLE IF NOT EXISTS servers (
   id             INTEGER PRIMARY KEY AUTOINCREMENT,
-  uuid           TEXT    NOT NULL UNIQUE,   -- agent 身份标识
+  agent_key_id   TEXT    NOT NULL UNIQUE,   -- agent key 指纹（SHA-256(key)），唯一身份标识
   name           TEXT    NOT NULL,
   "group"        TEXT    NOT NULL DEFAULT '', -- 分组（'' = 未分组）
   user_id        INTEGER NOT NULL,          -- 归属用户

@@ -87,7 +87,7 @@
     return `
       <div class="card">
         <div class="name">${escapeHtml(s.name)}</div>
-        <div class="meta">uuid: ${escapeHtml(s.uuid)}</div>
+        <div class="meta">id: ${s.id}</div>
         <div><span class="badge ${s.online ? 'on' : 'off'}">${s.online ? '在线' : '离线'}</span></div>
         <div class="actions">
           <button data-act="term" data-id="${s.id}" data-name="${escapeHtml(s.name)}">终端</button>
@@ -122,7 +122,7 @@
     if (!name) return toast('请输入服务器名称');
     try {
       const cfg = await api('/api/servers', { method: 'POST', body: JSON.stringify({ name, group, sort_order: sortOrder }) });
-      const text = `服务器已添加，agent 配置（仅显示一次）：\n\nWSS 地址: ${cfg.wss_base}\nUUID: ${cfg.uuid}\nKEY: ${cfg.agent_key}\n\n上报地址: ${cfg.report_url}`;
+      const text = `服务器已添加，agent 配置（仅显示一次）：\n\nWSS 地址: ${cfg.wss_base}\nKEY: ${cfg.agent_key}\n\n上报地址: ${cfg.report_url}`;
       alert(text); // 一次性展示 agent 凭据
       $('#inp-name').value = '';
       $('#inp-group').value = '';

@@ -124,11 +124,11 @@ DO 是整个设计的心脏，对应哪吒 Dashboard 里那两个 `io.Copy` 的�
 ```bash
 #!/usr/bin/env bash
 set -euo pipefail
-WSS=${AGENT_WSS_URL:?}; UUID=${AGENT_UUID:?}
+WSS=${AGENT_WSS_URL:?}; KEY=${AGENT_KEY:?}   # KEY 即唯一身份 + 凭证（uuid 已废弃）
 
 spawn_terminal() {
   local sid=$1
-  ( websocat -b "$WSS/terminal?sid=$sid" \
+  ( websocat -b "$WSS/terminal?sid=$sid" -H "X-Agent-Key: $KEY" \
       --exec "socat - /tmp/cfpanle-$sid" ) &
 }
 
@@ -252,7 +252,7 @@ DO 与 agent 之间的 WebSocket 用二进制帧，结构对齐哪吒实现：
 -- 服务器（agent 上报身份的归属）
 CREATE TABLE servers (
   id             INTEGER PRIMARY KEY AUTOINCREMENT,
-  uuid           TEXT    NOT NULL UNIQUE,   -- agent 身份标识
+  agent_key_id   TEXT    NOT NULL UNIQUE,   -- agent key 指纹（SHA-256(key)），唯一身份标识
   name           TEXT    NOT NULL,
   user_id        INTEGER NOT NULL,          -- 归属用户
   hide_for_guest INTEGER NOT NULL DEFAULT 0,

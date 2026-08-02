@@ -5,13 +5,12 @@
 # 依赖: websocat(必装), socat(resize 需要), jq, bash, stty
 # 用法:
 #   AGENT_WSS_URL=wss://panel.example.com/ws/agent \
-#   AGENT_UUID=<uuid> AGENT_KEY=<key> ./agent.sh
+#   AGENT_KEY=<key> ./agent.sh
 # ============================================================
 set -euo pipefail
 
 WSS=${AGENT_WSS_URL:?}        # 例: wss://panel.example.com/ws/agent
-UUID=${AGENT_UUID:?}
-KEY=${AGENT_KEY:?}
+KEY=${AGENT_KEY:?}            # 唯一身份 + 凭证（uuid 已废弃，仅保留这一个）
 TMP_DIR=${AGENT_TMPDIR:-/tmp/cfpanle}
 DISABLE_EXEC=${DISABLE_EXEC:-0}   # =1 时全局禁止命令执行（终端/exec 全部忽略）
 
@@ -30,8 +29,8 @@ log() { echo "[cf-panle] $*" >&2; }
 
 # 控制通道常驻循环（断线自动重连）
 while true; do
-  log "connecting control channel (uuid=$UUID)..."
-  websocat -b "$WSS/control?uuid=$UUID" -H "X-Agent-Key: $KEY" 2>/dev/null | while IFS= read -r line; do
+  log "connecting control channel..."
+  websocat -b "$WSS/control" -H "X-Agent-Key: $KEY" 2>/dev/null | while IFS= read -r line; do
     [ -z "$line" ] && continue
     case "$(jq -r .type <<<"$line" 2>/dev/null)" in
       open_terminal)

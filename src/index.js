@@ -83,6 +83,11 @@ function randomHex(len = 32) {
   crypto.getRandomValues(a);
   return bytesToHex(a);
 }
+// key 指纹：无盐 SHA-256，用于"用 key 反查服务器"（检索键，不参与校验）
+async function sha256Hex(input) {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(String(input)));
+  return bytesToHex(new Uint8Array(digest));
+}
 // 任何秘密（agent key / PAT token）统一用 HMAC 哈希后落库
 async function hashSecret(value, env) {
   return bytesToHex(await hmacSha256(new TextEncoder().encode(secret(env)), new TextEncoder().encode(value)));
@@ -219,7 +224,6 @@ async function handleApi(request, env) {
       name: s.name,
       group: s.group || '',
       display_index: s.display_index || 0,
-      uuid: s.uuid,
       online: s.online === 1 && now - (s.last_seen || 0) < 60000,
     }));
     return json(list);
@@ -233,15 +237,14 @@ async function handleApi(request, env) {
     if (!name) return err('name required');
     const group = String(body.group || '').trim();
     const displayIndex = Number(body.sort_order) || 0;
-    const uuid = crypto.randomUUID();
-    const key = randomHex(32);
+    const key = randomHex(32); // key 即唯一身份 + 凭证，agent 侧只保留这一个
+    const keyId = await sha256Hex(key);
     const hash = await hashSecret(key, env);
-    await env.DB.prepare('INSERT INTO servers (uuid, name, "group", display_index, user_id, agent_key_hash) VALUES (?,?,?,?,?,?)')
-      .bind(uuid, name, group, displayIndex, user.id, hash)
+    await env.DB.prepare('INSERT INTO servers (agent_key_id, name, "group", display_index, user_id, agent_key_hash) VALUES (?,?,?,?,?,?)')
+      .bind(keyId, name, group, displayIndex, user.id, hash)
       .run();
     await env.DB.prepare('INSERT INTO audit_logs (user_id, action) VALUES (?,?)').bind(user.id, 'server.create').run();
     return json({
-      uuid,
       agent_key: key,
       wss_base: `wss://${url.host}/ws/agent`,
       report_url: `https://${url.host}/api/report`,
@@ -276,11 +279,12 @@ async function handleApi(request, env) {
     return json({ session_id: streamId, server_id: server.id, server_name: server.name });
   }
 
-  // POST /api/report —— agent 监控上报（uuid + key 校验，无需登录）
+  // POST /api/report —— agent 监控上报（key 指纹定位 + hash 校验，无需登录）
   // 时序数据写入内存 DO（MetricsDO 热区）；last_seen/online 仍落 D1
   if (method === 'POST' && path === '/api/report') {
     const body = await request.json().catch(() => ({}));
-    const server = await env.DB.prepare('SELECT * FROM servers WHERE uuid = ?').bind(String(body.uuid || '')).first();
+    const keyId = await sha256Hex(String(body.key || ''));
+    const server = await env.DB.prepare('SELECT * FROM servers WHERE agent_key_id = ?').bind(keyId).first();
     if (!server) return err('unknown agent', 401);
     const hash = await hashSecret(String(body.key || ''), env);
     if (hash !== server.agent_key_hash) return err('bad key', 401);
@@ -371,8 +375,10 @@ async function handleWs(request, env) {
   if (path.startsWith('/ws/terminal/')) {
     shard = shardFromStreamId(path.slice('/ws/terminal/'.length));
   } else if (path === '/ws/agent/control') {
-    const uuid = url.searchParams.get('uuid') || '';
-    const server = await env.DB.prepare('SELECT * FROM servers WHERE uuid = ?').bind(uuid).first();
+    // 用 key 指纹反查服务器定位分片（身份与凭证合一，uuid 已废弃）
+    const key = request.headers.get('x-agent-key') || url.searchParams.get('key') || '';
+    const keyId = await sha256Hex(key);
+    const server = await env.DB.prepare('SELECT * FROM servers WHERE agent_key_id = ?').bind(keyId).first();
     if (!server) return new Response('unknown agent', { status: 401 });
     shard = shardForServerId(server.id);
   } else if (path === '/ws/agent/terminal') {
@@ -438,11 +444,11 @@ export class TerminalDO {
       return new Response(null, { status: 101, webSocket: pair[0] });
     }
 
-    // GET /ws/agent/control —— agent 常驻控制通道（uuid + key 校验）
+    // GET /ws/agent/control —— agent 常驻控制通道（key 指纹定位 + hash 校验）
     if (path === '/ws/agent/control') {
-      const uuid = url.searchParams.get('uuid') || '';
       const key = request.headers.get('x-agent-key') || url.searchParams.get('key') || '';
-      const server = await this.env.DB.prepare('SELECT * FROM servers WHERE uuid = ?').bind(uuid).first();
+      const keyId = await sha256Hex(key);
+      const server = await this.env.DB.prepare('SELECT * FROM servers WHERE agent_key_id = ?').bind(keyId).first();
       if (!server) return new Response('unknown agent', { status: 401 });
       const hash = await hashSecret(key, this.env);
       if (hash !== server.agent_key_hash) return new Response('bad key', { status: 401 });
@@ -452,7 +458,7 @@ export class TerminalDO {
       return new Response(null, { status: 101, webSocket: pair[0] });
     }
 
-    // GET /ws/agent/terminal?sid=&key= —— agent 终端数据流（stream 归属校验 §6.2）
+    // GET /ws/agent/terminal?sid=&key= —— agent 终端数据流（key 校验 + stream 归属校验 §6.2）
     if (path === '/ws/agent/terminal') {
       const sid = url.searchParams.get('sid') || '';
       const key = request.headers.get('x-agent-key') || url.searchParams.get('key') || '';

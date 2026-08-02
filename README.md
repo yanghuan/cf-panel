@@ -44,6 +44,12 @@ wrangler deploy
 > wrangler d1 execute cf-panle --remote --command 'ALTER TABLE servers ADD COLUMN "group" TEXT NOT NULL DEFAULT "";'
 > wrangler d1 execute cf-panle --remote --command 'CREATE TABLE IF NOT EXISTS kv_json (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL DEFAULT (datetime("now")));'
 > ```
+>
+> 已按旧版（带 `uuid` 列）添加过服务器？`agent_key_id`（key 指纹）无法从旧数据回填，需要重建 `servers` 表或在面板删除旧服务器后重新添加，agent 端改用新版 `agent.sh`/`report.sh`（只配 `AGENT_KEY`）：
+> ```
+> wrangler d1 execute cf-panle --remote --command 'DROP TABLE servers;'
+> # 再执行 wrangler d1 execute cf-panle --remote --file=schema.sql 重建
+> ```
 
 部署完成后访问 `https://cf-panle.<你的子域>.workers.dev`，输入 `PANEL_PASSWORD` 密码即可登录（登录即管理员）。
 
@@ -51,7 +57,7 @@ wrangler deploy
 
 ## 二、添加服务器并安装 agent
 
-1. 在面板点「添加服务器」→ 填名称（可选填分组）→ 弹出一次性 agent 配置（WSS 地址 / UUID / KEY），**妥善保存**。
+1. 在面板点「添加服务器」→ 填名称（可选填分组）→ 弹出一次性 agent 配置（WSS 地址 / KEY），**妥善保存**。KEY 是 agent 的唯一身份 + 凭证（uuid 已废弃）。
 2. 在目标 Linux 机器上安装依赖：
    ```bash
    # websocat（必装）：https://github.com/vi/websocat/releases 下载静态二进制
@@ -63,12 +69,11 @@ wrangler deploy
    mkdir -p /opt/cf-panle-agent
    cp agent/agent.sh agent/report.sh /opt/cf-panle-agent/
    chmod +x /opt/cf-panle-agent/*.sh
-   cat > /etc/cf-panle-agent.env <<EOF
-   AGENT_WSS_URL=wss://<面板域名>/ws/agent
-   AGENT_UUID=<你的 uuid>
-   AGENT_KEY=<你的 key>
-   DISABLE_EXEC=0   # 设为 1 可全局禁止命令执行（终端不可用，仅保留监控）
-   EOF
+  cat > /etc/cf-panle-agent.env <<EOF
+  AGENT_WSS_URL=wss://<面板域名>/ws/agent
+  AGENT_KEY=<你的 key>
+  DISABLE_EXEC=0   # 设为 1 可全局禁止命令执行（终端不可用，仅保留监控）
+  EOF
    ```
 4. 注册 systemd 服务：
    ```bash
@@ -78,7 +83,7 @@ wrangler deploy
    ```
 5. 可选：监控上报 crontab（每分钟）：
    ```bash
-   echo '* * * * * REPORT_URL=https://<面板域名>/api/report AGENT_UUID=<uuid> AGENT_KEY=<key> /opt/cf-panle-agent/report.sh' | crontab -
+   echo '* * * * * REPORT_URL=https://<面板域名>/api/report AGENT_KEY=<key> /opt/cf-panle-agent/report.sh' | crontab -
    ```
 
 ## 三、使用
@@ -102,9 +107,9 @@ wrangler deploy
 | DELETE | `/api/servers/:id` | 删除服务器（仅管理员） |
 | POST | `/api/terminal` | 创建终端会话（exec 权限 + 归属校验），返回 session_id |
 | GET | `/ws/terminal/{id}` | 浏览器终端 WebSocket（校验创建者/admin） |
-| GET | `/ws/agent/control` | agent 控制通道（uuid+key 校验，按分片路由） |
-| GET | `/ws/agent/terminal` | agent 终端数据流（stream 归属校验） |
-| POST | `/api/report` | agent 监控上报（uuid+key 校验） |
+| GET | `/ws/agent/control` | agent 控制通道（key 指纹定位 + 校验，按分片路由） |
+| GET | `/ws/agent/terminal` | agent 终端数据流（key 校验 + stream 归属校验） |
+| POST | `/api/report` | agent 监控上报（key 指纹定位 + 校验） |
 | GET | `/api/monitor?server_id=` | 监控历史 |
 | GET | `/api/tokens` | PAT 列表（仅管理员） |
 | POST | `/api/tokens` | 创建 PAT（scopes + server_ids 白名单，明文只返回一次） |
@@ -113,9 +118,9 @@ wrangler deploy
 
 ## 五、安全要点（实现清单已覆盖）
 
-- `/ws/terminal/{id}` 仅允许会话创建者或管理员连接（防 UUID 劫持，GHSA 教训）。
-- agent 建连必须提供 `X-Agent-Key`（或 query key），并与 `servers.agent_key_hash` 比对；`/ws/agent/terminal` 额外校验 stream 归属。
-- 面板登录密码存 CF secret（`PANEL_PASSWORD`），不进代码库；agent key 与 PAT 只存 HMAC 哈希。
+- `/ws/terminal/{id}` 仅允许会话创建者或管理员连接（防 stream UUID 劫持，GHSA 教训）。
+- agent 建连必须提供 `X-Agent-Key`（或 query key）；服务端先用 key 的 SHA-256 指纹（`servers.agent_key_id`）反查服务器，再与 `servers.agent_key_hash` 比对；`/ws/agent/terminal` 额外校验 stream 归属。
+- 面板登录密码存 CF secret（`PANEL_PASSWORD`），不进代码库；agent key 与 PAT 只存哈希（key 指纹用于检索，HMAC 哈希用于校验）。
 - 审计日志：`terminal.open` / `server.create` 写 `audit_logs`。
 - agent 侧 `DISABLE_EXEC=1` 可全局禁止命令执行（终端任务直接忽略）。
 - 终端/监控接口按权限收敛：JWT 管理员全量；PAT 按 scopes + server_ids 白名单收窄。

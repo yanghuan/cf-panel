@@ -7,8 +7,7 @@
 set -euo pipefail
 
 REPORT_URL=${REPORT_URL:?}    # 例: https://panel.example.com/api/report
-UUID=${AGENT_UUID:?}
-KEY=${AGENT_KEY:?}
+KEY=${AGENT_KEY:?}            # 唯一身份 + 凭证（uuid 已废弃，仅保留这一个）
 
 # ---- CPU 使用率（两次采样求差值，抵消瞬时误差） ----
 read -r _ cpu0_u cpu0_n cpu0_s cpu0_i < <(awk '/^cpu /{print}' /proc/stat)
@@ -31,5 +30,5 @@ mem=$(awk '/MemTotal/{t=$2} /MemAvailable/{a=$2} END {printf "%.0f", (t-a)*1024}
 # ---- 上报 ----
 curl -s -X POST "$REPORT_URL" \
   -H 'Content-Type: application/json' \
-  -d "{\"uuid\":\"$UUID\",\"key\":\"$KEY\",\"cpu\":$cpu,\"mem_used\":$mem}" \
+  -d "{\"key\":\"$KEY\",\"cpu\":$cpu,\"mem_used\":$mem}" \
   -o /dev/null -w '%{http_code}\n'

@@ -147,9 +147,16 @@ collect_report() {   # CPU/内存/网络采集 → JSON {type:"report",...}
 ( exec 3<>"$CTL_IN"; while true; do sleep "$REPORT_INTERVAL"; collect_report >&3; done ) &
 
 spawn_terminal() {
-  local sid=$1
-  ( websocat -b "$WSS/terminal?sid=$sid" -H "X-Agent-Key: $KEY" \
-      --exec "socat - $TMP_DIR/$sid" ) &
+  local sid=$1 pty_pid=$2   # pty_pid = PTY 端 socat PID
+  (
+    websocat -b "$WSS/terminal?sid=$sid" -H "X-Agent-Key: $KEY" \
+      --exec "socat - $TMP_DIR/$sid"
+    # WS 断开（会话结束）→ 级联清理 PTY 进程组，防子进程残留
+    local bash_pid; bash_pid=$(pgrep -P "$pty_pid" | head -1) || true
+    [ -n "$bash_pid" ] && kill -- -"$bash_pid" 2>/dev/null || true
+    kill "$pty_pid" 2>/dev/null || true
+    rm -f "$TMP_DIR/$sid"
+  ) &
 }
 
 while true; do
@@ -159,7 +166,7 @@ while true; do
         sid=$(jq -r .stream_id <<<"$line")
         socat -d pty,link=$TMP_DIR/$sid,raw,echo=0 \
               EXEC:'bash -i',pty,stderr,setsid,sigint,sighup &
-        spawn_terminal "$sid" ;;
+        spawn_terminal "$sid" $! ;;
       resize)
         sid=$(jq -r .stream_id <<<"$line")
         stty -F "$TMP_DIR/$sid" \
@@ -173,6 +180,7 @@ done
 **关键点**
 
 - 开终端：`socat` 创建 pty slave（`link=/tmp/cfpanle-<sid>` 暴露路径）并挂 `bash -i`；`websocat -b --exec socat` 把 WS 字节流与 slave 对接，全双工。
+- **残留清理**：浏览器关闭终端 → DO 关 agent WS → websocat 退出 → 执行清理逻辑：按 PTY 端 socat 的 PID 找到 `bash -i`（setsid 会话首进程），`kill -- -<bash_pid>` 整组清理（bash + `vim`/`top` 等子进程），再杀 PTY socat、删 slave link——避免僵尸进程累计。
 - resize：控制 WS 收到 `{type:resize,...}` → `stty -F <slave路径>` 改 winsize → 内核发 `SIGWINCH`，`vim`/`top` 跟着变尺寸。
 - 监控上报：后台循环每 `REPORT_INTERVAL`（默认 60s）采集一次，JSON 写入 FIFO；控制通道 websocat 以 FIFO 为 stdin，数据自动经 WS 上行，服务端识别 `{type:"report"}` 落监控热区——**免 crontab、免独立脚本**。
 - 上报内容：固定列（CPU/内存/网络速率）+ `extra` JSON（Swap/磁盘/负载/温度/进程数/TCP-UDP 连接数，紧凑短 key 不压缩）+ `info`（OS/内核/IP，服务端比对变化才更新 `servers.info_json`）。网络速率由 agent 对 `/proc/net/dev` 累计值做差分，避免累计值当速率。

@@ -2,7 +2,7 @@
 # ============================================================
 # cf-panle agent —— 纯 Shell 实现（websocat + socat + jq）
 # 对齐 docs/architecture.md §3.5
-# 依赖: websocat(必装), socat(resize 需要), jq, bash, stty
+# 依赖: websocat(必装), socat(resize 需要), jq, pgrep(会话结束清理进程组), bash, stty
 # 功能: 常驻控制通道（终端 + resize）+ 内置监控上报（经控制 WS，无需 crontab）
 #       上报指标: CPU / 内存 / Swap / 磁盘 / 负载 / 温度 / 进程数 / TCP-UDP 连接数 / 网络速率 / 系统信息
 # 用法:
@@ -120,11 +120,21 @@ mkfifo "$CTL_IN"
 ) &
 
 # ---- 拉起一个终端会话：WS 全双工 ⇄ socat ⇄ pty slave ⇄ bash ----
+# pty_pid = PTY 端 socat 的 PID。websocat 退出（会话结束）后级联清理：
+# bash 通过 setsid 独立成会话（PGID=其 PID），kill 进程组可连其子进程一起清理，不留残留。
 spawn_terminal() {
-  local sid=$1
+  local sid=$1 pty_pid=$2
   (
     websocat -b "$WSS/terminal?sid=$sid" -H "X-Agent-Key: $KEY" \
       --exec "socat - $TMP_DIR/$sid"
+    # 会话结束（浏览器关闭 / WS 断开）→ 清理 PTY 端进程组
+    local bash_pid
+    bash_pid=$(pgrep -P "$pty_pid" 2>/dev/null | head -1) || true
+    if [ -n "$bash_pid" ]; then
+      kill -- -"$bash_pid" 2>/dev/null || true  # bash 为 setsid 会话首进程，整组 SIGHUP/TERM
+    fi
+    kill "$pty_pid" 2>/dev/null || true
+    rm -f "$TMP_DIR/$sid"
   ) &
 }
 
@@ -143,7 +153,7 @@ while true; do
         # 创建 PTY：slave 路径通过 link 暴露，供 stty 改窗口尺寸
         socat -d pty,link="$TMP_DIR/$sid",raw,echo=0 \
               EXEC:'bash -i',pty,stderr,setsid,sigint,sighup 2>/dev/null &
-        spawn_terminal "$sid"
+        spawn_terminal "$sid" $!
         ;;
       resize)
         sid=$(jq -r .stream_id <<<"$line" 2>/dev/null)

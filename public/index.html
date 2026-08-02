@@ -113,10 +113,23 @@
         <button id="btn-save-settings">保存站点信息</button>
       </div>
 
-      <h4>告警（Webhook）</h4>
+      <h4>告警（Webhook，模板化）</h4>
       <div class="settings-row">
-        <input id="set-alert-url" type="text" placeholder="Webhook 地址（留空禁用告警）" />
-        <input id="set-alert-token" type="text" placeholder="Token（可选，Bearer 鉴权）" />
+        <select id="set-alert-method" style="padding:8px 12px;border-radius:10px;background:rgba(20,25,40,.6);border:1px solid var(--border);color:var(--text)">
+          <option value="POST">POST</option>
+          <option value="GET">GET</option>
+        </select>
+        <input id="set-alert-url" type="text" placeholder="Webhook 地址（留空禁用；支持占位符）" />
+      </div>
+      <div class="settings-row">
+        <input id="set-alert-token" type="text" placeholder="Token（作为 {token} 占位符使用）" />
+        <input id="set-alert-content-type" type="text" placeholder="Content-Type（默认 application/json）" />
+      </div>
+      <div class="settings-row">
+        <input id="set-alert-body" type="text" placeholder="Body 模板（POST；留空发结构化 JSON）" />
+      </div>
+      <div class="settings-row">
+        <input id="set-alert-headers" type="text" placeholder='Headers JSON（如 {"Authorization":"Bearer {token}"}）' />
       </div>
       <div class="settings-row">
         <input id="set-alert-cpu" type="number" placeholder="CPU阈值%" />
@@ -128,6 +141,11 @@
         <input id="set-alert-cooldown" type="number" placeholder="冷却(分钟)" />
         <input id="set-alert-offline" type="number" placeholder="离线(秒)" />
       </div>
+      <p class="muted" style="font-size:12px">占位符：{event} {title} {message} {server_name} {server_id} {details_json} {time} {token}</p>
+      <details class="alert-presets">
+        <summary>常见渠道示例（点击「使用」自动填入，再填 Token 即可）</summary>
+        <div id="alert-preset-list"></div>
+      </details>
 
       <h4>访问令牌（PAT）</h4>
       <div class="settings-row">

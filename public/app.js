@@ -545,16 +545,41 @@
   }
 
   // ---------- 设置 / PAT ----------
+  const ALERT_PRESETS = [
+    { name: 'Server酱', desc: 'GET，token 在 URL', method: 'GET', url: 'https://sctapi.ftqq.com/{token}.send?title={title}&desp={message}', body: '', ct: '', headers: '' },
+    { name: '钉钉机器人', desc: 'POST JSON，token 在 URL', method: 'POST', url: 'https://oapi.dingtalk.com/robot/send?access_token={token}', body: '{"msgtype":"text","text":{"content":"{message}"}}', ct: '', headers: '' },
+    { name: '企业微信机器人', desc: 'POST JSON，token 在 URL', method: 'POST', url: 'https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key={token}', body: '{"msgtype":"text","text":{"content":"{message}"}}', ct: '', headers: '' },
+    { name: 'Telegram Bot', desc: 'POST JSON，token 在 URL', method: 'POST', url: 'https://api.telegram.org/bot{token}/sendMessage', body: '{"chat_id":"你的chat_id","text":"{message}"}', ct: '', headers: '' },
+    { name: 'Bark', desc: 'GET，token 在 URL', method: 'GET', url: 'https://api.day.app/{token}/{title}/{message}', body: '', ct: '', headers: '' },
+    { name: 'Slack', desc: 'POST 结构化 JSON，token 走 Header', method: 'POST', url: 'https://hooks.slack.com/services/T/B/{token}', body: '', ct: '', headers: '{"Authorization":"Bearer {token}"}' },
+  ];
+
+  function renderAlertPresets() {
+    const box = $('#alert-preset-list');
+    if (!box) return;
+    box.innerHTML = ALERT_PRESETS.map((p, i) => `
+      <div class="alert-preset">
+        <span class="ap-name">${escapeHtml(p.name)}</span>
+        <span class="muted">${escapeHtml(p.desc)}</span>
+        <button class="ghost ap-use" data-i="${i}">使用</button>
+      </div>`).join('');
+  }
+
   function openSettings() {
     $('#settings-modal').classList.remove('hidden');
+    renderAlertPresets();
     api('/api/public/settings').then((s) => {
       $('#set-site-name').value = s.site_name === 'cf-panle' ? '' : s.site_name;
       $('#set-notice').value = s.notice || '';
     }).catch(() => { /* ignore */ });
     api('/api/settings').then((s) => {
       const a = s.alerts || {};
+      $('#set-alert-method').value = a.method || 'POST';
       $('#set-alert-url').value = a.webhook_url || '';
       $('#set-alert-token').value = a.webhook_token || '';
+      $('#set-alert-body').value = a.body_template || '';
+      $('#set-alert-content-type').value = a.content_type || '';
+      $('#set-alert-headers').value = a.headers ? JSON.stringify(a.headers) : '';
       $('#set-alert-cpu').value = a.cpu_pct || '';
       $('#set-alert-mem').value = a.mem_pct || '';
       $('#set-alert-disk').value = a.disk_pct || '';
@@ -576,6 +601,10 @@
           alerts: {
             webhook_url: $('#set-alert-url').value.trim(),
             webhook_token: $('#set-alert-token').value.trim(),
+            method: $('#set-alert-method').value,
+            body_template: $('#set-alert-body').value.trim(),
+            content_type: $('#set-alert-content-type').value.trim(),
+            headers: $('#set-alert-headers').value.trim(),
             cpu_pct: num($('#set-alert-cpu').value),
             mem_pct: num($('#set-alert-mem').value),
             disk_pct: num($('#set-alert-disk').value),
@@ -667,6 +696,21 @@
     const btn = e.target.closest('.range-btn');
     if (!btn || !monitorState) return;
     showMonitor(monitorState.serverId, monitorState.serverName, btn.dataset.range);
+  });
+
+  // 告警渠道预设：点击「使用」填入表单模板
+  $('#alert-preset-list').addEventListener('click', (e) => {
+    const btn = e.target.closest('.ap-use');
+    if (!btn) return;
+    const p = ALERT_PRESETS[Number(btn.dataset.i)];
+    if (!p) return;
+    $('#set-alert-method').value = p.method;
+    $('#set-alert-url').value = p.url;
+    $('#set-alert-body').value = p.body;
+    $('#set-alert-content-type').value = p.ct;
+    $('#set-alert-headers').value = p.headers;
+    $('#set-alert-token').value = '';
+    toast(`已填入「${p.name}」模板，请填写 Token`);
   });
 
   // 文件管理操作

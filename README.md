@@ -121,16 +121,33 @@ wrangler secret put PANEL_USERS      # 回车后粘贴值，如 alice:pass1,bob:
 
 > ⚠️ 配置过 dashboard secret 的 Worker 只能通过 Builds/CI 部署（`wrangler deploy` 会被拒绝），参见方式一第 4 步说明。
 
-**Webhook 告警配置**（可选）：登录面板 → **设置**弹窗 → 「告警」区填写即启用（存 D1 `settings.alerts`，**无需环境变量**）。触发时面板会 **POST JSON** 到 Webhook 地址，**任意渠道由用户侧对接**（企业微信/钉钉/Server酱/Telegram Bot/Slack/邮件网关/自建服务等）。
+**Webhook 告警配置**（可选，**模板化**）：登录面板 → **设置**弹窗 → 「告警」区填写即启用（存 D1 `settings.alerts`，**无需环境变量**）。支持 **GET/POST**、**JSON/纯文本**、**token 放 URL/Header/Body 任意位置**，任意渠道由用户侧对接。
 
 | 配置项 | 默认 | 说明 |
 | --- | --- | --- |
-| Webhook 地址 | 无 | 告警回调地址（留空禁用告警） |
-| Token | 无 | 可选，作为 `Authorization: Bearer` 发送 |
+| 方法 | `POST` | `GET` 或 `POST` |
+| Webhook 地址 | 无 | 告警回调地址（留空禁用）；支持占位符 |
+| Token | 无 | 仅作为占位符 `{token}`，放哪由你拼 |
+| Body 模板 | 留空 | POST 请求体（JSON/文本模板）；留空则发默认结构化 JSON |
+| Content-Type | `application/json` | Body 的 Content-Type |
+| Headers | 无 | 追加请求头 JSON（如 `{"Authorization":"Bearer {token}"}`），值支持占位符 |
 | CPU / 内存 / 磁盘阈值 | `90` | 指标告警阈值（%） |
 | 负载阈值 | 不启用 | 负载告警阈值（load1） |
 | 冷却（分钟） | `30` | 同类告警冷却间隔 |
 | 离线（秒） | `180` | 离线判定秒数（超过未上报） |
+
+**占位符**（用于 地址/Body/Headers）：`{event}` `{title}` `{message}` `{server_name}` `{server_id}` `{details_json}` `{time}` `{token}`
+
+**常见渠道配置示例**：
+
+| 渠道 | 方法 | 地址（含占位符） | Body / 说明 |
+| --- | --- | --- | --- |
+| Server酱 | GET | `https://sctapi.ftqq.com/{token}.send?title={title}&desp={message}` | 无 |
+| 钉钉机器人 | POST | `https://oapi.dingtalk.com/robot/send?access_token={token}` | `{"msgtype":"text","text":{"content":"{message}"}}` |
+| 企业微信机器人 | POST | `https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key={token}` | `{"msgtype":"text","text":{"content":"{message}"}}` |
+| Telegram Bot | POST | `https://api.telegram.org/bot{token}/sendMessage` | `{"chat_id":"你的ID","text":"{message}"}` |
+| Bark | GET | `https://api.day.app/{token}/{title}/{message}` | 无 |
+| Slack | POST | 默认 | 留空 Body 发结构化 JSON，Headers `{"Authorization":"Bearer {token}"}` |
 
 **Webhook payload 结构**（`event` 区分 `alert` / `offline` / `recovered`）：
 

@@ -152,6 +152,17 @@ function sanitizeAlerts(a) {
   if (url) out.webhook_url = url;
   const token = String(a.webhook_token || '').trim();
   if (token) out.webhook_token = token;
+  const method = String(a.method || '').trim().toUpperCase();
+  if (method === 'GET' || method === 'POST' || method === 'PUT') out.method = method;
+  const bt = String(a.body_template || '').trim();
+  if (bt) out.body_template = bt;
+  const ct = String(a.content_type || '').trim();
+  if (ct) out.content_type = ct;
+  let hdrs = a.headers;
+  if (typeof hdrs === 'string') {
+    try { hdrs = JSON.parse(hdrs); } catch { hdrs = null; }
+  }
+  if (hdrs && typeof hdrs === 'object') out.headers = hdrs;
   if (a.cpu_pct !== undefined) out.cpu_pct = num(a.cpu_pct, 90);
   if (a.mem_pct !== undefined) out.mem_pct = num(a.mem_pct, 90);
   if (a.disk_pct !== undefined) out.disk_pct = num(a.disk_pct, 90);
@@ -266,6 +277,10 @@ async function getAlertCfg(env) {
     enabled: !!a.webhook_url,
     webhook_url: String(a.webhook_url || ''),
     webhook_token: String(a.webhook_token || ''),
+    method: String(a.method || 'POST').toUpperCase(),
+    body_template: String(a.body_template || ''),
+    content_type: String(a.content_type || ''),
+    headers: a.headers || null,
     cpu_pct: Number(a.cpu_pct) || 90,
     mem_pct: Number(a.mem_pct) || 90,
     disk_pct: Number(a.disk_pct) || 90,
@@ -275,18 +290,46 @@ async function getAlertCfg(env) {
   };
 }
 
-// 发送告警 Webhook：POST JSON 到配置的地址（可选 token 作 Bearer 鉴权）。
-// 任意渠道（企业微信/钉钉/Server酱/Telegram/Slack/邮件网关/自建）由用户侧对接该地址。
+// 告警占位符替换：{event} {title} {message} {server_name} {server_id} {details_json} {time} {token}
+function renderTemplate(tpl, vars) {
+  if (!tpl) return '';
+  return String(tpl).replace(/\{(\w+)\}/g, (_, k) => (vars[k] !== undefined ? String(vars[k]) : ''));
+}
+
+// 解析自定义 headers（对象或 JSON 字符串），值支持占位符
+function parseHeaders(s, vars) {
+  if (!s) return {};
+  let obj = s;
+  if (typeof s === 'string') {
+    try { obj = JSON.parse(s); } catch { return {}; }
+  }
+  if (!obj || typeof obj !== 'object') return {};
+  const out = {};
+  for (const [k, v] of Object.entries(obj)) out[k] = renderTemplate(String(v), vars);
+  return out;
+}
+
+// 发送告警 Webhook（模板化）：method/url/body/headers 均支持占位符；
+// token 仅作为 {token} 占位符变量，由用户放在 URL/header/body 任意位置。
 async function sendWebhook(cfg, payload) {
   if (!cfg.enabled || !cfg.webhook_url) return;
-  const headers = { 'content-type': 'application/json' };
-  if (cfg.webhook_token) headers.authorization = `Bearer ${cfg.webhook_token}`;
+  const vars = {
+    event: payload.event,
+    title: payload.title,
+    message: payload.message,
+    server_name: payload.server && payload.server.name,
+    server_id: payload.server && payload.server.id,
+    details_json: JSON.stringify(payload.details || []),
+    time: payload.time,
+    token: cfg.webhook_token,
+  };
+  const method = cfg.method === 'GET' ? 'GET' : 'POST';
+  const url = renderTemplate(cfg.webhook_url, vars);
+  const headers = parseHeaders(cfg.headers, vars);
+  if (!headers['content-type']) headers['content-type'] = cfg.content_type || 'application/json';
+  const body = method === 'GET' ? undefined : (cfg.body_template ? renderTemplate(cfg.body_template, vars) : JSON.stringify(payload));
   try {
-    await fetch(cfg.webhook_url, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify(payload),
-    });
+    await fetch(url, { method, headers, body });
   } catch { /* 发送失败不影响主流程 */ }
 }
 

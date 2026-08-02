@@ -950,6 +950,7 @@ export class TerminalDO {
 
   async fetch(request) {
     this.maybeSweep();
+    this.rebuildIndex(); // 休眠唤醒后内存索引可能已丢，先从存活的 WS 附件重建
     const url = new URL(request.url);
     const path = url.pathname;
 
@@ -997,6 +998,11 @@ export class TerminalDO {
       const pair = new WebSocketPair();
       this.state.acceptWebSocket(pair[1]);
       sess.userWs = pair[1];
+      // 附件随连接持久化：DO 休眠唤醒后靠它重建会话索引（§3.3 Hibernation）
+      pair[1].serializeAttachment({
+        role: 'user', sid: streamId, serverId: sess.serverId,
+        creatorUserId: sess.creatorUserId, type: sess.type, createdAt: sess.createdAt,
+      });
       return new Response(null, { status: 101, webSocket: pair[0] });
     }
 
@@ -1011,7 +1017,8 @@ export class TerminalDO {
       const pair = new WebSocketPair();
       this.state.acceptWebSocket(pair[1]);
       this.agents.set(server.id, pair[1]);
-      pair[1].serializeAttachment(String(server.id)); // 休眠唤醒后靠附件识别 serverId（上报用）
+      // 附件随连接持久化：休眠唤醒后靠它重建 agents 索引（role 区分控制通道与会话流）
+      pair[1].serializeAttachment({ role: 'control', serverId: server.id });
       // 连接建立即下发当前上报间隔（省配额：有观看者快采 3s / 无观看者慢采 120s）
       try {
         const vResp = await doPanel(this.env).fetch('https://do.internal/viewers');
@@ -1036,6 +1043,11 @@ export class TerminalDO {
       const pair = new WebSocketPair();
       this.state.acceptWebSocket(pair[1]);
       sess.agentWs = pair[1];
+      // 附件随连接持久化：休眠唤醒后靠它重建会话索引
+      pair[1].serializeAttachment({
+        role: 'agent', sid, serverId: sess.serverId,
+        creatorUserId: sess.creatorUserId, type: sess.type, createdAt: sess.createdAt,
+      });
       return new Response(null, { status: 101, webSocket: pair[0] });
     }
 
@@ -1054,8 +1066,57 @@ export class TerminalDO {
     }
   }
 
+  // Hibernation：DO 实例空闲冻结后，WebSocket 连接由 workerd 托管持久，但本类
+  // 实例的 sessions/agents 内存 Map 会随冻结全部丢失。附件（serializeAttachment）
+  // 随连接持久化，唤醒后据此惰性重建索引，避免误判 "agent offline" / "session not found"。
+  // 活跃态（索引已非空）跳过，避免每次消息 O(N) 遍历。
+  rebuildIndex() {
+    if (this.sessions.size > 0 || this.agents.size > 0) return;
+    const socks = this.state.getWebSockets?.() || [];
+    for (const ws of socks) {
+      const att = ws.deserializeAttachment();
+      if (att === null || att === undefined) continue;
+      if (typeof att === 'string') {
+        // 兼容旧格式：控制通道附件为 String(server.id)
+        const serverId = Number(att);
+        if (Number.isInteger(serverId) && serverId > 0) this.agents.set(serverId, ws);
+        continue;
+      }
+      if (typeof att !== 'object') continue;
+      if (att.role === 'control') {
+        if (Number(att.serverId) > 0) this.agents.set(Number(att.serverId), ws);
+      } else if (att.role === 'user' || att.role === 'agent') {
+        let sess = this.sessions.get(att.sid);
+        if (!sess) {
+          sess = {
+            streamId: att.sid,
+            serverId: att.serverId,
+            creatorUserId: att.creatorUserId,
+            createdAt: att.createdAt,
+            type: att.type,
+            userWs: null,
+            agentWs: null,
+          };
+          this.sessions.set(att.sid, sess);
+        }
+        if (att.role === 'user') sess.userWs = ws;
+        else sess.agentWs = ws;
+      }
+    }
+  }
+
+  // 从连接附件解析 serverId（兼容旧字符串格式与新对象格式）
+  wsServerId(ws) {
+    const att = ws.deserializeAttachment();
+    if (att === null || att === undefined) return 0;
+    if (typeof att === 'string') return Number(att) || 0;
+    if (typeof att === 'object') return Number(att.serverId) || 0;
+    return 0;
+  }
+
   // Hibernation：消息转发（§3.3 双向对拷 + resize 走控制通道）
   async webSocketMessage(ws, message) {
+    this.rebuildIndex(); // 休眠唤醒后索引可能已丢，先按附件重建
     // agent 控制通道（不在任何 session）：仅处理监控上报 {type:"report"}
     const sess = [...this.sessions.values()].find((s) => s.userWs === ws || s.agentWs === ws);
     if (!sess) {
@@ -1063,7 +1124,7 @@ export class TerminalDO {
         try {
           const j = JSON.parse(message);
           if (j && j.type === 'report') {
-            const serverId = Number(ws.deserializeAttachment());
+            const serverId = this.wsServerId(ws);
             if (serverId) {
               await handleReport(this.env, {
                 serverId,
@@ -1122,9 +1183,11 @@ export class TerminalDO {
   }
 
   async webSocketClose(ws) {
+    this.rebuildIndex(); // 确保索引完整后再清理，否则休眠唤醒后的断连无法正确解除
     this.cleanup(ws);
   }
   async webSocketError(ws) {
+    this.rebuildIndex();
     this.cleanup(ws);
   }
 

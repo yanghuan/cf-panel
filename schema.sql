@@ -23,6 +23,7 @@ CREATE TABLE IF NOT EXISTS servers (
   display_index  INTEGER NOT NULL DEFAULT 0,
   last_seen      INTEGER,                   -- unix 秒，最近上报时间
   online         INTEGER NOT NULL DEFAULT 0,
+  info_json      TEXT,                      -- 系统信息 JSON（OS/内核/IP，变更时更新）
   created_at     TEXT    NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -47,14 +48,15 @@ CREATE TABLE IF NOT EXISTS audit_logs (
   created_at       TEXT    NOT NULL DEFAULT (datetime('now'))
 );
 
--- 监控时序（分钟级聚合，控制写入量 ≈ 43 行/天/机器）
+-- 监控时序（分钟级聚合：1 行/分钟/机器；默认归档开启，保留 30 天）
 CREATE TABLE IF NOT EXISTS metrics_min (
   server_id INTEGER NOT NULL,
   ts        INTEGER NOT NULL,                -- unix 分钟戳
   cpu       REAL,
   mem_used  REAL,
-  net_in    REAL,
+  net_in    REAL,                            -- 网络速率（字节/秒，agent 差分）
   net_out   REAL,
+  extra     TEXT,                            -- 扩展监控项 JSON（swap/disk/load/temp/procs/tcp/udp，紧凑不压缩）
   PRIMARY KEY (server_id, ts)
 ) WITHOUT ROWID;
 

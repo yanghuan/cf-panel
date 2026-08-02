@@ -175,6 +175,7 @@ done
 - 开终端：`socat` 创建 pty slave（`link=/tmp/cfpanle-<sid>` 暴露路径）并挂 `bash -i`；`websocat -b --exec socat` 把 WS 字节流与 slave 对接，全双工。
 - resize：控制 WS 收到 `{type:resize,...}` → `stty -F <slave路径>` 改 winsize → 内核发 `SIGWINCH`，`vim`/`top` 跟着变尺寸。
 - 监控上报：后台循环每 `REPORT_INTERVAL`（默认 60s）采集一次，JSON 写入 FIFO；控制通道 websocat 以 FIFO 为 stdin，数据自动经 WS 上行，服务端识别 `{type:"report"}` 落监控热区——**免 crontab、免独立脚本**。
+- 上报内容：固定列（CPU/内存/网络速率）+ `extra` JSON（Swap/磁盘/负载/温度/进程数/TCP-UDP 连接数，紧凑短 key 不压缩）+ `info`（OS/内核/IP，服务端比对变化才更新 `servers.info_json`）。网络速率由 agent 对 `/proc/net/dev` 累计值做差分，避免累计值当速率。
 - 权衡：零解释器依赖、部署极简；并发能力弱于编译型 agent，适合个人/小规模；协议不变，后续可无缝迁移 Go/Rust agent。
 
 ### 3.6 PTY（伪终端）
@@ -278,6 +279,9 @@ CREATE TABLE servers (
   user_id        INTEGER NOT NULL,          -- 归属用户
   hide_for_guest INTEGER NOT NULL DEFAULT 0,
   display_index  INTEGER NOT NULL DEFAULT 0,
+  last_seen      INTEGER,                   -- unix 秒，最近上报时间
+  online         INTEGER NOT NULL DEFAULT 0,
+  info_json      TEXT,                      -- 系统信息 JSON（OS/内核/IP，变更时才更新）
   created_at     TEXT    NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -317,8 +321,9 @@ CREATE TABLE metrics_min (
   ts        INTEGER NOT NULL,                -- unix 分钟戳
   cpu       REAL,
   mem_used  REAL,
-  net_in    REAL,
+  net_in    REAL,                            -- 网络速率（字节/秒，agent 差分）
   net_out   REAL,
+  extra     TEXT,                            -- 扩展监控项 JSON（swap/disk/load/temp/procs/tcp/udp，紧凑不压缩）
   PRIMARY KEY (server_id, ts)
 ) WITHOUT ROWID;
 

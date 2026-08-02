@@ -50,6 +50,12 @@ wrangler deploy
 > wrangler d1 execute cf-panle --remote --command 'DROP TABLE servers;'
 > # 再执行 wrangler d1 execute cf-panle --remote --file=schema.sql 重建
 > ```
+>
+> 已有旧表缺新列？执行增量迁移（可空列，无需回填）：
+> ```
+> wrangler d1 execute cf-panle --remote --command 'ALTER TABLE servers ADD COLUMN info_json TEXT;'
+> wrangler d1 execute cf-panle --remote --command 'ALTER TABLE metrics_min ADD COLUMN extra TEXT;'
+> ```
 
 部署完成后访问 `https://cf-panle.<你的子域>.workers.dev`，输入 `PANEL_PASSWORD` 密码即可登录（登录即管理员）。
 
@@ -81,13 +87,13 @@ wrangler deploy
    systemctl daemon-reload && systemctl enable --now cf-panle-agent
    journalctl -u cf-panle-agent -f   # 看日志
    ```
-5. 监控上报已内置：agent.sh 每 60 秒经控制通道 WS 上报 CPU/内存/网络（无需 crontab），间隔可用 `REPORT_INTERVAL` 调整。
+5. 监控上报已内置：agent.sh 每 60 秒经控制通道 WS 上报 CPU / 内存 / Swap / 磁盘 / 负载 / 温度 / 进程数 / TCP-UDP 连接数 / 网络速率 / 系统信息（无需 crontab），间隔可用 `REPORT_INTERVAL` 调整。
 
 ## 三、使用
 
 - **实时列表**：登录后前端与 `/ws/push` 保持 WebSocket，客户端每 3 秒发一次 sync 请求，服务端（PanelDO，Hibernation 休眠态，费用趋近普通 Worker）按权限返回服务器列表（在线状态自动更新），无需手动刷新。
 - **终端**：面板服务器卡片点「终端」→ xterm.js 弹出 → 按键实时到达被控机 shell；窗口拉伸自动 resize（经控制通道 `stty` 下发）；断线自动重连（最多 3 次）。
-- **监控**：点「监控」默认看近 12 小时 CPU/内存分钟数据（内存 DO 热区，秒回）；可切 1小时/3天/7天/30天查看 D1 归档历史（分钟粒度，超长区间自动降采样显示）。
+- **监控**：点「监控」默认看近 12 小时分钟数据（内存 DO 热区，秒回）；可切 1小时/3天/7天/30天查看 D1 归档历史（分钟粒度，超长区间自动降采样）。指标：CPU / 内存 / Swap / 磁盘（根分区）/ 负载 / 温度 / 进程数；服务器卡片显示 OS / 内核 / IP 系统信息。
 - **分组与排序**：添加服务器可填「分组」和「序号」，列表按分组展示、组内按序号排序（未填归入「未分组」）。
 - **登录**：单面板密码（`PANEL_PASSWORD`，存 CF secret），登录即管理员。
 - **公告**：设置里可改站点名/公告（存 D1 `kv_json` 表），公告对所有访客可见。

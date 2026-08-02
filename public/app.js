@@ -90,10 +90,11 @@
   }
 
   function cardHtml(s) {
+    const info = s.info ? [s.info.os, s.info.kern, s.info.ip4, s.info.ip6].filter(Boolean).join(' · ') : '';
     return `
       <div class="card">
         <div class="name">${escapeHtml(s.name)}</div>
-        <div class="meta">id: ${s.id}</div>
+        <div class="meta">id: ${s.id}${info ? ' · ' + escapeHtml(info) : ''}</div>
         <div><span class="badge ${s.online ? 'on' : 'off'}">${s.online ? '在线' : '离线'}</span></div>
         <div class="actions">
           <button data-act="term" data-id="${s.id}" data-name="${escapeHtml(s.name)}">终端</button>
@@ -294,7 +295,17 @@
         const t = new Date(r.ts * 60000).toISOString().slice(5, 16).replace('T', ' ');
         const cpu = r.cpu == null ? '-' : r.cpu.toFixed(1) + '%';
         const mem = r.mem_used == null ? '-' : (r.mem_used / 1048576).toFixed(0) + 'M';
-        return `${t}  cpu=${cpu}  mem=${mem}`;
+        const parts = [`${t}`, `cpu=${cpu}`, `mem=${mem}`];
+        const x = r.extra || {};
+        if (x.swap != null) parts.push(`swap=${(x.swap / 1048576).toFixed(0)}M`);
+        if (x.disk && x.disk.length) {
+          const root = x.disk.find((d) => d.m === '/') || x.disk[0];
+          if (root && root.u != null) parts.push(`disk=${Number(root.u).toFixed(0)}%`);
+        }
+        if (x.load1 != null) parts.push(`load=${x.load1}`);
+        if (x.temp != null) parts.push(`temp=${Number(x.temp).toFixed(1)}°`);
+        if (x.procs != null) parts.push(`proc=${x.procs}`);
+        return parts.join('  ');
       });
       $('#monitor-chart').textContent = lines.join('\n') || '暂无数据';
       $('#monitor-panel').classList.remove('hidden');

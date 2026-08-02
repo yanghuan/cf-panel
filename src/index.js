@@ -97,6 +97,11 @@ function parseRangeHours(range) {
   const n = Number(m[1]);
   return m[2] === 'd' ? n * 24 : n;
 }
+// 安全解析 JSON 字符串（extra/info 列），失败回退 null
+function safeJson(s) {
+  if (s == null) return null;
+  try { return JSON.parse(s); } catch { return null; }
+}
 // 任何秘密（agent key / PAT token）统一用 HMAC 哈希后落库
 async function hashSecret(value, env) {
   return bytesToHex(await hmacSha256(new TextEncoder().encode(secret(env)), new TextEncoder().encode(value)));
@@ -137,11 +142,24 @@ function doPanel(env) {
   return env.PANEL.get(env.PANEL.idFromName('main')); // 单实例：服务器列表实时推送
 }
 
-// agent 监控上报落库：更新 last_seen/online，写入 MetricsDO 热区（供 /api/report 与控制通道复用）
+// agent 监控上报落库：更新 last_seen/online（系统信息变更才写 info_json），
+// 时序写入 MetricsDO 热区（供 /api/report 与控制通道复用）
 async function handleReport(env, payload) {
   const ts = Math.floor(Date.now() / 1000);
   const minTs = Math.floor(ts / 60);
-  await env.DB.prepare('UPDATE servers SET last_seen = ?, online = 1 WHERE id = ?').bind(ts, payload.serverId).run();
+  const server = await env.DB.prepare('SELECT info_json FROM servers WHERE id = ?').bind(payload.serverId).first();
+  if (!server) return;
+  if (payload.info) {
+    const infoJson = JSON.stringify(payload.info);
+    if (server.info_json !== infoJson) {
+      await env.DB.prepare('UPDATE servers SET last_seen = ?, online = 1, info_json = ? WHERE id = ?')
+        .bind(ts, payload.serverId, infoJson, payload.serverId).run();
+    } else {
+      await env.DB.prepare('UPDATE servers SET last_seen = ?, online = 1 WHERE id = ?').bind(ts, payload.serverId).run();
+    }
+  } else {
+    await env.DB.prepare('UPDATE servers SET last_seen = ?, online = 1 WHERE id = ?').bind(ts, payload.serverId).run();
+  }
   const mdo = doMetrics(env);
   await mdo.fetch('https://do.internal/report', {
     method: 'POST',
@@ -151,8 +169,9 @@ async function handleReport(env, payload) {
       minTs,
       cpu: payload.cpu ?? null,
       mem_used: payload.mem_used ?? null,
-      net_in: payload.net_in ?? null,
+      net_in: payload.net_in ?? null,   // 网络速率（字节/秒）
       net_out: payload.net_out ?? null,
+      extra: payload.extra ?? null,     // 扩展监控项对象 → 序列化存入 extra 列
     }),
   });
 }
@@ -261,6 +280,7 @@ async function handleApi(request, env) {
       group: s.group || '',
       display_index: s.display_index || 0,
       online: s.online === 1 && now - (s.last_seen || 0) < 60000,
+      info: safeJson(s.info_json),
     }));
     return json(list);
   }
@@ -324,7 +344,15 @@ async function handleApi(request, env) {
     if (!server) return err('unknown agent', 401);
     const hash = await hashSecret(String(body.key || ''), env);
     if (hash !== server.agent_key_hash) return err('bad key', 401);
-    await handleReport(env, { serverId: server.id, cpu: body.cpu, mem_used: body.mem_used, net_in: body.net_in, net_out: body.net_out });
+    await handleReport(env, {
+      serverId: server.id,
+      cpu: body.cpu,
+      mem_used: body.mem_used,
+      net_in: body.net_in,
+      net_out: body.net_out,
+      extra: body.extra,
+      info: body.info,
+    });
     return json({ ok: true });
   }
 
@@ -341,11 +369,21 @@ async function handleApi(request, env) {
       const mdo = doMetrics(env);
       return mdo.fetch(`https://do.internal/query?server_id=${serverId}&limit=${Math.max(1, Math.round(hours * 60))}`);
     }
-    const sinceMin = Math.floor(Date.now() / 1000 / 60) - hours * 60;
-    const rows = await env.DB.prepare(
-      'SELECT ts, cpu, mem_used, net_in, net_out FROM metrics_min WHERE server_id = ? AND ts >= ? ORDER BY ts'
-    ).bind(serverId, sinceMin).all();
-    return json(rows.results);
+    const minutes = hours * 60;
+    const sinceMin = Math.floor(Date.now() / 1000 / 60) - minutes;
+    const MONITOR_D1_MAX_ROWS = 1500; // 长区间 SQL 抽样上限，防响应/解析放大
+    let rows;
+    if (minutes > MONITOR_D1_MAX_ROWS) {
+      const step = Math.ceil(minutes / MONITOR_D1_MAX_ROWS);
+      rows = await env.DB.prepare(
+        'SELECT ts, cpu, mem_used, net_in, net_out, extra FROM metrics_min WHERE server_id = ? AND ts >= ? AND ts % ? = 0 ORDER BY ts'
+      ).bind(serverId, sinceMin, step).all();
+    } else {
+      rows = await env.DB.prepare(
+        'SELECT ts, cpu, mem_used, net_in, net_out, extra FROM metrics_min WHERE server_id = ? AND ts >= ? ORDER BY ts'
+      ).bind(serverId, sinceMin).all();
+    }
+    return json(rows.results.map((r) => ({ ...r, extra: safeJson(r.extra) })));
   }
 
   // ---- PAT 管理（仅管理员）----
@@ -541,7 +579,15 @@ export class TerminalDO {
           if (j && j.type === 'report') {
             const serverId = Number(ws.deserializeAttachment());
             if (serverId) {
-              await handleReport(this.env, { serverId, cpu: j.cpu, mem_used: j.mem_used, net_in: j.net_in, net_out: j.net_out });
+              await handleReport(this.env, {
+                serverId,
+                cpu: j.cpu,
+                mem_used: j.mem_used,
+                net_in: j.net_in,
+                net_out: j.net_out,
+                extra: j.extra,
+                info: j.info,
+              });
             }
           }
         } catch { /* 忽略非 JSON 的控制消息 */ }
@@ -624,7 +670,7 @@ export class MetricsDO {
         m = new Map();
         this.data.set(b.serverId, m);
       }
-      m.set(b.minTs, { cpu: b.cpu, mem_used: b.mem_used, net_in: b.net_in, net_out: b.net_out });
+      m.set(b.minTs, { cpu: b.cpu, mem_used: b.mem_used, net_in: b.net_in, net_out: b.net_out, extra: b.extra });
       this.trim(m);
       this.scheduleArchive();
       return json({ ok: true });
@@ -638,7 +684,7 @@ export class MetricsDO {
       const arr = [...m.entries()]
         .sort((a, b) => a[0] - b[0])
         .slice(-limit)
-        .map(([ts, v]) => ({ ts, cpu: v.cpu, mem_used: v.mem_used, net_in: v.net_in, net_out: v.net_out }));
+        .map(([ts, v]) => ({ ts, cpu: v.cpu, mem_used: v.mem_used, net_in: v.net_in, net_out: v.net_out, extra: v.extra }));
       return json(arr);
     }
 
@@ -672,8 +718,8 @@ export class MetricsDO {
         if (ts <= cutoff && !done.has(ts)) {
           stmts.push(
             this.env.DB.prepare(
-              'INSERT OR IGNORE INTO metrics_min (server_id, ts, cpu, mem_used, net_in, net_out) VALUES (?,?,?,?,?,?)'
-            ).bind(serverId, ts, v.cpu, v.mem_used, v.net_in, v.net_out)
+              'INSERT OR IGNORE INTO metrics_min (server_id, ts, cpu, mem_used, net_in, net_out, extra) VALUES (?,?,?,?,?,?,?)'
+            ).bind(serverId, ts, v.cpu, v.mem_used, v.net_in, v.net_out, v.extra ? JSON.stringify(v.extra) : null)
           );
           done.add(ts);
         }

@@ -117,6 +117,7 @@
         <div class="meta">${info ? escapeHtml(info) : `id: ${s.id}`}</div>
         <div class="actions">
           <button data-act="term" data-id="${s.id}" data-name="${escapeHtml(s.name)}">终端</button>
+          <button data-act="file" data-id="${s.id}" data-name="${escapeHtml(s.name)}" class="ghost">文件</button>
           <button data-act="mon" data-id="${s.id}" data-name="${escapeHtml(s.name)}" class="ghost">监控</button>
           <button data-act="del" data-id="${s.id}" class="danger">删除</button>
         </div>
@@ -303,6 +304,97 @@
     connect();
   }
 
+  // ---------- 文件管理（目录浏览 / 上传 / 下载） ----------
+  let fileWs = null;
+  let fileCwd = '/';
+
+  function fileParent(p) {
+    const t = String(p || '/').replace(/\/+$/, '');
+    const i = t.lastIndexOf('/');
+    return i <= 0 ? '/' : t.slice(0, i);
+  }
+  function fileJoin(dir, name) {
+    return (dir === '/' ? '' : dir) + '/' + name;
+  }
+
+  async function openFileManager(serverId, serverName) {
+    try {
+      const res = await api('/api/file/open', { method: 'POST', body: JSON.stringify({ server_id: serverId }) });
+      fileCwd = '/';
+      $('#file-title').textContent = `文件管理 · ${serverName}`;
+      $('#file-path').value = '/';
+      $('#file-msg').textContent = '';
+      $('#file-list').innerHTML = '<tr><td colspan="4" class="muted">连接中...</td></tr>';
+      $('#file-modal').classList.remove('hidden');
+      closeFileWs();
+      const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+      const ws = new WebSocket(`${proto}://${location.host}/ws/file/${res.session_id}?token=${encodeURIComponent(token)}`);
+      fileWs = ws;
+      ws.onopen = () => fileSend({ type: 'list', path: fileCwd });
+      ws.onmessage = (ev) => {
+        let j; try { j = JSON.parse(ev.data); } catch { return; }
+        if (j.type === 'list_result' && j.ok) renderFileList(j.entries);
+        else if (j.type === 'read_result' && j.ok) downloadFile(j.path, j.data);
+        else if (j.type === 'write_result' && j.ok) { $('#file-msg').textContent = '上传成功'; fileSend({ type: 'list', path: fileCwd }); }
+        else if (j.type === 'error') $('#file-msg').textContent = `错误：${j.message}`;
+      };
+      ws.onclose = () => { if (fileWs === ws) fileWs = null; };
+      ws.onerror = () => { try { ws.close(); } catch { /* ignore */ } };
+    } catch (e) {
+      toast(e.message);
+    }
+  }
+
+  function closeFileModal() {
+    if (fileWs) { try { fileWs.close(); } catch { /* ignore */ } fileWs = null; }
+    $('#file-modal').classList.add('hidden');
+  }
+
+  function fileSend(obj) {
+    if (fileWs && fileWs.readyState === 1) fileWs.send(JSON.stringify(obj));
+  }
+
+  function renderFileList(entries) {
+    const rows = entries.map((e) => {
+      const size = e.type === 'dir' ? '—' : fmtBytes(e.size);
+      const time = e.mtime ? new Date(e.mtime * 1000).toLocaleString('zh-CN') : '—';
+      const nameCell = e.type === 'dir'
+        ? `<a class="f-dir" data-path="${escapeHtml(fileJoin(fileCwd, e.name))}">📁 ${escapeHtml(e.name)}</a>`
+        : `<span class="f-file">📄 ${escapeHtml(e.name)}</span>`;
+      const dl = e.type === 'file' ? `<button class="ghost f-dl" data-path="${escapeHtml(fileJoin(fileCwd, e.name))}">下载</button>` : '';
+      return `<tr><td>${nameCell}</td><td>${size}</td><td>${escapeHtml(time)}</td><td>${dl}</td></tr>`;
+    });
+    $('#file-list').innerHTML = rows.join('') || '<tr><td colspan="4" class="muted">空目录</td></tr>';
+  }
+
+  function downloadFile(path, b64) {
+    try {
+      const bin = atob(b64);
+      const bytes = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(new Blob([bytes]));
+      a.download = path.split('/').pop() || 'download';
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(a.href);
+      $('#file-msg').textContent = `已下载：${path}`;
+    } catch {
+      $('#file-msg').textContent = '下载失败';
+    }
+  }
+
+  function uploadFile(file) {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const b64 = String(reader.result).split(',')[1] || '';
+      fileSend({ type: 'write', path: fileJoin(fileCwd, file.name), data: b64 });
+      $('#file-msg').textContent = `上传中：${file.name}（${fmtBytes(file.size)}）...`;
+    };
+    reader.readAsDataURL(file);
+  }
+
   // ---------- 监控（简易文本图，支持时间范围） ----------
   const MONITOR_STEP_MAX = 240; // 长区间降采样目标点数
   const MONITOR_RANGE_LABEL = { '1h': '近1小时', '12h': '近12小时', '3d': '近3天', '7d': '近7天', '30d': '近30天' };
@@ -469,6 +561,7 @@
     if (!btn) return;
     const { act, id, name } = btn.dataset;
     if (act === 'term') openTerminal(Number(id), name);
+    else if (act === 'file') openFileManager(Number(id), name);
     else if (act === 'mon') showMonitor(Number(id), name);
     else if (act === 'del') {
       if (!confirm(`确认删除服务器「${name}」？`)) return;
@@ -481,6 +574,20 @@
     const btn = e.target.closest('.range-btn');
     if (!btn || !monitorState) return;
     showMonitor(monitorState.serverId, monitorState.serverName, btn.dataset.range);
+  });
+
+  // 文件管理操作
+  $('#btn-file-close').onclick = closeFileModal;
+  $('#file-refresh').onclick = () => fileSend({ type: 'list', path: fileCwd });
+  $('#file-up').onclick = () => { fileCwd = fileParent(fileCwd); $('#file-path').value = fileCwd; fileSend({ type: 'list', path: fileCwd }); };
+  $('#file-go').onclick = () => { const p = $('#file-path').value.trim(); if (!p) return; fileCwd = p; fileSend({ type: 'list', path: p }); };
+  $('#file-path').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('#file-go').click(); });
+  $('#file-input').addEventListener('change', (e) => { const f = e.target.files[0]; if (f) uploadFile(f); e.target.value = ''; });
+  $('#file-list').addEventListener('click', (e) => {
+    const dir = e.target.closest('.f-dir');
+    if (dir) { fileCwd = dir.dataset.path; $('#file-path').value = fileCwd; fileSend({ type: 'list', path: fileCwd }); return; }
+    const dl = e.target.closest('.f-dl');
+    if (dl) fileSend({ type: 'read', path: dl.dataset.path });
   });
 
   // ---------- 启动 ----------

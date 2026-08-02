@@ -369,6 +369,26 @@ async function handleApi(request, env) {
     return json({ session_id: streamId, server_id: server.id, server_name: server.name });
   }
 
+  // POST /api/file/open —— 创建文件管理会话（exec 权限 + 服务器归属）
+  if (method === 'POST' && path === '/api/file/open') {
+    const body = await request.json().catch(() => ({}));
+    const server = await env.DB.prepare('SELECT * FROM servers WHERE id = ?').bind(Number(body.server_id) || 0).first();
+    if (!server) return err('server not found', 404);
+    if (!canExec(user, server)) return err('forbidden', 403);
+    const streamId = makeStreamId(server.id);
+    const stub = doForShard(env, shardForServerId(server.id));
+    const resp = await stub.fetch('https://do.internal/rpc', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ op: 'open_file', streamId, serverId: server.id, creatorUserId: user.id }),
+    });
+    if (!resp.ok) return err(`agent not reachable: ${await resp.text()}`, 502);
+    await env.DB.prepare('INSERT INTO audit_logs (user_id, action, target_server_id) VALUES (?,?,?)')
+      .bind(user.id, 'file.open', server.id)
+      .run();
+    return json({ session_id: streamId, server_id: server.id, server_name: server.name });
+  }
+
   // POST /api/report —— agent 监控上报（key 指纹定位 + hash 校验，无需登录）
   // 时序数据写入内存 DO（MetricsDO 热区）；last_seen/online 仍落 D1
   if (method === 'POST' && path === '/api/report') {
@@ -630,6 +650,8 @@ async function handleWs(request, env) {
 
   if (path.startsWith('/ws/terminal/')) {
     shard = shardFromStreamId(path.slice('/ws/terminal/'.length));
+  } else if (path.startsWith('/ws/file/')) {
+    shard = shardFromStreamId(path.slice('/ws/file/'.length));
   } else if (path === '/ws/agent/control') {
     // 用 key 指纹反查服务器定位分片（身份与凭证合一，uuid 已废弃）
     const key = request.headers.get('x-agent-key') || url.searchParams.get('key') || '';
@@ -637,7 +659,7 @@ async function handleWs(request, env) {
     const server = await env.DB.prepare('SELECT * FROM servers WHERE agent_key_id = ?').bind(keyId).first();
     if (!server) return new Response('unknown agent', { status: 401 });
     shard = shardForServerId(server.id);
-  } else if (path === '/ws/agent/terminal') {
+  } else if (path === '/ws/agent/terminal' || path === '/ws/agent/file') {
     shard = shardFromStreamId(url.searchParams.get('sid') || '');
   }
 
@@ -674,30 +696,32 @@ export class TerminalDO {
       return json({ ok: true });
     }
 
-    // 内部 RPC：worker 创建终端会话时调用
+    // 内部 RPC：worker 创建终端/文件会话时调用
     if (path === '/rpc' && request.method === 'POST') {
       const body = await request.json();
-      if (body.op === 'create') {
+      if (body.op === 'create' || body.op === 'open_file') {
+        const isFile = body.op === 'open_file';
         this.sessions.set(body.streamId, {
           streamId: body.streamId,
           serverId: body.serverId,
           creatorUserId: body.creatorUserId,
           createdAt: Date.now(),
+          type: isFile ? 'file' : 'terminal',
           userWs: null,
           agentWs: null,
         });
         const agentWs = this.agents.get(body.serverId);
         if (!agentWs) return json({ error: 'agent offline' }, 502);
-        agentWs.send(JSON.stringify({ type: 'open_terminal', stream_id: body.streamId }));
+        agentWs.send(JSON.stringify({ type: isFile ? 'open_file' : 'open_terminal', stream_id: body.streamId }));
         return json({ ok: true });
       }
       return err('bad op');
     }
 
-    // GET /ws/terminal/:id —— 浏览器会话（校验创建者/admin，防 UUID 劫持 §6.1）
-    let m = path.match(/^\/ws\/terminal\/(.+)$/);
+    // GET /ws/terminal/:id | /ws/file/:id —— 浏览器会话（校验创建者/admin，防 UUID 劫持 §6.1）
+    let m = path.match(/^\/ws\/(terminal|file)\/(.+)$/);
     if (m) {
-      const streamId = m[1];
+      const streamId = m[2];
       const sess = this.sessions.get(streamId);
       if (!sess) return new Response('session not found', { status: 404 });
       const token = url.searchParams.get('token') || '';
@@ -733,8 +757,8 @@ export class TerminalDO {
       return new Response(null, { status: 101, webSocket: pair[0] });
     }
 
-    // GET /ws/agent/terminal?sid=&key= —— agent 终端数据流（key 校验 + stream 归属校验 §6.2）
-    if (path === '/ws/agent/terminal') {
+    // GET /ws/agent/terminal?sid= | /ws/agent/file?sid= —— agent 数据流（key 校验 + stream 归属校验 §6.2）
+    if (path === '/ws/agent/terminal' || path === '/ws/agent/file') {
       const sid = url.searchParams.get('sid') || '';
       const key = request.headers.get('x-agent-key') || url.searchParams.get('key') || '';
       const sess = this.sessions.get(sid);

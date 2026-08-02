@@ -273,6 +273,39 @@ button.danger:hover { background: rgba(248, 113, 113, .12); }
 .token-list li { display: flex; justify-content: space-between; align-items: center; padding: 6px 8px; border-bottom: 1px solid var(--border); word-break: break-all; }
 .token-list .muted { color: var(--muted); }
 
+/* ---------- 文件管理 ---------- */
+.file-body {
+  max-width: 760px;
+  margin: 0 auto;
+  width: 100%;
+  background: var(--panel);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 16px;
+}
+.file-toolbar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 12px; }
+.file-toolbar input { flex: 1; min-width: 180px; }
+.file-upload {
+  background: var(--grad);
+  color: #fff;
+  border-radius: 10px;
+  padding: 8px 14px;
+  font-size: 13px;
+  cursor: pointer;
+  box-shadow: 0 2px 12px rgba(99, 102, 241, .28);
+}
+.file-upload:hover { filter: brightness(1.12); }
+.file-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.file-table th, .file-table td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); }
+.file-table th { color: var(--muted); font-weight: 600; font-size: 12px; }
+.file-table td.muted { color: var(--muted); text-align: center; }
+.f-dir { color: var(--accent-2); cursor: pointer; text-decoration: none; }
+.f-dir:hover { text-decoration: underline; }
+.f-file { color: var(--text); }
+.file-table .f-dl { padding: 3px 10px; font-size: 12px; }
+
 /* ---------- 监控 ---------- */
 #monitor-panel { margin-top: 24px; }
 #monitor-panel h3 { font-size: 14px; }

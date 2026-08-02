@@ -94,6 +94,7 @@ wrangler deploy
 - **概览与实时指标**：顶部概览条显示服务器总数/在线数/平均 CPU/负载/总内存；每张服务器卡片实时显示 CPU / 内存 / 负载（经 `/ws/push` 每 3 秒随列表推送，PanelDO 从 MetricsDO 取最新值）。
 - **实时列表**：登录后前端与 `/ws/push` 保持 WebSocket，客户端每 3 秒发一次 sync 请求，服务端（PanelDO，Hibernation 休眠态，费用趋近普通 Worker）按权限返回服务器列表（在线状态自动更新），无需手动刷新。
 - **终端**：面板服务器卡片点「终端」→ xterm.js 弹出 → 按键实时到达被控机 shell；窗口拉伸自动 resize（经控制通道 `stty` 下发）；断线自动重连（最多 3 次）。
+- **文件管理**：面板服务器卡片点「文件」→ 弹出文件管理器，可浏览目录（点击进入/上级/路径跳转）、**上传**（本地文件写入 agent）、**下载**（agent 文件回传浏览器）；文件内容 base64 经独立 WS 会话传输。
 - **监控**：点「监控」默认看近 12 小时分钟数据（内存 DO 热区，秒回）；可切 1小时/3天/7天/30天查看 D1 归档历史（分钟粒度，超长区间自动降采样）。指标：CPU / 内存 / Swap / 磁盘（根分区）/ 负载 / 温度 / 进程数；服务器卡片显示 OS / 内核 / IP 系统信息。
 - **分组与排序**：添加服务器可填「分组」和「序号」，列表按分组展示、组内按序号排序（未填归入「未分组」）。
 - **登录**：单面板密码（`PANEL_PASSWORD`，存 CF secret），登录即管理员。
@@ -111,7 +112,10 @@ wrangler deploy
 | POST | `/api/servers` | 添加服务器（name + 可选 group/sort_order），返回 agent 配置 |
 | DELETE | `/api/servers/:id` | 删除服务器（仅管理员） |
 | POST | `/api/terminal` | 创建终端会话（exec 权限 + 归属校验），返回 session_id |
+| POST | `/api/file/open` | 创建文件管理会话（exec 权限 + 归属校验），返回 session_id |
 | GET | `/ws/terminal/{id}` | 浏览器终端 WebSocket（校验创建者/admin） |
+| GET | `/ws/file/{id}` | 浏览器文件管理 WebSocket（JSON 行协议：list/read/write，校验创建者/admin） |
+| GET | `/ws/agent/file` | agent 文件数据流（key 校验 + stream 归属校验） |
 | GET | `/ws/push` | 面板实时刷新：客户端每 3 秒发 sync，服务端按权限返回服务器列表 |
 | GET | `/ws/agent/control` | agent 控制通道（key 指纹定位 + 校验，按分片路由；监控上报也走这里） |
 | GET | `/ws/agent/terminal` | agent 终端数据流（key 校验 + stream 归属校验） |

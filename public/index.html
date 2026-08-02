@@ -73,6 +73,28 @@
     <div id="term" class="term"></div>
   </div>
 
+  <!-- 文件管理弹窗 -->
+  <div id="file-modal" class="modal hidden">
+    <div class="modal-head">
+      <span id="file-title">文件管理</span>
+      <button id="btn-file-close" class="ghost">关闭</button>
+    </div>
+    <div class="file-body">
+      <div class="file-toolbar">
+        <button id="file-up" class="ghost">上级</button>
+        <button id="file-refresh" class="ghost">刷新</button>
+        <input id="file-path" type="text" placeholder="路径，如 /home/user" />
+        <button id="file-go" class="ghost">跳转</button>
+        <label class="file-upload"><input id="file-input" type="file" hidden />上传</label>
+      </div>
+      <p id="file-msg" class="msg"></p>
+      <table class="file-table">
+        <thead><tr><th>名称</th><th>大小</th><th>修改时间</th><th></th></tr></thead>
+        <tbody id="file-list"></tbody>
+      </table>
+    </div>
+  </div>
+
   <!-- 设置弹窗：站点信息 + PAT 管理 -->
   <div id="settings-modal" class="modal hidden">
     <div class="modal-head">

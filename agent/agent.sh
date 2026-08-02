@@ -3,8 +3,9 @@
 # cf-panle agent —— 纯 Shell 实现（websocat + socat + jq）
 # 对齐 docs/architecture.md §3.5
 # 依赖: websocat(必装), socat(resize 需要), jq, pgrep(会话结束清理进程组), bash, stty
-# 功能: 常驻控制通道（终端 + resize）+ 内置监控上报（经控制 WS，无需 crontab）
+# 功能: 常驻控制通道（终端 + resize + 文件管理）+ 内置监控上报（经控制 WS，无需 crontab）
 #       上报指标: CPU / 内存 / Swap / 磁盘 / 负载 / 温度 / 进程数 / TCP-UDP 连接数 / 网络速率 / 系统信息
+#       文件管理: 目录浏览 / 上传 / 下载（独立 WS 会话，JSON 行协议 + base64）
 # 省配额: 有面板观看者时 3s 上报（服务端下发 set_report_interval），无人查看时 120s 低频采样
 # 用法:
 #   AGENT_WSS_URL=wss://panel.example.com/ws/agent \
@@ -151,6 +152,64 @@ spawn_terminal() {
   ) &
 }
 
+# ---- 文件管理会话：JSON 行协议（list/read/write，base64 传文件内容）----
+# WS 断开即结束，无需额外清理
+spawn_file() {
+  local sid=$1
+  # 生成文件服务脚本（stdin 收指令 JSON，stdout 回结果 JSON，均由 websocat 透传 WS）
+  # 用 sid 区分脚本文件，避免多个文件会话互相覆盖
+  local fs="$TMP_DIR/file-server-$sid.sh"
+  cat > "$fs" <<'SERVEREOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+ls_entries() {
+  local path=$1
+  [ -d "$path" ] || { echo '[]'; return 0; }
+  find "$path" -maxdepth 1 -mindepth 1 -printf '%f|%y|%s|%T@\n' 2>/dev/null | while IFS='|' read -r name typ size mt; do
+    jq -nc --arg n "$name" --arg t "$typ" --argjson s "${size:-0}" --argjson m "${mt:-0}" \
+      '{name:$n, type:($t=="d"?"dir":"file"), size:$s, mtime:$m}'
+  done | jq -s '.'
+}
+
+while IFS= read -r line; do
+  [ -z "$line" ] && continue
+  t=$(jq -r .type <<<"$line" 2>/dev/null)
+  case "$t" in
+    list)
+      path=$(jq -r .path <<<"$line")
+      entries=$(ls_entries "$path" 2>/dev/null) || entries='[]'
+      jq -nc --arg p "$path" --argjson e "$entries" '{type:"list_result", ok:true, path:$p, entries:$e}'
+      ;;
+    read)
+      path=$(jq -r .path <<<"$line")
+      if [ -f "$path" ]; then
+        size=$(wc -c < "$path" 2>/dev/null || echo 0)
+        data=$(base64 -w0 < "$path" 2>/dev/null) || data=''
+        jq -nc --arg p "$path" --arg d "$data" --argjson s "$size" '{type:"read_result", ok:true, path:$p, data:$d, size:$s}'
+      else
+        jq -nc --arg p "$path" '{type:"error", ok:false, message:"not a file or unreadable"}'
+      fi
+      ;;
+    write)
+      path=$(jq -r .path <<<"$line")
+      data=$(jq -r .data <<<"$line")
+      if mkdir -p "$(dirname "$path" 2>/dev/null)" 2>/dev/null && printf '%s' "$data" | base64 -d > "$path" 2>/dev/null; then
+        jq -nc --arg p "$path" '{type:"write_result", ok:true, path:$p}'
+      else
+        jq -nc --arg p "$path" '{type:"error", ok:false, message:"write failed"}'
+      fi
+      ;;
+  esac
+done
+SERVEREOF
+  (
+    websocat -b "$WSS/file?sid=$sid" -H "X-Agent-Key: $KEY" \
+      --exec "bash $fs"
+    rm -f "$fs"
+  ) &
+}
+
 # ---- 控制通道常驻循环（断线自动重连；下行=控制指令，上行=监控上报） ----
 while true; do
   log "connecting control channel..."
@@ -167,6 +226,14 @@ while true; do
         socat -d pty,link="$TMP_DIR/$sid",raw,echo=0 \
               EXEC:'bash -i',pty,stderr,setsid,sigint,sighup 2>/dev/null &
         spawn_terminal "$sid" $!
+        ;;
+      open_file)
+        sid=$(jq -r .stream_id <<<"$line" 2>/dev/null)
+        if [ "$DISABLE_EXEC" = "1" ]; then
+          log "命令执行已被禁用 (DISABLE_EXEC=1)，忽略 open_file sid=$sid"
+          continue
+        fi
+        spawn_file "$sid"
         ;;
       resize)
         sid=$(jq -r .stream_id <<<"$line" 2>/dev/null)

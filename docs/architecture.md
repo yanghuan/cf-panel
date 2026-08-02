@@ -84,6 +84,14 @@ DO 是整个设计的心脏，对应哪吒 Dashboard 里那两个 `io.Copy` 的�
 
 > DO 是单实例、有并发上限；多终端会话可按 `streamId` 哈希到不同 DO，避免单点瓶颈。
 
+#### 3.3.1 面板实时刷新（PanelDO）
+
+服务器列表不需要用户手动刷新：前端登录后建一条 WebSocket 到 `/ws/push?token=...`，**由客户端每 3 秒发一条 `sync` 请求**，单实例 **PanelDO** 收到后才查一次 D1，按该连接的用户权限（admin 全量 / PAT 白名单 / member 归属）过滤后回发服务器列表（含秒级 `online` 状态）。
+
+- **Hibernation API + 客户端触发**：DO 空闲即休眠（不计时长），收到 sync 才短暂唤醒——避免"服务端定时器"造成的实例常驻费用，开销趋近普通 Worker。
+- token 通过 `serializeAttachment` 随连接持久化，休眠唤醒后在 `webSocketMessage` 里 `deserializeAttachment` 取回，无需额外存储。
+- 单实例 DO（`idFromName('main')`）；D1 临时故障时跳过该周期，下个周期自动恢复。
+
 ### 3.4 外部 Agent
 部署在每台目标机器上（复用哪吒 agent 思路，实现选型见 3.5）：
 

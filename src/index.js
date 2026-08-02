@@ -124,12 +124,13 @@ function doForShard(env, n) {
 function doMetrics(env) {
   return env.METRICS.get(env.METRICS.idFromName('main'));
 }
+function doPanel(env) {
+  return env.PANEL.get(env.PANEL.idFromName('main')); // 单实例：服务器列表实时推送
+}
 
 // ---------------- 鉴权（JWT 或 PAT） ----------------
 
-async function authUser(request, env) {
-  const header = request.headers.get('authorization') || '';
-  const token = header.startsWith('Bearer ') ? header.slice(7) : '';
+async function authUserByToken(token, env) {
   if (!token) return null;
 
   // 1) PAT：以 cfp_ 开头
@@ -150,6 +151,12 @@ async function authUser(request, env) {
   const payload = await verifyJwt(token, env);
   if (!payload || !payload.uid) return null;
   return { id: payload.uid, username: 'admin', role: 1, pat: null };
+}
+
+async function authUser(request, env) {
+  const header = request.headers.get('authorization') || '';
+  const token = header.startsWith('Bearer ') ? header.slice(7) : '';
+  return authUserByToken(token, env);
 }
 
 // 面板管理员（JWT 登录，非 PAT）
@@ -370,6 +377,16 @@ async function handleApi(request, env) {
 async function handleWs(request, env) {
   const url = new URL(request.url);
   const path = url.pathname;
+
+  // 面板实时推送：服务器列表每 3 秒广播给在线前端（单实例 PanelDO，非分片）
+  if (path === '/ws/push') {
+    const stub = doPanel(env);
+    const target = new URL(request.url);
+    target.protocol = 'https:';
+    target.hostname = 'do.internal';
+    return stub.fetch(target.toString(), request);
+  }
+
   let shard = 0;
 
   if (path.startsWith('/ws/terminal/')) {
@@ -631,6 +648,57 @@ export class MetricsDO {
     if (this.env.ARCHIVE_TO_D1 === '1') {
       this.state.storage.setAlarm(Date.now() + ARCHIVE_INTERVAL_MS);
     }
+  }
+}
+
+// ---------------- Durable Object：面板实时推送 ----------------
+// 前端登录后建 WS 到 /ws/push?token=...，之后每 3 秒发一条 'sync' 请求；
+// 本 DO 用 WebSocket Hibernation API：空闲时实例休眠（不计时长），
+// 只有收到客户端消息才短暂唤醒查一次 D1 并回发 → 费用开销趋近普通 Worker。
+// token 通过 serializeAttachment 随连接持久化，休眠唤醒后取回。
+
+export class PanelDO {
+  constructor(state, env) {
+    this.state = state;
+    this.env = env;
+  }
+
+  async fetch(request) {
+    const url = new URL(request.url);
+    if (url.pathname !== '/ws/push') return new Response('not found', { status: 404 });
+    const token = url.searchParams.get('token') || '';
+    if (!(await authUserByToken(token, this.env))) return new Response('unauthorized', { status: 401 });
+
+    const pair = new WebSocketPair();
+    this.state.acceptWebSocket(pair[1]);
+    pair[1].serializeAttachment(token);
+    return new Response(null, { status: 101, webSocket: pair[0] });
+  }
+
+  // 客户端 sync 请求 → 查库 → 按该连接的用户权限过滤后回发
+  async webSocketMessage(ws) {
+    const token = ws.deserializeAttachment() || '';
+    const user = await authUserByToken(token, this.env);
+    if (!user) return;
+    let rows;
+    try {
+      rows = await this.env.DB.prepare('SELECT * FROM servers ORDER BY "group", display_index, id').all();
+    } catch {
+      return; // D1 临时故障，下个周期再试
+    }
+    const now = Date.now();
+    const list = [];
+    for (const s of rows.results) {
+      if (!canAccessServer(user, s)) continue;
+      list.push({
+        id: s.id,
+        name: s.name,
+        group: s.group || '',
+        display_index: s.display_index || 0,
+        online: s.online === 1 && now - (s.last_seen || 0) < 60000,
+      });
+    }
+    try { ws.send(JSON.stringify(list)); } catch { /* ignore */ }
   }
 }
 

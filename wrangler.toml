@@ -12,7 +12,7 @@ binding = "DB"
 database_name = "cf-panle"
 database_id = "REPLACE_WITH_D1_DATABASE_ID"
 
-# ---------- Durable Object（WebSocket 中转核心 + 监控时序热区） ----------
+# ---------- Durable Object（WebSocket 中转 + 监控时序热区 + 面板实时推送） ----------
 [[durable_objects.bindings]]
 name = "TERMINAL"
 class_name = "TerminalDO"
@@ -21,9 +21,17 @@ class_name = "TerminalDO"
 name = "METRICS"
 class_name = "MetricsDO"
 
+[[durable_objects.bindings]]
+name = "PANEL"
+class_name = "PanelDO"
+
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["TerminalDO", "MetricsDO"]
+
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["PanelDO"]
 
 # ---------- 静态资源（前端，Pages 模式零构建） ----------
 [assets]

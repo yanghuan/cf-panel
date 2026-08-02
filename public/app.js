@@ -5,6 +5,9 @@
   const $ = (sel) => document.querySelector(sel);
   let token = localStorage.getItem('cfpanle_token') || '';
   let serversCache = [];
+  let pushWs = null;       // 服务器列表实时推送 WS
+  let pushTimer = null;    // 每 3 秒发一次 sync 请求的定时器
+  let pushRetries = 0;     // 推送重连计数
   const TERM_RETRY_MAX = 3; // 终端断线自动重连次数
 
   // ---------- 基础 ----------
@@ -46,6 +49,7 @@
 
   // ---------- 鉴权视图 ----------
   function showAuth() {
+    stopPush();
     $('#auth').classList.remove('hidden');
     $('#app').classList.add('hidden');
   }
@@ -53,7 +57,8 @@
     $('#auth').classList.add('hidden');
     $('#app').classList.remove('hidden');
     $('#whoami').textContent = user.is_pat ? `令牌（${escapeHtml(user.username)}）` : '管理员';
-    loadServers();
+    loadServers(); // 先拉一次，WS 建立后每 3 秒由服务端推送覆盖
+    startPush();
   }
 
   async function doLogin() {
@@ -77,7 +82,7 @@
       renderServers();
     } catch (e) {
       if (String(e.message).includes('401') || String(e.message).includes('unauthorized')) {
-        token = ''; localStorage.removeItem('cfpanle_token'); showAuth(); return;
+        token = ''; localStorage.removeItem('cfpanle_token'); showAuth(); return; // showAuth 内会 stopPush
       }
       toast(e.message);
     }
@@ -131,6 +136,52 @@
     } catch (e) {
       toast(e.message);
     }
+  }
+
+  // ---------- 服务器列表实时刷新（WS /ws/push，客户端每 3 秒发 sync 请求一次） ----------
+  function startPush() {
+    if (pushWs && (pushWs.readyState === WebSocket.CONNECTING || pushWs.readyState === WebSocket.OPEN)) return;
+    if (!token) return;
+    const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+    const ws = new WebSocket(`${proto}://${location.host}/ws/push?token=${encodeURIComponent(token)}`);
+    pushWs = ws;
+
+    ws.onopen = () => {
+      pushRetries = 0;
+      if (pushTimer) clearInterval(pushTimer);
+      pushTimer = setInterval(() => {
+        try { if (ws.readyState === WebSocket.OPEN) ws.send('sync'); } catch { /* ignore */ }
+      }, 3000);
+    };
+    ws.onmessage = (ev) => {
+      try {
+        const list = JSON.parse(ev.data);
+        if (Array.isArray(list)) {
+          serversCache = list;
+          renderServers();
+        }
+      } catch { /* 忽略非 JSON 帧 */ }
+    };
+    ws.onclose = () => {
+      if (pushTimer) { clearInterval(pushTimer); pushTimer = null; }
+      if (pushWs !== ws) return; // 已被 stopPush 主动关闭
+      if (!token) return;
+      if (pushRetries < 5) {
+        pushRetries += 1;
+        setTimeout(startPush, 3000);
+      } else {
+        toast('实时刷新连接失败，请刷新页面');
+      }
+    };
+    ws.onerror = () => { try { ws.close(); } catch { /* ignore */ } };
+  }
+
+  function stopPush() {
+    if (pushTimer) { clearInterval(pushTimer); pushTimer = null; }
+    if (!pushWs) return;
+    const w = pushWs;
+    pushWs = null;
+    try { w.close(); } catch { /* ignore */ }
   }
 
   // ---------- 终端（断线自动重连） ----------

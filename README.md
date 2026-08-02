@@ -14,7 +14,7 @@
 cf-panle/
 ├── wrangler.toml        # Worker/DO/D1/静态资源配置
 ├── schema.sql           # D1 数据库表（含 kv_json 键值表）
-├── src/index.js         # Worker：REST API + 鉴权 + TerminalDO 双端对拷
+├── src/index.js         # Worker：REST API + 鉴权 + TerminalDO 双端对拷 + PanelDO 实时推送
 ├── public/              # 前端（index.html / app.js / style.css）
 ├── agent/               # 被控机 agent（agent.sh / report.sh / systemd 模板）
 └── docs/architecture.md # 架构设计文档
@@ -88,6 +88,7 @@ wrangler deploy
 
 ## 三、使用
 
+- **实时列表**：登录后前端与 `/ws/push` 保持 WebSocket，客户端每 3 秒发一次 sync 请求，服务端（PanelDO，Hibernation 休眠态，费用趋近普通 Worker）按权限返回服务器列表（在线状态自动更新），无需手动刷新。
 - **终端**：面板服务器卡片点「终端」→ xterm.js 弹出 → 按键实时到达被控机 shell；窗口拉伸自动 resize（经控制通道 `stty` 下发）；断线自动重连（最多 3 次）。
 - **监控**：点「监控」查看近 12 小时 CPU/内存分钟数据（存内存 DO 热区，秒回，不占 D1 配额）。
 - **分组与排序**：添加服务器可填「分组」和「序号」，列表按分组展示、组内按序号排序（未填归入「未分组」）。
@@ -107,6 +108,7 @@ wrangler deploy
 | DELETE | `/api/servers/:id` | 删除服务器（仅管理员） |
 | POST | `/api/terminal` | 创建终端会话（exec 权限 + 归属校验），返回 session_id |
 | GET | `/ws/terminal/{id}` | 浏览器终端 WebSocket（校验创建者/admin） |
+| GET | `/ws/push` | 面板实时刷新：客户端每 3 秒发 sync，服务端按权限返回服务器列表 |
 | GET | `/ws/agent/control` | agent 控制通道（key 指纹定位 + 校验，按分片路由） |
 | GET | `/ws/agent/terminal` | agent 终端数据流（key 校验 + stream 归属校验） |
 | POST | `/api/report` | agent 监控上报（key 指纹定位 + 校验） |
@@ -128,6 +130,7 @@ wrangler deploy
 ## 六、架构要点（多 DO 分片等）
 
 - **多 DO 分片**：终端 DO `SHARDS = 4`，streamId 带 `shard-序号` 前缀，浏览器/agent 的 WS 请求按前缀路由到对应 DO 实例，避免单点瓶颈。
+- **实时刷新 PanelDO**：单实例 DO，前端 `/ws/push` 连接后由**客户端每 3 秒发 sync 触发**；DO 用 Hibernation API，空闲即休眠（不计时长），收到 sync 才唤醒查 D1 并回发，按用户权限过滤（在线状态秒级更新）。
 - **会话回收**：终端会话两端都断开超过 10 分钟，DO 惰性清理（每 60s 扫描一次）。
 - **监控时序存内存 DO（MetricsDO）**：agent 上报直接写内存滚动窗口（保留最近 720 分钟/机），前端查询秒回，**默认不写 D1**。可选 `ARCHIVE_TO_D1=1`（`wrangler secret put ARCHIVE_TO_D1 1`）开启 alarm 定时归档：每 10 分钟把超过 1 小时的旧数据批量写入 `metrics_min` 表后从内存移除（重启不丢历史，写入量 ≈ 60 行/机/小时，配额友好）。
 - **已知限制**：

@@ -22,6 +22,19 @@ cf-panle/
 
 ## 一、部署面板（Cloudflare）
 
+### 方式一：网页端部署（推荐，无需本地 CLI）
+
+利用 Cloudflare **Workers Builds**（Git 集成）在 Dashboard 直连 GitHub 仓库，push 即自动部署；`wrangler.toml` 中的 D1 / Durable Objects / assets 绑定由仓库配置驱动，构建时自动生效。
+
+1. **创建 D1 数据库（网页端）**：Dashboard → Workers & Pages → **D1** → Create database，名称 `cf-panle`；把 Overview 页的 **database_id** 填入 `wrangler.toml` 的 `[[d1_databases]]`（当前为占位符 `REPLACE_WITH_D1_DATABASE_ID`），提交并推送。
+2. **建表（网页端）**：在该 D1 数据库页 → **Console** 粘贴执行 `schema.sql` 全部内容（或 **Import** 上传该文件）。
+3. **连接 GitHub 自动部署**：Workers & Pages → Create application → **Import a repository** → Get started → 授权 GitHub 并选择仓库。项目名须与 `wrangler.toml` 的 `name = "cf-panle"` **完全一致**，根目录 `/`，Save and Deploy。之后每次 `git push` 自动重新部署，可在 Worker 的 **Deployments** 页查看构建历史。
+4. **配置密钥（网页端）**：该 Worker → Settings → Variables and Secrets → 添加 `JWT_SECRET`（必）、`PANEL_USERS` 或 `PANEL_PASSWORD`（必）、`ALERT_WEBHOOK_URL` 等（可选，见下方告警配置）。
+   > ⚠️ Cloudflare 规则：Worker 配置过 dashboard secret 后，`wrangler deploy` 会被拒绝，只能走 Builds/CI 部署——因此本方式同时是配密钥后的**唯一部署路径**。
+5. 部署完成后访问 `https://cf-panle.<你的子域>.workers.dev`，输入配置的密码即可登录。
+
+### 方式二：CLI 部署（wrangler，备选）
+
 前置：已安装 [wrangler](https://developers.cloudflare.com/workers/wrangler/) 并登录（`wrangler login`）。
 
 ```bash

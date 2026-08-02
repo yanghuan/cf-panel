@@ -16,7 +16,7 @@ cf-panle/
 ├── schema.sql           # D1 数据库表（含 kv_json 键值表）
 ├── src/index.js         # Worker：REST API + 鉴权 + TerminalDO 双端对拷 + PanelDO 实时推送
 ├── public/              # 前端（index.html / app.js / style.css）
-├── agent/               # 被控机 agent（agent.sh / report.sh / systemd 模板）
+├── agent/               # 被控机 agent（agent.sh 含监控上报 / systemd 模板）
 └── docs/architecture.md # 架构设计文档
 ```
 
@@ -45,7 +45,7 @@ wrangler deploy
 > wrangler d1 execute cf-panle --remote --command 'CREATE TABLE IF NOT EXISTS kv_json (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL DEFAULT (datetime("now")));'
 > ```
 >
-> 已按旧版（带 `uuid` 列）添加过服务器？`agent_key_id`（key 指纹）无法从旧数据回填，需要重建 `servers` 表或在面板删除旧服务器后重新添加，agent 端改用新版 `agent.sh`/`report.sh`（只配 `AGENT_KEY`）：
+> 已按旧版（带 `uuid` 列）添加过服务器？`agent_key_id`（key 指纹）无法从旧数据回填，需要重建 `servers` 表或在面板删除旧服务器后重新添加，agent 端改用新版 `agent.sh`（只配 `AGENT_KEY`，监控上报已内置）：
 > ```
 > wrangler d1 execute cf-panle --remote --command 'DROP TABLE servers;'
 > # 再执行 wrangler d1 execute cf-panle --remote --file=schema.sql 重建
@@ -67,8 +67,8 @@ wrangler deploy
 3. 放置脚本并配置环境：
    ```bash
    mkdir -p /opt/cf-panle-agent
-   cp agent/agent.sh agent/report.sh /opt/cf-panle-agent/
-   chmod +x /opt/cf-panle-agent/*.sh
+   cp agent/agent.sh /opt/cf-panle-agent/
+   chmod +x /opt/cf-panle-agent/agent.sh
   cat > /etc/cf-panle-agent.env <<EOF
   AGENT_WSS_URL=wss://<面板域名>/ws/agent
   AGENT_KEY=<你的 key>
@@ -81,10 +81,7 @@ wrangler deploy
    systemctl daemon-reload && systemctl enable --now cf-panle-agent
    journalctl -u cf-panle-agent -f   # 看日志
    ```
-5. 可选：监控上报 crontab（每分钟）：
-   ```bash
-   echo '* * * * * REPORT_URL=https://<面板域名>/api/report AGENT_KEY=<key> /opt/cf-panle-agent/report.sh' | crontab -
-   ```
+5. 监控上报已内置：agent.sh 每 60 秒经控制通道 WS 上报 CPU/内存/网络（无需 crontab），间隔可用 `REPORT_INTERVAL` 调整。
 
 ## 三、使用
 
@@ -109,9 +106,9 @@ wrangler deploy
 | POST | `/api/terminal` | 创建终端会话（exec 权限 + 归属校验），返回 session_id |
 | GET | `/ws/terminal/{id}` | 浏览器终端 WebSocket（校验创建者/admin） |
 | GET | `/ws/push` | 面板实时刷新：客户端每 3 秒发 sync，服务端按权限返回服务器列表 |
-| GET | `/ws/agent/control` | agent 控制通道（key 指纹定位 + 校验，按分片路由） |
+| GET | `/ws/agent/control` | agent 控制通道（key 指纹定位 + 校验，按分片路由；监控上报也走这里） |
 | GET | `/ws/agent/terminal` | agent 终端数据流（key 校验 + stream 归属校验） |
-| POST | `/api/report` | agent 监控上报（key 指纹定位 + 校验） |
+| POST | `/api/report` | agent 监控上报 HTTP 备用入口（key 指纹定位 + 校验） |
 | GET | `/api/monitor?server_id=` | 监控历史 |
 | GET | `/api/tokens` | PAT 列表（仅管理员） |
 | POST | `/api/tokens` | 创建 PAT（scopes + server_ids 白名单，明文只返回一次） |

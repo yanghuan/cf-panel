@@ -120,12 +120,16 @@ DO 是整个设计的心脏，对应哪吒 Dashboard 里那两个 `io.Copy` 的�
 **进程拓扑**
 
 ```
-控制循环:  websocat -b $WSS/control ──> bash + jq 循环
+后台上报:  collect_report() ──FIFO──> websocat(上行) ──> 面板 {type:"report",cpu,mem,...} 每 60s
+                                      ▲
+控制循环:  websocat -b $WSS/control   │ bash + jq 循环
              │  open_terminal {sid} → 拉起终端会话
              │  resize {sid,rows,cols} → stty -F /tmp/cfpanle-$sid
              ▼
 终端会话:  websocat -b $WSS/terminal?sid=<id> ⇄ socat ⇄ /tmp/cfpanle-<sid> ⇄ bash (PTY)
 ```
+
+> 监控上报复用控制通道 WS：websocat 的 stdin→WS 转发天然是"上行"，后台采集循环把 JSON 写入 FIFO 即完成上报，**无需 crontab / 独立脚本**；服务端在 TerminalDO 中识别 `{type:"report"}` 并写入监控热区。
 
 **控制循环骨架（`agent.sh`）**
 
@@ -133,24 +137,32 @@ DO 是整个设计的心脏，对应哪吒 Dashboard 里那两个 `io.Copy` 的�
 #!/usr/bin/env bash
 set -euo pipefail
 WSS=${AGENT_WSS_URL:?}; KEY=${AGENT_KEY:?}   # KEY 即唯一身份 + 凭证（uuid 已废弃）
+TMP_DIR=/tmp/cfpanle; REPORT_INTERVAL=${REPORT_INTERVAL:-60}
+mkdir -p "$TMP_DIR"; CTL_IN="$TMP_DIR/control-in"; rm -f "$CTL_IN"; mkfifo "$CTL_IN"
+
+collect_report() {   # CPU/内存/网络采集 → JSON {type:"report",...}
+  # ...（CPU 两次采样、/proc/meminfo、/proc/net/dev 累加）
+  jq -nc '{type:"report", cpu:$cpu, mem_used:$mem, net_in:$rx, net_out:$tx}'
+}
+( exec 3<>"$CTL_IN"; while true; do sleep "$REPORT_INTERVAL"; collect_report >&3; done ) &
 
 spawn_terminal() {
   local sid=$1
   ( websocat -b "$WSS/terminal?sid=$sid" -H "X-Agent-Key: $KEY" \
-      --exec "socat - /tmp/cfpanle-$sid" ) &
+      --exec "socat - $TMP_DIR/$sid" ) &
 }
 
 while true; do
-  websocat -b "$WSS/control" 2>/dev/null | while read -r line; do
+  websocat -b "$WSS/control" -H "X-Agent-Key: $KEY" < "$CTL_IN" 2>/dev/null | while read -r line; do
     case "$(jq -r .type <<<"$line")" in
       open_terminal)
         sid=$(jq -r .stream_id <<<"$line")
-        socat -d pty,link=/tmp/cfpanle-$sid,raw,echo=0 \
+        socat -d pty,link=$TMP_DIR/$sid,raw,echo=0 \
               EXEC:'bash -i',pty,stderr,setsid,sigint,sighup &
         spawn_terminal "$sid" ;;
       resize)
         sid=$(jq -r .stream_id <<<"$line")
-        stty -F "/tmp/cfpanle-$sid" \
+        stty -F "$TMP_DIR/$sid" \
              rows "$(jq -r .rows <<<"$line")" cols "$(jq -r .cols <<<"$line")" ;;
     esac
   done
@@ -162,6 +174,7 @@ done
 
 - 开终端：`socat` 创建 pty slave（`link=/tmp/cfpanle-<sid>` 暴露路径）并挂 `bash -i`；`websocat -b --exec socat` 把 WS 字节流与 slave 对接，全双工。
 - resize：控制 WS 收到 `{type:resize,...}` → `stty -F <slave路径>` 改 winsize → 内核发 `SIGWINCH`，`vim`/`top` 跟着变尺寸。
+- 监控上报：后台循环每 `REPORT_INTERVAL`（默认 60s）采集一次，JSON 写入 FIFO；控制通道 websocat 以 FIFO 为 stdin，数据自动经 WS 上行，服务端识别 `{type:"report"}` 落监控热区——**免 crontab、免独立脚本**。
 - 权衡：零解释器依赖、部署极简；并发能力弱于编译型 agent，适合个人/小规模；协议不变，后续可无缝迁移 Go/Rust agent。
 
 ### 3.6 PTY（伪终端）

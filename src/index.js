@@ -128,6 +128,26 @@ function doPanel(env) {
   return env.PANEL.get(env.PANEL.idFromName('main')); // 单实例：服务器列表实时推送
 }
 
+// agent 监控上报落库：更新 last_seen/online，写入 MetricsDO 热区（供 /api/report 与控制通道复用）
+async function handleReport(env, payload) {
+  const ts = Math.floor(Date.now() / 1000);
+  const minTs = Math.floor(ts / 60);
+  await env.DB.prepare('UPDATE servers SET last_seen = ?, online = 1 WHERE id = ?').bind(ts, payload.serverId).run();
+  const mdo = doMetrics(env);
+  await mdo.fetch('https://do.internal/report', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      serverId: payload.serverId,
+      minTs,
+      cpu: payload.cpu ?? null,
+      mem_used: payload.mem_used ?? null,
+      net_in: payload.net_in ?? null,
+      net_out: payload.net_out ?? null,
+    }),
+  });
+}
+
 // ---------------- 鉴权（JWT 或 PAT） ----------------
 
 async function authUserByToken(token, env) {
@@ -295,22 +315,7 @@ async function handleApi(request, env) {
     if (!server) return err('unknown agent', 401);
     const hash = await hashSecret(String(body.key || ''), env);
     if (hash !== server.agent_key_hash) return err('bad key', 401);
-    const ts = Math.floor(Date.now() / 1000);
-    const minTs = Math.floor(ts / 60);
-    await env.DB.prepare('UPDATE servers SET last_seen = ?, online = 1 WHERE id = ?').bind(ts, server.id).run();
-    const mdo = doMetrics(env);
-    await mdo.fetch('https://do.internal/report', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        serverId: server.id,
-        minTs,
-        cpu: body.cpu ?? null,
-        mem_used: body.mem_used ?? null,
-        net_in: body.net_in ?? null,
-        net_out: body.net_out ?? null,
-      }),
-    });
+    await handleReport(env, { serverId: server.id, cpu: body.cpu, mem_used: body.mem_used, net_in: body.net_in, net_out: body.net_out });
     return json({ ok: true });
   }
 
@@ -472,6 +477,7 @@ export class TerminalDO {
       const pair = new WebSocketPair();
       this.state.acceptWebSocket(pair[1]);
       this.agents.set(server.id, pair[1]);
+      pair[1].serializeAttachment(String(server.id)); // 休眠唤醒后靠附件识别 serverId（上报用）
       return new Response(null, { status: 101, webSocket: pair[0] });
     }
 
@@ -508,8 +514,22 @@ export class TerminalDO {
 
   // Hibernation：消息转发（§3.3 双向对拷 + resize 走控制通道）
   async webSocketMessage(ws, message) {
+    // agent 控制通道（不在任何 session）：仅处理监控上报 {type:"report"}
     const sess = [...this.sessions.values()].find((s) => s.userWs === ws || s.agentWs === ws);
-    if (!sess) return;
+    if (!sess) {
+      if (typeof message === 'string') {
+        try {
+          const j = JSON.parse(message);
+          if (j && j.type === 'report') {
+            const serverId = Number(ws.deserializeAttachment());
+            if (serverId) {
+              await handleReport(this.env, { serverId, cpu: j.cpu, mem_used: j.mem_used, net_in: j.net_in, net_out: j.net_out });
+            }
+          }
+        } catch { /* 忽略非 JSON 的控制消息 */ }
+      }
+      return;
+    }
 
     if (ws === sess.userWs) {
       // 浏览器 → DO

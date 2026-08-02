@@ -24,6 +24,7 @@ CREATE TABLE IF NOT EXISTS servers (
   last_seen      INTEGER,                   -- unix 秒，最近上报时间
   online         INTEGER NOT NULL DEFAULT 0,
   info_json      TEXT,                      -- 系统信息 JSON（OS/内核/IP，变更时更新）
+  probe_json     TEXT,                      -- 服务探活结果 JSON（[{name,ok,code,ms}]，变更时更新）
   created_at     TEXT    NOT NULL DEFAULT (datetime('now'))
 );
 

@@ -33,7 +33,12 @@ wrangler d1 execute cf-panle --remote --file=schema.sql
 
 # 3. 设置密钥（必做，生产安全）
 wrangler secret put JWT_SECRET        # JWT 签名密钥
-wrangler secret put PANEL_PASSWORD    # 面板登录密码（登录只填这个）
+wrangler secret put PANEL_USERS       # 多用户（与 PANEL_PASSWORD 二选一，优先级更高）："alice:pass1,bob:pass2"
+wrangler secret put PANEL_PASSWORD    # 单管理员密码（未配置 PANEL_USERS 时使用）
+
+# 可选：Webhook 告警（阈值/离线，见下方告警配置）
+wrangler secret put ALERT_WEBHOOK_URL    # 告警回调 HTTP 地址（企业微信/钉钉/Server酱/Telegram/邮件网关等任意渠道）
+wrangler secret put ALERT_WEBHOOK_TOKEN  # 可选：回调鉴权 token（作为 Bearer 发送）
 
 # 4. 部署
 wrangler deploy
@@ -54,10 +59,37 @@ wrangler deploy
 > 已有旧表缺新列？执行增量迁移（可空列，无需回填）：
 > ```
 > wrangler d1 execute cf-panle --remote --command 'ALTER TABLE servers ADD COLUMN info_json TEXT;'
+> wrangler d1 execute cf-panle --remote --command 'ALTER TABLE servers ADD COLUMN probe_json TEXT;'
 > wrangler d1 execute cf-panle --remote --command 'ALTER TABLE metrics_min ADD COLUMN extra TEXT;'
 > ```
 
-部署完成后访问 `https://cf-panle.<你的子域>.workers.dev`，输入 `PANEL_PASSWORD` 密码即可登录（登录即管理员）。
+部署完成后访问 `https://cf-panle.<你的子域>.workers.dev`，输入配置的密码即可登录（登录即管理员）。
+
+**Webhook 告警配置**（可选）：配置 `ALERT_WEBHOOK_URL` 即启用——触发时面板会 **POST JSON** 到该地址，**任意渠道由用户侧对接**（企业微信/钉钉/Server酱/Telegram Bot/Slack/邮件网关/自建服务等）。可用环境变量覆盖阈值：
+
+| 变量 | 默认 | 说明 |
+| --- | --- | --- |
+| `ALERT_WEBHOOK_URL` | 无 | 告警回调地址（必配才启用告警） |
+| `ALERT_WEBHOOK_TOKEN` | 无 | 可选，作为 `Authorization: Bearer` 发送 |
+| `ALERT_CPU_PCT` / `ALERT_MEM_PCT` / `ALERT_DISK_PCT` | `90` | 指标告警阈值（%） |
+| `ALERT_LOAD` | 不启用 | 负载告警阈值（load1） |
+| `ALERT_COOLDOWN_MIN` | `30` | 同类告警冷却间隔（分钟） |
+| `ALERT_OFFLINE_AFTER_S` | `180` | 离线判定秒数（超过未上报） |
+
+**Webhook payload 结构**（`event` 区分 `alert` / `offline` / `recovered`）：
+
+```json
+{
+  "event": "alert",
+  "title": "[cf-panle] my-server 指标告警",
+  "server": { "id": 1, "name": "my-server" },
+  "message": "服务器 my-server 指标超阈值：\nCPU 92.3% >= 90%",
+  "details": ["CPU 92.3% >= 90%"],
+  "time": "2026-08-02T08:00:00.000Z"
+}
+```
+
+> 告警支持：CPU/内存/磁盘（根分区）/负载超阈值 + 机器离线/恢复通知。内存告警依赖 agent `mem_total` 上报（新版 agent.sh）。
 
 本地调试：`wrangler dev --local`（本地 SQLite 建表：`wrangler d1 execute cf-panle --local --file=schema.sql`）。
 
@@ -88,16 +120,23 @@ wrangler deploy
    journalctl -u cf-panle-agent -f   # 看日志
    ```
 5. 监控上报已内置：agent.sh 经控制通道 WS 上报 CPU / 内存 / Swap / 磁盘 / 负载 / 温度 / 进程数 / TCP-UDP 连接数 / 网络速率 / 系统信息（无需 crontab）。**省配额策略**：有面板观看者时约 3 秒上报（服务端动态下发），无人查看时 120 秒低频采样；`REPORT_INTERVAL` 可设默认值。
+6. 可选：服务探活（agent 上配置 `PROBES` 探测本机 HTTP/TCP 服务，结果随上报展示在卡片 + 失败告警）：
+   ```bash
+   # 追加到 /etc/cf-panle-agent.env
+   PROBES="web:http:http://127.0.0.1/,mysql:tcp:127.0.0.1:3306"
+   ```
+   `PROBES` 格式：`名称:类型:目标,...`；类型 `http`（目标为 URL，检查 2xx/3xx）或 `tcp`（目标为 `host:port`，测连通）。
 
 ## 三、使用
 
 - **概览与实时指标**：顶部概览条显示服务器总数/在线数/平均 CPU/负载/总内存；每张服务器卡片实时显示 CPU / 内存 / 负载（经 `/ws/push` 每 3 秒随列表推送，PanelDO 从 MetricsDO 取最新值）。
+- **服务探活**：agent 配置 `PROBES` 后，卡片显示每个服务的状态徽章（绿=正常/红=异常，悬停显示 HTTP 码）；探测失败持续超冷却会触发 Webhook（`event: probe_down`，恢复发 `probe_recovered`）。
 - **实时列表**：登录后前端与 `/ws/push` 保持 WebSocket，客户端每 3 秒发一次 sync 请求，服务端（PanelDO，Hibernation 休眠态，费用趋近普通 Worker）按权限返回服务器列表（在线状态自动更新），无需手动刷新。
 - **终端**：面板服务器卡片点「终端」→ xterm.js 弹出 → 按键实时到达被控机 shell；窗口拉伸自动 resize（经控制通道 `stty` 下发）；断线自动重连（最多 3 次）。
 - **文件管理**：面板服务器卡片点「文件」→ 弹出文件管理器，可浏览目录（点击进入/上级/路径跳转）、**上传**（本地文件写入 agent）、**下载**（agent 文件回传浏览器）；文件经独立 WS 会话**分段传输**（1MB/段，base64），**单文件上限 500MB**（需 GNU coreutils 的 `find -printf`/`tail -c`/`base64 -w0`）。
 - **监控**：点「监控」默认看近 12 小时分钟数据（内存 DO 热区，秒回）；可切 1小时/3天/7天/30天查看 D1 归档历史（分钟粒度，超长区间自动降采样）。指标：CPU / 内存 / Swap / 磁盘（根分区）/ 负载 / 温度 / 进程数；服务器卡片显示 OS / 内核 / IP 系统信息。
 - **分组与排序**：添加服务器可填「分组」和「序号」，列表按分组展示、组内按序号排序（未填归入「未分组」）。
-- **登录**：单面板密码（`PANEL_PASSWORD`，存 CF secret），登录即管理员；同 IP 60 秒内失败 5 次后限流（429）。
+- **登录**：`PANEL_USERS` 多用户（`user:pass,user:pass`）或单管理员（`PANEL_PASSWORD`），登录即管理员；同 IP 60 秒内失败 5 次后限流（429）。
 - **公告**：设置里可改站点名/公告（存 D1 `kv_json` 表），公告对所有访客可见。
 - **PAT**：设置里可创建访问令牌（scopes + server_ids 白名单），供 API 调用（`Authorization: Bearer cfp_xxx`）。
 
@@ -105,7 +144,7 @@ wrangler deploy
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| POST | `/api/login` | 用面板密码（PANEL_PASSWORD）登录，返回 JWT |
+| POST | `/api/login` | 用面板密码（PANEL_USERS/PANEL_PASSWORD）登录，返回 JWT |
 | GET | `/api/me` | 当前用户（JWT 或 PAT） |
 | GET | `/api/public/settings` | 公开配置（站点名/公告，D1 kv_json，无需登录） |
 | GET | `/api/servers` | 服务器列表（含分组、序号；按权限过滤） |
@@ -170,7 +209,7 @@ curl -X POST https://<面板域名>/mcp -H "Authorization: Bearer <token>" \
 
 - `/ws/terminal/{id}` 仅允许会话创建者或管理员连接（防 stream UUID 劫持，GHSA 教训）。
 - agent 建连必须提供 `X-Agent-Key`（或 query key）；服务端先用 key 的 SHA-256 指纹（`servers.agent_key_id`）反查服务器，再与 `servers.agent_key_hash` 比对；`/ws/agent/terminal` 额外校验 stream 归属。
-- 面板登录密码存 CF secret（`PANEL_PASSWORD`），不进代码库；agent key 与 PAT 只存哈希（key 指纹用于检索，HMAC 哈希用于校验）。
+- 面板登录密码存 CF secret（`PANEL_USERS`/`PANEL_PASSWORD`），不进代码库；agent key 与 PAT 只存哈希（key 指纹用于检索，HMAC 哈希用于校验）。
 - 审计日志：`terminal.open` / `server.create` 写 `audit_logs`。
 - agent 侧 `DISABLE_EXEC=1` 可全局禁止命令执行（终端任务直接忽略）。
 - 终端/监控接口按权限收敛：JWT 管理员全量；PAT 按 scopes + server_ids 白名单收窄。
@@ -186,4 +225,4 @@ curl -X POST https://<面板域名>/mcp -H "Authorization: Bearer <token>" \
   - D1 归档默认开启（保留 30 天）；若关闭（`ARCHIVE_TO_D1=0`），DO 重启会丢失 12 小时外的历史。
   - 监控图表为 CPU/内存双折线（Chart.js）；磁盘/温度/连接数等扩展项仅在数据层，图表展示可后续迭代。
   - 纯 Shell agent 适合个人/小规模；并发大了可无缝换 Go/Rust agent（协议不变）。
-  - 登录为单密码（环境变量）；如需要多用户/用户名登录，可恢复 `users` 表逻辑。
+  - 多用户通过 `PANEL_USERS` 环境变量配置（`user:pass,user:pass`），所有用户同权限（管理员）；如需按用户分配服务器归属，可恢复 `users` 表逻辑。

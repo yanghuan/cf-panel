@@ -30,6 +30,18 @@ const MCP_VERSION = '2025-11-25'; // 服务器声明支持的协议版本（缺�
 
 // 简单登录限流：同一 IP 60 秒内最多 5 次失败（Worker 实例内存，重启清零）
 const LOGIN_FAILS = new Map();
+
+// 解析面板用户：PANEL_USERS="alice:pass1,bob:pass2"；未设置时回退 PANEL_PASSWORD 单管理员
+function parsePanelUsers(env) {
+  const raw = String(env.PANEL_USERS || '').trim();
+  if (!raw) {
+    return env.PANEL_PASSWORD ? [{ username: 'admin', password: String(env.PANEL_PASSWORD) }] : [];
+  }
+  return raw.split(',').map((pair) => {
+    const idx = pair.indexOf(':');
+    return { username: pair.slice(0, idx).trim(), password: pair.slice(idx + 1).trim() };
+  }).filter((u) => u.username && u.password);
+}
 const MCP_TOOLS = [
   {
     name: 'list_servers',
@@ -188,13 +200,124 @@ async function queryMonitorRows(env, serverId, hours) {
   return r.results.map((x) => ({ ...x, extra: safeJson(x.extra) }));
 }
 
-// agent 监控上报落库：更新 last_seen/online（系统信息变更才写 info_json），
+// 指标告警冷却状态（serverId:kind -> 上次触发时间，Worker 实例内存，重启清零）
+const ALERT_LAST = new Map();
+// 服务探活状态（serverId:probeName -> {ok, lastFail}，Worker 实例内存，重启清零）
+const PROBE_STATE = new Map();
+
+// 发送告警 Webhook：POST JSON 到 ALERT_WEBHOOK_URL（可选 ALERT_WEBHOOK_TOKEN 作为 Bearer 鉴权）。
+// 任意渠道（企业微信/钉钉/Server酱/Telegram/Slack/邮件网关/自建）由用户侧对接该地址。
+async function sendWebhook(env, payload) {
+  if (!env.ALERT_WEBHOOK_URL) return;
+  const headers = { 'content-type': 'application/json' };
+  if (env.ALERT_WEBHOOK_TOKEN) headers.authorization = `Bearer ${env.ALERT_WEBHOOK_TOKEN}`;
+  try {
+    await fetch(String(env.ALERT_WEBHOOK_URL), {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(payload),
+    });
+  } catch { /* 发送失败不影响主流程 */ }
+}
+
+// 指标阈值告警（CPU/内存/磁盘/负载），带冷却去抖；在 handleReport 中调用
+async function checkAlerts(env, payload, serverName) {
+  if (!env.ALERT_WEBHOOK_URL) return;
+  const now = Date.now();
+  const cooldown = (Number(env.ALERT_COOLDOWN_MIN) || 30) * 60 * 1000;
+  const cooled = (key) => {
+    const last = ALERT_LAST.get(key);
+    if (last && now - last < cooldown) return false;
+    ALERT_LAST.set(key, now);
+    return true;
+  };
+  const alerts = [];
+  // CPU
+  const cpuTh = Number(env.ALERT_CPU_PCT) || 90;
+  if (payload.cpu != null && payload.cpu >= cpuTh && cooled(`${payload.serverId}:cpu`)) {
+    alerts.push(`CPU ${payload.cpu.toFixed(1)}% >= ${cpuTh}%`);
+  }
+  // 内存（需要 agent 上报 mem_total）
+  const memTh = Number(env.ALERT_MEM_PCT) || 90;
+  if (payload.mem_used != null && payload.mem_total != null && payload.mem_total > 0) {
+    const memPct = (payload.mem_used / payload.mem_total) * 100;
+    if (memPct >= memTh && cooled(`${payload.serverId}:mem`)) {
+      alerts.push(`内存 ${memPct.toFixed(1)}% >= ${memTh}%`);
+    }
+  }
+  // 磁盘（根分区）
+  const diskTh = Number(env.ALERT_DISK_PCT) || 90;
+  const rootDisk = payload.extra && payload.extra.disk && payload.extra.disk.find((d) => d.m === '/');
+  if (rootDisk && rootDisk.u != null && rootDisk.u >= diskTh && cooled(`${payload.serverId}:disk`)) {
+    alerts.push(`磁盘 / ${rootDisk.u}% >= ${diskTh}%`);
+  }
+  // 负载（可选，ALERT_LOAD 未设置则不启用）
+  const loadTh = Number(env.ALERT_LOAD);
+  if (loadTh > 0 && payload.extra && payload.extra.load1 != null && payload.extra.load1 >= loadTh && cooled(`${payload.serverId}:load`)) {
+    alerts.push(`负载 ${payload.extra.load1} >= ${loadTh}`);
+  }
+  if (alerts.length) {
+    await sendWebhook(env, {
+      event: 'alert',
+      title: `[cf-panle] ${serverName} 指标告警`,
+      server: { id: payload.serverId, name: serverName },
+      message: `服务器 ${serverName}（id=${payload.serverId}）指标超阈值：\n` + alerts.join('\n'),
+      details: alerts,
+      time: new Date().toISOString(),
+    });
+  }
+}
+
+// 服务探活告警：失败持续超冷却 → probe_down；恢复 → probe_recovered
+async function checkProbeAlerts(env, serverId, serverName, probes) {
+  if (!env.ALERT_WEBHOOK_URL || !Array.isArray(probes)) return;
+  const now = Date.now();
+  const cooldown = (Number(env.ALERT_COOLDOWN_MIN) || 30) * 60 * 1000;
+  for (const p of probes) {
+    if (!p || !p.name) continue;
+    const key = `${serverId}:${p.name}`;
+    const st = PROBE_STATE.get(key) || { ok: true, lastFail: 0 };
+    if (p.ok) {
+      if (!st.ok) {
+        PROBE_STATE.set(key, { ok: true, lastFail: 0 });
+        await sendWebhook(env, {
+          event: 'probe_recovered',
+          title: `[cf-panle] ${serverName} 服务恢复：${p.name}`,
+          server: { id: serverId, name: serverName },
+          message: `服务器 ${serverName} 的服务「${p.name}」已恢复正常。`,
+          time: new Date().toISOString(),
+        });
+      }
+    } else if (st.ok || now - st.lastFail >= cooldown) {
+      PROBE_STATE.set(key, { ok: false, lastFail: now });
+      await sendWebhook(env, {
+        event: 'probe_down',
+        title: `[cf-panle] ${serverName} 服务异常：${p.name}`,
+        server: { id: serverId, name: serverName },
+        message: `服务器 ${serverName} 的服务「${p.name}」探测失败${p.code ? `（HTTP ${p.code}）` : ''}。`,
+        details: p,
+        time: new Date().toISOString(),
+      });
+    }
+  }
+}
+
+// agent 监控上报落库：更新 last_seen/online（系统信息变更才写 info_json，探活变更才写 probe_json），
 // 时序写入 MetricsDO 热区（供 /api/report 与控制通道复用）
 async function handleReport(env, payload) {
   const ts = Math.floor(Date.now() / 1000);
   const minTs = Math.floor(ts / 60);
-  const server = await env.DB.prepare('SELECT info_json FROM servers WHERE id = ?').bind(payload.serverId).first();
+  const server = await env.DB.prepare('SELECT info_json, probe_json, name FROM servers WHERE id = ?').bind(payload.serverId).first();
   if (!server) return;
+  await checkAlerts(env, payload, server.name);
+  // 探活状态：变更才写 probe_json，并做探活告警
+  if (Array.isArray(payload.probes)) {
+    const probeJson = JSON.stringify(payload.probes);
+    if (server.probe_json !== probeJson) {
+      await env.DB.prepare('UPDATE servers SET probe_json = ? WHERE id = ?').bind(probeJson, payload.serverId).run();
+    }
+    await checkProbeAlerts(env, payload.serverId, server.name, payload.probes);
+  }
   if (payload.info) {
     const infoJson = JSON.stringify(payload.info);
     if (server.info_json !== infoJson) {
@@ -244,7 +367,7 @@ async function authUserByToken(token, env) {
   // 2) JWT（面板登录）
   const payload = await verifyJwt(token, env);
   if (!payload || !payload.uid) return null;
-  return { id: payload.uid, username: 'admin', role: 1, pat: null };
+  return { id: payload.uid, username: payload.username || 'admin', role: 1, pat: null };
 }
 
 async function authUser(request, env) {
@@ -283,18 +406,20 @@ async function handleApi(request, env) {
   const path = url.pathname;
   const method = request.method;
 
-  // POST /api/login —— 面板单密码（CF secret: PANEL_PASSWORD，同 IP 60s 内 5 次失败限流）
+  // POST /api/login —— 面板登录（PANEL_USERS 多用户 或 PANEL_PASSWORD 单管理员；同 IP 60s 内 5 次失败限流）
   if (method === 'POST' && path === '/api/login') {
     const body = await request.json().catch(() => ({}));
     const password = String(body.password || '');
-    if (!env.PANEL_PASSWORD) return err('server misconfigured: PANEL_PASSWORD not set', 500);
+    const users = parsePanelUsers(env);
+    if (!users.length) return err('server misconfigured: PANEL_USERS/PANEL_PASSWORD not set', 500);
     const ip = request.headers.get('cf-connecting-ip') || 'unknown';
     const nowMs = Date.now();
     const rec = LOGIN_FAILS.get(ip);
     if (rec && nowMs - rec.ts < 60000 && rec.count >= 5) {
       return err('too many attempts, try again later', 429);
     }
-    if (password !== env.PANEL_PASSWORD) {
+    const userIdx = users.findIndex((u) => u.password === password);
+    if (userIdx < 0) {
       const cur = rec && nowMs - rec.ts < 60000 ? rec : { count: 0, ts: nowMs };
       cur.count += 1;
       cur.ts = nowMs;
@@ -302,8 +427,10 @@ async function handleApi(request, env) {
       return err('bad password', 401);
     }
     LOGIN_FAILS.delete(ip);
-    const token = await signJwt({ uid: 1, role: 1, exp: Math.floor(Date.now() / 1000) + 86400 }, env);
-    return json({ token, user: { id: 1, username: 'admin', role: 1 } });
+    const uid = userIdx + 1;
+    const username = users[userIdx].username;
+    const token = await signJwt({ uid, username, role: 1, exp: Math.floor(Date.now() / 1000) + 86400 }, env);
+    return json({ token, user: { id: uid, username, role: 1 } });
   }
 
   // GET /api/public/settings —— 公开配置（D1 kv_json，无需登录）
@@ -345,6 +472,7 @@ async function handleApi(request, env) {
       display_index: s.display_index || 0,
       online: s.online === 1 && now - (s.last_seen || 0) < 60000,
       info: safeJson(s.info_json),
+      probes: safeJson(s.probe_json),
       metric: latest[s.id] || null,
     }));
     return json(list);
@@ -433,10 +561,12 @@ async function handleApi(request, env) {
       serverId: server.id,
       cpu: body.cpu,
       mem_used: body.mem_used,
+      mem_total: body.mem_total,
       net_in: body.net_in,
       net_out: body.net_out,
       extra: body.extra,
       info: body.info,
+      probes: body.probes,
     });
     return json({ ok: true });
   }
@@ -804,10 +934,12 @@ export class TerminalDO {
                 serverId,
                 cpu: j.cpu,
                 mem_used: j.mem_used,
+                mem_total: j.mem_total,
                 net_in: j.net_in,
                 net_out: j.net_out,
                 extra: j.extra,
                 info: j.info,
+                probes: j.probes,
               });
               await this.syncAgentInterval(ws, serverId);
             }
@@ -951,17 +1083,56 @@ export class MetricsDO {
     }
   }
 
-  // 归档默认开启（ARCHIVE_TO_D1=0 关闭），每次上报后注册 alarm
+  // 归档默认开启（ARCHIVE_TO_D1=0 关闭）或告警启用时，注册 alarm
   scheduleArchive() {
-    if (this.env.ARCHIVE_TO_D1 !== '0') {
+    const archiveOn = this.env.ARCHIVE_TO_D1 !== '0';
+    const alertOn = !!this.env.ALERT_WEBHOOK_URL;
+    if (archiveOn || alertOn) {
       this.state.storage.setAlarm(Date.now() + ARCHIVE_INTERVAL_MS);
     }
   }
 
-  // alarm：把超过 1 小时的数据批量 INSERT 进 D1（INSERT OR IGNORE 幂等），再从内存移除；
-  // 每天顺带清理超过保留期的历史行
+  // 离线/恢复告警：状态存 DO Storage（重启不丢，避免重复告警）
+  async checkOfflineAlerts() {
+    if (!this.env.ALERT_WEBHOOK_URL) return;
+    const now = Math.floor(Date.now() / 1000);
+    const offlineAfter = Number(this.env.ALERT_OFFLINE_AFTER_S) || 180;
+    const rows = await this.env.DB.prepare('SELECT id, name, online, last_seen FROM servers').all();
+    for (const s of rows.results) {
+      const isOnline = s.online === 1 && (s.last_seen || 0) > now - offlineAfter;
+      const key = `alert:offline:${s.id}`;
+      const last = (await this.state.storage.get(key)) || 'on';
+      if (!isOnline && last !== 'off') {
+        await this.state.storage.put(key, 'off');
+        await sendWebhook(this.env, {
+          event: 'offline',
+          title: `[cf-panle] ${s.name} 离线`,
+          server: { id: s.id, name: s.name },
+          message: `服务器 ${s.name}（id=${s.id}）超过 ${offlineAfter}s 未上报，已判定离线。`,
+          time: new Date().toISOString(),
+        });
+      } else if (isOnline && last === 'off') {
+        await this.state.storage.put(key, 'on');
+        await sendWebhook(this.env, {
+          event: 'recovered',
+          title: `[cf-panle] ${s.name} 恢复在线`,
+          server: { id: s.id, name: s.name },
+          message: `服务器 ${s.name}（id=${s.id}）已恢复上报。`,
+          time: new Date().toISOString(),
+        });
+      }
+    }
+  }
+
+  // alarm：归档（超过 1 小时数据批量落 D1 + 每天清理保留期）+ 离线/恢复告警
   async alarm() {
-    if (this.env.ARCHIVE_TO_D1 === '0') return;
+    const archiveOn = this.env.ARCHIVE_TO_D1 !== '0';
+    const alertOn = !!this.env.ALERT_WEBHOOK_URL;
+    if (alertOn) await this.checkOfflineAlerts();
+    if (!archiveOn) {
+      if (alertOn) this.state.storage.setAlarm(Date.now() + ARCHIVE_INTERVAL_MS);
+      return;
+    }
     const cutoff = Math.floor(Date.now() / 1000 / 60) - ARCHIVE_AFTER_MIN;
     const stmts = [];
     for (const [serverId, m] of this.data) {
@@ -1065,6 +1236,7 @@ export class PanelDO {
         display_index: s.display_index || 0,
         online: s.online === 1 && now - (s.last_seen || 0) < 60000,
         info: safeJson(s.info_json),
+        probes: safeJson(s.probe_json),
         metric: latest[s.id] || null,
       });
     }

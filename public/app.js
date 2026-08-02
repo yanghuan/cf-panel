@@ -66,7 +66,7 @@
   function showApp(user) {
     $('#auth').classList.add('hidden');
     $('#app').classList.remove('hidden');
-    $('#whoami').textContent = user.is_pat ? `令牌（${escapeHtml(user.username)}）` : '管理员';
+    $('#whoami').textContent = user.is_pat ? `令牌（${escapeHtml(user.username)}）` : escapeHtml(user.username || 'admin');
     loadServers(); // 先拉一次，WS 建立后每 3 秒由服务端推送覆盖
     startPush();
   }
@@ -107,6 +107,8 @@
           <span class="m-cell"><b>${fmtBytes(m.mem_used)}</b><i>内存</i></span>
           <span class="m-cell"><b>${m.extra && m.extra.load1 != null ? m.extra.load1 : '-'}</b><i>负载</i></span>
         </div>` : '';
+    const probes = Array.isArray(s.probes) && s.probes.length ? `
+        <div class="probes">${s.probes.map((p) => `<span class="probe ${p.ok ? 'ok' : 'down'}" title="${escapeHtml(p.name)}${p.code ? ` · HTTP ${p.code}` : ''}"><i class="dot"></i>${escapeHtml(p.name)}</span>`).join('')}</div>` : '';
     return `
       <div class="card">
         <div class="card-head">
@@ -114,6 +116,7 @@
           <span class="badge ${s.online ? 'on' : 'off'}"><i class="dot"></i>${s.online ? '在线' : '离线'}</span>
         </div>
         ${metricHtml}
+        ${probes}
         <div class="meta">${info ? escapeHtml(info) : `id: ${s.id}`}</div>
         <div class="actions">
           <button data-act="term" data-id="${s.id}" data-name="${escapeHtml(s.name)}">终端</button>

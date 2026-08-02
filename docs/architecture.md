@@ -75,6 +75,11 @@
 
 `/mcp` 实现标准 MCP **无状态 Streamable HTTP**（2026-07-28 修订版）：单一 POST 端点、无 `Mcp-Session-Id` 会话、每请求独立 `Authorization: Bearer` 鉴权（复用 JWT/PAT），服务端不返回 session-id 即天然无状态且兼容所有版本客户端。暴露只读工具 `list_servers`（服务器状态 + 系统信息）、`get_monitor`（监控历史，复用内存热区/D1 归档查询与权限过滤）。JSON-RPC 2.0：`initialize` / `tools/list` / `tools/call` / `ping`；通知返回 202；校验 `Origin` 防 DNS rebinding。
 
+#### 3.2.2 告警通知与多用户
+
+- **Webhook 告警**：`handleReport` 每次上报后做阈值检查（CPU/内存/磁盘根分区/负载），同类告警带冷却去抖（内存 Map）；**离线/恢复告警**在 MetricsDO 的 alarm 中扫描 `servers.last_seen`，状态存 DO Storage（重启不重复告警）。触发时 **POST JSON** 到 `ALERT_WEBHOOK_URL`（结构化 `event/title/server/message/details/time`），任意渠道（企业微信/钉钉/Telegram/邮件网关等）由用户侧对接；可选 `ALERT_WEBHOOK_TOKEN` 作 Bearer 鉴权。
+- **多用户**：`PANEL_USERS="user:pass,user:pass"` 环境变量，登录匹配签发 JWT（`uid`+`username`）；未配置时回退 `PANEL_PASSWORD` 单管理员。所有用户同权限（管理员），按用户分配服务器可后续恢复 `users` 表逻辑。
+
 ### 3.3 Durable Object — WebSocket 中转核心
 DO 是整个设计的心脏，对应哪吒 Dashboard 里那两个 `io.Copy` 的活儿：
 

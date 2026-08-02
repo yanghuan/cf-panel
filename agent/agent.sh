@@ -19,6 +19,7 @@ KEY=${AGENT_KEY:?}            # 唯一身份 + 凭证（uuid 已废弃，仅保�
 TMP_DIR=${AGENT_TMPDIR:-/tmp/cfpanle}
 DISABLE_EXEC=${DISABLE_EXEC:-0}         # =1 时全局禁止命令执行（终端/exec 全部忽略）
 REPORT_INTERVAL=${REPORT_INTERVAL:-120} # 默认上报间隔（秒）：省配额策略下无人查看用 120s，有观看者由服务端下发 3s
+PROBES=${PROBES:-}              # 服务探活配置："name:http:URL,name:tcp:host:port,..."（空则不启用）
 
 mkdir -p "$TMP_DIR"
 CTL_IN="$TMP_DIR/control-in"  # 控制通道上行 FIFO（上报 JSON → websocat → WS）
@@ -43,7 +44,53 @@ collect_info() {
     '{os:$os, kern:$kern, ip4:$ip4, ip6:$ip6}'
 }
 
-# ---- 监控采集：输出 JSON（固定列 + extra 扩展项 + 系统信息）----
+# ---- 服务探活：输出 JSON 数组 [{name, ok, code, ms}]（PROBES 配置的 HTTP/TCP 服务）----
+collect_probes() {
+  [ -z "${PROBES:-}" ] && { echo '[]'; return; }
+  local items p name type target rest code ms host port t0 t1 ok
+  IFS=',' read -ra items <<<"$PROBES"
+  local out=()
+  for p in "${items[@]}"; do
+    [ -z "$p" ] && continue
+    name=${p%%:*}
+    rest=${p#*:}
+    type=${rest%%:*}
+    target=${rest#*:}
+    [ -z "$name" ] || [ -z "$type" ] || [ -z "$target" ] && continue
+    ok=0; code=0; ms=0
+    case "$type" in
+      http)
+        # 一次 curl 同时拿 HTTP 状态码与耗时
+        resp=$(curl -s -o /dev/null -w '%{http_code} %{time_total}' -m 5 "$target" 2>/dev/null) || true
+        code=${resp%% *}
+        ms=${resp##* }
+        case "$code" in
+          2*|3*) ok=1 ;;
+          *) ok=0 ;;
+        esac
+        [ -n "$code" ] || code=0
+        ;;
+      tcp)
+        host=${target%:*}
+        port=${target##*:}
+        t0=$(date +%s)
+        if timeout 3 bash -c "exec 3<>/dev/tcp/$host/$port" 2>/dev/null; then
+          ok=1
+        else
+          ok=0
+        fi
+        t1=$(date +%s)
+        ms=$(( (t1 - t0) * 1000 ))
+        ;;
+    esac
+    out+=("{\"name\":\"$name\",\"ok\":$ok,\"code\":$code,\"ms\":$ms}")
+  done
+  local joined
+  joined=$(IFS=,; echo "${out[*]}")
+  echo "[$joined]"
+}
+
+# ---- 监控采集：输出 JSON（固定列 + extra 扩展项 + 系统信息 + 探活）----
 collect_report() {
   # CPU 使用率（两次采样求差值，抵消瞬时误差）
   read -r _ c0u c0n c0s c0i < <(awk '/^cpu /{print}' /proc/stat)
@@ -58,9 +105,10 @@ collect_report() {
       if (total <= 0) { print 0; exit }
       printf "%.2f", 100 * (1 - idle / total)
     }')
-  # 内存已用 / Swap 已用（字节）
-  local mem swap
+  # 内存已用 / 总内存 / Swap 已用（字节）
+  local mem mem_total swap
   mem=$(awk '/MemTotal/{t=$2} /MemAvailable/{a=$2} END {printf "%.0f", (t-a)*1024}' /proc/meminfo)
+  mem_total=$(awk '/MemTotal/{print $2*1024}' /proc/meminfo)
   swap=$(awk '/SwapTotal/{t=$2} /SwapFree/{f=$2} END {printf "%.0f", (t-f)*1024}' /proc/meminfo)
   # 负载 load1/5/15 + 进程数（/proc/loadavg 第4字段 running/total 的 total）
   local load1 load5 load15 proc_info procs
@@ -92,12 +140,15 @@ collect_report() {
   fi
   NET_PREV_RX=$rx; NET_PREV_TX=$tx; NET_PREV_TS=$now_s
 
-  local info
+  local info probes
   info=$(collect_info)
+  probes=$(collect_probes)
+  probes=$(jq -e . <<<"$probes" 2>/dev/null || echo '[]')
 
   jq -nc \
     --argjson cpu "${cpu:-0}" \
     --argjson mem "${mem:-0}" \
+    --argjson mt "${mem_total:-0}" \
     --argjson swap "${swap:-0}" \
     --argjson load1 "${load1:-0}" \
     --argjson load5 "${load5:-0}" \
@@ -110,9 +161,10 @@ collect_report() {
     --argjson nin "${n_in_rate:-0}" \
     --argjson nout "${n_out_rate:-0}" \
     --argjson info "$info" \
-    '{type:"report", cpu:$cpu, mem_used:$mem, net_in:$nin, net_out:$nout,
+    --argjson probes "$probes" \
+    '{type:"report", cpu:$cpu, mem_used:$mem, mem_total:$mt, net_in:$nin, net_out:$nout,
       extra:{swap:$swap, disk:$disk, load1:$load1, load5:$load5, load15:$load15, temp:$temp, procs:$procs, tcp:$tcp, udp:$udp},
-      info:$info}'
+      info:$info, probes:$probes}'
 }
 
 # ---- 后台上报循环：JSON 写入 FIFO，控制通道 websocat 会原样发到面板 ----

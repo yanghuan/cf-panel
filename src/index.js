@@ -172,8 +172,12 @@ function sanitizeAlerts(a) {
   return out;
 }
 // 任何秘密（agent key / PAT token）统一用 HMAC 哈希后落库
+// 哈希密钥与 JWT 签名密钥隔离（纵深防御）：优先 HASH_SECRET，未配置时回退 JWT_SECRET（平滑迁移）。
+// ⚠️ 配置/切换 HASH_SECRET 后，已存的 servers.agent_key_hash 与 api_tokens.token_hash 全部失效，
+// 需重新添加服务器（重新生成 agent key）并重建 PAT；agent_key_id（无盐 SHA-256 检索键）不受影响。
 async function hashSecret(value, env) {
-  return bytesToHex(await hmacSha256(new TextEncoder().encode(secret(env)), new TextEncoder().encode(value)));
+  const hashKey = env.HASH_SECRET || secret(env);
+  return bytesToHex(await hmacSha256(new TextEncoder().encode(hashKey), new TextEncoder().encode(value)));
 }
 
 // D1 键值表（替代 Workers KV）：value 直接存 JSON 字符串

@@ -29,7 +29,7 @@ cf-panel/
 1. **创建 D1 数据库（网页端）**：Dashboard → Workers & Pages → **D1** → Create database，名称 `cf-panel`；把 Overview 页的 **database_id** 填入 `wrangler.toml` 的 `[[d1_databases]]`（当前为占位符 `REPLACE_WITH_D1_DATABASE_ID`），提交并推送。
 2. **建表（网页端）**：在该 D1 数据库页 → **Console** 粘贴执行 `schema.sql` 全部内容（或 **Import** 上传该文件）。
 3. **连接 GitHub 自动部署**：Workers & Pages → Create application → **Import a repository** → Get started → 授权 GitHub 并选择仓库。项目名须与 `wrangler.toml` 的 `name = "cf-panel"` **完全一致**，根目录 `/`，Save and Deploy。之后每次 `git push` 自动重新部署，可在 Worker 的 **Deployments** 页查看构建历史。
-4. **配置密钥（网页端）**：该 Worker → Settings → Variables and Secrets → 添加 `JWT_SECRET`（必）、`PANEL_USERS` 或 `PANEL_PASSWORD`（必）。
+4. **配置密钥（网页端）**：该 Worker → Settings → Variables and Secrets → 添加 `JWT_SECRET`（必）、`PANEL_USERS` 或 `PANEL_PASSWORD`（必）、`HASH_SECRET`（推荐，见下方密钥详解）。
    > ⚠️ Cloudflare 规则：Worker 配置过 dashboard secret 后，`wrangler deploy` 会被拒绝，只能走 Builds/CI 部署——因此本方式同时是配密钥后的**唯一部署路径**。
    > 告警配置**不需要环境变量**：登录面板 → 设置弹窗 → 「告警」区直接填 Webhook 地址与阈值（存 D1，见下方告警配置）。
 5. 部署完成后访问 `https://cf-panel.<你的子域>.workers.dev`，输入配置的密码即可登录。
@@ -47,6 +47,7 @@ wrangler d1 execute cf-panel --remote --file=schema.sql
 
 # 3. 设置密钥（必做，生产安全）
 wrangler secret put JWT_SECRET        # JWT 签名密钥
+wrangler secret put HASH_SECRET       # 哈希密钥（agent key / PAT 哈希，推荐独立配置，见下方详解）
 wrangler secret put PANEL_USERS       # 多用户（与 PANEL_PASSWORD 二选一，优先级更高）："alice:pass1,bob:pass2"
 wrangler secret put PANEL_PASSWORD    # 单管理员密码（未配置 PANEL_USERS 时使用）
 
@@ -81,6 +82,7 @@ wrangler deploy
 | 变量 | 是否必配 | 作用 |
 | --- | --- | --- |
 | `JWT_SECRET` | ✅ 必 | JWT 签名密钥：签发/验证登录令牌，泄露可伪造任意用户登录 |
+| `HASH_SECRET` | 推荐 | agent key / PAT 的 HMAC 哈希密钥（与 JWT 签名密钥隔离；未配置时回退 `JWT_SECRET`） |
 | `PANEL_USERS` | ✅（与 PANEL_PASSWORD 二选一） | 多用户列表：`用户名:密码,用户名:密码` |
 | `PANEL_PASSWORD` | 二选一 | 单管理员密码（未配置 PANEL_USERS 时使用） |
 
@@ -92,6 +94,17 @@ openssl rand -hex 32   # 例如：xk3f9M2c...（64 位十六进制）
 
 - 不配置时回退 `dev-secret`，**仅限本地调试**，生产必须覆盖
 - 修改它会让所有已登录用户 token 失效（需重新登录）
+
+**`HASH_SECRET`** —— 格式：任意字符串，建议 32 字节以上随机串。
+
+```bash
+openssl rand -hex 32
+```
+
+- 用途：agent key 与 PAT 的 **HMAC 哈希密钥**（`servers.agent_key_hash` / `api_tokens.token_hash`），与 `JWT_SECRET`（签名）**职责隔离**——即使签名密钥泄露也无法伪造 agent key / PAT 哈希，反之亦然
+- **未配置时回退 `JWT_SECRET`**（平滑迁移，行为与旧版一致）
+- ⚠️ 首次配置或切换 `HASH_SECRET` 是**有损操作**：已存的 agent key 与 PAT 哈希全部失效，需在面板删除服务器后重新添加（生成新 key）并重建 PAT；`agent_key_id`（无盐 SHA-256 检索键）不受影响
+- 建议新部署从第一天就配置它，避免后期切换的重建成本
 
 **`PANEL_USERS`** —— 格式：`用户名:密码,用户名:密码`（逗号分隔用户，冒号分隔用户名与密码）。
 
@@ -116,6 +129,7 @@ MyS3cret!Pass
 
 ```bash
 wrangler secret put JWT_SECRET       # 回车后粘贴值
+wrangler secret put HASH_SECRET      # 回车后粘贴值（推荐）
 wrangler secret put PANEL_USERS      # 回车后粘贴值，如 alice:pass1,bob:pass2
 ```
 

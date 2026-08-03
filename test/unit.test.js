@@ -77,6 +77,25 @@ test('hashSecret 确定性且随输入/密钥变化', async () => {
   assert.notEqual(h1, await I.hashSecret('key1', { JWT_SECRET: 'other' }));
 });
 
+test('hashSecret：未配置 HASH_SECRET 时回退 JWT_SECRET（平滑迁移）', async () => {
+  // 只有 JWT_SECRET，无 HASH_SECRET → 用 JWT_SECRET 作为哈希密钥
+  const noHash = await I.hashSecret('key1', env);
+  assert.equal(noHash, await I.hashSecret('key1', { JWT_SECRET: 'unit-secret' }));
+  // 与直接回退逻辑等价
+  assert.equal(noHash, await I.hashSecret('key1', { JWT_SECRET: 'unit-secret', HASH_SECRET: undefined }));
+});
+
+test('hashSecret：HASH_SECRET 优先于 JWT_SECRET，两者独立', async () => {
+  const e = { JWT_SECRET: 'jwt-secret', HASH_SECRET: 'hash-secret' };
+  const withHash = await I.hashSecret('key1', e);
+  // HASH_SECRET 生效 → 结果不等于仅用 JWT_SECRET 计算的值
+  assert.notEqual(withHash, await I.hashSecret('key1', { JWT_SECRET: 'jwt-secret' }));
+  // 确定性
+  assert.equal(withHash, await I.hashSecret('key1', e));
+  // 与直接用 HASH_SECRET 计算的值一致（确认哈希密钥取的是 HASH_SECRET）
+  assert.equal(withHash, await I.hashSecret('key1', { HASH_SECRET: 'hash-secret' }));
+});
+
 test('sha256Hex 标准向量', async () => {
   assert.equal(await I.sha256Hex(''), 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855');
   assert.equal(await I.sha256Hex('abc'), 'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad');

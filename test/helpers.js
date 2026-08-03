@@ -136,6 +136,7 @@ export function makeEnv(overrides = {}) {
     METRICS: makeMetricsStub(),
     PANEL: makePanelStub(),
     JWT_SECRET: 'test-jwt-secret-0123456789abcdef',
+    HASH_SECRET: 'test-hash-secret-0123456789abcdef',
     PANEL_PASSWORD: 'admin123',
     ...overrides,
   };

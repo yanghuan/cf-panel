@@ -21,9 +21,12 @@ const ARCHIVE_AFTER_MIN = 60; // 超过 1 小时的旧数据才归档/可淘汰
 const METRICS_RETENTION_DAYS = 30; // D1 历史保留期（天），过期行每日清理
 const AUDIT_RETENTION_DAYS = 90; // 审计日志保留期（天），过期行随每日清理删除
 const PRUNE_INTERVAL_MS = 24 * 60 * 60 * 1000; // 保留期清理周期
-// 在线判定宽限期（秒）：与告警离线阈值默认值（offline_after_s=180）对齐。
-// 无观看者时 agent 慢采间隔 120s > 旧阈值 60s，会导致存活服务器误显示离线，故放宽到 180s。
-const ONLINE_GRACE_S = 180;
+// 在线判定宽限期（秒）：按观看者状态动态选择——
+// 无观看者：agent 慢采 120s，需约 1.5 倍间隔宽限（与离线告警阈值 offline_after_s=180 对齐）；
+// 有观看者：agent 快采 3s，5 次未上报（15s）即判定离线。15s = 5 个快采周期，
+// 留足"切快采 ≤5s + 控制通道重连间隙 3~6s + 网络抖动"的余量，又远快于 180s。
+const ONLINE_GRACE_SLOW_S = 180;
+const ONLINE_GRACE_FAST_S = 15;
 
 // 省配额上报策略：有前端观看者时 agent 快采，否则低频采样
 const REPORT_FAST_INTERVAL_S = 3;  // 有观看者：3 秒上报
@@ -465,6 +468,16 @@ async function queryServersForUser(env, user) {
   return env.DB.prepare('SELECT * FROM servers WHERE user_id = ? ORDER BY "group", display_index, id').bind(user.id).all();
 }
 
+// 当前是否有面板观看者（决定在线判定用快/慢宽限期；查询失败按无观看者处理）
+async function hasPanelViewers(env) {
+  try {
+    const resp = await doPanel(env).fetch('https://do.internal/viewers');
+    return Number((await resp.json()).count || 0) > 0;
+  } catch {
+    return false;
+  }
+}
+
 // ---------------- REST API ----------------
 
 async function handleApi(request, env) {
@@ -535,12 +548,13 @@ async function handleApi(request, env) {
       latest = await lResp.json();
     } catch { /* 无最新指标 */ }
     const now = Math.floor(Date.now() / 1000);
+    const grace = (await hasPanelViewers(env)) ? ONLINE_GRACE_FAST_S : ONLINE_GRACE_SLOW_S;
     const list = rows.results.map((s) => ({
       id: s.id,
       name: s.name,
       group: s.group || '',
       display_index: s.display_index || 0,
-      online: now - (s.last_seen || 0) < ONLINE_GRACE_S, // 宽限期内上报算在线（last_seen 为 unix 秒）
+      online: now - (s.last_seen || 0) < grace, // 观看者在线时快宽限（30s），否则慢宽限（180s）
       wan_ip: s.wan_ip || '',
       info: safeJson(s.info_json),
       probes: safeJson(s.probe_json),
@@ -753,6 +767,7 @@ async function mcpListServers(user, env) {
     latest = await lResp.json();
   } catch { /* 无最新指标 */ }
   const now = Math.floor(Date.now() / 1000);
+  const grace = (await hasPanelViewers(env)) ? ONLINE_GRACE_FAST_S : ONLINE_GRACE_SLOW_S;
   const list = [];
   for (const s of rows.results) {
     const m = latest[s.id] || null;
@@ -760,7 +775,7 @@ async function mcpListServers(user, env) {
       id: s.id,
       name: s.name,
       group: s.group || '',
-      online: now - (s.last_seen || 0) < ONLINE_GRACE_S, // 宽限期内上报算在线（last_seen 为 unix 秒）
+      online: now - (s.last_seen || 0) < grace, // 观看者在线时快宽限（30s），否则慢宽限（180s）
       wan_ip: s.wan_ip || '',
       info: safeJson(s.info_json),
       metrics: m ? {
@@ -1626,6 +1641,9 @@ export class PanelDO {
       latest = await lResp.json();
     } catch { /* 无最新指标 */ }
     const now = Math.floor(Date.now() / 1000);
+    // 本 DO 内直接统计已鉴权观看者（无需额外 RPC）
+    const grace = (this.state.getWebSockets?.() || []).filter((w) => w.deserializeAttachment?.()).length > 0
+      ? ONLINE_GRACE_FAST_S : ONLINE_GRACE_SLOW_S;
     const list = [];
     for (const s of rows.results) {
       list.push({
@@ -1633,7 +1651,7 @@ export class PanelDO {
         name: s.name,
         group: s.group || '',
         display_index: s.display_index || 0,
-        online: now - (s.last_seen || 0) < ONLINE_GRACE_S, // 宽限期内上报算在线（last_seen 为 unix 秒）
+        online: now - (s.last_seen || 0) < grace, // 观看者在线时快宽限（30s），否则慢宽限（180s）
         wan_ip: s.wan_ip || '',
         info: safeJson(s.info_json),
         probes: safeJson(s.probe_json),

@@ -6,7 +6,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import worker, { __internals as I } from '../src/index.js';
-import { makeEnv, requestBuilder } from './helpers.js';
+import { makeEnv, makePanelStub, requestBuilder } from './helpers.js';
 
 const call = requestBuilder(worker);
 
@@ -194,6 +194,26 @@ test('服务器：在线状态按 last_seen 宽限期（180s）判定', async ()
     .bind(Math.floor(Date.now() / 1000) - 300, id).run();
   const list3 = await (await call(env, { path: '/api/servers', token })).json();
   assert.equal(list3[0].online, false);
+});
+
+test('服务器：有观看者时用快宽限期（15s）判定在线', async () => {
+  // 模拟 1 个观看者在线（PanelDO /viewers 返回 count=1）
+  const env = makeEnv({ PANEL: makePanelStub({ viewers: 1 }) });
+  const token = await login(env);
+  await addServer(env, token, { name: 's1' });
+  const id = (await (await call(env, { path: '/api/servers', token })).json())[0].id;
+
+  // 60s 前上报：观看者在线 → 快宽限 15s → 判离线（死亡检测更快）
+  await env.DB.prepare('UPDATE servers SET last_seen = ? WHERE id = ?')
+    .bind(Math.floor(Date.now() / 1000) - 60, id).run();
+  const list1 = await (await call(env, { path: '/api/servers', token })).json();
+  assert.equal(list1[0].online, false);
+
+  // 刚上报 → 在线
+  await env.DB.prepare('UPDATE servers SET last_seen = ? WHERE id = ?')
+    .bind(Math.floor(Date.now() / 1000), id).run();
+  const list2 = await (await call(env, { path: '/api/servers', token })).json();
+  assert.equal(list2[0].online, true);
 });
 
 // ---------------- agent 上报 ----------------

@@ -28,6 +28,11 @@ PROBES=${PROBES:-}              # 服务探活配置："name:http:URL,name:tcp:h
 CUSTOM_METRICS=${CUSTOM_METRICS:-} # 自定义监控项 JSON：[{"name":"x","cmd":"...","cycle":60}]（空则不启用）
 
 mkdir -p "$TMP_DIR"
+# 启动前清理上次异常退出（kill -9 / OOM 等）遗留的孤儿进程与临时文件，避免与本次运行冲突
+pkill -f "pty,link=$TMP_DIR/" 2>/dev/null || true
+pkill -f "$TMP_DIR/file-server-" 2>/dev/null || true
+pkill -f "websocat.*$KEY" 2>/dev/null || true
+rm -f "$TMP_DIR"/file-server-* 2>/dev/null || true
 CTL_IN="$TMP_DIR/control-in"  # 控制通道上行 FIFO（上报 JSON → websocat → WS）
 
 log() { printf '[cf-panel] %s\n' "$*" >> "$AGENT_LOG" 2>/dev/null || echo "[cf-panel] $*" >&2; }
@@ -299,7 +304,8 @@ ls_entries() {
   local path=$1
   [ -d "$path" ] || { echo '[]'; return 0; }
   # drvfs（Windows 盘）上 find 可能因访问部分条目返回非0（输出正常），用 || true 忽略退出码
-  { find "$path" -maxdepth 1 -mindepth 1 -printf '%f|%y|%s|%T@\n' 2>/dev/null || true; } | while IFS='|' read -r name typ size mt; do
+  # timeout 兜底：挂死的挂载点（NFS 等）上 find 可能无限阻塞
+  { timeout 10 find "$path" -maxdepth 1 -mindepth 1 -printf '%f|%y|%s|%T@\n' 2>/dev/null || true; } | while IFS='|' read -r name typ size mt; do
     jq -nc --arg n "$name" --arg t "$typ" --argjson s "${size:-0}" --argjson m "${mt:-0}" \
       '{name:$n, type:(if $t=="d" then "dir" else "file" end), size:$s, mtime:$m}'
   done | jq -s '.'
@@ -319,7 +325,7 @@ while IFS= read -r line; do
       offset=$(jq -r '.offset // 0' <<<"$line")
       limit=$(jq -r '.limit // 0' <<<"$line")
       if [ -f "$path" ]; then
-        size=$(wc -c < "$path" 2>/dev/null || echo 0)
+        size=$(timeout 10 wc -c < "$path" 2>/dev/null || echo 0)
         if [ "$size" -gt 524288000 ]; then   # 500MB 上限
           jq -nc --arg p "$path" '{type:"error", ok:false, message:"file exceeds 500MB limit"}'
           continue
@@ -327,8 +333,9 @@ while IFS= read -r line; do
         [ "${limit:-0}" -le 0 ] && limit=$size
         # 注意：tail 输出超出 head 读取量时 tail 会 SIGPIPE（141），pipefail 下必须 || true
         # 保留 head 已读到的完整数据（命令替换的输出不会被丢弃，只是退出码非 0）
-        data=$(tail -c +$((offset + 1)) "$path" 2>/dev/null | head -c "$limit" | base64 -w0 2>/dev/null) || true
-        got=$(printf '%s' "$data" | base64 -d 2>/dev/null | wc -c) || got=0
+        # timeout 兜底：挂死的挂载点上 tail/head 可能无限阻塞
+        data=$(timeout 30 tail -c +$((offset + 1)) "$path" 2>/dev/null | timeout 30 head -c "$limit" | timeout 30 base64 -w0 2>/dev/null) || true
+        got=$(printf '%s' "$data" | timeout 30 base64 -d 2>/dev/null | timeout 10 wc -c) || got=0
         # 大数据不能走 --arg（单参数 >128KB 会 "Argument list too long"），改用 --rawfile 从进程替换读
         jq -nc --rawfile d <(printf '%s' "$data") --arg p "$path" --argjson o "$offset" --argjson g "$got" --argjson s "$size" \
           '{type:"read_result", ok:true, path:$p, offset:$o, data:$d, got:$g, size:$s}'
@@ -340,16 +347,17 @@ while IFS= read -r line; do
       path=$(jq -r .path <<<"$line")
       data=$(jq -r .data <<<"$line")
       offset=$(jq -r '.offset // 0' <<<"$line")
-      if ! mkdir -p "$(dirname "$path" 2>/dev/null)" 2>/dev/null; then
+      if ! timeout 10 mkdir -p "$(dirname "$path" 2>/dev/null)" 2>/dev/null; then
         jq -nc --arg p "$path" '{type:"error", ok:false, message:"mkdir failed"}'
         continue
       fi
+      # timeout 包裹整个写入 sh：覆盖 open 阻塞（写入 FIFO/特殊设备）与写阻塞（挂死挂载点）
       if [ "$offset" -eq 0 ]; then
-        printf '%s' "$data" | base64 -d > "$path" 2>/dev/null || { jq -nc '{type:"error", ok:false, message:"write failed"}'; continue; }
+        timeout 30 sh -c 'printf "%s" "$1" | base64 -d > "$2"' _ "$data" "$path" 2>/dev/null || { jq -nc '{type:"error", ok:false, message:"write failed"}'; continue; }
       else
-        printf '%s' "$data" | base64 -d >> "$path" 2>/dev/null || { jq -nc '{type:"error", ok:false, message:"write failed"}'; continue; }
+        timeout 30 sh -c 'printf "%s" "$1" | base64 -d >> "$2"' _ "$data" "$path" 2>/dev/null || { jq -nc '{type:"error", ok:false, message:"write failed"}'; continue; }
       fi
-      cur=$(wc -c < "$path" 2>/dev/null || echo 0)
+      cur=$(timeout 10 wc -c < "$path" 2>/dev/null || echo 0)
       if [ "$cur" -gt 524288000 ]; then   # 500MB 上限，超限删除
         rm -f "$path" 2>/dev/null
         jq -nc '{type:"error", ok:false, message:"file exceeds 500MB limit, aborted"}'
@@ -387,8 +395,11 @@ while true; do
     # read -t：长时间无下行（半开连接）时超时重连，自愈卡死状态
     while IFS= read -t 180 -r line <&3; do
       [ -z "$line" ] && continue
-      log "CTL-DBG recv: $(jq -r .type <<<"$line" 2>/dev/null)"
-      case "$(jq -r .type <<<"$line" 2>/dev/null)" in
+      # 心跳保活消息：仅维持下行流量（让 read -t 180 不误判半开重连），不处理、不记日志
+      _t=$(jq -r .type <<<"$line" 2>/dev/null)
+      [ "$_t" = "ping" ] && continue
+      log "CTL-DBG recv: $_t"
+      case "$_t" in
       open_terminal)
         sid=$(jq -r .stream_id <<<"$line" 2>/dev/null)
         log "CTL-DBG open_terminal sid=$sid"

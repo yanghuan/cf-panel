@@ -567,6 +567,44 @@ test('TerminalDO: 会话持久化到 DO Storage，休眠后可水合（浏览器
   }
 });
 
+test('TerminalDO: 控制通道上报后回复心跳 ping（30s 限频）', async () => {
+  const env = makeEnv();
+  await insertServer(env, 'k1', 'srv1');
+  const sent = [];
+  const ws = {
+    deserializeAttachment: () => ({ role: 'control', serverId: 1 }),
+    send: (m) => sent.push(m),
+    readyState: 1,
+  };
+  const inst = new TerminalDO(mockState(), env);
+  inst.agents.set(1, ws);
+
+  const pingCount = () => sent.filter((m) => {
+    try { return JSON.parse(m).type === 'ping'; } catch { return false; }
+  }).length;
+
+  await inst.webSocketMessage(ws, JSON.stringify({ type: 'report', cpu: 1, mem_used: 1, mem_total: 2 }));
+  assert.equal(pingCount(), 1, '上报应触发一次心跳');
+
+  // 30s 内再次上报 → 限频不再发心跳
+  await inst.webSocketMessage(ws, JSON.stringify({ type: 'report', cpu: 2 }));
+  assert.equal(pingCount(), 1, '30s 内限频只发一次心跳');
+});
+
+test('TerminalDO: 控制通道重连时关闭该服务器旧会话流（dropAgentSessions）', async () => {
+  const inst = new TerminalDO(mockState(), makeEnv());
+  const oldWs = { closed: false, close() { this.closed = true; } };
+  const otherWs = { closed: false, close() { this.closed = true; } };
+  inst.sessions.set('1-a', { streamId: '1-a', serverId: 1, creatorUserId: 1, createdAt: Date.now(), type: 'terminal', userWs: null, agentWs: oldWs, userBuf: [] });
+  inst.sessions.set('1-b', { streamId: '1-b', serverId: 1, creatorUserId: 1, createdAt: Date.now(), type: 'file', userWs: null, agentWs: null, userBuf: [] }); // 无 agent 流不受影响
+  inst.sessions.set('2-c', { streamId: '2-c', serverId: 2, creatorUserId: 1, createdAt: Date.now(), type: 'terminal', userWs: null, agentWs: otherWs, userBuf: [] });
+
+  inst.dropAgentSessions(1);
+
+  assert.equal(oldWs.closed, true, '目标服务器旧终端流应被关闭');
+  assert.equal(inst.sessions.get('2-c').agentWs.closed, false, '其他服务器会话不受影响');
+});
+
 test('TerminalDO: cleanup 断开后清空 agents/sessions/pendingTerm', async () => {
   const env = makeEnv();
   const ws1 = { send() {}, readyState: 1 };

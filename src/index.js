@@ -930,6 +930,7 @@ export class TerminalDO {
     this.agents = new Map(); // serverId -> 控制 WS
     this.agentInterval = new Map(); // serverId -> 当前下发的上报间隔（秒），避免重复下发
     this.pendingTerm = new Map(); // streamId -> {tries, timer} open_terminal 确认重发
+    this.lastPingAt = new Map(); // serverId -> 上次心跳时间（控制通道保活，防健康连接被 read -t 180 误判半开）
   }
 
   async fetch(request) {
@@ -1039,6 +1040,10 @@ export class TerminalDO {
       if (hash !== server.agent_key_hash) return new Response('bad key', { status: 401 });
       const pair = new WebSocketPair();
       this.state.acceptWebSocket(pair[1]);
+      // 控制通道（重）连接：说明旧连接已断/网络切换，关闭该服务器旧的终端/文件会话流，
+      // 让 agent 侧 websocat 收到 close → 退出 → 触发清理链（kill pty/bash/脚本），防半开残留。
+      // 配合服务端心跳后，健康连接不会因 read -t 180 误重连，故此处只会在真正断链时触发。
+      this.dropAgentSessions(server.id);
       this.agents.set(server.id, pair[1]);
       // 附件随连接持久化：休眠唤醒后靠它重建 agents 索引（role 区分控制通道与会话流）
       pair[1].serializeAttachment({ role: 'control', serverId: server.id });
@@ -1087,6 +1092,17 @@ export class TerminalDO {
     }
 
     return new Response('not found', { status: 404 });
+  }
+
+  // 控制通道（重）连接时调用：关闭该服务器旧的终端/文件会话流。
+  // agent 侧 websocat 收到 close → 退出 → 触发清理链（kill pty/bash/脚本），防半开残留。
+  dropAgentSessions(serverId) {
+    for (const [, sess] of this.sessions) {
+      if (sess.serverId !== serverId) continue;
+      if (sess.agentWs) {
+        try { sess.agentWs.close(); } catch { /* ignore */ }
+      }
+    }
   }
 
   // 取会话：先查内存，内存丢失（DO 休眠后）则从 DO Storage 水合兜底
@@ -1264,6 +1280,14 @@ export class TerminalDO {
                 custom: j.custom,
               });
               await this.syncAgentInterval(ws, serverId);
+              // 控制通道保活心跳（30s 限频）：agent 端 read -t 180 需要周期性下行流量，
+              // 否则健康但安静（无指令下发）时会被误判半开而每 ~180s 重连
+              const nowP = Date.now();
+              const lastP = this.lastPingAt.get(serverId) || 0;
+              if (nowP - lastP > 30000) {
+                this.lastPingAt.set(serverId, nowP);
+                try { ws.send(JSON.stringify({ type: 'ping' })); } catch { /* ignore */ }
+              }
             }
           }
         } catch { /* 忽略非 JSON 的控制消息 */ }

@@ -1,3 +1,10 @@
+# cf-panel agent（Rust 版）—— 与 agent.sh 同协议的对等实现
+# 构建：
+#   动态 glibc（默认）：cargo build --release        → 依赖系统 glibc，主流发行版可用
+#   全静态（推荐，任意发行版直跑，等同 Go 静态）：
+#     rustup target add x86_64-unknown-linux-musl
+#     cargo build --release --target x86_64-unknown-linux-musl
+#   （本机无 sudo/系统 gcc 时，需先搭宿主机 C 工具链供 ring 等 build script 使用）
 [package]
 name = "cf-panel-agent"
 version = "0.1.0"

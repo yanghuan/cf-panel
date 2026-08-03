@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================
-# cf-panle agent —— 纯 Shell 实现（websocat + socat + jq）
+# cf-panel agent —— 纯 Shell 实现（websocat + socat + jq）
 # 对齐 docs/architecture.md §3.5
 # 依赖: websocat(必装), socat(resize 需要), jq, pgrep(会话结束清理进程组), bash, stty
 #       文件管理另需 GNU coreutils（find -printf / tail -c / base64 -w0，busybox 精简环境不支持）
@@ -16,9 +16,9 @@ set -euo pipefail
 
 WSS=${AGENT_WSS_URL:?}        # 例: wss://panel.example.com/ws/agent
 KEY=${AGENT_KEY:?}            # 唯一身份 + 凭证（uuid 已废弃，仅保留这一个）
-TMP_DIR=${AGENT_TMPDIR:-/tmp/cfpanle}
+TMP_DIR=${AGENT_TMPDIR:-/tmp/cfpanel}
 WS_BUF=${WS_BUF:-3145728}     # websocat -B buffer 大小（字节）。前端文件块 1MB，base64 后约 1.4MB，3MB 留约 2 倍余量
-AGENT_LOG=${AGENT_LOG:-/tmp/cfpanle-agent.log} # 日志文件（每次 append 立即落盘，避免 stderr 块缓冲导致诊断滞后）
+AGENT_LOG=${AGENT_LOG:-/tmp/cfpanel-agent.log} # 日志文件（每次 append 立即落盘，避免 stderr 块缓冲导致诊断滞后）
 AGENT_LOG_MAX=${AGENT_LOG_MAX:-262144} # 日志轮转上限（字节，默认 256KB≈约5500行），超过则清空保留最近
 DISABLE_EXEC=${DISABLE_EXEC:-0}         # =1 时全局禁止命令执行（终端/exec 全部忽略）
 REPORT_INTERVAL=${REPORT_INTERVAL:-120} # 默认上报间隔（秒）：省配额策略下无人查看用 120s，有观看者由服务端下发 3s
@@ -28,7 +28,7 @@ CUSTOM_METRICS=${CUSTOM_METRICS:-} # 自定义监控项 JSON：[{"name":"x","cmd
 mkdir -p "$TMP_DIR"
 CTL_IN="$TMP_DIR/control-in"  # 控制通道上行 FIFO（上报 JSON → websocat → WS）
 
-log() { printf '[cf-panle] %s\n' "$*" >> "$AGENT_LOG" 2>/dev/null || echo "[cf-panle] $*" >&2; }
+log() { printf '[cf-panel] %s\n' "$*" >> "$AGENT_LOG" 2>/dev/null || echo "[cf-panel] $*" >&2; }
 
 # 日志轮转：超过上限清空（保留最近日志；open/append 的 fd 不受影响）
 rotate_log() {

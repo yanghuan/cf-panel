@@ -1,15 +1,15 @@
-# cf-panle — Cloudflare Workers 配置
+# cf-panel — Cloudflare Workers 配置
 # 部署步骤见 README.md
 
-name = "cf-panle"
+name = "cf-panel"
 main = "src/index.js"
 compatibility_date = "2026-08-02"
 
 # ---------- D1 数据库（面板核心数据 + 键值表 kv_json） ----------
-# 创建：wrangler d1 create cf-panle → 把 database_id 填进来
+# 创建：wrangler d1 create cf-panel → 把 database_id 填进来
 [[d1_databases]]
 binding = "DB"
-database_name = "cf-panle"
+database_name = "cf-panel"
 database_id = "REPLACE_WITH_D1_DATABASE_ID"
 
 # ---------- Durable Object（WebSocket 中转 + 监控时序热区 + 面板实时推送） ----------

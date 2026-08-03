@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>cf-panle · 监控面板</title>
+  <title>cf-panel · 监控面板</title>
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.min.css" />
   <link rel="stylesheet" href="/style.css?v=17" />
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
@@ -61,7 +61,7 @@
   <!-- 登录/注册 -->
   <div id="auth" class="auth-wrap">
     <form id="auth-form" class="auth-card">
-      <h1>cf-panle</h1>
+      <h1>cf-panel</h1>
       <p class="sub">在 Cloudflare 上实现带终端功能的监控面板</p>
       <input id="auth-pass" type="password" placeholder="面板密码" autocomplete="current-password" required />
       <p id="auth-msg" class="msg"></p>
@@ -231,7 +231,7 @@
       <button id="btn-custom-setup-close" class="ghost">关闭</button>
     </div>
     <div class="settings-body">
-      <p class="muted" style="font-size:13px">在目标机器的 <code>/etc/cf-panle-agent.env</code> 中配置 <code>CUSTOM_METRICS</code>（JSON 数组：<code>name</code> 指标名、<code>cmd</code> 采集命令），agent 会按上报周期执行命令采集数值指标；配置完成后可在该服务器卡片的「⋯ → 自定义指标」中查看曲线。</p>
+      <p class="muted" style="font-size:13px">在目标机器的 <code>/etc/cf-panel-agent.env</code> 中配置 <code>CUSTOM_METRICS</code>（JSON 数组：<code>name</code> 指标名、<code>cmd</code> 采集命令），agent 会按上报周期执行命令采集数值指标；配置完成后可在该服务器卡片的「⋯ → 自定义指标」中查看曲线。</p>
       <div class="settings-row">
         <textarea id="custom-setup-editor" rows="5" class="custom-editor" spellcheck="false">[{"name":"cpu_temp","cmd":"cat /sys/class/thermal/thermal_zone0/temp"},{"name":"estab_conns","cmd":"ss -t state established | wc -l"}]</textarea>
       </div>

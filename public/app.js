@@ -1,9 +1,9 @@
-// cf-panle 前端逻辑：登录、分组服务器列表、xterm 终端（自动重连）、公告/设置、PAT 管理
+// cf-panel 前端逻辑：登录、分组服务器列表、xterm 终端（自动重连）、公告/设置、PAT 管理
 (() => {
   'use strict';
 
   const $ = (sel) => document.querySelector(sel);
-  let token = localStorage.getItem('cfpanle_token') || '';
+  let token = localStorage.getItem('cfpanel_token') || '';
   let serversCache = [];
   let pushWs = null;       // 服务器列表实时推送 WS
   let pushTimer = null;    // 每 3 秒发一次 sync 请求的定时器
@@ -78,7 +78,7 @@
     try {
       const data = await api('/api/login', { method: 'POST', body: JSON.stringify({ password }) });
       token = data.token;
-      localStorage.setItem('cfpanle_token', token);
+      localStorage.setItem('cfpanel_token', token);
       showApp(data.user);
     } catch (e) {
       msg.textContent = e.message;
@@ -92,7 +92,7 @@
       renderServers();
     } catch (e) {
       if (String(e.message).includes('401') || String(e.message).includes('unauthorized')) {
-        token = ''; localStorage.removeItem('cfpanle_token'); showAuth(); return; // showAuth 内会 stopPush
+        token = ''; localStorage.removeItem('cfpanel_token'); showAuth(); return; // showAuth 内会 stopPush
       }
       toast(e.message);
     }
@@ -803,7 +803,7 @@
       for (const it of arr) {
         if (!it || typeof it !== 'object' || !it.name || !it.cmd) throw new Error('每项需包含 name 与 cmd');
       }
-      $('#custom-setup-out').textContent = `# 追加到 /etc/cf-panle-agent.env\nCUSTOM_METRICS='${JSON.stringify(arr)}'`;
+      $('#custom-setup-out').textContent = `# 追加到 /etc/cf-panel-agent.env\nCUSTOM_METRICS='${JSON.stringify(arr)}'`;
     } catch (e) {
       toast('JSON 格式错误：' + e.message);
     }
@@ -830,7 +830,7 @@
         return toast(`格式错误：「${it}」应为 名称:类型(http|tcp):目标`);
       }
     }
-    $('#service-setup-out').textContent = `# 追加到 /etc/cf-panle-agent.env\nPROBES="${raw}"`;
+    $('#service-setup-out').textContent = `# 追加到 /etc/cf-panel-agent.env\nPROBES="${raw}"`;
   }
   function copyServiceCfg() {
     const txt = $('#service-setup-out').textContent;
@@ -873,7 +873,7 @@
     $('#site-modal').classList.remove('hidden');
     lockScroll();
     api('/api/public/settings').then((s) => {
-      $('#set-site-name').value = s.site_name === 'cf-panle' ? '' : s.site_name;
+      $('#set-site-name').value = s.site_name === 'cf-panel' ? '' : s.site_name;
       $('#set-notice').value = s.notice || '';
     }).catch(() => { /* ignore */ });
   }
@@ -1056,7 +1056,7 @@
     else     if (act === 'custom-setup') openCustomSetupModal();
     else if (act === 'service-setup') openServiceSetupModal();
     else if (act === 'tokens') openTokensModal();
-    else if (act === 'logout') { token = ''; localStorage.removeItem('cfpanle_token'); showAuth(); }
+    else if (act === 'logout') { token = ''; localStorage.removeItem('cfpanel_token'); showAuth(); }
   });
 
   // 添加服务器弹窗
@@ -1172,7 +1172,7 @@
       showApp(me);
     } catch (e) {
       token = '';
-      localStorage.removeItem('cfpanle_token');
+      localStorage.removeItem('cfpanel_token');
       showAuth();
     }
   })();

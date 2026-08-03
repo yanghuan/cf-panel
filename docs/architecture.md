@@ -133,9 +133,9 @@ DO 是整个设计的心脏，对应哪吒 Dashboard 里那两个 `io.Copy` 的�
                                       ▲
 控制循环:  websocat -b $WSS/control   │ bash + jq 循环
              │  open_terminal {sid} → 拉起终端会话
-             │  resize {sid,rows,cols} → stty -F /tmp/cfpanle-$sid
+             │  resize {sid,rows,cols} → stty -F /tmp/cfpanel-$sid
              ▼
-终端会话:  websocat -b $WSS/terminal?sid=<id> ⇄ socat ⇄ /tmp/cfpanle-<sid> ⇄ bash (PTY)
+终端会话:  websocat -b $WSS/terminal?sid=<id> ⇄ socat ⇄ /tmp/cfpanel-<sid> ⇄ bash (PTY)
 ```
 
 > 监控上报复用控制通道 WS：websocat 的 stdin→WS 转发天然是"上行"，后台采集循环把 JSON 写入 FIFO 即完成上报，**无需 crontab / 独立脚本**；服务端在 TerminalDO 中识别 `{type:"report"}` 并写入监控热区。
@@ -146,7 +146,7 @@ DO 是整个设计的心脏，对应哪吒 Dashboard 里那两个 `io.Copy` 的�
 #!/usr/bin/env bash
 set -euo pipefail
 WSS=${AGENT_WSS_URL:?}; KEY=${AGENT_KEY:?}   # KEY 即唯一身份 + 凭证（uuid 已废弃）
-TMP_DIR=/tmp/cfpanle; REPORT_INTERVAL=${REPORT_INTERVAL:-60}
+TMP_DIR=/tmp/cfpanel; REPORT_INTERVAL=${REPORT_INTERVAL:-60}
 mkdir -p "$TMP_DIR"; CTL_IN="$TMP_DIR/control-in"; rm -f "$CTL_IN"; mkfifo "$CTL_IN"
 
 collect_report() {   # CPU/内存/网络采集 → JSON {type:"report",...}
@@ -188,7 +188,7 @@ done
 
 **关键点**
 
-- 开终端：`socat` 创建 pty slave（`link=/tmp/cfpanle-<sid>` 暴露路径）并挂 `bash -i`；`websocat -b --exec socat` 把 WS 字节流与 slave 对接，全双工。
+- 开终端：`socat` 创建 pty slave（`link=/tmp/cfpanel-<sid>` 暴露路径）并挂 `bash -i`；`websocat -b --exec socat` 把 WS 字节流与 slave 对接，全双工。
 - **残留清理**：浏览器关闭终端 → DO 关 agent WS → websocat 退出 → 执行清理逻辑：按 PTY 端 socat 的 PID 找到 `bash -i`（setsid 会话首进程），`kill -- -<bash_pid>` 整组清理（bash + `vim`/`top` 等子进程），再杀 PTY socat、删 slave link——避免僵尸进程累计。
 - resize：控制 WS 收到 `{type:resize,...}` → `stty -F <slave路径>` 改 winsize → 内核发 `SIGWINCH`，`vim`/`top` 跟着变尺寸。
 - 监控上报：后台循环每 `REPORT_INTERVAL`（默认 60s）采集一次，JSON 写入 FIFO；控制通道 websocat 以 FIFO 为 stdin，数据自动经 WS 上行，服务端识别 `{type:"report"}` 落监控热区——**免 crontab、免独立脚本**。

@@ -1,5 +1,5 @@
--- cf-panle D1 数据库 Schema（对齐 docs/architecture.md §8.2）
--- 应用：wrangler d1 execute cf-panle --remote --file=schema.sql
+-- cf-panel D1 数据库 Schema（对齐 docs/architecture.md §8.2）
+-- 应用：wrangler d1 execute cf-panel --remote --file=schema.sql
 
 -- 用户
 CREATE TABLE IF NOT EXISTS users (

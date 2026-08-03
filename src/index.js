@@ -1,5 +1,5 @@
 // ============================================================
-// cf-panle — Cloudflare Worker 主逻辑
+// cf-panel — Cloudflare Worker 主逻辑
 // REST API + WebSocket 中转（Durable Object: TerminalDO，多分片）
 // 依赖：D1(DB)、DO(TERMINAL/METRICS/PANEL)、secret: JWT_SECRET / PANEL_PASSWORD
 // 对齐 docs/architecture.md §3.2 / §3.3 / §6
@@ -369,7 +369,7 @@ async function checkAlerts(env, payload, serverName) {
   if (alerts.length) {
     await sendWebhook(cfg, {
       event: 'alert',
-      title: `[cf-panle] ${serverName} 指标告警`,
+      title: `[cf-panel] ${serverName} 指标告警`,
       server: { id: payload.serverId, name: serverName },
       message: `服务器 ${serverName}（id=${payload.serverId}）指标超阈值：\n` + alerts.join('\n'),
       details: alerts,
@@ -393,7 +393,7 @@ async function checkProbeAlerts(env, serverId, serverName, probes) {
         PROBE_STATE.set(key, { ok: true, lastFail: 0 });
         await sendWebhook(cfg, {
           event: 'probe_recovered',
-          title: `[cf-panle] ${serverName} 服务恢复：${p.name}`,
+          title: `[cf-panel] ${serverName} 服务恢复：${p.name}`,
           server: { id: serverId, name: serverName },
           message: `服务器 ${serverName} 的服务「${p.name}」已恢复正常。`,
           time: new Date().toISOString(),
@@ -403,7 +403,7 @@ async function checkProbeAlerts(env, serverId, serverName, probes) {
       PROBE_STATE.set(key, { ok: false, lastFail: now });
       await sendWebhook(cfg, {
         event: 'probe_down',
-        title: `[cf-panle] ${serverName} 服务异常：${p.name}`,
+        title: `[cf-panel] ${serverName} 服务异常：${p.name}`,
         server: { id: serverId, name: serverName },
         message: `服务器 ${serverName} 的服务「${p.name}」探测失败${p.code ? `（HTTP ${p.code}）` : ''}。`,
         details: p,
@@ -557,7 +557,7 @@ async function handleApi(request, env) {
   // GET /api/public/settings —— 公开配置（D1 kv_json，无需登录）
   if (method === 'GET' && path === '/api/public/settings') {
     const settings = (await kvGet(env, 'settings', {})) || {};
-    return json({ site_name: settings.site_name || 'cf-panle', notice: settings.notice || '' });
+    return json({ site_name: settings.site_name || 'cf-panel', notice: settings.notice || '' });
   }
 
   // POST /api/report —— agent 监控上报（key 指纹定位 + hash 校验，无需登录）
@@ -871,8 +871,8 @@ async function handleMcp(request, env) {
       return mcpResult(id, {
         protocolVersion: MCP_VERSION,
         capabilities: { tools: {} },
-        serverInfo: { name: 'cf-panle', version: '0.1.0' },
-        instructions: 'cf-panle 面板只读查询。可用工具：list_servers（服务器状态）、get_monitor（监控历史）。认证：Authorization: Bearer <JWT 或 PAT>',
+        serverInfo: { name: 'cf-panel', version: '0.1.0' },
+        instructions: 'cf-panel 面板只读查询。可用工具：list_servers（服务器状态）、get_monitor（监控历史）。认证：Authorization: Bearer <JWT 或 PAT>',
       });
     case 'notifications/initialized':
     case 'notifications/cancelled':
@@ -1356,7 +1356,7 @@ export class MetricsDO {
         await this.state.storage.put(key, 'off');
         await sendWebhook(cfg, {
           event: 'offline',
-          title: `[cf-panle] ${s.name} 离线`,
+          title: `[cf-panel] ${s.name} 离线`,
           server: { id: s.id, name: s.name },
           message: `服务器 ${s.name}（id=${s.id}）超过 ${offlineAfter}s 未上报，已判定离线。`,
           time: new Date().toISOString(),
@@ -1365,7 +1365,7 @@ export class MetricsDO {
         await this.state.storage.put(key, 'on');
         await sendWebhook(cfg, {
           event: 'recovered',
-          title: `[cf-panle] ${s.name} 恢复在线`,
+          title: `[cf-panel] ${s.name} 恢复在线`,
           server: { id: s.id, name: s.name },
           message: `服务器 ${s.name}（id=${s.id}）已恢复上报。`,
           time: new Date().toISOString(),

@@ -1,4 +1,4 @@
-# cf-panle
+# cf-panel
 
 在 Cloudflare 上实现带终端功能的监控面板。
 
@@ -11,7 +11,7 @@
 ## 目录结构
 
 ```
-cf-panle/
+cf-panel/
 ├── wrangler.toml        # Worker/DO/D1/静态资源配置
 ├── schema.sql           # D1 数据库表（含 kv_json 键值表）
 ├── src/index.js         # Worker：REST API + 鉴权 + TerminalDO 双端对拷 + PanelDO 实时推送
@@ -26,13 +26,13 @@ cf-panle/
 
 利用 Cloudflare **Workers Builds**（Git 集成）在 Dashboard 直连 GitHub 仓库，push 即自动部署；`wrangler.toml` 中的 D1 / Durable Objects / assets 绑定由仓库配置驱动，构建时自动生效。
 
-1. **创建 D1 数据库（网页端）**：Dashboard → Workers & Pages → **D1** → Create database，名称 `cf-panle`；把 Overview 页的 **database_id** 填入 `wrangler.toml` 的 `[[d1_databases]]`（当前为占位符 `REPLACE_WITH_D1_DATABASE_ID`），提交并推送。
+1. **创建 D1 数据库（网页端）**：Dashboard → Workers & Pages → **D1** → Create database，名称 `cf-panel`；把 Overview 页的 **database_id** 填入 `wrangler.toml` 的 `[[d1_databases]]`（当前为占位符 `REPLACE_WITH_D1_DATABASE_ID`），提交并推送。
 2. **建表（网页端）**：在该 D1 数据库页 → **Console** 粘贴执行 `schema.sql` 全部内容（或 **Import** 上传该文件）。
-3. **连接 GitHub 自动部署**：Workers & Pages → Create application → **Import a repository** → Get started → 授权 GitHub 并选择仓库。项目名须与 `wrangler.toml` 的 `name = "cf-panle"` **完全一致**，根目录 `/`，Save and Deploy。之后每次 `git push` 自动重新部署，可在 Worker 的 **Deployments** 页查看构建历史。
+3. **连接 GitHub 自动部署**：Workers & Pages → Create application → **Import a repository** → Get started → 授权 GitHub 并选择仓库。项目名须与 `wrangler.toml` 的 `name = "cf-panel"` **完全一致**，根目录 `/`，Save and Deploy。之后每次 `git push` 自动重新部署，可在 Worker 的 **Deployments** 页查看构建历史。
 4. **配置密钥（网页端）**：该 Worker → Settings → Variables and Secrets → 添加 `JWT_SECRET`（必）、`PANEL_USERS` 或 `PANEL_PASSWORD`（必）。
    > ⚠️ Cloudflare 规则：Worker 配置过 dashboard secret 后，`wrangler deploy` 会被拒绝，只能走 Builds/CI 部署——因此本方式同时是配密钥后的**唯一部署路径**。
    > 告警配置**不需要环境变量**：登录面板 → 设置弹窗 → 「告警」区直接填 Webhook 地址与阈值（存 D1，见下方告警配置）。
-5. 部署完成后访问 `https://cf-panle.<你的子域>.workers.dev`，输入配置的密码即可登录。
+5. 部署完成后访问 `https://cf-panel.<你的子域>.workers.dev`，输入配置的密码即可登录。
 
 ### 方式二：CLI 部署（wrangler，备选）
 
@@ -40,10 +40,10 @@ cf-panle/
 
 ```bash
 # 1. 创建 D1 数据库，把返回的 database_id 填入 wrangler.toml
-wrangler d1 create cf-panle
+wrangler d1 create cf-panel
 
 # 2. 建表（远程库）
-wrangler d1 execute cf-panle --remote --file=schema.sql
+wrangler d1 execute cf-panel --remote --file=schema.sql
 
 # 3. 设置密钥（必做，生产安全）
 wrangler secret put JWT_SECRET        # JWT 签名密钥
@@ -56,25 +56,25 @@ wrangler deploy
 
 > 已部署过旧版（无 `"group"` 列 / 无 `kv_json` 表）？执行迁移：
 > ```
-> wrangler d1 execute cf-panle --remote --command 'ALTER TABLE servers ADD COLUMN "group" TEXT NOT NULL DEFAULT "";'
-> wrangler d1 execute cf-panle --remote --command 'CREATE TABLE IF NOT EXISTS kv_json (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL DEFAULT (datetime("now")));'
+> wrangler d1 execute cf-panel --remote --command 'ALTER TABLE servers ADD COLUMN "group" TEXT NOT NULL DEFAULT "";'
+> wrangler d1 execute cf-panel --remote --command 'CREATE TABLE IF NOT EXISTS kv_json (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL DEFAULT (datetime("now")));'
 > ```
 >
 > 已按旧版（带 `uuid` 列）添加过服务器？`agent_key_id`（key 指纹）无法从旧数据回填，需要重建 `servers` 表或在面板删除旧服务器后重新添加，agent 端改用新版 `agent.sh`（只配 `AGENT_KEY`，监控上报已内置）：
 > ```
-> wrangler d1 execute cf-panle --remote --command 'DROP TABLE servers;'
-> # 再执行 wrangler d1 execute cf-panle --remote --file=schema.sql 重建
+> wrangler d1 execute cf-panel --remote --command 'DROP TABLE servers;'
+> # 再执行 wrangler d1 execute cf-panel --remote --file=schema.sql 重建
 > ```
 >
 > 已有旧表缺新列/新表？执行增量迁移（可空列，无需回填）：
 > ```
-> wrangler d1 execute cf-panle --remote --command 'ALTER TABLE servers ADD COLUMN info_json TEXT;'
-> wrangler d1 execute cf-panle --remote --command 'ALTER TABLE servers ADD COLUMN probe_json TEXT;'
-> wrangler d1 execute cf-panle --remote --command 'ALTER TABLE metrics_min ADD COLUMN extra TEXT;'
-> wrangler d1 execute cf-panle --remote --command 'CREATE TABLE IF NOT EXISTS metrics_custom (server_id INTEGER NOT NULL, name TEXT NOT NULL, ts INTEGER NOT NULL, value REAL, PRIMARY KEY (server_id, name, ts)) WITHOUT ROWID;'
+> wrangler d1 execute cf-panel --remote --command 'ALTER TABLE servers ADD COLUMN info_json TEXT;'
+> wrangler d1 execute cf-panel --remote --command 'ALTER TABLE servers ADD COLUMN probe_json TEXT;'
+> wrangler d1 execute cf-panel --remote --command 'ALTER TABLE metrics_min ADD COLUMN extra TEXT;'
+> wrangler d1 execute cf-panel --remote --command 'CREATE TABLE IF NOT EXISTS metrics_custom (server_id INTEGER NOT NULL, name TEXT NOT NULL, ts INTEGER NOT NULL, value REAL, PRIMARY KEY (server_id, name, ts)) WITHOUT ROWID;'
 > ```
 
-部署完成后访问 `https://cf-panle.<你的子域>.workers.dev`，输入配置的密码即可登录（登录即管理员）。
+部署完成后访问 `https://cf-panel.<你的子域>.workers.dev`，输入配置的密码即可登录（登录即管理员）。
 
 ### 密钥配置详解（Secrets）
 
@@ -154,7 +154,7 @@ wrangler secret put PANEL_USERS      # 回车后粘贴值，如 alice:pass1,bob:
 ```json
 {
   "event": "alert",
-  "title": "[cf-panle] my-server 指标告警",
+  "title": "[cf-panel] my-server 指标告警",
   "server": { "id": 1, "name": "my-server" },
   "message": "服务器 my-server 指标超阈值：\nCPU 92.3% >= 90%",
   "details": ["CPU 92.3% >= 90%"],
@@ -164,7 +164,7 @@ wrangler secret put PANEL_USERS      # 回车后粘贴值，如 alice:pass1,bob:
 
 > 告警支持：CPU/内存/磁盘（根分区）/负载超阈值 + 机器离线/恢复通知。内存告警依赖 agent `mem_total` 上报（新版 agent.sh）。
 
-本地调试：`wrangler dev --local`（本地 SQLite 建表：`wrangler d1 execute cf-panle --local --file=schema.sql`）。
+本地调试：`wrangler dev --local`（本地 SQLite 建表：`wrangler d1 execute cf-panel --local --file=schema.sql`）。
 
 ## 二、添加服务器并安装 agent
 
@@ -177,10 +177,10 @@ wrangler secret put PANEL_USERS      # 回车后粘贴值，如 alice:pass1,bob:
    ```
 3. 放置脚本并配置环境：
    ```bash
-   mkdir -p /opt/cf-panle-agent
-   cp agent/agent.sh /opt/cf-panle-agent/
-   chmod +x /opt/cf-panle-agent/agent.sh
-  cat > /etc/cf-panle-agent.env <<EOF
+   mkdir -p /opt/cf-panel-agent
+   cp agent/agent.sh /opt/cf-panel-agent/
+   chmod +x /opt/cf-panel-agent/agent.sh
+  cat > /etc/cf-panel-agent.env <<EOF
   AGENT_WSS_URL=wss://<面板域名>/ws/agent
   AGENT_KEY=<你的 key>
   DISABLE_EXEC=0   # 设为 1 可全局禁止命令执行（终端不可用，仅保留监控）
@@ -188,20 +188,20 @@ wrangler secret put PANEL_USERS      # 回车后粘贴值，如 alice:pass1,bob:
    ```
 4. 注册 systemd 服务：
    ```bash
-   cp agent/cf-panle-agent.service /etc/systemd/system/
-   systemctl daemon-reload && systemctl enable --now cf-panle-agent
-   journalctl -u cf-panle-agent -f   # 看日志
+   cp agent/cf-panel-agent.service /etc/systemd/system/
+   systemctl daemon-reload && systemctl enable --now cf-panel-agent
+   journalctl -u cf-panel-agent -f   # 看日志
    ```
 5. 监控上报已内置：agent.sh 经控制通道 WS 上报 CPU / 内存 / Swap / 磁盘 / 负载 / 温度 / 进程数 / TCP-UDP 连接数 / 网络速率 / 系统信息（无需 crontab）。**省配额策略**：有面板观看者时约 3 秒上报（服务端动态下发），无人查看时 120 秒低频采样；`REPORT_INTERVAL` 可设默认值。
 6. 可选：服务探活（agent 上配置 `PROBES` 探测本机 HTTP/TCP 服务，结果随上报展示在卡片 + 失败告警）：
    ```bash
-   # 追加到 /etc/cf-panle-agent.env
+   # 追加到 /etc/cf-panel-agent.env
    PROBES="web:http:http://127.0.0.1/,mysql:tcp:127.0.0.1:3306"
    ```
    `PROBES` 格式：`名称:类型:目标,...`；类型 `http`（目标为 URL，检查 2xx/3xx）或 `tcp`（目标为 `host:port`，测连通）。
 7. 可选：自定义监控项（agent 上配置 `CUSTOM_METRICS`，执行任意命令采集数值指标，随上报存入 D1 并可看历史曲线）：
    ```bash
-   # 追加到 /etc/cf-panle-agent.env
+   # 追加到 /etc/cf-panel-agent.env
    CUSTOM_METRICS='[{"name":"cpu_temp","cmd":"cat /sys/class/thermal/thermal_zone0/temp"},{"name":"estab_conns","cmd":"ss -t state established | wc -l"}]'
    ```
    `CUSTOM_METRICS` 为 JSON 数组：`name` 指标名、`cmd` 采集命令（输出第一行数值）、`cycle` 采样周期（当前随上报周期）。命令执行带 5 秒超时；非数值输出自动跳过。
@@ -263,7 +263,7 @@ wrangler secret put PANEL_USERS      # 回车后粘贴值，如 alice:pass1,bob:
 ```json
 {
   "mcpServers": {
-    "cf-panle": {
+    "cf-panel": {
       "type": "http",
       "url": "https://<面板域名>/mcp",
       "headers": { "Authorization": "Bearer <JWT 或 PAT>" }

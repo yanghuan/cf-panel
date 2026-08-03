@@ -16,9 +16,11 @@ set -euo pipefail
 
 WSS=${AGENT_WSS_URL:?}        # 例: wss://panel.example.com/ws/agent
 KEY=${AGENT_KEY:?}            # 唯一身份 + 凭证（uuid 已废弃，仅保留这一个）
-TMP_DIR=${AGENT_TMPDIR:-/tmp/cfpanel}
+# 临时目录/日志按 key 前 8 位隔离：同一台机器可安全运行多个 agent（不同服务器），互不冲突、互不误杀
+KEY_SLUG=${KEY:0:8}
+TMP_DIR=${AGENT_TMPDIR:-/tmp/cfpanel-$KEY_SLUG}
 WS_BUF=${WS_BUF:-3145728}     # websocat -B buffer 大小（字节）。前端文件块 1MB，base64 后约 1.4MB，3MB 留约 2 倍余量
-AGENT_LOG=${AGENT_LOG:-/tmp/cfpanel-agent.log} # 日志文件（每次 append 立即落盘，避免 stderr 块缓冲导致诊断滞后）
+AGENT_LOG=${AGENT_LOG:-/tmp/cfpanel-$KEY_SLUG-agent.log} # 日志文件（每次 append 立即落盘，避免 stderr 块缓冲导致诊断滞后）
 AGENT_LOG_MAX=${AGENT_LOG_MAX:-262144} # 日志轮转上限（字节，默认 256KB≈约5500行），超过则清空保留最近
 DISABLE_EXEC=${DISABLE_EXEC:-0}         # =1 时全局禁止命令执行（终端/exec 全部忽略）
 REPORT_INTERVAL=${REPORT_INTERVAL:-120} # 默认上报间隔（秒）：省配额策略下无人查看用 120s，有观看者由服务端下发 3s

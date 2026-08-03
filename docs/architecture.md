@@ -129,7 +129,7 @@ DO 是整个设计的心脏，对应哪吒 Dashboard 里那两个 `io.Copy` 的�
 **进程拓扑**
 
 ```
-后台上报:  collect_report() ──FIFO──> websocat(上行) ──> 面板 {type:"report",cpu,mem,...} 每 60s
+后台上报:  collect_report() ──FIFO──> websocat(上行) ──> 面板 {type:"report",cpu,mem,...} 每 120s（默认；有观看者时服务端下发 3s）
                                       ▲
 控制循环:  websocat -b $WSS/control   │ bash + jq 循环
              │  open_terminal {sid} → 拉起终端会话
@@ -146,7 +146,7 @@ DO 是整个设计的心脏，对应哪吒 Dashboard 里那两个 `io.Copy` 的�
 #!/usr/bin/env bash
 set -euo pipefail
 WSS=${AGENT_WSS_URL:?}; KEY=${AGENT_KEY:?}   # KEY 即唯一身份 + 凭证（uuid 已废弃）
-TMP_DIR=/tmp/cfpanel; REPORT_INTERVAL=${REPORT_INTERVAL:-60}
+TMP_DIR=/tmp/cfpanel-${KEY:0:8}; REPORT_INTERVAL=${REPORT_INTERVAL:-120}  # TMP_DIR 按 key 隔离，支持同机多 agent
 mkdir -p "$TMP_DIR"; CTL_IN="$TMP_DIR/control-in"; rm -f "$CTL_IN"; mkfifo "$CTL_IN"
 
 collect_report() {   # CPU/内存/网络采集 → JSON {type:"report",...}
@@ -191,7 +191,7 @@ done
 - 开终端：`socat` 创建 pty slave（`link=/tmp/cfpanel-<sid>` 暴露路径）并挂 `bash -i`；`websocat -b --exec socat` 把 WS 字节流与 slave 对接，全双工。
 - **残留清理**：浏览器关闭终端 → DO 关 agent WS → websocat 退出 → 执行清理逻辑：按 PTY 端 socat 的 PID 找到 `bash -i`（setsid 会话首进程），`kill -- -<bash_pid>` 整组清理（bash + `vim`/`top` 等子进程），再杀 PTY socat、删 slave link——避免僵尸进程累计。
 - resize：控制 WS 收到 `{type:resize,...}` → `stty -F <slave路径>` 改 winsize → 内核发 `SIGWINCH`，`vim`/`top` 跟着变尺寸。
-- 监控上报：后台循环每 `REPORT_INTERVAL`（默认 60s）采集一次，JSON 写入 FIFO；控制通道 websocat 以 FIFO 为 stdin，数据自动经 WS 上行，服务端识别 `{type:"report"}` 落监控热区——**免 crontab、免独立脚本**。
+- 监控上报：后台循环每 `REPORT_INTERVAL`（默认 120s）采集一次，JSON 写入 FIFO；控制通道 websocat 以 FIFO 为 stdin，数据自动经 WS 上行，服务端识别 `{type:"report"}` 落监控热区——**免 crontab、免独立脚本**。
 - 上报内容：固定列（CPU/内存/网络速率）+ `extra` JSON（Swap/磁盘/负载/温度/进程数/TCP-UDP 连接数，紧凑短 key 不压缩）+ `info`（OS/内核/IP，服务端比对变化才更新 `servers.info_json`）。网络速率由 agent 对 `/proc/net/dev` 累计值做差分，避免累计值当速率。
 - **省配额策略**：PanelDO 暴露 `/viewers` RPC（`state.getWebSockets().length` 统计在线前端）；TerminalDO 在 agent 控制通道建立与每次上报后查询它，通过 `{type:"set_report_interval", interval}` 下发间隔（仅变化时）：有观看者 3s 快采、无人 120s 低频采样——配额从"时刻满采"降到"只在有人看时满采"。首位观看者上线时 PanelDO 还会向各分片广播 `/rpc/wakeup`，agent 立即切快采（免等下一次上报）。agent 端把下发的间隔写入 `$TMP_DIR/report-interval`，上报循环每次唤醒后读取。
 - **文件管理**：与终端同构的独立会话——面板 `POST /api/file/open` 创建会话并下发 `open_file` 指令，agent 用 `websocat` 连回 `/ws/agent/file` 跑 `file-server.sh`（JSON 行协议：`list`/`read`/`write`，文件内容 base64）；浏览器经 `/ws/file/{sid}` 透传。服务端复用 TerminalDO 会话注册表/权限/清理，DO 只做双向透传。

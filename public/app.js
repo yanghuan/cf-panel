@@ -283,9 +283,7 @@
       const text = `服务器已添加，agent 配置（仅显示一次）：\n\nWSS 地址: ${cfg.wss_base}\nKEY: ${cfg.agent_key}`;
       $('#add-modal').classList.add('hidden');
       unlockScroll();
-      infoDialog('服务器已添加 · agent 配置（仅显示一次）', text);
-      loadServers();
-      unlockScroll();
+      infoDialog('服务器已添加 · agent 配置（仅显示一次）', text); // 内部会重新 lockScroll，弹窗期间保持锁定
       loadServers();
     } catch (e) {
       toast(e.message);
@@ -879,7 +877,8 @@
     $('#site-modal').classList.remove('hidden');
     lockScroll();
     api('/api/public/settings').then((s) => {
-      $('#set-site-name').value = s.site_name === 'cf-panel' ? '' : s.site_name;
+      // 直接回填实际存储值（不再硬编码默认名判断，避免用户真的设成 "cf-panel" 时显示为空）
+      $('#set-site-name').value = s.site_name || '';
       $('#set-notice').value = s.notice || '';
     }).catch(() => { /* ignore */ });
   }

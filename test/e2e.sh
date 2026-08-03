@@ -20,7 +20,8 @@ TMP="$(mktemp -d)"
 STATE="$TMP/wrangler-state"
 WRANGLER_LOG="$TMP/wrangler.log"
 AGENT_LOG="$TMP/agent.log"
-PIDS=()
+WRANGLER_PID=""
+AGENT_PID=""
 PASS=0
 FAIL=0
 
@@ -31,12 +32,13 @@ fi
 E2E_PASSWORD="${E2E_PASSWORD:-}"
 
 cleanup() {
-  # 结束 agent（按 key/临时目录特征精确清理其子进程）与 wrangler/workerd
+  # 只清理本次启动的进程（按进程组 kill，避免全局 pkill 误杀同机其他 wrangler/agent）
   [ -n "${AGENT_KEY:-}" ] && { pkill -f "websocat.*$AGENT_KEY" 2>/dev/null || true; }
   [ -n "${AGENT_KEY:-}" ] && { pkill -f "pty,link=$TMP/agent/" 2>/dev/null || true; }
-  [ ${#PIDS[@]} -gt 0 ] && kill "${PIDS[@]}" 2>/dev/null || true
-  pkill -f "wrangler" 2>/dev/null || true
-  pkill -f "workerd" 2>/dev/null || true
+  [ -n "$AGENT_PID" ] && { kill -- -"$AGENT_PID" 2>/dev/null || true; }
+  [ -n "$WRANGLER_PID" ] && { kill -- -"$WRANGLER_PID" 2>/dev/null || true; }
+  [ -n "$AGENT_PID" ] && { kill "$AGENT_PID" 2>/dev/null || true; }
+  [ -n "$WRANGLER_PID" ] && { kill "$WRANGLER_PID" 2>/dev/null || true; }
   sleep 0.3
   rm -rf "$TMP"
   if [ "$FAIL" -eq 0 ]; then
@@ -82,8 +84,8 @@ ok "D1 schema 已建表"
 
 # 2) 启动 wrangler dev --local（独立 persist 目录，不影响仓库 .wrangler）
 echo "[2/6] 启动 wrangler dev --local ..."
-npx wrangler dev --local --port "$PORT" --persist-to "$STATE" >"$WRANGLER_LOG" 2>&1 &
-PIDS+=("$!")
+setsid npx wrangler dev --local --port "$PORT" --persist-to "$STATE" >"$WRANGLER_LOG" 2>&1 &
+WRANGLER_PID=$!
 if ! wait_for "wrangler dev 就绪" 60 curl -s -o /dev/null "$BASE/api/public/settings"; then
   bad "wrangler dev 未在 60s 内就绪"
   tail -20 "$WRANGLER_LOG" 2>/dev/null || true
@@ -122,6 +124,7 @@ ok "已注册服务器（agent_key=${AGENT_KEY:0:8}...）"
 
 # 5) 启动 agent，等待其控制通道上线并上报监控
 echo "[5/6] 启动 agent.sh 并等待上线/上报 ..."
+setsid env \
 AGENT_WSS_URL="ws://127.0.0.1:$PORT/ws/agent" \
 AGENT_KEY="$AGENT_KEY" \
 AGENT_TMPDIR="$TMP/agent" \
@@ -129,7 +132,7 @@ AGENT_LOG="$AGENT_LOG" \
 AGENT_LOG_MAX=1048576 \
 REPORT_INTERVAL=5 \
 bash "$ROOT/agent/agent.sh" &
-PIDS+=("$!")
+AGENT_PID=$!
 
 if ! wait_for "agent 上线（servers.online=true）" 60 bash -c \
   "curl -s '$BASE/api/servers' -H 'authorization: Bearer $TOKEN' | jq -e '.[] | select(.name==\"e2e-node\") | .online == true' >/dev/null"; then

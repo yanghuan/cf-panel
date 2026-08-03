@@ -12,8 +12,7 @@ CREATE TABLE IF NOT EXISTS servers (
   user_id        INTEGER NOT NULL,          -- 归属用户（创建者）
   agent_key_hash TEXT    NOT NULL,          -- agent 密钥哈希（HMAC-SHA256）
   display_index  INTEGER NOT NULL DEFAULT 0,
-  last_seen      INTEGER,                   -- unix 秒，最近上报时间
-  online         INTEGER NOT NULL DEFAULT 0,
+  last_seen      INTEGER,                   -- unix 秒，最近上报时间（在线判定唯一依据：宽限期 ONLINE_GRACE_S 内算在线）
   wan_ip         TEXT,                      -- 节点公网出口 IP（agent 控制 WS 的 CF-Connecting-IP）
   info_json      TEXT,                      -- 系统信息 JSON（OS/内核/IP，变更时更新）
   probe_json     TEXT,                      -- 服务探活结果 JSON（[{name,ok,code,ms}]，变更时更新）

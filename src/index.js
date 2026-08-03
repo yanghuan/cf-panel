@@ -21,6 +21,9 @@ const ARCHIVE_AFTER_MIN = 60; // 超过 1 小时的旧数据才归档/可淘汰
 const METRICS_RETENTION_DAYS = 30; // D1 历史保留期（天），过期行每日清理
 const AUDIT_RETENTION_DAYS = 90; // 审计日志保留期（天），过期行随每日清理删除
 const PRUNE_INTERVAL_MS = 24 * 60 * 60 * 1000; // 保留期清理周期
+// 在线判定宽限期（秒）：与告警离线阈值默认值（offline_after_s=180）对齐。
+// 无观看者时 agent 慢采间隔 120s > 旧阈值 60s，会导致存活服务器误显示离线，故放宽到 180s。
+const ONLINE_GRACE_S = 180;
 
 // 省配额上报策略：有前端观看者时 agent 快采，否则低频采样
 const REPORT_FAST_INTERVAL_S = 3;  // 有观看者：3 秒上报
@@ -334,7 +337,7 @@ async function sendWebhook(cfg, payload) {
   } catch { /* 发送失败不影响主流程 */ }
 }
 
-// agent 监控上报落库：更新 last_seen/online（系统信息变更才写 info_json，探活变更才写 probe_json），
+// agent 监控上报落库：更新 last_seen（在线判定唯一依据；系统信息变更才写 info_json，探活变更才写 probe_json），
 // 时序写入 MetricsDO 热区（供 /api/report 与控制通道复用）。
 // 告警冷却/探活去重判定在 MetricsDO 内部完成（见 MetricsDO.checkAlerts / checkProbeAlerts）。
 async function handleReport(env, payload) {
@@ -361,13 +364,13 @@ async function handleReport(env, payload) {
   if (payload.info) {
     const infoJson = JSON.stringify(payload.info);
     if (server.info_json !== infoJson) {
-      await env.DB.prepare('UPDATE servers SET last_seen = ?, online = 1, info_json = ? WHERE id = ?')
+      await env.DB.prepare('UPDATE servers SET last_seen = ?, info_json = ? WHERE id = ?')
         .bind(ts, infoJson, payload.serverId).run();
     } else {
-      await env.DB.prepare('UPDATE servers SET last_seen = ?, online = 1 WHERE id = ?').bind(ts, payload.serverId).run();
+      await env.DB.prepare('UPDATE servers SET last_seen = ? WHERE id = ?').bind(ts, payload.serverId).run();
     }
   } else {
-    await env.DB.prepare('UPDATE servers SET last_seen = ?, online = 1 WHERE id = ?').bind(ts, payload.serverId).run();
+    await env.DB.prepare('UPDATE servers SET last_seen = ? WHERE id = ?').bind(ts, payload.serverId).run();
   }
   // 时序写入 MetricsDO 热区；告警/探活判定也在该调用内顺带完成（零额外请求）
   const mdo = doMetrics(env);
@@ -491,7 +494,7 @@ async function handleApi(request, env) {
   }
 
   // POST /api/report —— agent 监控上报（key 指纹定位 + hash 校验，无需登录）
-  // 时序数据写入内存 DO（MetricsDO 热区）；last_seen/online 仍落 D1
+  // 时序数据写入内存 DO（MetricsDO 热区）；last_seen 仍落 D1
   if (method === 'POST' && path === '/api/report') {
     const body = await request.json().catch(() => ({}));
     const keyId = await sha256Hex(String(body.key || ''));
@@ -537,7 +540,7 @@ async function handleApi(request, env) {
       name: s.name,
       group: s.group || '',
       display_index: s.display_index || 0,
-      online: s.online === 1 && now - (s.last_seen || 0) < 60, // now/last_seen 均为 unix 秒，60 秒内上报算在线
+      online: now - (s.last_seen || 0) < ONLINE_GRACE_S, // 宽限期内上报算在线（last_seen 为 unix 秒）
       wan_ip: s.wan_ip || '',
       info: safeJson(s.info_json),
       probes: safeJson(s.probe_json),
@@ -757,7 +760,7 @@ async function mcpListServers(user, env) {
       id: s.id,
       name: s.name,
       group: s.group || '',
-      online: s.online === 1 && now - (s.last_seen || 0) < 60, // now/last_seen 均为 unix 秒，60 秒内上报算在线
+      online: now - (s.last_seen || 0) < ONLINE_GRACE_S, // 宽限期内上报算在线（last_seen 为 unix 秒）
       wan_ip: s.wan_ip || '',
       info: safeJson(s.info_json),
       metrics: m ? {
@@ -1020,7 +1023,7 @@ export class TerminalDO {
       // 连接建立即标记在线（不等首次上报），避免上报延迟/丢帧导致误显示离线
       try {
         const now = Math.floor(Date.now() / 1000);
-        await this.env.DB.prepare('UPDATE servers SET last_seen = ?, online = 1 WHERE id = ?').bind(now, server.id).run();
+        await this.env.DB.prepare('UPDATE servers SET last_seen = ? WHERE id = ?').bind(now, server.id).run();
       } catch { /* 标记失败不影响连接 */ }
       // 连接建立即下发当前上报间隔（省配额：有观看者快采 3s / 无观看者慢采 120s）
       try {
@@ -1478,9 +1481,9 @@ export class MetricsDO {
     if (!cfg.enabled) return;
     const now = Math.floor(Date.now() / 1000);
     const offlineAfter = cfg.offline_after_s;
-    const rows = await this.env.DB.prepare('SELECT id, name, online, last_seen FROM servers').all();
+    const rows = await this.env.DB.prepare('SELECT id, name, last_seen FROM servers').all();
     for (const s of rows.results) {
-      const isOnline = s.online === 1 && (s.last_seen || 0) > now - offlineAfter;
+      const isOnline = (s.last_seen || 0) > now - offlineAfter;
       const key = `alert:offline:${s.id}`;
       const last = (await this.state.storage.get(key)) || 'on';
       if (!isOnline && last !== 'off') {
@@ -1630,7 +1633,7 @@ export class PanelDO {
         name: s.name,
         group: s.group || '',
         display_index: s.display_index || 0,
-        online: s.online === 1 && now - (s.last_seen || 0) < 60, // now/last_seen 均为 unix 秒，60 秒内上报算在线
+        online: now - (s.last_seen || 0) < ONLINE_GRACE_S, // 宽限期内上报算在线（last_seen 为 unix 秒）
         wan_ip: s.wan_ip || '',
         info: safeJson(s.info_json),
         probes: safeJson(s.probe_json),

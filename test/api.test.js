@@ -170,7 +170,7 @@ test('删除服务器：清理历史数据 + 审计日志 + 通知 DO 断开 age
   assert.ok(drops.every((c) => c.init.body === JSON.stringify({ serverId: id })));
 });
 
-test('服务器：在线状态按 last_seen 60 秒判定', async () => {
+test('服务器：在线状态按 last_seen 宽限期（180s）判定', async () => {
   const env = makeEnv();
   const token = await login(env);
   await addServer(env, token, { name: 's1' });
@@ -178,16 +178,22 @@ test('服务器：在线状态按 last_seen 60 秒判定', async () => {
   const id = list0[0].id;
 
   // 模拟刚刚上报 → 在线
-  await env.DB.prepare('UPDATE servers SET online = 1, last_seen = ? WHERE id = ?')
+  await env.DB.prepare('UPDATE servers SET last_seen = ? WHERE id = ?')
     .bind(Math.floor(Date.now() / 1000), id).run();
   const list1 = await (await call(env, { path: '/api/servers', token })).json();
   assert.equal(list1[0].online, true);
 
-  // last_seen 超过 60s → 离线（即使 online=1）
+  // 慢采间隔内（120s < 180s 宽限期）→ 仍在线（存活服务器不应误显示离线）
   await env.DB.prepare('UPDATE servers SET last_seen = ? WHERE id = ?')
     .bind(Math.floor(Date.now() / 1000) - 120, id).run();
   const list2 = await (await call(env, { path: '/api/servers', token })).json();
-  assert.equal(list2[0].online, false);
+  assert.equal(list2[0].online, true);
+
+  // 超过宽限期 → 离线（即使 online=1）
+  await env.DB.prepare('UPDATE servers SET last_seen = ? WHERE id = ?')
+    .bind(Math.floor(Date.now() / 1000) - 300, id).run();
+  const list3 = await (await call(env, { path: '/api/servers', token })).json();
+  assert.equal(list3[0].online, false);
 });
 
 // ---------------- agent 上报 ----------------
@@ -221,8 +227,7 @@ test('agent 上报：key 指纹定位 + 哈希校验 + 落库', async () => {
   assert.equal(ok.status, 200);
 
   const row = await env.DB.prepare('SELECT * FROM servers WHERE id = ?').bind(id).first();
-  assert.equal(row.online, 1);
-  assert.ok(row.last_seen > 0);
+  assert.ok(row.last_seen > 0); // 上报更新 last_seen
   assert.equal(JSON.parse(row.info_json).os, 'Debian 12');
   assert.equal(JSON.parse(row.probe_json)[0].name, 'web');
   const custom = await env.DB.prepare('SELECT * FROM metrics_custom WHERE server_id = ?').bind(id).all();

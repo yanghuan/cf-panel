@@ -235,19 +235,29 @@ mkfifo "$CTL_IN"
 (
   exec 3<>"$CTL_IN"  # 读写方式打开 FIFO，立即成功不阻塞
   local_iv=${REPORT_INTERVAL:-120}
+  # 读取服务端下发的动态间隔（有观看者 3s / 无人 120s）
+  read_iv() {
+    [ -f "$TMP_DIR/report-interval" ] || return 0
+    local new_iv
+    read -r new_iv < "$TMP_DIR/report-interval" 2>/dev/null || true
+    case "$new_iv" in
+      ''|*[!0-9]*) ;;
+      *) local_iv=$new_iv ;;
+    esac
+  }
   while true; do
-    # 读取服务端下发的动态间隔（有观看者 3s / 无人 120s）
-    if [ -f "$TMP_DIR/report-interval" ]; then
-      read -r new_iv < "$TMP_DIR/report-interval" 2>/dev/null || true
-      case "$new_iv" in
-        ''|*[!0-9]*) ;;
-        *) local_iv=$new_iv ;;
-      esac
-    fi
+    read_iv
     # 立即上报一次再 sleep：重启/重连后第一时间有数据，不用等首个间隔
     collect_report >&3 2>/dev/null || true
     rotate_log # 定期检查日志大小并轮转
-    sleep "$local_iv"
+    # 分段睡眠并每 5s 重读间隔：观看者上线后 ≤5s 内切到快采，不用等满一个旧周期
+    waited=0
+    while [ "$waited" -lt "$local_iv" ]; do
+      step=$((local_iv - waited)); [ "$step" -gt 5 ] && step=5
+      sleep "$step"
+      waited=$((waited + step))
+      read_iv
+    done
   done
 ) &
 

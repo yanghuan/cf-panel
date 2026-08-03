@@ -33,8 +33,8 @@ function mkMetrics(env, state) {
 
 function insertServer(env, keyId, name, extra = {}) {
   return env.DB.prepare(
-    'INSERT INTO servers (agent_key_id, name, user_id, agent_key_hash, online, last_seen) VALUES (?,?,?,?,?,?)'
-  ).bind(keyId, name, 1, 'h', extra.online ?? 0, extra.last_seen ?? null).run();
+    'INSERT INTO servers (agent_key_id, name, user_id, agent_key_hash, last_seen) VALUES (?,?,?,?,?)'
+  ).bind(keyId, name, 1, 'h', extra.last_seen ?? null).run();
 }
 
 test.beforeEach(() => I.__reset());
@@ -151,7 +151,7 @@ test('MetricsDO: alarm 清理超过 90 天的审计日志，保留近期', async
 
 test('MetricsDO: alarm 离线/恢复告警（DO Storage 状态去重）', async () => {
   const env = makeEnv();
-  await insertServer(env, 'k1', 'srv1', { online: 1, last_seen: Math.floor(Date.now() / 1000) - 1000 });
+  await insertServer(env, 'k1', 'srv1', { last_seen: Math.floor(Date.now() / 1000) - 1000 });
   await env.DB.prepare("INSERT INTO kv_json (key, value) VALUES ('settings', ?)")
     .bind(JSON.stringify({ alerts: { webhook_url: 'https://example.com/hook', offline_after_s: 180 } })).run();
   const st = mockState();
@@ -420,8 +420,7 @@ test('TerminalDO: 控制通道 report 消息 → 落库 + 按观看者数下发�
   await inst.webSocketMessage(ws, JSON.stringify({ type: 'report', cpu: 33, mem_used: 1, mem_total: 2 }));
 
   const row = await env.DB.prepare('SELECT * FROM servers WHERE id = 1').first();
-  assert.equal(row.online, 1);
-  assert.ok(row.last_seen > 0);
+  assert.ok(row.last_seen > 0); // 在线判定唯一依据 last_seen
   // 观看者数 0 → 慢采间隔 120
   assert.ok(sent.includes(JSON.stringify({ type: 'set_report_interval', interval: 120 })));
 });

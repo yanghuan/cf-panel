@@ -963,6 +963,7 @@ export class TerminalDO {
         try { sess.userWs && sess.userWs.close(); } catch { /* ignore */ }
         try { sess.agentWs && sess.agentWs.close(); } catch { /* ignore */ }
         this.sessions.delete(sid);
+        this.state.storage.delete('sess:' + sid).catch(() => {}); // 清理持久化会话
       }
       // 清理该服务器的 open_terminal 待确认（定时器停止）
       for (const sid of sids) {
@@ -978,15 +979,28 @@ export class TerminalDO {
       const body = await request.json();
       if (body.op === 'create' || body.op === 'open_file') {
         const isFile = body.op === 'open_file';
+        const createdAt = Date.now();
         this.sessions.set(body.streamId, {
           streamId: body.streamId,
           serverId: body.serverId,
           creatorUserId: body.creatorUserId,
-          createdAt: Date.now(),
+          createdAt,
           type: isFile ? 'file' : 'terminal',
           userWs: null,
           agentWs: null,
+          userBuf: [], // 浏览器鉴权挂接前缓冲 agent 输出（如初始 bash 提示符），鉴权后补发
         });
+        // 会话元数据持久化到 DO Storage：防 DO 休眠后、浏览器/agent WS 挂接前会话丢失
+        // （否则前端会先看到"连接断开"，重连才成功）
+        try {
+          await this.state.storage.put('sess:' + body.streamId, {
+            streamId: body.streamId,
+            serverId: body.serverId,
+            creatorUserId: body.creatorUserId,
+            createdAt,
+            type: isFile ? 'file' : 'terminal',
+          });
+        } catch { /* 持久化失败则降级为纯内存会话 */ }
         const agentWs = this.agents.get(body.serverId);
         if (!agentWs) return json({ error: 'agent offline' }, 502);
         agentWs.send(JSON.stringify({ type: isFile ? 'open_file' : 'open_terminal', stream_id: body.streamId }));
@@ -1004,7 +1018,7 @@ export class TerminalDO {
     let m = path.match(/^\/ws\/(terminal|file)\/(.+)$/);
     if (m) {
       const streamId = m[2];
-      const sess = this.sessions.get(streamId);
+      const sess = await this.hydrateSession(streamId);
       if (!sess) return new Response('session not found', { status: 404 });
       const pair = new WebSocketPair();
       this.state.acceptWebSocket(pair[1]);
@@ -1055,7 +1069,7 @@ export class TerminalDO {
     if (path === '/ws/agent/terminal' || path === '/ws/agent/file') {
       const sid = url.searchParams.get('sid') || '';
       const key = request.headers.get('x-agent-key') || url.searchParams.get('key') || '';
-      const sess = this.sessions.get(sid);
+      const sess = await this.hydrateSession(sid);
       if (!sess) return new Response('session not found', { status: 404 });
       const server = await this.env.DB.prepare('SELECT * FROM servers WHERE id = ?').bind(sess.serverId).first();
       if (!server) return new Response('unknown agent', { status: 401 });
@@ -1075,6 +1089,20 @@ export class TerminalDO {
     return new Response('not found', { status: 404 });
   }
 
+  // 取会话：先查内存，内存丢失（DO 休眠后）则从 DO Storage 水合兜底
+  async hydrateSession(streamId) {
+    let sess = this.sessions.get(streamId);
+    if (sess) return sess;
+    try {
+      const raw = await this.state.storage.get('sess:' + streamId);
+      if (raw) {
+        sess = { ...raw, userWs: null, agentWs: null, userBuf: [] };
+        this.sessions.set(streamId, sess);
+      }
+    } catch { /* 水合失败按不存在处理 */ }
+    return sess;
+  }
+
   // 惰性清理：两端都断开且超过 TTL 的僵尸会话 → 删除；并清理对应 pendingTerm。
   // 若有未到期的僵尸会话，则安排 DO alarm 到最早到期时间——Hibernation 下零流量也会
   // 被 alarm 短暂唤醒执行清理，避免"必须等下一次 fetch 才回收"的滞留（alarm 每次 = 1 次请求，僵尸会话罕见，成本可忽略）。
@@ -1085,6 +1113,7 @@ export class TerminalDO {
       if (sess.userWs || sess.agentWs) continue; // 任一端有连接即不回收
       if (now - sess.createdAt > SESSION_TTL_MS) {
         this.sessions.delete(sid);
+        this.state.storage.delete('sess:' + sid).catch(() => {}); // 清理持久化会话
       } else {
         next = Math.min(next, sess.createdAt + SESSION_TTL_MS);
       }
@@ -1157,6 +1186,7 @@ export class TerminalDO {
             type: att.type,
             userWs: null,
             agentWs: null,
+            userBuf: [],
           };
           this.sessions.set(att.sid, sess);
         }
@@ -1185,7 +1215,7 @@ export class TerminalDO {
       try { j = JSON.parse(typeof message === 'string' ? message : ''); } catch { /* 非 JSON */ }
       const token = j && j.type === 'auth' ? String(j.token || '') : '';
       const payload = token ? await verifyJwt(token, this.env) : null;
-      const sess = this.sessions.get(att.sid);
+      const sess = await this.hydrateSession(att.sid);
       if (!payload || !payload.uid || !sess || !(payload.role === 1 || payload.uid === sess.creatorUserId)) {
         try { ws.close(1008, 'unauthorized'); } catch { /* ignore */ }
         return;
@@ -1196,6 +1226,13 @@ export class TerminalDO {
         role: 'user', sid: att.sid, serverId: sess.serverId,
         creatorUserId: sess.creatorUserId, type: sess.type, createdAt: sess.createdAt,
       });
+      // 补发鉴权前缓冲的 agent 输出（如初始 bash 提示符），保证打开即见首屏
+      if (sess.userBuf && sess.userBuf.length) {
+        for (const m of sess.userBuf) {
+          try { ws.send(m); } catch { /* ignore */ }
+        }
+        sess.userBuf = [];
+      }
       return;
     }
     // agent 控制通道（不在任何 session）：处理监控上报 {type:"report"} 与终端确认 {type:"terminal_ready"}
@@ -1253,7 +1290,12 @@ export class TerminalDO {
       if (sess.agentWs) sess.agentWs.send(message);
     } else if (ws === sess.agentWs) {
       // agent → DO → 浏览器（纯字节透传）
-      if (sess.userWs) sess.userWs.send(message);
+      if (sess.userWs) {
+        sess.userWs.send(message);
+      } else if (sess.userBuf && sess.userBuf.length < 128) {
+        // 浏览器尚未鉴权挂接：缓冲首屏输出（如 bash 初始提示符），避免被丢弃
+        sess.userBuf.push(message);
+      }
     }
   }
 
@@ -1293,7 +1335,10 @@ export class TerminalDO {
           try { sess.userWs.close(); } catch { /* ignore */ }
         }
       }
-      if (!sess.userWs && !sess.agentWs) this.sessions.delete(sid);
+      if (!sess.userWs && !sess.agentWs) {
+        this.sessions.delete(sid);
+        this.state.storage.delete('sess:' + sid).catch(() => {}); // 清理持久化会话
+      }
     }
     for (const [serverId, w] of this.agents) {
       if (w === ws) this.agents.delete(serverId);

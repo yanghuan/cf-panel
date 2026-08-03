@@ -18,6 +18,9 @@ function mockState(store = {}) {
     async put(k, v) {
       map.set(k, v);
     },
+    async delete(k) {
+      map.delete(k);
+    },
     setAlarm(ts) {
       this.alarmTs = ts;
     },
@@ -500,6 +503,68 @@ test('TerminalDO: user-pending 首帧鉴权后挂接 userWs，非法 token 断�
   assert.equal(good.closed, false);
   assert.equal(inst.sessions.get('0-sid').userWs, good);
   assert.equal(good.attachment.role, 'user');
+});
+
+test('TerminalDO: 浏览器鉴权前 agent 输出缓冲，鉴权后补发（初始提示符不丢）', async () => {
+  const env = makeEnv();
+  const token = await I.signJwt({ uid: 1, username: 'admin', role: 1, exp: Math.floor(Date.now() / 1000) + 3600 }, env);
+  const inst = new TerminalDO(mockState(), env);
+  const agentWs = { send() {}, readyState: 1 };
+  inst.sessions.set('0-sid', {
+    streamId: '0-sid', serverId: 1, creatorUserId: 1, createdAt: Date.now(), type: 'terminal',
+    userWs: null, agentWs, userBuf: [],
+  });
+
+  // agent 初始输出（如 bash 提示符）在浏览器挂接前到达 → 缓冲
+  const prompt = new TextEncoder().encode('prompt> ');
+  await inst.webSocketMessage(agentWs, prompt);
+  const sess0 = inst.sessions.get('0-sid');
+  assert.equal(sess0.userWs, null);
+  assert.equal(sess0.userBuf.length, 1);
+
+  // 浏览器 user-pending 鉴权 → 挂接并补发缓冲
+  const browserSent = [];
+  const browserWs = {
+    closed: false,
+    attachment: { role: 'user-pending', sid: '0-sid', serverId: 1, creatorUserId: 1, type: 'terminal', createdAt: Date.now() },
+    deserializeAttachment() { return this.attachment; },
+    serializeAttachment(a) { this.attachment = a; },
+    send(m) { browserSent.push(m); },
+    close() { this.closed = true; },
+  };
+  await inst.webSocketMessage(browserWs, JSON.stringify({ type: 'auth', token }));
+  const sess = inst.sessions.get('0-sid');
+  assert.equal(sess.userWs, browserWs);
+  assert.equal(browserSent.length, 1);
+  assert.deepEqual(browserSent[0], prompt);
+  assert.equal(sess.userBuf.length, 0);
+});
+
+test('TerminalDO: 会话持久化到 DO Storage，休眠后可水合（浏览器 auth 不因会话丢失被拒）', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] }); // 屏蔽 scheduleTermAck 的 5s 定时器
+  try {
+    const env = makeEnv();
+    const st = mockState(); // 共享 storage，模拟 DO 持久化跨实例存活
+    const inst1 = new TerminalDO(st, env);
+    inst1.agents.set(1, { send() {}, readyState: 1 });
+
+    const resp = await inst1.fetch(new Request('https://do.internal/rpc', {
+      method: 'POST',
+      body: JSON.stringify({ op: 'create', streamId: '0-sid', serverId: 1, creatorUserId: 1 }),
+    }));
+    assert.equal(resp.status, 200);
+    assert.ok(st.storage.map.has('sess:0-sid'), '会话应持久化到 DO Storage');
+
+    // 模拟 DO 休眠：新实例（内存空）共享同一 storage
+    const inst2 = new TerminalDO(st, env);
+    assert.equal(inst2.sessions.size, 0);
+    const sess = await inst2.hydrateSession('0-sid');
+    assert.ok(sess, '应从 Storage 水合出会话');
+    assert.equal(sess.serverId, 1);
+    assert.equal(sess.userWs, null);
+  } finally {
+    t.mock.timers.reset();
+  }
 });
 
 test('TerminalDO: cleanup 断开后清空 agents/sessions/pendingTerm', async () => {

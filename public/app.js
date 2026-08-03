@@ -416,9 +416,11 @@
           w.onopen = () => {
             retries = 0;
             rebuilding = false;
-            fit.fit();
             term.focus();
+            // 必须先发 auth（服务端首帧鉴权），再调用会触发 onResize 发 resize 帧的 fit.fit()，
+            // 否则 resize 抢在 auth 前被当作未鉴权拒绝（表现为首次"连接断开"，重连才成功）
             try { w.send(JSON.stringify({ type: 'auth', token })); } catch { /* ignore */ }
+            fit.fit();
             w.send(JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows }));
             // 自愈：连接后长时间无数据（open_terminal 在 agent 重连窗口丢失）→ 重建会话
             if (noDataTimer) clearTimeout(noDataTimer);

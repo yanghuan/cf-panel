@@ -230,7 +230,8 @@ wrangler secret put PANEL_USERS      # 回车后粘贴值，如 alice:pass1,bob:
 - **文件管理**：面板服务器卡片点「文件」→ 弹出文件管理器，可浏览目录（点击进入/上级/路径跳转）、**上传**（本地文件写入 agent）、**下载**（agent 文件回传浏览器）；文件经独立 WS 会话**分段传输**（1MB/段，base64），**单文件上限 500MB**（需 GNU coreutils 的 `find -printf`/`tail -c`/`base64 -w0`）。
 - **监控**：点「监控」默认看近 12 小时分钟数据（内存 DO 热区，秒回）；可切 1小时/3天/7天/30天查看 D1 归档历史（分钟粒度，超长区间自动降采样）。指标：CPU / 内存 / Swap / 磁盘（根分区）/ 负载 / 温度 / 进程数；服务器卡片显示 OS / 内核 / IP 系统信息。
 - **分组与排序**：添加服务器可填「分组」和「序号」，列表按分组展示、组内按序号排序（未填归入「未分组」）。
-- **登录**：`PANEL_USERS` 多用户（`user:pass,user:pass`）或单管理员（`PANEL_PASSWORD`），登录即管理员；同 IP 60 秒内失败 5 次后限流（429）。
+- **登录**：`PANEL_USERS` 多用户（`user:pass,user:pass`）或单管理员（`PANEL_PASSWORD`），登录即管理员。**暴力破解防护推荐用前置的 Cloudflare Access**（面板整体放在 Access 之后，登录密码作为第二层）；应用内置不再限流。
+  > ⚠️ Access 需为 agent 路径放行：`/ws/agent/*` 与 `/api/report` 使用 `X-Agent-Key` 头（非浏览器 SSO），必须配置 Bypass 或 Service Token 策略，否则 agent 无法连接。
 - **公告**：设置里可改站点名/公告（存 D1 `kv_json` 表），公告对所有访客可见。
 - **PAT**：设置里可创建访问令牌（scopes + server_ids 白名单），供 API 调用（`Authorization: Bearer cfp_xxx`）。
 

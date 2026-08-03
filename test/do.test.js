@@ -168,6 +168,100 @@ test('MetricsDO: alarm 离线/恢复告警（DO Storage 状态去重）', async 
   }
 });
 
+// ---------------- MetricsDO：阈值告警 / 探活告警（/report 顺风车，单实例去重） ----------------
+test('MetricsDO: /report 顺风车触发 CPU 阈值告警，冷却期内抑制', async () => {
+  const env = makeEnv();
+  await env.DB.prepare("INSERT INTO kv_json (key, value) VALUES ('settings', ?)")
+    .bind(JSON.stringify({
+      alerts: { webhook_url: 'https://example.com/{token}?ev={event}&name={server_name}', webhook_token: 'tok', cpu_pct: 90, mem_pct: 90, cooldown_min: 30 },
+    })).run();
+  const { call } = mkMetrics(env, mockState());
+  const cap = captureFetch();
+  try {
+    const nowMin = Math.floor(Date.now() / 1000 / 60);
+    await call('/report', { method: 'POST', body: JSON.stringify({ serverId: 1, serverName: 'srv1', minTs: nowMin, cpu: 95 }) });
+    assert.equal(cap.calls.length, 1);
+    assert.match(cap.calls[0].url, /^https:\/\/example\.com\/tok\?ev=alert&name=srv1$/);
+    const body = JSON.parse(cap.calls[0].init.body);
+    assert.equal(body.event, 'alert');
+    assert.equal(body.server.id, 1);
+    assert.deepEqual(body.details, ['CPU 95.0% >= 90%']);
+
+    // 冷却期内再次触发 → 抑制（同一 DO 实例状态去重）
+    await call('/report', { method: 'POST', body: JSON.stringify({ serverId: 1, serverName: 'srv1', minTs: nowMin, cpu: 98 }) });
+    assert.equal(cap.calls.length, 1);
+
+    // 未达阈值不触发
+    await call('/report', { method: 'POST', body: JSON.stringify({ serverId: 1, serverName: 'srv1', minTs: nowMin, cpu: 50 }) });
+    assert.equal(cap.calls.length, 1);
+  } finally {
+    cap.restore();
+  }
+});
+
+test('MetricsDO: /report 内存/磁盘/负载阈值告警', async () => {
+  const env = makeEnv();
+  await env.DB.prepare("INSERT INTO kv_json (key, value) VALUES ('settings', ?)")
+    .bind(JSON.stringify({ alerts: { webhook_url: 'https://example.com/hook', cpu_pct: 90, mem_pct: 90, disk_pct: 80, load: 5, cooldown_min: 30 } })).run();
+  const { call } = mkMetrics(env, mockState());
+  const cap = captureFetch();
+  try {
+    const nowMin = Math.floor(Date.now() / 1000 / 60);
+    await call('/report', {
+      method: 'POST',
+      body: JSON.stringify({
+        serverId: 2, serverName: 'srv2', minTs: nowMin,
+        cpu: 10, mem_used: 900, mem_total: 1000, // mem 90%
+        extra: { disk: [{ m: '/', u: 95 }], load1: 8 },
+      }),
+    });
+    assert.equal(cap.calls.length, 1);
+    const details = JSON.parse(cap.calls[0].init.body).details;
+    assert.deepEqual(details, ['内存 90.0% >= 90%', '磁盘 / 95% >= 80%', '负载 8 >= 5']);
+  } finally {
+    cap.restore();
+  }
+});
+
+test('MetricsDO: /report 探活 down/recovered/冷却抑制', async () => {
+  const env = makeEnv();
+  await env.DB.prepare("INSERT INTO kv_json (key, value) VALUES ('settings', ?)")
+    .bind(JSON.stringify({ alerts: { webhook_url: 'https://example.com/hook', cooldown_min: 30 } })).run();
+  const { call } = mkMetrics(env, mockState());
+  const cap = captureFetch();
+  try {
+    const nowMin = Math.floor(Date.now() / 1000 / 60);
+    const report = (probes) => call('/report', {
+      method: 'POST',
+      body: JSON.stringify({ serverId: 1, serverName: 'srv1', minTs: nowMin, probes }),
+    });
+
+    await report([{ name: 'web', ok: false }]);
+    assert.equal(cap.calls.length, 1);
+    assert.equal(JSON.parse(cap.calls[0].init.body).event, 'probe_down');
+
+    // 冷却内再次失败 → 抑制
+    await report([{ name: 'web', ok: false }]);
+    assert.equal(cap.calls.length, 1);
+
+    // 恢复 → recovered
+    await report([{ name: 'web', ok: true }]);
+    assert.equal(cap.calls.length, 2);
+    assert.equal(JSON.parse(cap.calls[1].init.body).event, 'probe_recovered');
+
+    // 恢复后再次失败 → 立即触发 down（状态已回 ok，冷却不生效）
+    await report([{ name: 'web', ok: false }]);
+    assert.equal(cap.calls.length, 3);
+    assert.equal(JSON.parse(cap.calls[2].init.body).event, 'probe_down');
+
+    // 持续失败 → 冷却抑制
+    await report([{ name: 'web', ok: false }]);
+    assert.equal(cap.calls.length, 3);
+  } finally {
+    cap.restore();
+  }
+});
+
 // ---------------- PanelDO ----------------
 test('PanelDO: /viewers 返回在线观看者数；其他路径 404', async () => {
   const env = makeEnv();

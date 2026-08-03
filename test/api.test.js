@@ -74,20 +74,15 @@ test('登录：PANEL_USERS 优先级高于 PANEL_PASSWORD', async () => {
   assert.equal(user.username, 'alice');
 });
 
-test('登录：同 IP 60 秒内 5 次失败后限流 429', async () => {
+test('登录：错误密码连续多次仍只返回 401（暴力破解由前置 CF Access 防护）', async () => {
   const env = makeEnv();
-  for (let i = 0; i < 5; i++) {
-    const res = await call(env, { method: 'POST', path: '/api/login', body: { password: 'no' }, ip: '6.6.6.6' });
+  for (let i = 0; i < 10; i++) {
+    const res = await call(env, { method: 'POST', path: '/api/login', body: { password: 'no' } });
     assert.equal(res.status, 401);
   }
-  const res = await call(env, { method: 'POST', path: '/api/login', body: { password: 'no' }, ip: '6.6.6.6' });
-  assert.equal(res.status, 429);
-  // 正确密码也被限流
-  const ok = await call(env, { method: 'POST', path: '/api/login', body: { password: 'admin123' }, ip: '6.6.6.6' });
-  assert.equal(ok.status, 429);
-  // 换 IP 不受影响
-  const other = await call(env, { method: 'POST', path: '/api/login', body: { password: 'admin123' }, ip: '7.7.7.7' });
-  assert.equal(other.status, 200);
+  // 正确密码不受影响
+  const ok = await call(env, { method: 'POST', path: '/api/login', body: { password: 'admin123' } });
+  assert.equal(ok.status, 200);
 });
 
 // ---------------- 鉴权 ----------------
@@ -199,10 +194,21 @@ test('agent 上报：key 指纹定位 + 哈希校验 + 落库', async () => {
   assert.equal(custom.results.length, 1);
   assert.equal(custom.results[0].value, 42);
 
-  // MetricsDO 桩收到 /report（含 serverId 与 minTs）
+  // MetricsDO 桩收到 /report（含 serverId/minTs/serverName/probes，告警判定在 DO 顺带执行）
   const reportCalls = env.METRICS.calls.filter((c) => c.path === '/report');
   assert.equal(reportCalls.length, 1);
-  assert.equal(reportCalls[0].init.body, JSON.stringify({ serverId: id, minTs: Math.floor(Date.now() / 1000 / 60), cpu: 12.5, mem_used: 1024, mem_total: 4096, net_in: 1000, net_out: 2000, extra: { load1: 0.5 } }));
+  assert.equal(reportCalls[0].init.body, JSON.stringify({
+    serverId: id,
+    serverName: 'node-1',
+    minTs: Math.floor(Date.now() / 1000 / 60),
+    cpu: 12.5,
+    mem_used: 1024,
+    mem_total: 4096,
+    net_in: 1000,
+    net_out: 2000,
+    extra: { load1: 0.5 },
+    probes: [{ name: 'web', ok: true, ms: 5 }],
+  }));
 
   // 上报后列表显示在线 + 指标
   const after = await (await call(env, { path: '/api/servers', token })).json();

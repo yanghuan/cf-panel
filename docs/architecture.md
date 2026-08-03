@@ -13,7 +13,7 @@
 | 能力 | 能否在 Cloudflare 上运行 | 承载组件 |
 | --- | --- | --- |
 | 面板前端（静态） | ✅ 可行 | Cloudflare Pages |
-| 鉴权 / 路由 / 限流 | ✅ 可行 | Cloudflare Worker |
+| 鉴权 / 路由 | ✅ 可行 | Cloudflare Worker |
 | WebSocket 长连接中转、双向字节对拷 | ✅ 可行 | Durable Object（WebSocket Hibernation） |
 | **终端执行端（fork 进程 / 开 PTY / exec）** | ❌ **不可行** | 必须在外部有 OS 的机器上（VPS / 本地） |
 
@@ -69,7 +69,7 @@
 ### 3.2 鉴权 Worker
 - 校验 JWT / PAT，校验当前用户对目标 `server_id` 是否有权限（参考哪吒 `server.HasPermission`）。
 - 终端功能需要独立的权限 scope（哪吒用 `nezha:server:exec`），与"只读监控"分离。
-- 做限流、审计入口。
+- 审计入口；暴力破解防护由前置的 Cloudflare Access 承担（应用内不再内置登录限流）。
 
 #### 3.2.1 MCP（AI 接入端点）
 

@@ -28,9 +28,6 @@ const REPORT_SLOW_INTERVAL_S = 120; // 无人查看：120 秒上报
 // 端点 /mcp 仅接受 POST；每请求独立用 Authorization: Bearer 鉴权（JWT 或 PAT），无会话状态
 const MCP_VERSION = '2025-11-25'; // 服务器声明支持的协议版本（缺失头时客户端按 2025-03-26 兼容）
 
-// 简单登录限流：同一 IP 60 秒内最多 5 次失败（Worker 实例内存，重启清零）
-const LOGIN_FAILS = new Map();
-
 // 解析面板用户：PANEL_USERS="alice:pass1,bob:pass2"；未设置时回退 PANEL_PASSWORD 单管理员
 function parsePanelUsers(env) {
   const raw = String(env.PANEL_USERS || '').trim();
@@ -254,12 +251,9 @@ async function queryCustomMetrics(env, serverId, hours) {
   return custom;
 }
 
-// 指标告警冷却状态（serverId:kind -> 上次触发时间，Worker 实例内存，重启清零）
-const ALERT_LAST = new Map();
-// 服务探活状态（serverId:probeName -> {ok, lastFail}，Worker 实例内存，重启清零）
-const PROBE_STATE = new Map();
-
 // 设置缓存（避免告警检查每次上报读 D1），TTL 60s，保存设置时清除
+// 注意：告警冷却（ALERT_LAST）与探活去重（PROBE_STATE）状态已移至 MetricsDO 实例内存
+// （单实例全局一致，且复用每次上报已有的 /report 调用，零额外请求），见 MetricsDO.checkAlerts/checkProbeAlerts
 const SETTINGS_CACHE = new Map();
 const SETTINGS_TTL_MS = 60 * 1000;
 async function kvGetCached(env, key, fallback) {
@@ -337,101 +331,20 @@ async function sendWebhook(cfg, payload) {
   } catch { /* 发送失败不影响主流程 */ }
 }
 
-// 指标阈值告警（CPU/内存/磁盘/负载），带冷却去抖；在 handleReport 中调用
-async function checkAlerts(env, payload, serverName) {
-  const cfg = await getAlertCfg(env);
-  if (!cfg.enabled) return;
-  const now = Date.now();
-  const cooldown = cfg.cooldown_min * 60 * 1000;
-  const cooled = (key) => {
-    const last = ALERT_LAST.get(key);
-    if (last && now - last < cooldown) return false;
-    ALERT_LAST.set(key, now);
-    return true;
-  };
-  const alerts = [];
-  // CPU
-  if (payload.cpu != null && payload.cpu >= cfg.cpu_pct && cooled(`${payload.serverId}:cpu`)) {
-    alerts.push(`CPU ${payload.cpu.toFixed(1)}% >= ${cfg.cpu_pct}%`);
-  }
-  // 内存（需要 agent 上报 mem_total）
-  if (payload.mem_used != null && payload.mem_total != null && payload.mem_total > 0) {
-    const memPct = (payload.mem_used / payload.mem_total) * 100;
-    if (memPct >= cfg.mem_pct && cooled(`${payload.serverId}:mem`)) {
-      alerts.push(`内存 ${memPct.toFixed(1)}% >= ${cfg.mem_pct}%`);
-    }
-  }
-  // 磁盘（根分区）
-  const rootDisk = payload.extra && payload.extra.disk && payload.extra.disk.find((d) => d.m === '/');
-  if (rootDisk && rootDisk.u != null && rootDisk.u >= cfg.disk_pct && cooled(`${payload.serverId}:disk`)) {
-    alerts.push(`磁盘 / ${rootDisk.u}% >= ${cfg.disk_pct}%`);
-  }
-  // 负载（可选，未设置则不启用）
-  if (cfg.load > 0 && payload.extra && payload.extra.load1 != null && payload.extra.load1 >= cfg.load && cooled(`${payload.serverId}:load`)) {
-    alerts.push(`负载 ${payload.extra.load1} >= ${cfg.load}`);
-  }
-  if (alerts.length) {
-    await sendWebhook(cfg, {
-      event: 'alert',
-      title: `[cf-panel] ${serverName} 指标告警`,
-      server: { id: payload.serverId, name: serverName },
-      message: `服务器 ${serverName}（id=${payload.serverId}）指标超阈值：\n` + alerts.join('\n'),
-      details: alerts,
-      time: new Date().toISOString(),
-    });
-  }
-}
-
-// 服务探活告警：失败持续超冷却 → probe_down；恢复 → probe_recovered
-async function checkProbeAlerts(env, serverId, serverName, probes) {
-  const cfg = await getAlertCfg(env);
-  if (!cfg.enabled || !Array.isArray(probes)) return;
-  const now = Date.now();
-  const cooldown = cfg.cooldown_min * 60 * 1000;
-  for (const p of probes) {
-    if (!p || !p.name) continue;
-    const key = `${serverId}:${p.name}`;
-    const st = PROBE_STATE.get(key) || { ok: true, lastFail: 0 };
-    if (p.ok) {
-      if (!st.ok) {
-        PROBE_STATE.set(key, { ok: true, lastFail: 0 });
-        await sendWebhook(cfg, {
-          event: 'probe_recovered',
-          title: `[cf-panel] ${serverName} 服务恢复：${p.name}`,
-          server: { id: serverId, name: serverName },
-          message: `服务器 ${serverName} 的服务「${p.name}」已恢复正常。`,
-          time: new Date().toISOString(),
-        });
-      }
-    } else if (st.ok || now - st.lastFail >= cooldown) {
-      PROBE_STATE.set(key, { ok: false, lastFail: now });
-      await sendWebhook(cfg, {
-        event: 'probe_down',
-        title: `[cf-panel] ${serverName} 服务异常：${p.name}`,
-        server: { id: serverId, name: serverName },
-        message: `服务器 ${serverName} 的服务「${p.name}」探测失败${p.code ? `（HTTP ${p.code}）` : ''}。`,
-        details: p,
-        time: new Date().toISOString(),
-      });
-    }
-  }
-}
-
 // agent 监控上报落库：更新 last_seen/online（系统信息变更才写 info_json，探活变更才写 probe_json），
-// 时序写入 MetricsDO 热区（供 /api/report 与控制通道复用）
+// 时序写入 MetricsDO 热区（供 /api/report 与控制通道复用）。
+// 告警冷却/探活去重判定在 MetricsDO 内部完成（见 MetricsDO.checkAlerts / checkProbeAlerts）。
 async function handleReport(env, payload) {
   const ts = Math.floor(Date.now() / 1000);
   const minTs = Math.floor(ts / 60);
   const server = await env.DB.prepare('SELECT info_json, probe_json, name FROM servers WHERE id = ?').bind(payload.serverId).first();
   if (!server) return;
-  await checkAlerts(env, payload, server.name);
-  // 探活状态：变更才写 probe_json，并做探活告警
+  // 探活状态：变更才写 probe_json（告警去重状态在 MetricsDO 顺风车处理）
   if (Array.isArray(payload.probes)) {
     const probeJson = JSON.stringify(payload.probes);
     if (server.probe_json !== probeJson) {
       await env.DB.prepare('UPDATE servers SET probe_json = ? WHERE id = ?').bind(probeJson, payload.serverId).run();
     }
-    await checkProbeAlerts(env, payload.serverId, server.name, payload.probes);
   }
   // 自定义监控项：低频直写 D1（分钟级，无需内存热区）
   if (Array.isArray(payload.custom)) {
@@ -453,12 +366,14 @@ async function handleReport(env, payload) {
   } else {
     await env.DB.prepare('UPDATE servers SET last_seen = ?, online = 1 WHERE id = ?').bind(ts, payload.serverId).run();
   }
+  // 时序写入 MetricsDO 热区；告警/探活判定也在该调用内顺带完成（零额外请求）
   const mdo = doMetrics(env);
   await mdo.fetch('https://do.internal/report', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({
       serverId: payload.serverId,
+      serverName: server.name,
       minTs,
       cpu: payload.cpu ?? null,
       mem_used: payload.mem_used ?? null,
@@ -466,6 +381,7 @@ async function handleReport(env, payload) {
       net_in: payload.net_in ?? null,   // 网络速率（字节/秒）
       net_out: payload.net_out ?? null,
       extra: payload.extra ?? null,     // 扩展监控项对象 → 序列化存入 extra 列
+      probes: payload.probes ?? null,
     }),
   });
 }
@@ -531,27 +447,15 @@ async function handleApi(request, env) {
   const path = url.pathname;
   const method = request.method;
 
-  // POST /api/login —— 面板登录（PANEL_USERS 多用户 或 PANEL_PASSWORD 单管理员；同 IP 60s 内 5 次失败限流）
+  // POST /api/login —— 面板登录（PANEL_USERS 多用户 或 PANEL_PASSWORD 单管理员）
+  // 暴力破解防护由前置的 Cloudflare Access 承担（服务部署在 Access 之后），此处不再内置限流
   if (method === 'POST' && path === '/api/login') {
     const body = await request.json().catch(() => ({}));
     const password = String(body.password || '');
     const users = parsePanelUsers(env);
     if (!users.length) return err('server misconfigured: PANEL_USERS/PANEL_PASSWORD not set', 500);
-    const ip = request.headers.get('cf-connecting-ip') || 'unknown';
-    const nowMs = Date.now();
-    const rec = LOGIN_FAILS.get(ip);
-    if (rec && nowMs - rec.ts < 60000 && rec.count >= 5) {
-      return err('too many attempts, try again later', 429);
-    }
     const userIdx = users.findIndex((u) => u.password === password);
-    if (userIdx < 0) {
-      const cur = rec && nowMs - rec.ts < 60000 ? rec : { count: 0, ts: nowMs };
-      cur.count += 1;
-      cur.ts = nowMs;
-      LOGIN_FAILS.set(ip, cur);
-      return err('bad password', 401);
-    }
-    LOGIN_FAILS.delete(ip);
+    if (userIdx < 0) return err('bad password', 401);
     const uid = userIdx + 1;
     const username = users[userIdx].username;
     const token = await signJwt({ uid, username, role: 1, exp: Math.floor(Date.now() / 1000) + 86400 }, env);
@@ -1278,6 +1182,9 @@ export class MetricsDO {
     this.data = new Map(); // serverId -> Map(minTs -> {cpu, mem_used, net_in, net_out})
     this.archived = new Map(); // serverId -> Set(minTs) 已归档标记（避免重复写 D1）
     this.lastPrune = 0; // 上次执行保留期清理的时间
+    // 告警去重状态（单实例全局一致，随 DO 生命周期；重启清零——与旧 Worker 内存行为等价）
+    this.alertLast = new Map(); // `${serverId}:kind` -> 上次触发时间
+    this.probeState = new Map(); // `${serverId}:probeName` -> {ok, lastFail}
   }
 
   async fetch(request) {
@@ -1293,6 +1200,11 @@ export class MetricsDO {
       m.set(b.minTs, { cpu: b.cpu, mem_used: b.mem_used, mem_total: b.mem_total, net_in: b.net_in, net_out: b.net_out, extra: b.extra });
       this.trim(m);
       this.scheduleArchive();
+      // 告警/探活去重判定搭本次 /report 调用顺风车（零额外请求）；失败不影响监控存储
+      try {
+        if (b.serverName) await this.checkAlerts(b);
+        if (Array.isArray(b.probes)) await this.checkProbeAlerts(b.serverId, b.serverName, b.probes);
+      } catch { /* 告警失败不影响监控存储 */ }
       return json({ ok: true });
     }
 
@@ -1342,6 +1254,88 @@ export class MetricsDO {
     const alertOn = (await getAlertCfg(this.env)).enabled;
     if (archiveOn || alertOn) {
       this.state.storage.setAlarm(Date.now() + ARCHIVE_INTERVAL_MS);
+    }
+  }
+
+  // 指标阈值告警（CPU/内存/磁盘/负载），带冷却去抖。
+  // 状态在本 DO 实例内存（单实例全局一致，避免多 Worker 隔离实例重复告警）；
+  // 由 /report 处理顺带调用，不增加额外 DO 请求。
+  async checkAlerts(b) {
+    const cfg = await getAlertCfg(this.env);
+    if (!cfg.enabled) return;
+    const now = Date.now();
+    const cooldown = cfg.cooldown_min * 60 * 1000;
+    const cooled = (key) => {
+      const last = this.alertLast.get(key);
+      if (last && now - last < cooldown) return false;
+      this.alertLast.set(key, now);
+      return true;
+    };
+    const alerts = [];
+    // CPU
+    if (b.cpu != null && b.cpu >= cfg.cpu_pct && cooled(`${b.serverId}:cpu`)) {
+      alerts.push(`CPU ${b.cpu.toFixed(1)}% >= ${cfg.cpu_pct}%`);
+    }
+    // 内存（需要 agent 上报 mem_total）
+    if (b.mem_used != null && b.mem_total != null && b.mem_total > 0) {
+      const memPct = (b.mem_used / b.mem_total) * 100;
+      if (memPct >= cfg.mem_pct && cooled(`${b.serverId}:mem`)) {
+        alerts.push(`内存 ${memPct.toFixed(1)}% >= ${cfg.mem_pct}%`);
+      }
+    }
+    // 磁盘（根分区）
+    const rootDisk = b.extra && b.extra.disk && b.extra.disk.find((d) => d.m === '/');
+    if (rootDisk && rootDisk.u != null && rootDisk.u >= cfg.disk_pct && cooled(`${b.serverId}:disk`)) {
+      alerts.push(`磁盘 / ${rootDisk.u}% >= ${cfg.disk_pct}%`);
+    }
+    // 负载（可选，未设置则不启用）
+    if (cfg.load > 0 && b.extra && b.extra.load1 != null && b.extra.load1 >= cfg.load && cooled(`${b.serverId}:load`)) {
+      alerts.push(`负载 ${b.extra.load1} >= ${cfg.load}`);
+    }
+    if (alerts.length) {
+      await sendWebhook(cfg, {
+        event: 'alert',
+        title: `[cf-panel] ${b.serverName} 指标告警`,
+        server: { id: b.serverId, name: b.serverName },
+        message: `服务器 ${b.serverName}（id=${b.serverId}）指标超阈值：\n` + alerts.join('\n'),
+        details: alerts,
+        time: new Date().toISOString(),
+      });
+    }
+  }
+
+  // 服务探活告警：失败持续超冷却 → probe_down；恢复 → probe_recovered（状态同在本 DO 实例）
+  async checkProbeAlerts(serverId, serverName, probes) {
+    const cfg = await getAlertCfg(this.env);
+    if (!cfg.enabled || !Array.isArray(probes)) return;
+    const now = Date.now();
+    const cooldown = cfg.cooldown_min * 60 * 1000;
+    for (const p of probes) {
+      if (!p || !p.name) continue;
+      const key = `${serverId}:${p.name}`;
+      const st = this.probeState.get(key) || { ok: true, lastFail: 0 };
+      if (p.ok) {
+        if (!st.ok) {
+          this.probeState.set(key, { ok: true, lastFail: 0 });
+          await sendWebhook(cfg, {
+            event: 'probe_recovered',
+            title: `[cf-panel] ${serverName} 服务恢复：${p.name}`,
+            server: { id: serverId, name: serverName },
+            message: `服务器 ${serverName} 的服务「${p.name}」已恢复正常。`,
+            time: new Date().toISOString(),
+          });
+        }
+      } else if (st.ok || now - st.lastFail >= cooldown) {
+        this.probeState.set(key, { ok: false, lastFail: now });
+        await sendWebhook(cfg, {
+          event: 'probe_down',
+          title: `[cf-panel] ${serverName} 服务异常：${p.name}`,
+          server: { id: serverId, name: serverName },
+          message: `服务器 ${serverName} 的服务「${p.name}」探测失败${p.code ? `（HTTP ${p.code}）` : ''}。`,
+          details: p,
+          time: new Date().toISOString(),
+        });
+      }
     }
   }
 
@@ -1522,14 +1516,11 @@ export const __internals = {
   signJwt, verifyJwt, randomHex, sha256Hex,
   parseRangeHours, safeJson, sanitizeAlerts, hashSecret,
   renderTemplate, parseHeaders, sendWebhook,
-  checkAlerts, checkProbeAlerts,
   shardForServerId, makeStreamId, shardFromStreamId,
   isAdmin, canAccessServer, canExec,
-  // 重置模块级可变状态（登录限流/告警冷却/探活状态/设置缓存），保证测试间隔离
+  // 重置模块级可变状态（设置缓存），保证测试间隔离
+  // 注：告警冷却/探活去重状态在 MetricsDO 实例内存，由各测试实例自行隔离
   __reset() {
-    LOGIN_FAILS.clear();
-    ALERT_LAST.clear();
-    PROBE_STATE.clear();
     SETTINGS_CACHE.clear();
   },
 };

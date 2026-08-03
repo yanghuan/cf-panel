@@ -5,7 +5,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { __internals as I } from '../src/index.js';
-import { makeEnv, captureFetch } from './helpers.js';
 
 const env = { JWT_SECRET: 'unit-secret' };
 
@@ -230,92 +229,5 @@ test('isAdmin / canAccessServer / canExec', () => {
   assert.equal(I.canExec(null, s1), false);
 });
 
-// ---------------- 告警触发 / 冷却 / 探活 ----------------
-test('checkAlerts：超阈值触发 Webhook，冷却期内抑制', async () => {
-  const env2 = makeEnv();
-  await env2.DB.prepare(
-    "INSERT INTO kv_json (key, value) VALUES ('settings', ?)"
-  ).bind(JSON.stringify({
-    alerts: { webhook_url: 'https://example.com/{token}?ev={event}&name={server_name}', webhook_token: 'tok', cpu_pct: 90, mem_pct: 90, cooldown_min: 30 },
-  })).run();
-
-  const cap = captureFetch();
-  try {
-    // CPU 95 ≥ 90 → alert
-    await I.checkAlerts(env2, { serverId: 1, cpu: 95 }, 'srv1');
-    assert.equal(cap.calls.length, 1);
-    assert.match(cap.calls[0].url, /^https:\/\/example\.com\/tok\?ev=alert&name=srv1$/);
-    const body = JSON.parse(cap.calls[0].init.body);
-    assert.equal(body.event, 'alert');
-    assert.equal(body.server.id, 1);
-    assert.deepEqual(body.details, ['CPU 95.0% >= 90%']);
-
-    // 冷却期内的再次触发被抑制
-    await I.checkAlerts(env2, { serverId: 1, cpu: 98 }, 'srv1');
-    assert.equal(cap.calls.length, 1);
-
-    // 未达阈值不触发
-    I.__reset(); // 清冷却状态
-    await I.checkAlerts(env2, { serverId: 1, cpu: 50 }, 'srv1');
-    assert.equal(cap.calls.length, 1);
-  } finally {
-    cap.restore();
-  }
-});
-
-test('checkAlerts：内存与磁盘阈值（依赖 extra.disk 根分区）', async () => {
-  const env2 = makeEnv();
-  await env2.DB.prepare(
-    "INSERT INTO kv_json (key, value) VALUES ('settings', ?)"
-  ).bind(JSON.stringify({
-    alerts: { webhook_url: 'https://example.com/hook', cpu_pct: 90, mem_pct: 90, disk_pct: 80, load: 5, cooldown_min: 30 },
-  })).run();
-  const cap = captureFetch();
-  try {
-    await I.checkAlerts(env2, {
-      serverId: 2,
-      cpu: 10,
-      mem_used: 900,
-      mem_total: 1000, // 90%
-      extra: { disk: [{ m: '/', u: 95 }], load1: 8 },
-    }, 'srv2');
-    assert.equal(cap.calls.length, 1);
-    const details = JSON.parse(cap.calls[0].init.body).details;
-    assert.deepEqual(details, ['内存 90.0% >= 90%', '磁盘 / 95% >= 80%', '负载 8 >= 5']);
-  } finally {
-    cap.restore();
-  }
-});
-
-test('checkProbeAlerts：失败→down、恢复→recovered、冷却抑制重复 down', async () => {
-  const env2 = makeEnv();
-  await env2.DB.prepare(
-    "INSERT INTO kv_json (key, value) VALUES ('settings', ?)"
-  ).bind(JSON.stringify({ alerts: { webhook_url: 'https://example.com/hook', cooldown_min: 30 } })).run();
-  const cap = captureFetch();
-  try {
-    await I.checkProbeAlerts(env2, 1, 'srv1', [{ name: 'web', ok: false }]);
-    assert.equal(cap.calls.length, 1);
-    assert.equal(JSON.parse(cap.calls[0].init.body).event, 'probe_down');
-
-    // 冷却内再次失败 → 抑制
-    await I.checkProbeAlerts(env2, 1, 'srv1', [{ name: 'web', ok: false }]);
-    assert.equal(cap.calls.length, 1);
-
-    // 恢复 → recovered
-    await I.checkProbeAlerts(env2, 1, 'srv1', [{ name: 'web', ok: true }]);
-    assert.equal(cap.calls.length, 2);
-    assert.equal(JSON.parse(cap.calls[1].init.body).event, 'probe_recovered');
-
-    // 恢复后再次失败 → 立即触发 down（状态已回 ok，冷却不生效）
-    await I.checkProbeAlerts(env2, 1, 'srv1', [{ name: 'web', ok: false }]);
-    assert.equal(cap.calls.length, 3);
-    assert.equal(JSON.parse(cap.calls[2].init.body).event, 'probe_down');
-
-    // 持续失败 → 冷却抑制
-    await I.checkProbeAlerts(env2, 1, 'srv1', [{ name: 'web', ok: false }]);
-    assert.equal(cap.calls.length, 3);
-  } finally {
-    cap.restore();
-  }
-});
+// 注：告警触发/冷却/探活用例已随状态迁移至 MetricsDO（见 test/do.test.js），
+// 通过 /report 顺风车路径验证，覆盖"单实例全局去重"。

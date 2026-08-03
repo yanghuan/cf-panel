@@ -443,6 +443,25 @@ function canExec(user, server) {
   return server.user_id === user.id;
 }
 
+// 按用户权限查询服务器列表（admin 全量；PAT 按白名单+read scope 在 SQL 层过滤，避免查全表再 JS 过滤；member 看自己的）。
+// 三处共用：GET /api/servers、PanelDO 实时推送、MCP list_servers。
+async function queryServersForUser(env, user) {
+  if (isAdmin(user)) {
+    return env.DB.prepare('SELECT * FROM servers ORDER BY "group", display_index, id').all();
+  }
+  if (user.pat) {
+    // 只读 scope 是 PAT 访问服务器的前提
+    if (!user.pat.scopes.includes(SCOPE_READ)) return { results: [] };
+    if (user.pat.serverIDs && user.pat.serverIDs.length) {
+      const ids = [...new Set(user.pat.serverIDs.map(Number).filter((n) => n > 0))];
+      if (!ids.length) return { results: [] };
+      return env.DB.prepare(`SELECT * FROM servers WHERE id IN (${ids.map(() => '?').join(',')}) ORDER BY "group", display_index, id`).bind(...ids).all();
+    }
+    return env.DB.prepare('SELECT * FROM servers ORDER BY "group", display_index, id').all();
+  }
+  return env.DB.prepare('SELECT * FROM servers WHERE user_id = ? ORDER BY "group", display_index, id').bind(user.id).all();
+}
+
 // ---------------- REST API ----------------
 
 async function handleApi(request, env) {
@@ -504,26 +523,9 @@ async function handleApi(request, env) {
     return json({ id: user.id, username: user.username, role: user.role, is_pat: !!user.pat });
   }
 
-  // GET /api/servers —— 服务器列表（admin 全量；PAT 按白名单+read scope；member 看自己的）
+  // GET /api/servers —— 服务器列表（权限过滤由 queryServersForUser 在 SQL 层完成）
   if (method === 'GET' && path === '/api/servers') {
-    let rows;
-    if (isAdmin(user)) {
-      rows = await env.DB.prepare('SELECT * FROM servers ORDER BY "group", display_index, id').all();
-    } else if (user.pat) {
-      // 只读 scope 是 PAT 访问服务器的前提；有白名单时直接在 SQL 里按 id 过滤（避免查全表再 JS 过滤）
-      if (!user.pat.scopes.includes(SCOPE_READ)) {
-        rows = { results: [] };
-      } else if (user.pat.serverIDs && user.pat.serverIDs.length) {
-        const ids = [...new Set(user.pat.serverIDs.map(Number).filter((n) => n > 0))];
-        rows = ids.length
-          ? await env.DB.prepare(`SELECT * FROM servers WHERE id IN (${ids.map(() => '?').join(',')}) ORDER BY "group", display_index, id`).bind(...ids).all()
-          : { results: [] };
-      } else {
-        rows = await env.DB.prepare('SELECT * FROM servers ORDER BY "group", display_index, id').all();
-      }
-    } else {
-      rows = await env.DB.prepare('SELECT * FROM servers WHERE user_id = ? ORDER BY "group", display_index, id').bind(user.id).all();
-    }
+    const rows = await queryServersForUser(env, user);
     let latest = {};
     try {
       const lResp = await doMetrics(env).fetch('https://do.internal/latest');
@@ -741,7 +743,7 @@ function mcpResult(id, result, error) {
 
 // 工具：服务器列表 + 实时状态 + 系统信息
 async function mcpListServers(user, env) {
-  const rows = await env.DB.prepare('SELECT * FROM servers ORDER BY "group", display_index, id').all();
+  const rows = await queryServersForUser(env, user);
   let latest = {};
   try {
     const lResp = await doMetrics(env).fetch('https://do.internal/latest');
@@ -750,7 +752,6 @@ async function mcpListServers(user, env) {
   const now = Math.floor(Date.now() / 1000);
   const list = [];
   for (const s of rows.results) {
-    if (!canAccessServer(user, s)) continue;
     const m = latest[s.id] || null;
     list.push({
       id: s.id,
@@ -1611,7 +1612,7 @@ export class PanelDO {
     if (!user) return;
     let rows;
     try {
-      rows = await this.env.DB.prepare('SELECT * FROM servers ORDER BY "group", display_index, id').all();
+      rows = await queryServersForUser(this.env, user);
     } catch {
       return; // D1 临时故障，下个周期再试
     }
@@ -1624,7 +1625,6 @@ export class PanelDO {
     const now = Math.floor(Date.now() / 1000);
     const list = [];
     for (const s of rows.results) {
-      if (!canAccessServer(user, s)) continue;
       list.push({
         id: s.id,
         name: s.name,

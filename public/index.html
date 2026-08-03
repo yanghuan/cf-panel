@@ -6,7 +6,7 @@
   <title>cf-panel · 监控面板</title>
   <!-- 依赖已本地化（public/vendor），避免外部 CDN 不可达/供应链风险 -->
   <link rel="stylesheet" href="/vendor/xterm.min.css" />
-  <link rel="stylesheet" href="/style.css?v=18" />
+  <link rel="stylesheet" href="/style.css?v=19" />
   <script src="/vendor/chart.umd.min.js"></script>
 </head>
 <body>
@@ -204,6 +204,7 @@
         <input id="tok-servers" type="text" placeholder="server_ids（逗号分隔，空=全部服务器）" />
         <button id="btn-create-token">创建令牌</button>
       </div>
+      <p id="tok-hint" class="muted" style="font-size:12px"></p>
       <p id="tok-new" class="msg"></p>
       <ul id="token-list" class="token-list"></ul>
     </div>
@@ -294,6 +295,6 @@
 
   <script src="/vendor/xterm.min.js"></script>
   <script src="/vendor/addon-fit.min.js"></script>
-  <script src="/app.js?v=27"></script>
+  <script src="/app.js?v=28"></script>
 </body>
 </html>

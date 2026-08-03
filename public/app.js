@@ -178,7 +178,7 @@
         </div>
         ${metricHtml}
         ${probes}
-        <div class="meta" data-ip="${escapeHtml(ip)}">${info ? escapeHtml(info) : `id: ${s.id}`}</div>
+        <div class="meta" data-ip="${escapeHtml(ip)}"><span class="cid">#${s.id}</span>${info ? ' · ' + escapeHtml(info) : ''}</div>
       </div>`;
   }
 
@@ -908,6 +908,17 @@
     $('#tokens-modal').classList.remove('hidden');
     lockScroll();
     loadTokens();
+    loadTokenServerHint();
+  }
+
+  // 在 PAT 弹窗展示「server_id = 服务器名」参考列表，方便填白名单
+  async function loadTokenServerHint() {
+    try {
+      const list = await api('/api/servers');
+      $('#tok-hint').textContent = list.length
+        ? 'server_id 参考：' + list.map((s) => `${s.id}=${s.name}`).join('，')
+        : '暂无服务器';
+    } catch { /* 加载失败则不提示 */ }
   }
 
   async function saveSite() {

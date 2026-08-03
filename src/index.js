@@ -1508,3 +1508,24 @@ export default {
     return handleApi(request, env);
   },
 };
+
+// ============================================================
+// 测试辅助导出（不参与线上路由，仅供 test/ 目录单元测试使用）
+// ============================================================
+export const __internals = {
+  parsePanelUsers, json, err, secret,
+  b64u, b64uDecode, bytesToHex, hmacSha256,
+  signJwt, verifyJwt, randomHex, sha256Hex,
+  parseRangeHours, safeJson, sanitizeAlerts, hashSecret,
+  renderTemplate, parseHeaders, sendWebhook,
+  checkAlerts, checkProbeAlerts,
+  shardForServerId, makeStreamId, shardFromStreamId,
+  isAdmin, canAccessServer, canExec,
+  // 重置模块级可变状态（登录限流/告警冷却/探活状态/设置缓存），保证测试间隔离
+  __reset() {
+    LOGIN_FAILS.clear();
+    ALERT_LAST.clear();
+    PROBE_STATE.clear();
+    SETTINGS_CACHE.clear();
+  },
+};

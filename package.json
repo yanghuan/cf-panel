@@ -1,0 +1,13 @@
+{
+  "name": "cf-panel",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Cloudflare 上的带终端功能的监控面板（Worker + Durable Objects + D1）",
+  "scripts": {
+    "test": "node --test",
+    "test:unit": "node --test test/unit.test.js",
+    "test:api": "node --test test/api.test.js",
+    "test:do": "node --test test/do.test.js"
+  }
+}

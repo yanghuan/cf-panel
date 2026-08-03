@@ -1,0 +1,23 @@
+# cf-panel CI：提交/推送后自动运行测试（零依赖，node:test + node:sqlite）
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        # node:sqlite 内置模块需 Node >= 22；24 为稳定版
+        node-version: [22, 24]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+
+      - name: 运行测试
+        run: npm test

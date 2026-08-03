@@ -197,6 +197,46 @@ done
 - **文件管理**：与终端同构的独立会话——面板 `POST /api/file/open` 创建会话并下发 `open_file` 指令，agent 用 `websocat` 连回 `/ws/agent/file` 跑 `file-server.sh`（JSON 行协议：`list`/`read`/`write`，文件内容 base64）；浏览器经 `/ws/file/{sid}` 透传。服务端复用 TerminalDO 会话注册表/权限/清理，DO 只做双向透传。
 - 权衡：零解释器依赖、部署极简；并发能力弱于编译型 agent，适合个人/小规模；协议不变，后续可无缝迁移 Go/Rust agent。
 
+#### 3.5.1 内存占用对比（低内存设备选型）
+
+agent 可能运行在低内存设备（OpenWrt 路由器 / 树莓派 Zero 等），实现语言的内存占用是关键选型依据。
+
+**实测（Shell 现状，2026-08）**：
+
+| 状态 | 内存（RSS） | 进程数 |
+| --- | --- | --- |
+| 空闲（无终端/文件会话） | **~11 MB**（bash 主循环 3.8 + 上报子 shell 3.2 + websocat 控制通道 4.3） | 3 |
+| 每开 1 个终端会话 | **+8~9 MB**（pty socat + 数据端 socat + 终端 websocat + 包裹子 shell + sh） | +5~6 |
+| 3 个终端同时 | ~28~36 MB | 20+ |
+
+**三方案对比（Shell/Go 为实测，Python 为估算）**：
+
+| 维度 | Shell（实测） | Python（asyncio+websockets，估算） | Go（stdlib + pty 库，实测） |
+| --- | --- | --- | --- |
+| 空闲内存 | ~11 MB / 3 进程 | 15~25 MB / 1 进程 | **~5.7 MB / 1 进程**（最小 WS agent 实测；完整版含 PTY/TLS/文件 估算 8~15 MB） |
+| 每终端增量 | +8~9 MB / +5~6 进程 | +1~3 MB | +1~2 MB |
+| 磁盘 | websocat 7MB + socat + jq + bash + coreutils | 解释器（OpenWrt 常需先装，+20MB+） | **单静态二进制 ~5 MB**（实测 `-ldflags="-s -w"`） |
+| 启动 | 快 | 慢（100~400ms） | 快（~50ms） |
+| 低端 CPU（mips/arm） | 各工具需有对应架构包 | 解释器性能差 | 原生编译，性能好 |
+| 进程模型 | 多进程（fork 重） | asyncio 单线程 | goroutine 轻量 |
+| 部署 | 脚本 + 3 个外部二进制 | 解释器 + pip 依赖 | 单文件拷贝即用 |
+
+> 实测说明（2026-08）：最小 Go WS agent（读泵 + 心跳 + 周期上报 goroutine，gorilla/websocket，连接本地 `ws://`）warmup 后 RSS ≈ **5.7 MB**（VSZ 1200 MB 为 Go 预留虚拟地址空间，不占真实内存）。生产用 `wss://` 时 TLS 额外 +0.5~2 MB；完整 agent 再叠加 PTY/文件处理与更多会话后仍显著低于 Shell 的多进程峰值。
+
+**低内存设备适用性**：
+
+| 设备内存 | Shell | Python | Go |
+| --- | --- | --- | --- |
+| 64MB（老路由器） | ⚠️ 空闲 11MB 尚可，多终端脆弱（每终端 +9MB、进程碎片化） | ❌ 解释器基线太重 | ✅ 空闲 5.7MB + 单进程峰值可控 |
+| 128MB（树莓派 Zero） | ✅ 合适 | ⚠️ 勉强 | ✅ 合适 |
+| 256MB+ | ✅ 合适（部署零编译） | ✅ | ✅ |
+
+**结论**：
+- **内存角度 Go 全面占优**：空闲实测 5.7 MB < Shell 11 MB，单进程峰值可控，二进制 ~5 MB 且易交叉编译（mips/arm）。
+- 多终端场景 Shell 因"每终端 +9MB + 进程爆炸"在 64MB 设备上最脆弱；**Go 单进程是"低内存 + 常开多终端"的最优解**。
+- **保留 Shell 的真正理由不是内存，而是运维/部署**：零编译、脚本即改即用、无需 Go 工具链、对已有机器直接跑（`apt install socat jq` + 下载 websocat）。
+- 决策建议：目标设备 ≥256MB 且终端并发少 → 维持 Shell；目标含 64~128MB 低端设备或常开多终端 → 迁移 Go（协议不变，见 §3.5 权衡，单文件分发 + 交叉编译最省事）。
+
 ### 3.6 PTY（伪终端）
 - 用 `creack/pty`（Go）或等价的 PTY 库（其它语言）在 slave 端启动 shell，`TERM=xterm`。
 - agent 持有 master 文件句柄：

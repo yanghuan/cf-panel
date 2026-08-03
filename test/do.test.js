@@ -275,12 +275,46 @@ test('MetricsDO: /report 探活 down/recovered/冷却抑制', async () => {
 });
 
 // ---------------- PanelDO ----------------
-test('PanelDO: /viewers 返回在线观看者数；其他路径 404', async () => {
+test('PanelDO: /viewers 只统计已鉴权观看者；其他路径 404', async () => {
   const env = makeEnv();
-  const inst = new PanelDO({ getWebSockets: () => [{}, {}] }, env);
+  const ws1 = { deserializeAttachment: () => 'tok1' };
+  const ws2 = { deserializeAttachment: () => 'tok2' };
+  const ws3 = { deserializeAttachment: () => null }; // 未鉴权
+  const inst = new PanelDO({ getWebSockets: () => [ws1, ws2, ws3] }, env);
   const res = await inst.fetch(new Request('https://do.internal/viewers'));
   assert.deepEqual(await res.json(), { count: 2 });
   assert.equal((await inst.fetch(new Request('https://do.internal/other'))).status, 404);
+});
+
+test('PanelDO: 首帧 auth 鉴权通过后推送，非法 token 断开并触发快采唤醒', async () => {
+  const env = makeEnv();
+  const token = await I.signJwt({ uid: 1, username: 'admin', role: 1, exp: Math.floor(Date.now() / 1000) + 3600 }, env);
+  await insertServer(env, 'k1', 'srv-a');
+
+  // 非法 token → 关闭
+  const bad = { closed: false, deserializeAttachment: () => null, send() {}, close() { this.closed = true; } };
+  const inst = new PanelDO({ getWebSockets: () => [bad] }, env);
+  await inst.webSocketMessage(bad, JSON.stringify({ type: 'auth', token: 'bogus' }));
+  assert.equal(bad.closed, true);
+
+  // 合法 token → 鉴权通过（attachment 存 token），首位观看者触发各分片快采唤醒，之后 sync 推送列表
+  const ws = {
+    closed: false, attachment: null, sent: [],
+    deserializeAttachment() { return this.attachment; },
+    serializeAttachment(t) { this.attachment = t; },
+    send(m) { this.sent.push(m); },
+    close() { this.closed = true; },
+  };
+  const inst2 = new PanelDO({ getWebSockets: () => [ws] }, env);
+  await inst2.webSocketMessage(ws, JSON.stringify({ type: 'auth', token }));
+  assert.equal(ws.closed, false);
+  assert.equal(ws.attachment, token);
+  assert.ok(env.TERMINAL.calls.some((c) => c.path === '/rpc/wakeup')); // 快采唤醒
+
+  await inst2.webSocketMessage(ws, 'sync');
+  assert.equal(ws.sent.length, 1);
+  const list = JSON.parse(ws.sent[0]);
+  assert.deepEqual(list.map((s) => s.name), ['srv-a']);
 });
 
 test('PanelDO: webSocketMessage 按 token 推送过滤后的服务器列表', async () => {
@@ -437,6 +471,36 @@ test('TerminalDO: 僵尸会话超 TTL 由 alarm 清理，未到期安排下次 a
   assert.equal(inst.sessions.has('0-live'), true);
   // 安排了 alarm：最早僵尸到期时间 +1s
   assert.equal(st.storage.alarmTs, now - 1000 + TTL + 1000);
+});
+
+test('TerminalDO: user-pending 首帧鉴权后挂接 userWs，非法 token 断开', async () => {
+  const env = makeEnv();
+  const token = await I.signJwt({ uid: 1, username: 'admin', role: 1, exp: Math.floor(Date.now() / 1000) + 3600 }, env);
+  const inst = new TerminalDO(mockState(), env);
+  inst.sessions.set('0-sid', { streamId: '0-sid', serverId: 1, creatorUserId: 1, createdAt: Date.now(), type: 'terminal', userWs: null, agentWs: null });
+
+  const makeWs = () => ({
+    closed: false,
+    attachment: { role: 'user-pending', sid: '0-sid', serverId: 1, creatorUserId: 1, type: 'terminal', createdAt: Date.now() },
+    deserializeAttachment() { return this.attachment; },
+    serializeAttachment(a) { this.attachment = a; },
+    send() {},
+    close() { this.closed = true; },
+    readyState: 1,
+  });
+
+  // 非法 token → 关闭，userWs 不挂接
+  const bad = makeWs();
+  await inst.webSocketMessage(bad, JSON.stringify({ type: 'auth', token: 'bogus' }));
+  assert.equal(bad.closed, true);
+  assert.equal(inst.sessions.get('0-sid').userWs, null);
+
+  // 合法 token → 挂接 userWs，附件升级为 user 角色
+  const good = makeWs();
+  await inst.webSocketMessage(good, JSON.stringify({ type: 'auth', token }));
+  assert.equal(good.closed, false);
+  assert.equal(inst.sessions.get('0-sid').userWs, good);
+  assert.equal(good.attachment.role, 'user');
 });
 
 test('TerminalDO: cleanup 断开后清空 agents/sessions/pendingTerm', async () => {

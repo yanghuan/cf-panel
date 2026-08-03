@@ -250,6 +250,7 @@ DO 与 agent 之间的 WebSocket 用二进制帧，结构对齐哪吒实现：
 
 1. **WebSocket 连接者校验（防劫持）**
    - `/ws/terminal/{id}` 只允许会话**创建者或 admin** 连接。
+   - 鉴权 token **不放 URL**（避免进访问日志/浏览器历史），改为连接后**首帧发送** `{type:"auth", token}`，未通过前不挂接数据流。
    - 背景：哪吒曾有一个 GHSA 漏洞——任何人只要拿到 stream UUID（经 Referer 泄露、日志、浏览器历史），就能接管一个活跃终端、直接拿到目标机器的 shell。UUID 不可作为保密凭据。
 2. **agent 侧 stream 归属校验**
    - DO 收到 agent 的 magic 帧后，校验该 `streamId` 确实属于这个 agent 对应的 `server`，防止 A 机器的 agent 往 B 机器的 stream 注入 IO。

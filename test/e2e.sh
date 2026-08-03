@@ -175,10 +175,12 @@ if command -v socat >/dev/null 2>&1; then
     sleep 3
     # agent 数据流可能晚于浏览器 WS 注册，重复发送 echo 覆盖竞态窗口（DO 对未注册前
     # 的浏览器输入会直接丢弃，因此发到 agent 就绪后的那条 echo 必然产生回显）
+    # 鉴权走首帧 {type:"auth"}（token 不进 URL）
     OUT=$(
       {
+        printf '{"type":"auth","token":"%s"}\n' "$TOKEN"
         for _ in 1 2 3 4 5 6 7 8 9 10; do printf 'echo E2E_TERM_OK\n'; sleep 1; done
-      } | timeout 30 websocat -t "ws://127.0.0.1:$PORT/ws/terminal/$SID?token=$TOKEN" 2>/dev/null || true
+      } | timeout 30 websocat -t "ws://127.0.0.1:$PORT/ws/terminal/$SID" 2>/dev/null || true
     )
     if grep -q "E2E_TERM_OK" <<<"$OUT"; then
       ok "终端双向透传正常（收到 shell 回显）"

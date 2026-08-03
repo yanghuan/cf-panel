@@ -979,22 +979,18 @@ export class TerminalDO {
       return err('bad op');
     }
 
-    // GET /ws/terminal/:id | /ws/file/:id —— 浏览器会话（校验创建者/admin，防 UUID 劫持 §6.1）
+    // GET /ws/terminal/:id | /ws/file/:id —— 浏览器会话（防 UUID 劫持 §6.1）
+    // 鉴权改为首条消息（{type:'auth', token}），token 不进 URL（防访问日志/浏览器历史泄露）；
+    // 未鉴权前不挂接 userWs，任何数据都不会流向浏览器，防劫持语义不变
     let m = path.match(/^\/ws\/(terminal|file)\/(.+)$/);
     if (m) {
       const streamId = m[2];
       const sess = this.sessions.get(streamId);
       if (!sess) return new Response('session not found', { status: 404 });
-      const token = url.searchParams.get('token') || '';
-      const payload = await verifyJwt(token, this.env);
-      if (!payload || !payload.uid) return new Response('unauthorized', { status: 401 });
-      if (!(payload.role === 1 || payload.uid === sess.creatorUserId)) return new Response('forbidden', { status: 403 });
       const pair = new WebSocketPair();
       this.state.acceptWebSocket(pair[1]);
-      sess.userWs = pair[1];
-      // 附件随连接持久化：DO 休眠唤醒后靠它重建会话索引（§3.3 Hibernation）
       pair[1].serializeAttachment({
-        role: 'user', sid: streamId, serverId: sess.serverId,
+        role: 'user-pending', sid: streamId, serverId: sess.serverId,
         creatorUserId: sess.creatorUserId, type: sess.type, createdAt: sess.createdAt,
       });
       return new Response(null, { status: 101, webSocket: pair[0] });
@@ -1163,6 +1159,26 @@ export class TerminalDO {
   // Hibernation：消息转发（§3.3 双向对拷 + resize 走控制通道）
   async webSocketMessage(ws, message) {
     this.rebuildIndex(); // 休眠唤醒后索引可能已丢，先按附件重建
+    // 浏览器侧待鉴权连接（role: user-pending）：首帧必须是 {type:'auth', token}
+    const att = ws.deserializeAttachment?.();
+    if (att && att.role === 'user-pending') {
+      let j = null;
+      try { j = JSON.parse(typeof message === 'string' ? message : ''); } catch { /* 非 JSON */ }
+      const token = j && j.type === 'auth' ? String(j.token || '') : '';
+      const payload = token ? await verifyJwt(token, this.env) : null;
+      const sess = this.sessions.get(att.sid);
+      if (!payload || !payload.uid || !sess || !(payload.role === 1 || payload.uid === sess.creatorUserId)) {
+        try { ws.close(1008, 'unauthorized'); } catch { /* ignore */ }
+        return;
+      }
+      // 鉴权通过 → 挂接为会话用户端；附件升级为 user 角色（供休眠唤醒重建索引）
+      sess.userWs = ws;
+      ws.serializeAttachment({
+        role: 'user', sid: att.sid, serverId: sess.serverId,
+        creatorUserId: sess.creatorUserId, type: sess.type, createdAt: sess.createdAt,
+      });
+      return;
+    }
     // agent 控制通道（不在任何 session）：处理监控上报 {type:"report"} 与终端确认 {type:"terminal_ready"}
     const sess = [...this.sessions.values()].find((s) => s.userWs === ws || s.agentWs === ws);
     if (!sess) {
@@ -1550,22 +1566,16 @@ export class PanelDO {
 
   async fetch(request) {
     const url = new URL(request.url);
-    // 内部 RPC：供 TerminalDO 查询当前在线前端观看者数（省配额上报策略用）
+    // 内部 RPC：供 TerminalDO 查询当前已鉴权在线观看者数（省配额上报策略用）
     if (url.pathname === '/viewers') {
-      return json({ count: this.state.getWebSockets().length });
+      const count = (this.state.getWebSockets?.() || []).filter((w) => w.deserializeAttachment?.()).length;
+      return json({ count });
     }
     if (url.pathname !== '/ws/push') return new Response('not found', { status: 404 });
-    const token = url.searchParams.get('token') || '';
-    if (!(await authUserByToken(token, this.env))) return new Response('unauthorized', { status: 401 });
-
-    // 首位观看者上线：立即唤醒各分片 agent 切到快采（省配额策略，免等下一次上报）
-    if (this.state.getWebSockets().length === 0) {
-      this.wakeupAgents();
-    }
-
     const pair = new WebSocketPair();
     this.state.acceptWebSocket(pair[1]);
-    pair[1].serializeAttachment(token);
+    // 鉴权延迟到首条消息（{type:'auth', token}）：token 不进 URL（防访问日志/浏览器历史泄露）
+    pair[1].serializeAttachment(null);
     return new Response(null, { status: 101, webSocket: pair[0] });
   }
 
@@ -1578,8 +1588,24 @@ export class PanelDO {
     }
   }
 
-  // 客户端 sync 请求 → 查库 → 按该连接的用户权限过滤后回发
-  async webSocketMessage(ws) {
+  // 客户端首帧鉴权（{type:'auth', token}）；通过后每 3s 的 sync 消息 → 查库 → 按权限过滤回发
+  async webSocketMessage(ws, message) {
+    // 未鉴权连接：首条消息必须是鉴权帧
+    if (!ws.deserializeAttachment?.()) {
+      let j = null;
+      try { j = JSON.parse(typeof message === 'string' ? message : ''); } catch { /* 非 JSON 视为无效 */ }
+      const token = j && j.type === 'auth' ? String(j.token || '') : '';
+      const user = await authUserByToken(token, this.env);
+      if (!user) {
+        try { ws.close(1008, 'unauthorized'); } catch { /* ignore */ }
+        return;
+      }
+      ws.serializeAttachment(token);
+      // 首位已鉴权观看者上线 → 各分片 agent 立即切快采（省配额策略，免等下一次上报）
+      const authed = (this.state.getWebSockets?.() || []).filter((w) => w.deserializeAttachment?.());
+      if (authed.length === 1) this.wakeupAgents();
+      return;
+    }
     const token = ws.deserializeAttachment() || '';
     const user = await authUserByToken(token, this.env);
     if (!user) return;

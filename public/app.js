@@ -182,7 +182,7 @@
       </div>`;
   }
 
-  // ---------- IP 归属地（免费接口，前端查询；内网 IP 跳过） ----------
+  // ---------- IP 归属地（HTTPS 免费接口，前端查询；内网 IP 跳过） ----------
   const geoCache = new Map(); // ip -> 归属地标签（国家城市）
   // 私网/保留地址不查询：10.x 172.16-31.x 192.168.x 127.x 169.254.x 0.x 100.64-127.x
   const GEO_PRIVATE = /^(0\.|10\.|127\.|169\.254\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.|100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.)/;
@@ -190,23 +190,24 @@
     if (!ip || GEO_PRIVATE.test(ip)) return '';
     if (geoCache.has(ip)) return geoCache.get(ip) || '';
     let label = '';
-    // 主：ip-api.com 免费（中文），仅 http；备：ipapi.co（https，英文）
+    // 仅用 HTTPS 源（http:// 在 HTTPS 面板下是混合内容，会被浏览器直接拦截）
+    // 主：ipapi.co（https，免费无 key）；备：ipwho.is（https，免费无 key）
     try {
       const ctl = new AbortController();
       const t = setTimeout(() => ctl.abort(), 5000);
-      const r = await fetch(`http://ip-api.com/json/${encodeURIComponent(ip)}?lang=zh-CN&fields=status,country,city`, { signal: ctl.signal });
+      const r = await fetch(`https://ipapi.co/${encodeURIComponent(ip)}/json/`, { signal: ctl.signal });
       clearTimeout(t);
       const j = await r.json();
-      if (j && j.status === 'success') label = (j.country || '') + (j.city || '');
+      if (j && j.country_name) label = j.country_name + (j.city ? ' ' + j.city : '');
     } catch { /* 换备选 */ }
     if (!label) {
       try {
         const ctl = new AbortController();
         const t = setTimeout(() => ctl.abort(), 5000);
-        const r = await fetch(`https://ipapi.co/${encodeURIComponent(ip)}/json/`, { signal: ctl.signal });
+        const r = await fetch(`https://ipwho.is/${encodeURIComponent(ip)}`, { signal: ctl.signal });
         clearTimeout(t);
         const j = await r.json();
-        if (j && j.country_name) label = j.country_name + (j.city ? ' ' + j.city : '');
+        if (j && j.success) label = (j.country || '') + (j.city ? ' ' + j.city : '');
       } catch { /* 查询失败则不显示 */ }
     }
     geoCache.set(ip, label);
@@ -296,11 +297,13 @@
     if (pushWs && (pushWs.readyState === WebSocket.CONNECTING || pushWs.readyState === WebSocket.OPEN)) return;
     if (!token) return;
     const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-    const ws = new WebSocket(`${proto}://${location.host}/ws/push?token=${encodeURIComponent(token)}`);
+    // token 不放 URL（避免进访问日志/浏览器历史），连接后首帧发送鉴权
+    const ws = new WebSocket(`${proto}://${location.host}/ws/push`);
     pushWs = ws;
 
     ws.onopen = () => {
       pushRetries = 0;
+      try { ws.send(JSON.stringify({ type: 'auth', token })); } catch { /* ignore */ }
       if (pushTimer) clearInterval(pushTimer);
       pushTimer = setInterval(() => {
         try { if (ws.readyState === WebSocket.OPEN) ws.send('sync'); } catch { /* ignore */ }
@@ -407,7 +410,8 @@
       api('/api/terminal', { method: 'POST', body: JSON.stringify({ server_id: serverId }) })
         .then((res) => {
           const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-          const w = new WebSocket(`${proto}://${location.host}/ws/terminal/${res.session_id}?token=${encodeURIComponent(token)}`);
+          // token 不放 URL（避免进访问日志/浏览器历史），连接后首帧发送鉴权
+          const w = new WebSocket(`${proto}://${location.host}/ws/terminal/${res.session_id}`);
           ws = w;
           w.binaryType = 'arraybuffer';
 
@@ -416,6 +420,7 @@
             rebuilding = false;
             fit.fit();
             term.focus();
+            try { w.send(JSON.stringify({ type: 'auth', token })); } catch { /* ignore */ }
             w.send(JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows }));
             // 自愈：连接后长时间无数据（open_terminal 在 agent 重连窗口丢失）→ 重建会话
             if (noDataTimer) clearTimeout(noDataTimer);
@@ -496,9 +501,10 @@
       lockScroll();
       closeFileWs();
       const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-      const ws = new WebSocket(`${proto}://${location.host}/ws/file/${res.session_id}?token=${encodeURIComponent(token)}`);
+      // token 不放 URL（避免进访问日志/浏览器历史），连接后首帧发送鉴权
+      const ws = new WebSocket(`${proto}://${location.host}/ws/file/${res.session_id}`);
       fileWs = ws;
-      ws.onopen = () => fileSend({ type: 'list', path: fileCwd });
+      ws.onopen = () => { fileSend({ type: 'auth', token }); fileSend({ type: 'list', path: fileCwd }); };
       ws.onmessage = (ev) => {
         let j; try { j = JSON.parse(ev.data); } catch { return; }
         if (j.type === 'list_result' && j.ok) renderFileList(j.entries);

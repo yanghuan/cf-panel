@@ -990,6 +990,29 @@
     });
   }
 
+  // ---------- 审计日志（仅管理员，保留 90 天） ----------
+  const AUDIT_ACTION_LABEL = { 'server.create': '添加服务器', 'server.delete': '删除服务器', 'terminal.open': '打开终端', 'file.open': '文件管理' };
+  async function openAuditModal() {
+    $('#audit-modal').classList.remove('hidden');
+    lockScroll();
+    await loadAuditLogs();
+  }
+  async function loadAuditLogs() {
+    try {
+      const rows = await api('/api/audit-logs?limit=200');
+      $('#audit-list').innerHTML = rows.length
+        ? rows.map((r) => `
+            <li><div class="audit-row">
+              <span class="audit-action">${escapeHtml(AUDIT_ACTION_LABEL[r.action] || r.action)}</span>
+              <span class="audit-info">uid=${escapeHtml(r.user_id)}${r.target_server_id ? ` · server#${escapeHtml(r.target_server_id)}` : ''}${r.detail ? ` · ${escapeHtml(r.detail)}` : ''}</span>
+              <span class="audit-time">${escapeHtml(r.created_at || '')}</span>
+            </div></li>`).join('')
+        : '<li class="muted">暂无审计记录</li>';
+    } catch (e) {
+      $('#audit-list').innerHTML = `<li class="muted">${escapeHtml(e.message)}</li>`;
+    }
+  }
+
   // ---------- 事件绑定 ----------
   $('#btn-login').onclick = (e) => { e.preventDefault(); doLogin(); };
 
@@ -1056,6 +1079,7 @@
     else     if (act === 'custom-setup') openCustomSetupModal();
     else if (act === 'service-setup') openServiceSetupModal();
     else if (act === 'tokens') openTokensModal();
+    else if (act === 'audit-logs') openAuditModal();
     else if (act === 'logout') { token = ''; localStorage.removeItem('cfpanel_token'); showAuth(); }
   });
 
@@ -1096,6 +1120,9 @@
   // 访问令牌弹窗
   $('#btn-tokens-close').onclick = () => { $('#tokens-modal').classList.add('hidden'); unlockScroll(); };
   $('#btn-create-token').onclick = createToken;
+
+  // 审计日志弹窗
+  $('#btn-audit-close').onclick = () => { $('#audit-modal').classList.add('hidden'); unlockScroll(); };
   $('#token-list').addEventListener('click', (e) => {
     const btn = e.target.closest('button[data-tok-del]');
     if (btn) deleteToken(Number(btn.dataset.tokDel));

@@ -12,12 +12,14 @@ const SESSION_TTL_MS = 10 * 60 * 1000; // 会话两端都断开超过 10 分钟 
 const PAT_PREFIX = 'cfp_'; // PAT token 前缀
 const SCOPE_READ = 'server:read';
 const SCOPE_EXEC = 'server:exec';
+const ALLOWED_SCOPES = [SCOPE_READ, SCOPE_EXEC]; // PAT 合法 scope 白名单
 
 // 监控时序：内存 DO 热区 + alarm 归档 D1（默认开启，ARCHIVE_TO_D1=0 可关闭）
 const METRICS_KEEP_MIN = 720; // 内存保留最近 12 小时（分钟粒度）
 const ARCHIVE_INTERVAL_MS = 10 * 60 * 1000; // 归档周期
 const ARCHIVE_AFTER_MIN = 60; // 超过 1 小时的旧数据才归档/可淘汰
 const METRICS_RETENTION_DAYS = 30; // D1 历史保留期（天），过期行每日清理
+const AUDIT_RETENTION_DAYS = 90; // 审计日志保留期（天），过期行随每日清理删除
 const PRUNE_INTERVAL_MS = 24 * 60 * 60 * 1000; // 保留期清理周期
 
 // 省配额上报策略：有前端观看者时 agent 快采，否则低频采样
@@ -36,8 +38,9 @@ function parsePanelUsers(env) {
   }
   return raw.split(',').map((pair) => {
     const idx = pair.indexOf(':');
+    if (idx <= 0) return null; // 无冒号或用户名缺失（idx=-1/0）→ 丢弃，避免截断末字符
     return { username: pair.slice(0, idx).trim(), password: pair.slice(idx + 1).trim() };
-  }).filter((u) => u.username && u.password);
+  }).filter((u) => u && u.username && u.password);
 }
 const MCP_TOOLS = [
   {
@@ -507,8 +510,17 @@ async function handleApi(request, env) {
     if (isAdmin(user)) {
       rows = await env.DB.prepare('SELECT * FROM servers ORDER BY "group", display_index, id').all();
     } else if (user.pat) {
-      rows = await env.DB.prepare('SELECT * FROM servers ORDER BY "group", display_index, id').all();
-      rows.results = rows.results.filter((s) => canAccessServer(user, s));
+      // 只读 scope 是 PAT 访问服务器的前提；有白名单时直接在 SQL 里按 id 过滤（避免查全表再 JS 过滤）
+      if (!user.pat.scopes.includes(SCOPE_READ)) {
+        rows = { results: [] };
+      } else if (user.pat.serverIDs && user.pat.serverIDs.length) {
+        const ids = [...new Set(user.pat.serverIDs.map(Number).filter((n) => n > 0))];
+        rows = ids.length
+          ? await env.DB.prepare(`SELECT * FROM servers WHERE id IN (${ids.map(() => '?').join(',')}) ORDER BY "group", display_index, id`).bind(...ids).all()
+          : { results: [] };
+      } else {
+        rows = await env.DB.prepare('SELECT * FROM servers ORDER BY "group", display_index, id').all();
+      }
     } else {
       rows = await env.DB.prepare('SELECT * FROM servers WHERE user_id = ? ORDER BY "group", display_index, id').bind(user.id).all();
     }
@@ -554,11 +566,40 @@ async function handleApi(request, env) {
     });
   }
 
-  // DELETE /api/servers/:id —— 仅管理员
+  // DELETE /api/servers/:id —— 仅管理员；清理历史数据 + 审计 + 通知 DO 断开 agent
   if (method === 'DELETE' && path.startsWith('/api/servers/')) {
     if (!isAdmin(user)) return err('forbidden', 403);
     const id = Number(path.split('/')[3]) || 0;
+    const server = await env.DB.prepare('SELECT name FROM servers WHERE id = ?').bind(id).first();
+    if (!server) return err('not found', 404);
+    // 1) 清理该服务器的全部历史数据（归档时序 + 自定义指标）
+    await env.DB.batch([
+      env.DB.prepare('DELETE FROM metrics_min WHERE server_id = ?').bind(id),
+      env.DB.prepare('DELETE FROM metrics_custom WHERE server_id = ?').bind(id),
+    ]);
+    // 2) 删除服务器本体（agent key 随之失效，重连返回 401）
     await env.DB.prepare('DELETE FROM servers WHERE id = ?').bind(id).run();
+    // 3) 审计日志
+    await env.DB.prepare('INSERT INTO audit_logs (user_id, action, target_server_id, detail) VALUES (?,?,?,?)')
+      .bind(user.id, 'server.delete', id, server.name).run();
+    // 4) MetricsDO 清内存热区（避免残留数据被 alarm 重新归档回 D1）
+    try {
+      await doMetrics(env).fetch('https://do.internal/drop', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ server_id: id }),
+      });
+    } catch { /* 热区清理失败不影响删除 */ }
+    // 5) 通知各分片 DO 断开该 agent 的常驻控制通道与活跃会话
+    for (let i = 0; i < SHARDS; i++) {
+      try {
+        await doForShard(env, i).fetch('https://do.internal/rpc/drop_server', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ serverId: id }),
+        });
+      } catch { /* 分片暂不可达；agent 重连会因 key 失效被拒 */ }
+    }
     return json({ ok: true });
   }
 
@@ -629,9 +670,14 @@ async function handleApi(request, env) {
       const body = await request.json().catch(() => ({}));
       const name = String(body.name || '').trim();
       if (!name) return err('name required');
-      let scopes = body.scopes || [SCOPE_READ];
-      if (Array.isArray(body.scopes) && body.scopes.length) scopes = body.scopes;
-      scopes = scopes.filter((s) => typeof s === 'string');
+      // scopes 白名单校验：只允许 server:read / server:exec，非法值直接拒绝
+      let scopes;
+      if (Array.isArray(body.scopes) && body.scopes.length) {
+        scopes = [...new Set(body.scopes.filter((s) => ALLOWED_SCOPES.includes(s)))];
+        if (!scopes.length) return err(`invalid scope, allowed: ${ALLOWED_SCOPES.join(', ')}`, 400);
+      } else {
+        scopes = [SCOPE_READ];
+      }
       const serverIDs = Array.isArray(body.server_ids) ? body.server_ids.map(Number).filter((n) => n > 0) : null;
       const token = PAT_PREFIX + randomHex(32);
       const hash = await hashSecret(token, env);
@@ -647,6 +693,14 @@ async function handleApi(request, env) {
     const id = Number(path.split('/')[3]) || 0;
     await env.DB.prepare('DELETE FROM api_tokens WHERE id = ?').bind(id).run();
     return json({ ok: true });
+  }
+
+  // GET /api/audit-logs —— 审计日志（仅管理员，倒序分页，保留 90 天）
+  if (method === 'GET' && path === '/api/audit-logs') {
+    if (!isAdmin(user)) return err('forbidden', 403);
+    const limit = Math.min(Math.max(Number(url.searchParams.get('limit')) || 100, 1), 500);
+    const rows = await env.DB.prepare('SELECT id, user_id, action, target_server_id, detail, created_at FROM audit_logs ORDER BY id DESC LIMIT ?').bind(limit).all();
+    return json(rows.results);
   }
 
   // ---- 面板设置（D1 kv_json，仅管理员） ----
@@ -871,6 +925,32 @@ export class TerminalDO {
       for (const [serverId, w] of this.agents) {
         this.agentInterval.set(serverId, REPORT_FAST_INTERVAL_S);
         try { w.send(JSON.stringify({ type: 'set_report_interval', interval: REPORT_FAST_INTERVAL_S })); } catch { /* ignore */ }
+      }
+      return json({ ok: true });
+    }
+
+    // 内部 RPC：删除服务器时断开该 agent 的常驻控制通道与相关会话（key 已删，重连会被 401 拒绝）
+    if (path === '/rpc/drop_server' && request.method === 'POST') {
+      const body = await request.json();
+      const serverId = Number(body.serverId) || 0;
+      const w = this.agents.get(serverId);
+      if (w) {
+        try { w.close(); } catch { /* ignore */ }
+        this.agents.delete(serverId);
+      }
+      const sids = [];
+      for (const [sid, sess] of this.sessions) {
+        if (sess.serverId !== serverId) continue;
+        sids.push(sid);
+        try { sess.userWs && sess.userWs.close(); } catch { /* ignore */ }
+        try { sess.agentWs && sess.agentWs.close(); } catch { /* ignore */ }
+        this.sessions.delete(sid);
+      }
+      // 清理该服务器的 open_terminal 待确认（定时器停止）
+      for (const sid of sids) {
+        const r = this.pendingTerm.get(sid);
+        if (r && r.timer) clearTimeout(r.timer);
+        this.pendingTerm.delete(sid);
       }
       return json({ ok: true });
     }
@@ -1237,6 +1317,22 @@ export class MetricsDO {
       return json(out);
     }
 
+    // 删除服务器时清理内存热区与归档标记（防止残留数据被 alarm 重新归档回 D1）
+    if (url.pathname === '/drop' && request.method === 'POST') {
+      const b = await request.json();
+      const serverId = Number(b.server_id) || 0;
+      this.data.delete(serverId);
+      this.archived.delete(serverId);
+      // 清理该服务器的告警冷却与探活状态（键前缀 serverId:）
+      for (const k of [...this.alertLast.keys()]) {
+        if (k.startsWith(`${serverId}:`)) this.alertLast.delete(k);
+      }
+      for (const k of [...this.probeState.keys()]) {
+        if (k.startsWith(`${serverId}:`)) this.probeState.delete(k);
+      }
+      return json({ ok: true });
+    }
+
     return err('not found', 404);
   }
 
@@ -1403,7 +1499,8 @@ export class MetricsDO {
         if (ts <= cutoff) m.delete(ts);
       }
     }
-    // 保留期清理（每天一次）：删除超过 METRICS_RETENTION_DAYS 的旧数据
+    // 保留期清理（每天一次）：删除超过 METRICS_RETENTION_DAYS 的旧数据，以及超过
+    // AUDIT_RETENTION_DAYS 的审计日志（created_at 为 datetime('now') 文本，可直接比较）
     const now = Date.now();
     if (now - this.lastPrune > PRUNE_INTERVAL_MS) {
       this.lastPrune = now;
@@ -1411,6 +1508,8 @@ export class MetricsDO {
       await this.env.DB.batch([
         this.env.DB.prepare('DELETE FROM metrics_min WHERE ts < ?').bind(minTs),
         this.env.DB.prepare('DELETE FROM metrics_custom WHERE ts < ?').bind(minTs),
+        this.env.DB.prepare('DELETE FROM audit_logs WHERE created_at < datetime(\'now\', ?)')
+          .bind(`-${AUDIT_RETENTION_DAYS} days`),
       ]);
     }
     this.state.storage.setAlarm(Date.now() + ARCHIVE_INTERVAL_MS);

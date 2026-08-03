@@ -234,6 +234,7 @@ wrangler secret put PANEL_USERS      # 回车后粘贴值，如 alice:pass1,bob:
   > ⚠️ Access 需为 agent 路径放行：`/ws/agent/*` 与 `/api/report` 使用 `X-Agent-Key` 头（非浏览器 SSO），必须配置 Bypass 或 Service Token 策略，否则 agent 无法连接。
 - **公告**：设置里可改站点名/公告（存 D1 `kv_json` 表），公告对所有访客可见。
 - **PAT**：设置里可创建访问令牌（scopes + server_ids 白名单），供 API 调用（`Authorization: Bearer cfp_xxx`）。
+- **审计日志**：右上角菜单「审计日志」可查看（添加/删除服务器、打开终端/文件均记录），D1 保留 90 天后自动清理。
 
 ## 四、API 一览
 
@@ -259,6 +260,7 @@ wrangler secret put PANEL_USERS      # 回车后粘贴值，如 alice:pass1,bob:
 | GET | `/api/tokens` | PAT 列表（仅管理员） |
 | POST | `/api/tokens` | 创建 PAT（scopes + server_ids 白名单，明文只返回一次） |
 | DELETE | `/api/tokens/:id` | 删除 PAT（仅管理员） |
+| GET | `/api/audit-logs` | 审计日志（仅管理员，倒序，`?limit=` 上限 500，保留 90 天） |
 | GET | `/api/settings` | 读取全部设置（含告警配置，仅管理员） |
 | PUT | `/api/settings` | 更新站点名/公告/告警配置（D1 kv_json，仅管理员） |
 

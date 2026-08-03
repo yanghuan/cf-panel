@@ -137,6 +137,18 @@ test('MetricsDO: alarm 按 30 天保留期清理过期行', async () => {
   assert.deepEqual(rows.results.map((r) => r.ts), [nowMin - 10]);
 });
 
+test('MetricsDO: alarm 清理超过 90 天的审计日志，保留近期', async () => {
+  const env = makeEnv();
+  const { inst } = mkMetrics(env, mockState());
+  await env.DB.prepare("INSERT INTO audit_logs (user_id, action, created_at) VALUES (1, 'server.create', datetime('now', '-100 days'))").run();
+  await env.DB.prepare("INSERT INTO audit_logs (user_id, action, created_at) VALUES (1, 'server.delete', datetime('now', '-5 days'))").run();
+
+  await inst.alarm();
+
+  const rows = await env.DB.prepare('SELECT action FROM audit_logs').all();
+  assert.deepEqual(rows.results.map((r) => r.action), ['server.delete']);
+});
+
 test('MetricsDO: alarm 离线/恢复告警（DO Storage 状态去重）', async () => {
   const env = makeEnv();
   await insertServer(env, 'k1', 'srv1', { online: 1, last_seen: Math.floor(Date.now() / 1000) - 1000 });

@@ -65,6 +65,9 @@ test('parsePanelUsers', () => {
   ]);
   // 空项被过滤
   assert.deepEqual(I.parsePanelUsers({ PANEL_USERS: 'a:p,,' }), [{ username: 'a', password: 'p' }]);
+  // 边界：无冒号条目（旧实现会截断末字符成 "ba"/"bad"）、空用户名条目均被丢弃
+  assert.deepEqual(I.parsePanelUsers({ PANEL_USERS: 'a:p,bad,:' }), [{ username: 'a', password: 'p' }]);
+  assert.deepEqual(I.parsePanelUsers({ PANEL_USERS: ':pass,ok:go' }), [{ username: 'ok', password: 'go' }]);
 });
 
 // ---------------- 哈希 ----------------

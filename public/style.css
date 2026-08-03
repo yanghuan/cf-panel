@@ -424,6 +424,12 @@ button.danger:hover { background: rgba(248, 113, 113, .12); }
 .token-list li { display: flex; justify-content: space-between; align-items: center; padding: 6px 8px; border-bottom: 1px solid var(--border); word-break: break-all; }
 .token-list .muted { color: var(--muted); }
 
+/* 审计日志 */
+.audit-row { display: flex; align-items: center; gap: 10px; width: 100%; }
+.audit-action { font-weight: 600; white-space: nowrap; }
+.audit-info { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); }
+.audit-time { color: var(--muted); font-size: 12px; white-space: nowrap; font-variant-numeric: tabular-nums; }
+
 /* 告警渠道预设 */
 .alert-presets { margin-top: 8px; font-size: 13px; color: var(--muted); }
 .alert-presets summary { cursor: pointer; user-select: none; }

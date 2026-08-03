@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>cf-panel · 监控面板</title>
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.min.css" />
-  <link rel="stylesheet" href="/style.css?v=17" />
+  <link rel="stylesheet" href="/style.css?v=18" />
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
 </head>
 <body>
@@ -22,6 +22,7 @@
         <button class="dd-item" data-menu="custom-setup">自定义指标</button>
         <button class="dd-item" data-menu="service-setup">服务监控</button>
         <button class="dd-item" data-menu="tokens">访问令牌</button>
+        <button class="dd-item" data-menu="audit-logs">审计日志</button>
         <button class="dd-item dd-danger" data-menu="logout">退出</button>
       </div>
     </header>
@@ -262,6 +263,17 @@
     </div>
   </div>
 
+  <!-- 审计日志弹窗 -->
+  <div id="audit-modal" class="modal hidden">
+    <div class="modal-head">
+      <span>审计日志（保留 90 天）</span>
+      <button id="btn-audit-close" class="ghost">关闭</button>
+    </div>
+    <div class="settings-body">
+      <ul id="audit-list" class="token-list"></ul>
+    </div>
+  </div>
+
   <!-- 通用对话框（替代系统 alert/confirm） -->
   <div id="dialog" class="modal hidden">
     <div class="modal-head">
@@ -281,6 +293,6 @@
 
   <script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.min.js"></script>
-  <script src="/app.js?v=25"></script>
+  <script src="/app.js?v=26"></script>
 </body>
 </html>

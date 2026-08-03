@@ -135,6 +135,41 @@ test('服务器：管理员添加/列表/删除 + 分组排序', async () => {
   assert.deepEqual(after.map((s) => s.name), ['web-01', 'db-01']);
 });
 
+test('删除服务器：清理历史数据 + 审计日志 + 通知 DO 断开 agent', async () => {
+  const env = makeEnv();
+  const token = await login(env);
+  await addServer(env, token, { name: 'del-me' });
+  const list = await (await call(env, { path: '/api/servers', token })).json();
+  const id = list[0].id;
+
+  // 预置历史数据（归档时序 + 自定义指标）
+  await env.DB.prepare('INSERT INTO metrics_min (server_id, ts, cpu) VALUES (?,?,?)').bind(id, Math.floor(Date.now() / 1000 / 60), 5).run();
+  await env.DB.prepare('INSERT INTO metrics_custom (server_id, name, ts, value) VALUES (?,?,?,?)').bind(id, 'x', Math.floor(Date.now() / 1000 / 60), 1).run();
+
+  // 删除不存在的服务器 → 404
+  assert.equal((await call(env, { method: 'DELETE', path: '/api/servers/9999', token })).status, 404);
+
+  const res = await call(env, { method: 'DELETE', path: `/api/servers/${id}`, token });
+  assert.equal(res.status, 200);
+
+  // 服务器与历史数据已清理
+  assert.equal((await env.DB.prepare('SELECT id FROM servers WHERE id = ?').bind(id).first()), null);
+  assert.equal((await env.DB.prepare('SELECT COUNT(*) AS c FROM metrics_min WHERE server_id = ?').bind(id).all()).results[0].c, 0);
+  assert.equal((await env.DB.prepare('SELECT COUNT(*) AS c FROM metrics_custom WHERE server_id = ?').bind(id).all()).results[0].c, 0);
+
+  // 审计日志：server.delete（含服务器名）
+  const logs = await env.DB.prepare("SELECT * FROM audit_logs WHERE action = 'server.delete'").all();
+  assert.equal(logs.results.length, 1);
+  assert.equal(logs.results[0].target_server_id, id);
+  assert.equal(logs.results[0].detail, 'del-me');
+
+  // DO 通知：MetricsDO 收到 /drop，各分片收到 /rpc/drop_server
+  assert.ok(env.METRICS.calls.some((c) => c.path === '/drop'));
+  const drops = env.TERMINAL.calls.filter((c) => c.path === '/rpc/drop_server');
+  assert.equal(drops.length, 4); // SHARDS=4
+  assert.ok(drops.every((c) => c.init.body === JSON.stringify({ serverId: id })));
+});
+
 test('服务器：在线状态按 last_seen 60 秒判定', async () => {
   const env = makeEnv();
   const token = await login(env);
@@ -297,6 +332,52 @@ test('PAT：创建/使用/删除，scopes + 白名单生效', async () => {
   const del = await call(env, { method: 'DELETE', path: `/api/tokens/${list[0].id}`, token: adminToken });
   assert.equal(del.status, 200);
   assert.equal((await call(env, { path: '/api/me', token })).status, 401);
+});
+
+test('PAT：scopes 白名单校验（非法值 400，混合值只留合法项）', async () => {
+  const env = makeEnv();
+  const adminToken = await login(env);
+
+  // 全非法 → 400
+  const bad = await call(env, { method: 'POST', path: '/api/tokens', token: adminToken, body: { name: 'bad', scopes: ['admin:*', 'root'] } });
+  assert.equal(bad.status, 400);
+
+  // 混合合法/非法 → 只保留合法项（去重）
+  const mixed = await call(env, {
+    method: 'POST', path: '/api/tokens', token: adminToken,
+    body: { name: 'mixed', scopes: ['server:read', 'server:exec', 'server:read', 'bogus'] },
+  });
+  assert.equal(mixed.status, 200);
+  const rows = await env.DB.prepare("SELECT scopes FROM api_tokens WHERE name = 'mixed'").first();
+  assert.deepEqual(JSON.parse(rows.scopes), ['server:read', 'server:exec']);
+
+  // 未提供 scopes → 默认只读
+  const dflt = await call(env, { method: 'POST', path: '/api/tokens', token: adminToken, body: { name: 'dflt' } });
+  assert.equal(dflt.status, 200);
+  const rows2 = await env.DB.prepare("SELECT scopes FROM api_tokens WHERE name = 'dflt'").first();
+  assert.deepEqual(JSON.parse(rows2.scopes), ['server:read']);
+});
+
+test('审计日志：管理员可查（倒序 + limit），非管理员 403', async () => {
+  const env = makeEnv();
+  const adminToken = await login(env);
+  await addServer(env, adminToken, { name: 'a1' }); // 产生 server.create
+  await call(env, { method: 'POST', path: '/api/terminal', token: adminToken, body: { server_id: 1 } }); // 产生 terminal.open
+
+  const rows = await (await call(env, { path: '/api/audit-logs', token: adminToken })).json();
+  const actions = rows.map((r) => r.action);
+  assert.ok(actions.includes('server.create'));
+  assert.ok(actions.includes('terminal.open'));
+  // 倒序：最新（terminal.open）在前
+  assert.equal(rows[0].action, 'terminal.open');
+
+  // limit 生效
+  const one = await (await call(env, { path: '/api/audit-logs?limit=1', token: adminToken })).json();
+  assert.equal(one.length, 1);
+
+  // PAT 不能查看
+  const pat = await (await call(env, { method: 'POST', path: '/api/tokens', token: adminToken, body: { name: 'r', scopes: ['server:read'] } })).json();
+  assert.equal((await call(env, { path: '/api/audit-logs', token: pat.token })).status, 403);
 });
 
 // ---------------- 设置（仅管理员） ----------------

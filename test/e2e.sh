@@ -30,6 +30,8 @@ if [ -z "${E2E_PASSWORD:-}" ] && [ -f "$ROOT/.dev.vars" ]; then
   E2E_PASSWORD=$(grep -E '^PANEL_PASSWORD=' "$ROOT/.dev.vars" | cut -d= -f2-)
 fi
 E2E_PASSWORD="${E2E_PASSWORD:-}"
+# agent 启动命令（默认 Shell 版；可用 AGENT_CMD 换成其他实现，如 Rust 版）
+AGENT_CMD="${AGENT_CMD:-bash $ROOT/agent/agent.sh}"
 
 cleanup() {
   # 只清理本次启动的进程（按进程组 kill，避免全局 pkill 误杀同机其他 wrangler/agent）
@@ -123,7 +125,7 @@ fi
 ok "已注册服务器（agent_key=${AGENT_KEY:0:8}...）"
 
 # 5) 启动 agent，等待其控制通道上线并上报监控
-echo "[5/6] 启动 agent.sh 并等待上线/上报 ..."
+echo "[5/6] 启动 agent（${AGENT_CMD%% *}）并等待上线/上报 ..."
 setsid env \
 AGENT_WSS_URL="ws://127.0.0.1:$PORT/ws/agent" \
 AGENT_KEY="$AGENT_KEY" \
@@ -131,7 +133,7 @@ AGENT_TMPDIR="$TMP/agent" \
 AGENT_LOG="$AGENT_LOG" \
 AGENT_LOG_MAX=1048576 \
 REPORT_INTERVAL=5 \
-bash "$ROOT/agent/agent.sh" &
+$AGENT_CMD &
 AGENT_PID=$!
 
 if ! wait_for "agent 上线（servers.online=true）" 60 bash -c \

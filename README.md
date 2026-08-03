@@ -17,6 +17,7 @@ cf-panel/
 ├── src/index.js         # Worker：REST API + 鉴权 + TerminalDO 双端对拷 + PanelDO 实时推送
 ├── public/              # 前端（index.html / app.js / style.css）
 ├── agent/               # 被控机 agent（agent.sh 含监控上报 / systemd 模板）
+│   └── rust/            # Rust 版 agent（同协议对等实现，低内存设备可选）
 └── docs/architecture.md # 架构设计文档
 ```
 

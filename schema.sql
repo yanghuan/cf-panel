@@ -1,25 +1,16 @@
 -- cf-panel D1 数据库 Schema（对齐 docs/architecture.md §8.2）
 -- 应用：wrangler d1 execute cf-panel --remote --file=schema.sql
 
--- 用户
-CREATE TABLE IF NOT EXISTS users (
-  id            INTEGER PRIMARY KEY AUTOINCREMENT,
-  username      TEXT    NOT NULL UNIQUE,
-  password_hash TEXT    NOT NULL,            -- PBKDF2-SHA256
-  password_salt TEXT    NOT NULL,
-  role          INTEGER NOT NULL DEFAULT 0,  -- 0=member 1=admin
-  created_at    TEXT    NOT NULL DEFAULT (datetime('now'))
-);
-
 -- 服务器（agent 身份归属）
+-- 注：多用户当前由环境变量 PANEL_USERS/PANEL_PASSWORD 配置（登录即管理员），
+-- 不再维护 users 表；servers.user_id 保留（记录创建者，审计/归属用）
 CREATE TABLE IF NOT EXISTS servers (
   id             INTEGER PRIMARY KEY AUTOINCREMENT,
   agent_key_id   TEXT    NOT NULL UNIQUE,   -- agent key 指纹（SHA-256(key)），唯一身份标识
   name           TEXT    NOT NULL,
   "group"        TEXT    NOT NULL DEFAULT '', -- 分组（'' = 未分组）
-  user_id        INTEGER NOT NULL,          -- 归属用户
+  user_id        INTEGER NOT NULL,          -- 归属用户（创建者）
   agent_key_hash TEXT    NOT NULL,          -- agent 密钥哈希（HMAC-SHA256）
-  hide_for_guest INTEGER NOT NULL DEFAULT 0,
   display_index  INTEGER NOT NULL DEFAULT 0,
   last_seen      INTEGER,                   -- unix 秒，最近上报时间
   online         INTEGER NOT NULL DEFAULT 0,

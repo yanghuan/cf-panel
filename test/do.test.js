@@ -415,6 +415,30 @@ test('TerminalDO: terminal_ready 确认后停止重发', async (t) => {
   }
 });
 
+test('TerminalDO: 僵尸会话超 TTL 由 alarm 清理，未到期安排下次 alarm', async () => {
+  const env = makeEnv();
+  const st = mockState();
+  const inst = new TerminalDO(st, env);
+  const now = Date.now();
+  const TTL = 10 * 60 * 1000; // SESSION_TTL_MS
+  // 过期僵尸 → 直接清掉，其 pendingTerm 也清理
+  inst.sessions.set('0-old', { streamId: '0-old', serverId: 1, creatorUserId: 1, createdAt: now - TTL - 1000, userWs: null, agentWs: null });
+  inst.pendingTerm.set('0-old', { tries: 0, timer: null });
+  // 未过期僵尸 → 保留并安排 alarm 到其到期时间
+  inst.sessions.set('0-young', { streamId: '0-young', serverId: 1, creatorUserId: 1, createdAt: now - 1000, userWs: null, agentWs: null });
+  // 任一端有连接 → 不回收（即使创建很久）
+  inst.sessions.set('0-live', { streamId: '0-live', serverId: 1, creatorUserId: 1, createdAt: now - TTL * 2, userWs: {}, agentWs: null });
+
+  await inst.alarm();
+
+  assert.equal(inst.sessions.has('0-old'), false);
+  assert.equal(inst.pendingTerm.has('0-old'), false);
+  assert.equal(inst.sessions.has('0-young'), true);
+  assert.equal(inst.sessions.has('0-live'), true);
+  // 安排了 alarm：最早僵尸到期时间 +1s
+  assert.equal(st.storage.alarmTs, now - 1000 + TTL + 1000);
+});
+
 test('TerminalDO: cleanup 断开后清空 agents/sessions/pendingTerm', async () => {
   const env = makeEnv();
   const ws1 = { send() {}, readyState: 1 };

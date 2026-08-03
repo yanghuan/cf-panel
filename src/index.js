@@ -911,7 +911,6 @@ export class TerminalDO {
     this.agents = new Map(); // serverId -> 控制 WS
     this.agentInterval = new Map(); // serverId -> 当前下发的上报间隔（秒），避免重复下发
     this.pendingTerm = new Map(); // streamId -> {tries, timer} open_terminal 确认重发
-    this.lastSweep = 0;
   }
 
   async fetch(request) {
@@ -1061,16 +1060,37 @@ export class TerminalDO {
     return new Response('not found', { status: 404 });
   }
 
-  // 惰性清理：两端都断开且超过 TTL 的僵尸会话（每 60s 至多扫一次）
+  // 惰性清理：两端都断开且超过 TTL 的僵尸会话 → 删除；并清理对应 pendingTerm。
+  // 若有未到期的僵尸会话，则安排 DO alarm 到最早到期时间——Hibernation 下零流量也会
+  // 被 alarm 短暂唤醒执行清理，避免"必须等下一次 fetch 才回收"的滞留（alarm 每次 = 1 次请求，僵尸会话罕见，成本可忽略）。
   maybeSweep() {
     const now = Date.now();
-    if (now - this.lastSweep < 60 * 1000) return;
-    this.lastSweep = now;
+    let next = Infinity;
     for (const [sid, sess] of this.sessions) {
-      if (!sess.userWs && !sess.agentWs && now - sess.createdAt > SESSION_TTL_MS) {
+      if (sess.userWs || sess.agentWs) continue; // 任一端有连接即不回收
+      if (now - sess.createdAt > SESSION_TTL_MS) {
         this.sessions.delete(sid);
+      } else {
+        next = Math.min(next, sess.createdAt + SESSION_TTL_MS);
       }
     }
+    // 清理已无会话的 open_terminal 待确认（流已回收，停止定时器，防泄漏）
+    for (const sid of [...this.pendingTerm.keys()]) {
+      if (!this.sessions.has(sid)) {
+        const r = this.pendingTerm.get(sid);
+        if (r && r.timer) clearTimeout(r.timer);
+        this.pendingTerm.delete(sid);
+      }
+    }
+    if (next !== Infinity) {
+      try { this.state.storage.setAlarm(next + 1000); } catch { /* ignore */ }
+    }
+  }
+
+  // Hibernation alarm：零流量时也被唤醒执行清理；无僵尸会话则无需设定 alarm，保持休眠
+  async alarm() {
+    this.rebuildIndex();
+    this.maybeSweep();
   }
 
   // open_terminal 确认重发：下发后 5s 未收到 agent 的 terminal_ready 则重发，最多 3 次

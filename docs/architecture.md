@@ -209,33 +209,37 @@ agent 可能运行在低内存设备（OpenWrt 路由器 / 树莓派 Zero 等）
 | 每开 1 个终端会话 | **+8~9 MB**（pty socat + 数据端 socat + 终端 websocat + 包裹子 shell + sh） | +5~6 |
 | 3 个终端同时 | ~28~36 MB | 20+ |
 
-**三方案对比（Shell/Go 为实测，Python 为估算）**：
+**四方案对比（Shell/Go/Rust 为实测，Python 为估算）**：
 
-| 维度 | Shell（实测） | Python（asyncio+websockets，估算） | Go（stdlib + pty 库，实测） |
-| --- | --- | --- | --- |
-| 空闲内存 | ~11 MB / 3 进程 | 15~25 MB / 1 进程 | **~5.7 MB / 1 进程**（最小 WS agent 实测；完整版含 PTY/TLS/文件 估算 8~15 MB） |
-| 每终端增量 | +8~9 MB / +5~6 进程 | +1~3 MB | +1~2 MB |
-| 磁盘 | websocat 7MB + socat + jq + bash + coreutils | 解释器（OpenWrt 常需先装，+20MB+） | **单静态二进制 ~5 MB**（实测 `-ldflags="-s -w"`） |
-| 启动 | 快 | 慢（100~400ms） | 快（~50ms） |
-| 低端 CPU（mips/arm） | 各工具需有对应架构包 | 解释器性能差 | 原生编译，性能好 |
-| 进程模型 | 多进程（fork 重） | asyncio 单线程 | goroutine 轻量 |
-| 部署 | 脚本 + 3 个外部二进制 | 解释器 + pip 依赖 | 单文件拷贝即用 |
+| 维度 | Shell（实测） | Go（实测） | Rust（实测） | Python（估算） |
+| --- | --- | --- | --- | --- |
+| 空闲内存 | ~11 MB / 3 进程 | **~5.7 MB** / 1 进程 | **~3.6 MB** / 1 进程 | 15~25 MB / 1 进程 |
+| 每终端增量 | +8~9 MB / +5~6 进程 | +1~2 MB | +0.5~1.5 MB | +1~3 MB |
+| 二进制 | websocat 7MB + socat + jq + bash + coreutils | ~4.9 MB（实测，静态 `-s -w`） | ~1.4 MB（实测，动态 glibc） | 解释器 +20MB+ |
+| 启动 | 快 | 快 | 最快 | 慢（100~400ms） |
+| 低端 CPU（mips/arm） | 各工具需有对应架构包 | 原生编译（一条命令交叉） | 原生编译（需配 target+linker） | 解释器性能差 |
+| 进程模型 | 多进程（fork 重） | goroutine | async task | asyncio |
+| 部署 | 脚本 + 3 个外部二进制 | 单文件 | 单文件 | 解释器 + pip 依赖 |
 
-> 实测说明（2026-08）：最小 Go WS agent（读泵 + 心跳 + 周期上报 goroutine，gorilla/websocket，连接本地 `ws://`）warmup 后 RSS ≈ **5.7 MB**（VSZ 1200 MB 为 Go 预留虚拟地址空间，不占真实内存）。生产用 `wss://` 时 TLS 额外 +0.5~2 MB；完整 agent 再叠加 PTY/文件处理与更多会话后仍显著低于 Shell 的多进程峰值。
+> 实测说明（2026-08，本机）：
+> - **Go**：最小 WS agent（gorilla/websocket，读泵+心跳+上报 goroutine，连本地 `ws://`）warmup 后 RSS ≈ **5.7 MB**（VSZ 1200 MB 为预留虚拟空间，不占实存）；二进制 4.9 MB（静态）。
+> - **Rust**：同结构最小 agent（tokio + tokio-tungstenite）RSS ≈ **3.6 MB**，二进制 1.4 MB（动态链接 glibc；静态 musl 版约 2~5 MB，RSS 相近）。无 GC → 内存曲线最平、无 GC 尖峰。
+> - 生产用 `wss://` 时 TLS 各 +0.5~2 MB；完整 agent（PTY/文件/多会话）Go/Rust 仍显著低于 Shell 的多进程峰值。
 
 **低内存设备适用性**：
 
-| 设备内存 | Shell | Python | Go |
-| --- | --- | --- | --- |
-| 64MB（老路由器） | ⚠️ 空闲 11MB 尚可，多终端脆弱（每终端 +9MB、进程碎片化） | ❌ 解释器基线太重 | ✅ 空闲 5.7MB + 单进程峰值可控 |
-| 128MB（树莓派 Zero） | ✅ 合适 | ⚠️ 勉强 | ✅ 合适 |
-| 256MB+ | ✅ 合适（部署零编译） | ✅ | ✅ |
+| 设备内存 | Shell | Go | Rust | Python |
+| --- | --- | --- | --- | --- |
+| 64MB（老路由器） | ⚠️ 空闲 11MB 尚可，多终端脆弱 | ✅ 空闲 5.7MB | ✅ 空闲 3.6MB | ❌ 解释器基线太重 |
+| 128MB（树莓派 Zero） | ✅ 合适 | ✅ | ✅ | ⚠️ 勉强 |
+| 256MB+ | ✅ 合适（部署零编译） | ✅ | ✅ | ✅ |
 
 **结论**：
-- **内存角度 Go 全面占优**：空闲实测 5.7 MB < Shell 11 MB，单进程峰值可控，二进制 ~5 MB 且易交叉编译（mips/arm）。
-- 多终端场景 Shell 因"每终端 +9MB + 进程爆炸"在 64MB 设备上最脆弱；**Go 单进程是"低内存 + 常开多终端"的最优解**。
-- **保留 Shell 的真正理由不是内存，而是运维/部署**：零编译、脚本即改即用、无需 Go 工具链、对已有机器直接跑（`apt install socat jq` + 下载 websocat）。
-- 决策建议：目标设备 ≥256MB 且终端并发少 → 维持 Shell；目标含 64~128MB 低端设备或常开多终端 → 迁移 Go（协议不变，见 §3.5 权衡，单文件分发 + 交叉编译最省事）。
+- **内存角度 Rust 最省**（实测 3.6 MB < Go 5.7 MB < Shell 11 MB），且无 GC → 无内存尖峰；但开发成本最高（借用检查/async 样板/交叉编译配置）。
+- **综合性价比 Go 最优**：内存仅比 Rust 多 ~2 MB（同处几 MB 级），但开发效率、交叉编译（一条命令）、生态成熟度全面占优。
+- 多终端场景 Shell 因"每终端 +9MB + 进程爆炸"在 64MB 设备上最脆弱；Go/Rust 单进程是"低内存 + 常开多终端"的正解。
+- **保留 Shell 的真正理由不是内存，而是运维/部署**：零编译、脚本即改即用、无需任何工具链、对已有机器直接跑（`apt install socat jq` + 下载 websocat）。
+- 决策建议：目标设备 ≥256MB 且终端并发少 → 维持 Shell；目标含 64~128MB 低端设备或常开多终端 → 优先迁移 **Go**（若团队熟悉 Rust 且追求极限内存 → Rust；协议不变，见 §3.5 权衡）。
 
 ### 3.6 PTY（伪终端）
 - 用 `creack/pty`（Go）或等价的 PTY 库（其它语言）在 slave 端启动 shell，`TERM=xterm`。

@@ -1,4 +1,6 @@
-# cf-panel CI：提交/推送后自动运行测试（零依赖，node:test + node:sqlite）
+# cf-panel CI：提交/推送后自动运行测试
+# 1) 单元/集成测试（node:test + node:sqlite，零依赖）
+# 2) E2E 真实环境联调（wrangler dev --local + agent.sh + 终端透传）
 name: CI
 
 on:
@@ -19,5 +21,32 @@ jobs:
         with:
           node-version: ${{ matrix.node-version }}
 
-      - name: 运行测试
+      - name: 运行单元/集成测试
         run: npm test
+
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: 安装系统依赖（socat/jq）与 websocat
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y socat jq
+          curl -sL -o /usr/local/bin/websocat https://github.com/vi/websocat/releases/download/v1.14.0/websocat.x86_64-unknown-linux-musl
+          chmod +x /usr/local/bin/websocat
+
+      - name: 安装 wrangler
+        run: npm i -D wrangler
+
+      - name: 准备本地密钥（.dev.vars）
+        run: |
+          echo "JWT_SECRET=e2e-secret-$(openssl rand -hex 16)" > .dev.vars
+          echo "PANEL_PASSWORD=e2e-pass-$(openssl rand -hex 8)" >> .dev.vars
+
+      - name: 运行 E2E（wrangler dev + agent.sh 真实联调）
+        run: bash test/e2e.sh

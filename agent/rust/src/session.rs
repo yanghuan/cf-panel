@@ -9,7 +9,9 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message;
 
 const FILE_LIMIT: u64 = 500 * 1024 * 1024; // 单文件总上限 500MB
-const MAX_BLOCK: usize = 32 * 1024 * 1024; // 单次 read/write 块上限 32MB（防大块内存尖峰；前端按 1MB 分块）
+// 单次 read/write 块上限。前端固定按 1MB 分块，4MB 已是 4 倍余量。
+// 注意峰值内存 ≈ 块大小×3.7（buf + base64 1.33× + JSON 序列化副本），32MB 块会到 ~118MB、64MB 设备 OOM。
+const MAX_BLOCK: usize = 4 * 1024 * 1024;
 
 fn b64e(data: &[u8]) -> String {
     base64::Engine::encode(&base64::engine::general_purpose::STANDARD, data)

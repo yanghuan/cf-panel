@@ -20,7 +20,13 @@ portable-pty = "0.9"
 base64 = "0.22"
 libc = "0.2"
 
+# 构建优化说明（2026-08 实测）：
+# - opt-level="z"：体积优先，agent 为 IO 密集，opt=3 仅 +0.22MB 且收益小
+# - codegen-units=1 + lto：跨函数深度优化，代码更小更快（编译变慢，可接受）
+# - 不采用 mimalloc：实测 RSS 上升（11.9MB vs 不含时更低），低分配率无收益
+# - 不采用 panic="abort"：默认 unwinding 保留 tokio 的 task panic 隔离（单会话故障不杀全进程）
 [profile.release]
 opt-level = "z"
+codegen-units = 1
 lto = true
 strip = true

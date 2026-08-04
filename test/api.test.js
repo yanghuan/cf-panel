@@ -316,6 +316,16 @@ test('agent 上报：key 指纹定位 + 哈希校验 + 落库', async () => {
   assert.equal(after[0].online, true);
 });
 
+// ---------------- 安全响应头（L-01） ----------------
+test('安全响应头：API 响应带 nosniff/referrer/frame/CSP 头', async () => {
+  const env = makeEnv();
+  const res = await call(env, { path: '/api/public/settings' });
+  assert.equal(res.headers.get('x-content-type-options'), 'nosniff');
+  assert.equal(res.headers.get('referrer-policy'), 'no-referrer');
+  assert.equal(res.headers.get('x-frame-options'), 'DENY');
+  assert.match(res.headers.get('content-security-policy'), /frame-ancestors 'none'/);
+});
+
 // ---------------- 监控 ----------------
 test('监控：短区间走内存热区（METRICS /query），非法 range 回退 12h', async () => {
   const env = makeEnv();

@@ -71,10 +71,17 @@ const MCP_TOOLS = [
 
 // ---------------- 通用工具 ----------------
 
+// L-01：API 响应统一附加的安全响应头（防点击劫持/嗅探/Referrer 泄露）
+const SECURITY_HEADERS = {
+  'x-content-type-options': 'nosniff',
+  'referrer-policy': 'no-referrer',
+  'x-frame-options': 'DENY',
+  'content-security-policy': "frame-ancestors 'none'",
+};
 function json(data, status = 200, headers = {}) {
   return new Response(JSON.stringify(data), {
     status,
-    headers: { 'content-type': 'application/json; charset=utf-8', ...headers },
+    headers: { 'content-type': 'application/json; charset=utf-8', ...SECURITY_HEADERS, ...headers },
   });
 }
 function err(message, status = 400) {

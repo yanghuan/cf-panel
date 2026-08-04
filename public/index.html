@@ -4,6 +4,8 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>cf-panel · 监控面板</title>
+  <!-- L-01：内容安全策略（防注入/点击劫持；本地 JS/CSS + WebSocket + IP 地理查询放行） -->
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' ws: wss: https://ipapi.co https://ipwho.is; frame-ancestors 'none'">
   <!-- 依赖已本地化（public/vendor），避免外部 CDN 不可达/供应链风险 -->
   <link rel="stylesheet" href="/vendor/xterm.min.css" />
   <link rel="stylesheet" href="/style.css?v=19" />

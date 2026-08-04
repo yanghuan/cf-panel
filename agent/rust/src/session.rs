@@ -289,9 +289,16 @@ where
 
 async fn file_list(path: String) -> String {
     match blocking_with_timeout(10, move || {
+        // L-03：目录列表最大条目数，防超大目录物化全部条目/生成巨型 JSON
+        const FILE_LIST_MAX: usize = 1000;
         let mut entries = Vec::new();
+        let mut truncated = false;
         if let Ok(rd) = std::fs::read_dir(&path) {
             for e in rd.flatten() {
+                if entries.len() >= FILE_LIST_MAX {
+                    truncated = true;
+                    break;
+                }
                 let name = e.file_name().to_string_lossy().into_owned();
                 let meta = e.metadata();
                 let is_dir = meta.as_ref().map(|m| m.is_dir()).unwrap_or(false);
@@ -314,8 +321,11 @@ async fn file_list(path: String) -> String {
                 }));
             }
         }
-        serde_json::json!({ "type": "list_result", "ok": true, "path": path, "entries": entries })
-            .to_string()
+        serde_json::json!({
+            "type": "list_result", "ok": true, "path": path,
+            "entries": entries, "truncated": truncated,
+        })
+        .to_string()
     })
     .await
     {

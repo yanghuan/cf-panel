@@ -401,6 +401,8 @@
       term.dispose();
       $('#term-modal').classList.add('hidden');
       unlockScroll();
+      // L-02：移除 resize 监听器，防多次开关终端累积内存泄漏
+      window.removeEventListener('resize', onResize);
     };
     $('#btn-term-close').onclick = close;
 
@@ -467,7 +469,8 @@
     // 键盘输入 → WS；窗口变化 → resize 帧（走 DO → 控制 WS → stty）
     term.onData((data) => { if (ws && ws.readyState === 1) ws.send(data); });
     term.onResize(({ cols, rows }) => { if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: 'resize', cols, rows })); });
-    window.addEventListener('resize', () => { if (!closed) { try { fit.fit(); } catch { /* ignore */ } } });
+    const onResize = () => { if (!closed) { try { fit.fit(); } catch { /* ignore */ } } };
+    window.addEventListener('resize', onResize);
 
     connect();
   }
@@ -507,7 +510,10 @@
       ws.onopen = () => { fileSend({ type: 'auth', token }); fileSend({ type: 'list', path: fileCwd }); };
       ws.onmessage = (ev) => {
         let j; try { j = JSON.parse(ev.data); } catch { return; }
-        if (j.type === 'list_result' && j.ok) renderFileList(j.entries);
+        if (j.type === 'list_result' && j.ok) {
+          renderFileList(j.entries);
+          if (j.truncated) $('#file-msg').textContent = '目录条目过多，仅显示前 1000 项';
+        }
         else if (j.type === 'read_result' && j.ok) onReadResult(j);
         else if (j.type === 'write_result' && j.ok) onWriteResult(j);
         else if (j.type === 'error') $('#file-msg').textContent = `错误：${j.message}`;

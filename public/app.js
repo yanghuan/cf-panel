@@ -1233,7 +1233,8 @@
   // 对所有 .modal 注入 dialog 语义；用 MutationObserver 统一做"打开聚焦首个可聚焦元素、
   // 关闭恢复焦点到触发元素"，无需改造各弹窗的打开/关闭调用。
   {
-    const modals = [...document.querySelectorAll('.modal')];
+    // 覆盖所有弹窗：.modal 与 .monitor-modal（监控/自定义指标两处）
+    const modals = [...document.querySelectorAll('.modal, .monitor-modal')];
     modals.forEach((m) => {
       m.setAttribute('role', 'dialog');
       m.setAttribute('aria-modal', 'true');

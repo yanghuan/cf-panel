@@ -63,6 +63,10 @@ wrangler deploy
 ```
 
 > **数据库迁移（migrations）**：schema 由 `migrations/` 目录版本化管理，`wrangler d1 migrations apply cf-panel --remote` 幂等执行全部未应用迁移（新库自动建全表，旧库自动补齐增量）。以下为历史旧库的增量对齐命令（已用 migrations 的库无需手动执行）。
+> **旧库曾手动执行过 `ALTER TABLE metrics_min ADD COLUMN mem_total REAL;`（无迁移记录）**：直接 `apply` 会因 `0002` 重复加列失败，先手动标记 0002 已应用：
+> ```
+> wrangler d1 execute cf-panel --remote --command "INSERT OR IGNORE INTO d1_migrations (name) VALUES ('0002_add_mem_total.sql');"
+> ```
 >
 > 已部署过旧版（无 `"group"` 列 / 无 `kv_json` 表）？执行迁移：
 > ```

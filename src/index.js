@@ -1887,6 +1887,7 @@ export class MetricsDO {
   // + 每天 D1 保留期清理 + 离线/恢复告警。归档与删除无条件执行，防 ARCHIVE_TO_D1=0 时
   // storage 热区 / audit_logs 无限增长。
   async alarm() {
+    try {
     const archiveOn = this.env.ARCHIVE_TO_D1 !== '0';
     const alertOn = (await getAlertCfg(this.env)).enabled;
     if (alertOn) await this.checkOfflineAlerts();
@@ -1941,7 +1942,10 @@ export class MetricsDO {
           .bind(`-${AUDIT_RETENTION_DAYS} days`),
       ]);
     }
-    this.state.storage.setAlarm(Date.now() + ARCHIVE_INTERVAL_MS);
+    } finally {
+      // 无论是否异常都续排下一次 alarm：防归档/清理/告警因单次失败永久停摆
+      this.state.storage.setAlarm(Date.now() + ARCHIVE_INTERVAL_MS);
+    }
   }
 }
 

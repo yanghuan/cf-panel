@@ -1697,19 +1697,22 @@ export class MetricsDO {
           out[serverId] = { ts: lastTs, cpu: lastV.cpu, mem_used: lastV.mem_used, mem_total: lastV.mem_total, net_in: lastV.net_in, net_out: lastV.net_out, extra: lastV.extra };
         }
       }
-      // 从 storage 补齐缓存外的服务器（实例 evict 后 latest 不丢）
-      const keys = await this.listStorage('m:');
-      for (const k of keys) {
-        const rest = k.name.slice(2); // 去掉 'm:'
-        const sep = rest.indexOf(':');
-        if (sep <= 0) continue;
-        const serverId = Number(rest.slice(0, sep));
-        if (seen.has(serverId)) continue;
-        const ts = Number(rest.slice(sep + 1));
-        const cur = out[serverId];
-        if (!cur || ts > cur.ts) {
-          const v = JSON.parse(k.value);
-          out[serverId] = { ts, cpu: v.cpu, mem_used: v.mem_used, mem_total: v.mem_total, net_in: v.net_in, net_out: v.net_out, extra: v.extra };
+      // 仅实例 evict 后（内存缓存为空）才全量扫 storage 恢复；活跃期直接读内存，
+      // 避免面板 3s 轮询对 DO Storage 的全量读取放大（机器多时收益明显）
+      if (this.data.size === 0) {
+        const keys = await this.listStorage('m:');
+        for (const k of keys) {
+          const rest = k.name.slice(2); // 去掉 'm:'
+          const sep = rest.indexOf(':');
+          if (sep <= 0) continue;
+          const serverId = Number(rest.slice(0, sep));
+          if (seen.has(serverId)) continue;
+          const ts = Number(rest.slice(sep + 1));
+          const cur = out[serverId];
+          if (!cur || ts > cur.ts) {
+            const v = JSON.parse(k.value);
+            out[serverId] = { ts, cpu: v.cpu, mem_used: v.mem_used, mem_total: v.mem_total, net_in: v.net_in, net_out: v.net_out, extra: v.extra };
+          }
         }
       }
       return json(out);

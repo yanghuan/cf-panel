@@ -430,15 +430,19 @@ test('TerminalDO: /rpc/wakeup 给本分片全部 agent 下发快采间隔', asyn
   ]);
 });
 
-test('TerminalDO: /rpc create 时 agent 离线 → 502', async () => {
+test('TerminalDO: /rpc create 时 agent 离线 → 502 且不残留会话（M-04）', async () => {
   const env = makeEnv();
-  const inst = new TerminalDO(mockState(), env);
+  const st = mockState();
+  const inst = new TerminalDO(st, env);
   const res = await inst.fetch(new Request('https://do.internal/rpc', {
     method: 'POST',
     body: JSON.stringify({ op: 'create', streamId: '0-abc', serverId: 1, creatorUserId: 1 }),
   }));
   assert.equal(res.status, 502);
   assert.equal((await res.json()).error, 'agent offline');
+  // M-04：失败路径不落盘（内存 + storage 均无残留）
+  assert.equal(inst.sessions.has('0-abc'), false, '不残留内存会话');
+  assert.equal(st.storage.map.has('sess:0-abc'), false, '不残留持久化会话');
 });
 
 test('TerminalDO: /rpc create 下发 open_terminal，未确认时 5s 重发最多 3 次', async (t) => {

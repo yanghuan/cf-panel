@@ -1084,6 +1084,9 @@ export class TerminalDO {
       const body = await request.json();
       if (body.op === 'create' || body.op === 'open_file') {
         const isFile = body.op === 'open_file';
+        // M-04：先确认 agent 在线，离线时不创建/不落盘（避免失败会话残留）
+        const agentWs = this.agents.get(body.serverId);
+        if (!agentWs) return json({ error: 'agent offline' }, 502);
         const createdAt = Date.now();
         this.sessions.set(body.streamId, {
           streamId: body.streamId,
@@ -1107,8 +1110,12 @@ export class TerminalDO {
             type: isFile ? 'file' : 'terminal',
           });
         } catch { /* 持久化失败则降级为纯内存会话 */ }
-        const agentWs = this.agents.get(body.serverId);
-        if (!agentWs) return json({ error: 'agent offline' }, 502);
+        // M-04：安排 TTL 回收 alarm（两端都无连接时由 maybeSweep 按时回收）
+        try {
+          const existing = await this.state.storage.getAlarm();
+          const next = createdAt + SESSION_TTL_MS + 1000;
+          if (existing == null || next < existing) this.state.storage.setAlarm(next);
+        } catch { /* 无法安排 alarm 时依赖 fetch 时 maybeSweep */ }
         agentWs.send(JSON.stringify({ type: isFile ? 'open_file' : 'open_terminal', stream_id: body.streamId }));
         // 终端会话：确认重发机制——agent 收到并 spawn 后回 terminal_ready，
         // 未确认则定时重发（最多 3 次），避免控制通道重连窗口丢指令

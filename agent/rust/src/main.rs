@@ -5,7 +5,6 @@ mod session;
 
 use std::error::Error;
 use std::io::Write;
-use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -252,11 +251,8 @@ async fn main() {
         std::process::exit(1);
     }
     let _ = CONFIG.set(cfg.clone());
+    // 保留 AGENT_TMPDIR 环境变量兼容（Rust 版不依赖临时目录，pty/文件均由进程内管理）
     let _ = std::fs::create_dir_all(&cfg.tmp_dir);
-
-    // 启动清理残留（对齐 agent.sh：kill -9 遗留的孤儿进程/脚本）
-    let _ = Command::new("pkill").args(["-f", &format!("pty,link={}/", cfg.tmp_dir)]).status();
-    let _ = Command::new("pkill").args(["-f", &format!("{}/file-server-", cfg.tmp_dir)]).status();
     log(format!("agent starting (wss={})", cfg.wss));
 
     let sessions: Arc<Mutex<std::collections::HashMap<String, Arc<session::TermSession>>>> = Arc::new(Mutex::new(Default::default()));

@@ -33,9 +33,9 @@ cf-panel/
 3. **连接 GitHub 自动部署**：Workers & Pages → Create application → **Import a repository** → Get started → 授权 GitHub 并选择仓库。项目名须与 `wrangler.toml` 的 `name = "cf-panel"` **完全一致**，根目录 `/`，Save and Deploy。
    - **自动迁移建表**（推荐）：在该 Worker → **Builds → Build configuration → Deploy command** 配置为：
      ```
-     npx wrangler d1 migrations apply cf-panel --remote && npx wrangler deploy
+     npm run deploy
      ```
-     之后每次 `git push` 自动「迁移建表 + 部署」，**无需手动执行 SQL**（`apply` 按 `migrations/` 序号幂等执行，见下方迁移说明）。
+     `package.json` 的 `deploy` 脚本 = `wrangler d1 migrations apply cf-panel --remote && wrangler deploy`。之后每次 `git push` 自动「迁移建表 + 部署」，**无需手动执行 SQL**（`apply` 按 `migrations/` 序号幂等执行，见下方迁移说明）。也可本地手动 `npm run deploy` / `npm run migrate`。
 4. **配置密钥（网页端）**：该 Worker → Settings → Variables and Secrets → 添加 `JWT_SECRET`（必）、`PANEL_USERS` 或 `PANEL_PASSWORD`（必）、`HASH_SECRET`（推荐，见下方密钥详解）。
    > ⚠️ Cloudflare 规则：Worker 配置过 dashboard secret 后，`wrangler deploy` 会被拒绝，只能走 Builds/CI 部署——因此本方式同时是配密钥后的**唯一部署路径**。
    > 告警配置**不需要环境变量**：登录面板 → 设置弹窗 → 「告警」区直接填 Webhook 地址与阈值（存 D1，见下方告警配置）。

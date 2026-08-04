@@ -9,7 +9,11 @@
     "test:unit": "node --test test/unit.test.js",
     "test:api": "node --test test/api.test.js",
     "test:do": "node --test test/do.test.js",
-    "test:e2e": "bash test/e2e.sh"
+    "test:e2e": "bash test/e2e.sh",
+    "migrate": "wrangler d1 migrations apply cf-panel --remote",
+    "migrate:local": "wrangler d1 migrations apply cf-panel --local",
+    "deploy": "wrangler d1 migrations apply cf-panel --remote && wrangler deploy",
+    "deploy:local": "wrangler d1 migrations apply cf-panel --local && wrangler dev --local"
   },
   "devDependencies": {
     "wrangler": "^4.118.0"

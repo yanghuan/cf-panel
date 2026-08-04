@@ -350,8 +350,9 @@ function parseHeaders(s, vars) {
 
 // 发送告警 Webhook（模板化）：method/url/body/headers 均支持占位符；
 // token 仅作为 {token} 占位符变量，由用户放在 URL/header/body 任意位置。
+// M-08：检查 HTTP 状态，失败/异常记 console.error（Cloudflare 后台 Worker 日志可见，便于排查丢失的告警）。
 async function sendWebhook(cfg, payload) {
-  if (!cfg.enabled || !cfg.webhook_url) return;
+  if (!cfg.enabled || !cfg.webhook_url) return false;
   const vars = {
     event: payload.event,
     title: payload.title,
@@ -368,8 +369,16 @@ async function sendWebhook(cfg, payload) {
   if (!headers['content-type']) headers['content-type'] = cfg.content_type || 'application/json';
   const body = method === 'GET' ? undefined : (cfg.body_template ? renderTemplate(cfg.body_template, vars) : JSON.stringify(payload));
   try {
-    await fetch(url, { method, headers, body });
-  } catch { /* 发送失败不影响主流程 */ }
+    const resp = await fetch(url, { method, headers, body });
+    if (!resp.ok) {
+      console.error(`[cf-panel] webhook failed: ${payload.event} → ${url} HTTP ${resp.status}`);
+      return false;
+    }
+    return true;
+  } catch (e) {
+    console.error(`[cf-panel] webhook error: ${payload.event} → ${url} ${e && e.message ? e.message : e}`);
+    return false;
+  }
 }
 
 // agent 监控上报落库：更新 last_seen（在线判定唯一依据；系统信息变更才写 info_json，探活变更才写 probe_json），

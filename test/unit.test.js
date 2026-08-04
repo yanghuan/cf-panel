@@ -187,6 +187,39 @@ test('parseHeaders 支持对象与 JSON 字符串并做占位符替换', () => {
   assert.deepEqual(I.parseHeaders(123, vars), {});
 });
 
+test('sendWebhook：非 2xx / 网络异常记错误日志并返回 false（M-08）', async () => {
+  const origFetch = globalThis.fetch;
+  const origErr = console.error;
+  const errs = [];
+  console.error = (m) => errs.push(String(m));
+  const cfg = { webhook_url: 'https://x/hook', enabled: true };
+  try {
+    // 非 2xx → false + 错误日志（Cloudflare 后台 Worker 日志可见）
+    globalThis.fetch = async () => new Response('err', { status: 500 });
+    assert.equal(await I.sendWebhook(cfg, { event: 'alert' }), false, '500 返回 false');
+    assert.equal(errs.length, 1, '记录错误日志');
+    assert.match(errs[0], /webhook failed.*500/);
+
+    // 网络异常 → false + 错误日志
+    globalThis.fetch = async () => { throw new Error('net down'); };
+    assert.equal(await I.sendWebhook(cfg, { event: 'probe_down' }), false, '网络异常返回 false');
+    assert.equal(errs.length, 2, '记录网络错误日志');
+    assert.match(errs[1], /webhook error.*net down/);
+
+    // 2xx → true，不记日志
+    globalThis.fetch = async () => new Response('ok');
+    assert.equal(await I.sendWebhook(cfg, { event: 'alert' }), true, '2xx 返回 true');
+    assert.equal(errs.length, 2, '成功不记日志');
+
+    // 未启用/无 URL → false
+    assert.equal(await I.sendWebhook({ enabled: false }, { event: 'alert' }), false);
+    assert.equal(await I.sendWebhook({ enabled: true }, { event: 'alert' }), false);
+  } finally {
+    globalThis.fetch = origFetch;
+    console.error = origErr;
+  }
+});
+
 // ---------------- 分片路由 ----------------
 test('shard 路由：服务器 id → 分片，streamId 前缀带分片', () => {
   assert.equal(I.shardForServerId(0), 0);

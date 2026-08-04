@@ -15,7 +15,8 @@ use tokio::time::sleep;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message;
 
-type WsStream = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+type WsStream =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 type Sink = futures_util::stream::SplitSink<WsStream, Message>;
 
 // ---------------- 配置 ----------------
@@ -40,13 +41,20 @@ fn read_config() -> Config {
     Config {
         wss: std::env::var("AGENT_WSS_URL").unwrap_or_default(),
         key,
-        report_interval: std::env::var("REPORT_INTERVAL").ok().and_then(|v| v.parse().ok()).unwrap_or(120),
+        report_interval: std::env::var("REPORT_INTERVAL")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(120),
         disable_exec: std::env::var("DISABLE_EXEC").unwrap_or_default() == "1",
         probes: std::env::var("PROBES").unwrap_or_default(),
         custom_metrics: std::env::var("CUSTOM_METRICS").unwrap_or_default(),
         tmp_dir: std::env::var("AGENT_TMPDIR").unwrap_or_else(|_| format!("/tmp/cfpanel-{slug}")),
-        log_file: std::env::var("AGENT_LOG").unwrap_or_else(|_| format!("/tmp/cfpanel-{slug}-agent.log")),
-        log_max: std::env::var("AGENT_LOG_MAX").ok().and_then(|v| v.parse().ok()).unwrap_or(262144),
+        log_file: std::env::var("AGENT_LOG")
+            .unwrap_or_else(|_| format!("/tmp/cfpanel-{slug}-agent.log")),
+        log_max: std::env::var("AGENT_LOG_MAX")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(262144),
     }
 }
 
@@ -56,13 +64,21 @@ fn validate_wss(wss: &str) -> Result<(), String> {
         return Ok(());
     }
     if wss.starts_with("ws://") {
-        let allow = std::env::var("ALLOW_INSECURE_WS").map(|v| v == "1").unwrap_or(false);
+        let allow = std::env::var("ALLOW_INSECURE_WS")
+            .map(|v| v == "1")
+            .unwrap_or(false);
         if allow {
             return Ok(());
         }
-        let host = wss[5..].split('/').next().unwrap_or("");
+        let host = wss
+            .strip_prefix("ws://")
+            .unwrap_or("")
+            .split('/')
+            .next()
+            .unwrap_or("");
+        // IPv6 ::1 用 ':' 分割首段为空，故用完整 host 判断
         let host_only = host.split(':').next().unwrap_or(host);
-        if host_only == "127.0.0.1" || host_only == "localhost" || host_only == "::1" {
+        if host_only == "127.0.0.1" || host_only == "localhost" || host == "::1" {
             return Ok(()); // 本地回环调试/E2E
         }
         return Err(
@@ -97,7 +113,10 @@ pub fn log(msg: impl AsRef<str>) {
 }
 
 // ---------------- 控制通道（断线重连 + 指令分发 + 上报） ----------------
-async fn run_control(cfg: &Config, sessions: &Arc<Mutex<std::collections::HashMap<String, Arc<session::TermSession>>>>) {
+async fn run_control(
+    cfg: &Config,
+    sessions: &Arc<Mutex<std::collections::HashMap<String, Arc<session::TermSession>>>>,
+) {
     loop {
         match control_conn(cfg, sessions).await {
             Ok(_) => log("control channel closed"),
@@ -167,7 +186,11 @@ async fn dispatch(
             if cfg.disable_exec {
                 return Ok(());
             }
-            let sid = v.get("stream_id").and_then(|x| x.as_str()).unwrap_or("").to_string();
+            let sid = v
+                .get("stream_id")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string();
             if sid.is_empty() {
                 return Ok(());
             }
@@ -183,7 +206,11 @@ async fn dispatch(
             sessions.lock().await.insert(sid.clone(), term.clone());
             // 回执 terminal_ready：停止 DO 的 open_terminal 确认重发
             let mut w = write.lock().await;
-            let _ = w.send(Message::Text(format!(r#"{{"type":"terminal_ready","stream_id":"{sid}"}}"#))).await;
+            let _ = w
+                .send(Message::Text(format!(
+                    r#"{{"type":"terminal_ready","stream_id":"{sid}"}}"#
+                )))
+                .await;
             drop(w);
             // 启动数据流（独立任务；结束时自动 cleanup + 从 sessions 移除）
             let cfg2 = cfg.clone();
@@ -196,7 +223,11 @@ async fn dispatch(
             if cfg.disable_exec {
                 return Ok(());
             }
-            let sid = v.get("stream_id").and_then(|x| x.as_str()).unwrap_or("").to_string();
+            let sid = v
+                .get("stream_id")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string();
             if sid.is_empty() {
                 return Ok(());
             }
@@ -207,7 +238,11 @@ async fn dispatch(
             });
         }
         "resize" => {
-            let sid = v.get("stream_id").and_then(|x| x.as_str()).unwrap_or("").to_string();
+            let sid = v
+                .get("stream_id")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string();
             let rows = v.get("rows").and_then(|x| x.as_u64()).unwrap_or(24);
             let cols = v.get("cols").and_then(|x| x.as_u64()).unwrap_or(80);
             if let Some(term) = sessions.lock().await.get(&sid).cloned() {
@@ -220,7 +255,12 @@ async fn dispatch(
 }
 
 // 上报循环：立即上报 + 分段等待（每 5s 重读间隔，interval 变更立即生效）
-async fn report_loop(cfg: &Config, write: &Arc<Mutex<Sink>>, interval: &Arc<AtomicU64>, note: &Arc<Notify>) {
+async fn report_loop(
+    cfg: &Config,
+    write: &Arc<Mutex<Sink>>,
+    interval: &Arc<AtomicU64>,
+    note: &Arc<Notify>,
+) {
     loop {
         if let Some(r) = metrics::collect_report(cfg).await {
             let mut w = write.lock().await;
@@ -258,7 +298,9 @@ fn print_help() {
     println!("  REPORT_INTERVAL   默认 120   默认上报间隔（秒）；有观看者时服务端动态下发 3s");
     println!("  DISABLE_EXEC      默认 0     设为 1 禁用终端/文件管理（仅保留监控）");
     println!("  PROBES            默认 空    服务探活：\"name:http:URL,name:tcp:host:port,...\"");
-    println!("  CUSTOM_METRICS    默认 空    自定义指标 JSON：[{{\"name\":\"x\",\"cmd\":\"命令\"}}]");
+    println!(
+        "  CUSTOM_METRICS    默认 空    自定义指标 JSON：[{{\"name\":\"x\",\"cmd\":\"命令\"}}]"
+    );
     println!("  AGENT_TMPDIR      默认 /tmp/cfpanel-<key前8位>   临时目录");
     println!("  AGENT_LOG         默认 /tmp/cfpanel-<key前8位>-agent.log   日志文件");
     println!("  AGENT_LOG_MAX     默认 262144   日志轮转上限（字节）");
@@ -287,15 +329,20 @@ async fn main() {
     let _ = std::fs::create_dir_all(&cfg.tmp_dir);
     log(format!("agent starting (wss={})", cfg.wss));
 
-    let sessions: Arc<Mutex<std::collections::HashMap<String, Arc<session::TermSession>>>> = Arc::new(Mutex::new(Default::default()));
+    let sessions: Arc<Mutex<std::collections::HashMap<String, Arc<session::TermSession>>>> =
+        Arc::new(Mutex::new(Default::default()));
 
     // 信号：SIGTERM/SIGINT → 清理退出
     let shutdown = Arc::new(Notify::new());
     {
         let shutdown = shutdown.clone();
         tokio::spawn(async move {
-            let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).expect("sigterm");
-            let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()).expect("sigint");
+            let mut sigterm =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                    .expect("sigterm");
+            let mut sigint =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+                    .expect("sigint");
             tokio::select! {
                 _ = sigterm.recv() => {}
                 _ = sigint.recv() => {}
@@ -316,4 +363,40 @@ async fn main() {
         t.cleanup().await;
     }
     log("agent exiting");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_wss_accepts_wss() {
+        assert!(validate_wss("wss://panel.example.com/ws/agent").is_ok());
+    }
+
+    // env 操作集中在单个测试内顺序执行（Rust 测试并行，避免 ALLOW_INSECURE_WS 竞争）
+    #[test]
+    fn validate_wss_loopback_and_env_control() {
+        std::env::remove_var("ALLOW_INSECURE_WS");
+        assert!(validate_wss("ws://127.0.0.1:8787/ws/agent").is_ok());
+        assert!(validate_wss("ws://localhost/ws/agent").is_ok());
+        assert!(validate_wss("ws://::1/ws/agent").is_ok());
+        assert!(
+            validate_wss("ws://example.com/ws/agent").is_err(),
+            "无 ALLOW_INSECURE_WS 时远程明文拒绝"
+        );
+        std::env::set_var("ALLOW_INSECURE_WS", "1");
+        assert!(
+            validate_wss("ws://example.com/ws/agent").is_ok(),
+            "显式 ALLOW_INSECURE_WS=1 放行"
+        );
+        std::env::remove_var("ALLOW_INSECURE_WS");
+    }
+
+    #[test]
+    fn validate_wss_rejects_bad_scheme() {
+        assert!(validate_wss("http://example.com/ws/agent").is_err());
+        assert!(validate_wss("").is_err());
+        assert!(validate_wss("wss").is_err());
+    }
 }

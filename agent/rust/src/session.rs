@@ -9,9 +9,9 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message;
 
 const FILE_LIMIT: u64 = 500 * 1024 * 1024; // 单文件总上限 500MB
-// 服务端固定内部缓冲（与客户端分块解耦）：
-// - READ_BLOCK：单次 read 最多读取并返回的字节（前端按返回的 got 累加续传，自动适配任意值）
-// - WRITE_BUF：写路径流式 base64 解码的缓冲（边解边写，内存不随块大小增长）
+                                           // 服务端固定内部缓冲（与客户端分块解耦）：
+                                           // - READ_BLOCK：单次 read 最多读取并返回的字节（前端按返回的 got 累加续传，自动适配任意值）
+                                           // - WRITE_BUF：写路径流式 base64 解码的缓冲（边解边写，内存不随块大小增长）
 const READ_BLOCK: usize = 512 * 1024;
 const WRITE_BUF: usize = 64 * 1024;
 // 文件 WS 入站消息大小上限（防恶意超大 data 整包占内存；正常前端 1MB 分块远小于此）
@@ -22,6 +22,34 @@ fn b64e(data: &[u8]) -> String {
 }
 fn err_json(msg: &str) -> String {
     serde_json::json!({ "type": "error", "ok": false, "message": msg }).to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn b64e_roundtrip() {
+        assert_eq!(b64e(b"hello cf-panel"), "aGVsbG8gY2YtcGFuZWw=");
+        assert_eq!(b64e(b""), "");
+    }
+
+    #[test]
+    fn err_json_shape() {
+        let v: serde_json::Value = serde_json::from_str(&err_json("boom")).unwrap();
+        assert_eq!(v["type"], "error");
+        assert_eq!(v["ok"], false);
+        assert_eq!(v["message"], "boom");
+    }
+
+    #[test]
+    fn buffer_constants() {
+        // H-07/固定缓冲重构的常量约束（与前端分块解耦的服务端固定缓冲）
+        assert_eq!(READ_BLOCK, 512 * 1024);
+        assert_eq!(WRITE_BUF, 64 * 1024);
+        assert_eq!(WS_MSG_LIMIT, 8 * 1024 * 1024);
+        assert_eq!(FILE_LIMIT, 500 * 1024 * 1024);
+    }
 }
 
 // ---------------- 终端会话 ----------------
@@ -36,7 +64,12 @@ pub struct TermSession {
 impl TermSession {
     pub async fn spawn(sid: &str) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let pty = native_pty_system();
-        let pair = pty.openpty(PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 })?;
+        let pair = pty.openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })?;
         let mut cmd = CommandBuilder::new("bash");
         cmd.arg("-i");
         let child = pair.slave.spawn_command(cmd)?;
@@ -54,7 +87,12 @@ impl TermSession {
 
     pub fn resize(&self, rows: u16, cols: u16) {
         if let Ok(m) = self.master.try_lock() {
-            let _ = m.resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 });
+            let _ = m.resize(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            });
         }
     }
 
@@ -97,7 +135,8 @@ async fn run_terminal_inner(cfg: &Config, term: &Arc<TermSession>) {
             return;
         }
     };
-    req.headers_mut().insert("X-Agent-Key", cfg.key.parse().unwrap());
+    req.headers_mut()
+        .insert("X-Agent-Key", cfg.key.parse().unwrap());
     let (ws, _) = match tokio_tungstenite::connect_async(req).await {
         Ok(x) => x,
         Err(e) => {
@@ -170,13 +209,15 @@ pub async fn run_file_session(cfg: Config, sid: String) {
             return;
         }
     };
-    req.headers_mut().insert("X-Agent-Key", cfg.key.parse().unwrap());
+    req.headers_mut()
+        .insert("X-Agent-Key", cfg.key.parse().unwrap());
     // 限制入站消息大小，防恶意超大 data 整包占内存
     let cfg_ws = tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
         max_message_size: Some(WS_MSG_LIMIT),
         ..Default::default()
     };
-    let (ws, _) = match tokio_tungstenite::connect_async_with_config(req, Some(cfg_ws), false).await {
+    let (ws, _) = match tokio_tungstenite::connect_async_with_config(req, Some(cfg_ws), false).await
+    {
         Ok(x) => x,
         Err(e) => {
             log(format!("file {sid} connect failed: {e}"));
@@ -207,7 +248,11 @@ async fn handle_file_cmd(line: &str) -> String {
         Err(_) => return err_json("bad json"),
     };
     let ty = v.get("type").and_then(|x| x.as_str()).unwrap_or("");
-    let path = v.get("path").and_then(|x| x.as_str()).unwrap_or("").to_string();
+    let path = v
+        .get("path")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
     match ty {
         "list" => file_list(path).await,
         "read" => {
@@ -217,7 +262,11 @@ async fn handle_file_cmd(line: &str) -> String {
         }
         "write" => {
             let offset = v.get("offset").and_then(|x| x.as_u64()).unwrap_or(0);
-            let data = v.get("data").and_then(|x| x.as_str()).unwrap_or("").to_string();
+            let data = v
+                .get("data")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string();
             let commit = v.get("commit").and_then(|x| x.as_bool()).unwrap_or(false);
             file_write(path, offset, data, commit).await
         }
@@ -246,7 +295,11 @@ async fn file_list(path: String) -> String {
                 let name = e.file_name().to_string_lossy().into_owned();
                 let meta = e.metadata();
                 let is_dir = meta.as_ref().map(|m| m.is_dir()).unwrap_or(false);
-                let size = if is_dir { 0 } else { meta.as_ref().map(|m| m.len()).unwrap_or(0) };
+                let size = if is_dir {
+                    0
+                } else {
+                    meta.as_ref().map(|m| m.len()).unwrap_or(0)
+                };
                 let mtime = meta
                     .and_then(|m| m.modified())
                     .ok()
@@ -261,7 +314,8 @@ async fn file_list(path: String) -> String {
                 }));
             }
         }
-        serde_json::json!({ "type": "list_result", "ok": true, "path": path, "entries": entries }).to_string()
+        serde_json::json!({ "type": "list_result", "ok": true, "path": path, "entries": entries })
+            .to_string()
     })
     .await
     {
@@ -286,7 +340,11 @@ async fn file_read(path: String, offset: u64, limit: u64) -> String {
         }
         // 单次读取上限 READ_BLOCK：服务端固定 512KB 内部缓冲，与前端分块解耦。
         // 即使 limit=0（读全文件），也最多返回 READ_BLOCK，前端按返回的 got 累加 offset 续传，自动适配任意块大小。
-        let want = if limit == 0 { size } else { limit.min(size.saturating_sub(offset)) };
+        let want = if limit == 0 {
+            size
+        } else {
+            limit.min(size.saturating_sub(offset))
+        };
         let read_len = (want as usize).min(READ_BLOCK) as u64;
         let mut f = match std::fs::File::open(&path) {
             Ok(f) => f,
@@ -330,6 +388,8 @@ async fn file_write(path: String, offset: u64, data: String, commit: bool) -> St
         let cleanup = |tmp: &str| {
             let _ = std::fs::remove_file(tmp);
         };
+        // 注意：create 时不 truncate（首块由 set_len(0) 清空，后续块续写），clippy 提示已评估
+        #[allow(clippy::suspicious_open_options)]
         let mut f = match std::fs::OpenOptions::new().create(true).write(true).open(&tmp) {
             Ok(f) => f,
             Err(_) => return err_json("write failed"),
@@ -373,11 +433,9 @@ async fn file_write(path: String, offset: u64, data: String, commit: bool) -> St
             return err_json("file exceeds 500MB limit, aborted");
         }
         // commit：fsync + 原子 rename 覆盖目标文件
-        if commit {
-            if f.sync_all().is_err() || std::fs::rename(&tmp, &path).is_err() {
-                cleanup(&tmp);
-                return err_json("write failed");
-            }
+        if commit && (f.sync_all().is_err() || std::fs::rename(&tmp, &path).is_err()) {
+            cleanup(&tmp);
+            return err_json("write failed");
         }
         serde_json::json!({ "type": "write_result", "ok": true, "path": path, "offset": offset, "commit": commit }).to_string()
     })

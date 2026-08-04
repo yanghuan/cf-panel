@@ -14,7 +14,25 @@ permissions:
   contents: write
 
 jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      # M-13：发布前必须通过格式/静态检查/单元测试（避免"可编译但有缺陷"的版本成为正式产物）
+      - name: 格式检查 / 静态检查 / 单元测试
+        run: |
+          cd agent/rust
+          cargo fmt --check
+          cargo clippy --all-targets -- -D warnings
+          cargo test
+
   build-release:
+    needs: test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

@@ -58,7 +58,7 @@ async fn collect_cpu() -> f64 {
             if total <= 0 {
                 0.0
             } else {
-                (100.0 * (1.0 - idle as f64 / total as f64)).min(100.0).max(0.0)
+                (100.0 * (1.0 - idle as f64 / total as f64)).clamp(0.0, 100.0)
             }
         }
         _ => 0.0,
@@ -84,7 +84,11 @@ fn collect_mem() -> (u64, u64, u64) {
             _ => {}
         }
     }
-    (t.saturating_sub(a) * 1024, t * 1024, st.saturating_sub(sf) * 1024) // used, total, swap
+    (
+        t.saturating_sub(a) * 1024,
+        t * 1024,
+        st.saturating_sub(sf) * 1024,
+    ) // used, total, swap
 }
 
 // 负载 / 进程数 / 开机时间
@@ -94,7 +98,11 @@ fn collect_load() -> (f64, f64, f64, u64, u64) {
     let l1: f64 = it.next().and_then(|v| v.parse().ok()).unwrap_or(0.0);
     let l5: f64 = it.next().and_then(|v| v.parse().ok()).unwrap_or(0.0);
     let l15: f64 = it.next().and_then(|v| v.parse().ok()).unwrap_or(0.0);
-    let procs = it.next().and_then(|p| p.split('/').nth(1)).and_then(|p| p.parse().ok()).unwrap_or(0);
+    let procs = it
+        .next()
+        .and_then(|p| p.split('/').nth(1))
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(0);
     let uptime = read_file("/proc/uptime")
         .and_then(|s| s.split_whitespace().next().map(|v| v.to_string()))
         .and_then(|v| v.parse::<f64>().ok())
@@ -111,7 +119,9 @@ fn collect_temp() -> Option<f64> {
             if !name.starts_with("thermal_zone") {
                 continue;
             }
-            if let Some(v) = read_file(&format!("{dir}/{name}/temp")).and_then(|s| s.trim().parse::<f64>().ok()) {
+            if let Some(v) =
+                read_file(&format!("{dir}/{name}/temp")).and_then(|s| s.trim().parse::<f64>().ok())
+            {
                 return Some(v / 1000.0);
             }
         }
@@ -121,14 +131,21 @@ fn collect_temp() -> Option<f64> {
 
 // TCP/UDP 连接数
 fn collect_conns() -> (u64, u64) {
-    let tcp = read_file("/proc/net/tcp").map(|s| s.lines().count().saturating_sub(1) as u64).unwrap_or(0);
-    let udp = read_file("/proc/net/udp").map(|s| s.lines().count().saturating_sub(1) as u64).unwrap_or(0);
+    let tcp = read_file("/proc/net/tcp")
+        .map(|s| s.lines().count().saturating_sub(1) as u64)
+        .unwrap_or(0);
+    let udp = read_file("/proc/net/udp")
+        .map(|s| s.lines().count().saturating_sub(1) as u64)
+        .unwrap_or(0);
     (tcp, udp)
 }
 
 // 磁盘：df -Pk（挂载点以 / 开头）；阻塞命令放线程池 + 超时（df 撞挂死挂载点不阻塞 runtime）
 async fn collect_disk() -> Vec<serde_json::Value> {
-    let out = run_blocking(5, || std::process::Command::new("df").args(["-Pk"]).output()).await;
+    let out = run_blocking(5, || {
+        std::process::Command::new("df").args(["-Pk"]).output()
+    })
+    .await;
     let mut disk = Vec::new();
     if let Some(Ok(out)) = out {
         let text = String::from_utf8_lossy(&out.stdout);
@@ -170,14 +187,25 @@ async fn collect_net() -> (u64, u64) {
             }
         }
     }
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
     let st = net_state().await;
     let mut guard = st.lock().await;
     let (in_rate, out_rate) = match guard.as_ref() {
         Some(prev) if prev.ts > 0 && now > prev.ts => {
             let dt = now - prev.ts;
-            let i = if rx >= prev.rx { (rx - prev.rx) / dt } else { 0 };
-            let o = if tx >= prev.tx { (tx - prev.tx) / dt } else { 0 };
+            let i = if rx >= prev.rx {
+                (rx - prev.rx) / dt
+            } else {
+                0
+            };
+            let o = if tx >= prev.tx {
+                (tx - prev.tx) / dt
+            } else {
+                0
+            };
             (i, o)
         }
         _ => (0, 0),
@@ -190,19 +218,26 @@ async fn collect_net() -> (u64, u64) {
 async fn collect_info() -> serde_json::Value {
     let os = read_file("/etc/os-release")
         .and_then(|s| {
-            s.lines().find(|l| l.starts_with("PRETTY_NAME=")).and_then(|l| {
-                l.splitn(2, '=').nth(1).map(|v| v.trim_matches('"').trim().to_string())
-            })
+            s.lines()
+                .find(|l| l.starts_with("PRETTY_NAME="))
+                .and_then(|l| {
+                    l.split_once('=')
+                        .map(|(_, v)| v.trim_matches('"').trim().to_string())
+                })
         })
         .unwrap_or_else(|| std::env::consts::OS.to_string());
-    let kern = run_blocking(5, || std::process::Command::new("uname").arg("-r").output()).await
+    let kern = run_blocking(5, || std::process::Command::new("uname").arg("-r").output())
+        .await
         .and_then(|r| r.ok())
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .unwrap_or_default();
-    let host = run_blocking(5, || std::process::Command::new("hostname").arg("-I").output()).await
-        .and_then(|r| r.ok())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .unwrap_or_default();
+    let host = run_blocking(5, || {
+        std::process::Command::new("hostname").arg("-I").output()
+    })
+    .await
+    .and_then(|r| r.ok())
+    .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+    .unwrap_or_default();
     let mut ip4 = String::new();
     let mut ip6 = String::new();
     for p in host.split_whitespace() {
@@ -243,10 +278,19 @@ async fn http_probe(url: &str, timeout_secs: u64) -> Option<(u16, u128)> {
         let mut buf = vec![0u8; 4096];
         let n = conn.read(&mut buf).await.ok()?;
         let head = String::from_utf8_lossy(&buf[..n]);
-        let status: u16 = head.lines().next()?.split_whitespace().nth(1)?.parse().ok()?;
+        let status: u16 = head
+            .lines()
+            .next()?
+            .split_whitespace()
+            .nth(1)?
+            .parse()
+            .ok()?;
         Some(status)
     };
-    let status = tokio::time::timeout(Duration::from_secs(timeout_secs), fut).await.ok().flatten()?;
+    let status = tokio::time::timeout(Duration::from_secs(timeout_secs), fut)
+        .await
+        .ok()
+        .flatten()?;
     Some((status, t0.elapsed().as_millis()))
 }
 
@@ -294,7 +338,7 @@ async fn collect_probes(cfg: &Config) -> Vec<serde_json::Value> {
             "http" => {
                 let t0 = Instant::now();
                 let (code, ok) = match http_probe(&target, 5).await {
-                    Some((c, _)) => (c, c >= 200 && c < 400),
+                    Some((c, _)) => (c, (200..400).contains(&c)),
                     None => (0, false),
                 };
                 let ms = t0.elapsed().as_millis() as u64;
@@ -328,8 +372,16 @@ async fn collect_custom(cfg: &Config) -> Vec<serde_json::Value> {
         None => return out,
     };
     for item in items {
-        let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let cmd = item.get("cmd").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let name = item
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let cmd = item
+            .get("cmd")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
         if name.is_empty() || cmd.is_empty() {
             continue;
         }
@@ -340,7 +392,12 @@ async fn collect_custom(cfg: &Config) -> Vec<serde_json::Value> {
         c.process_group(0);
         let fut = c.output();
         if let Ok(Ok(o)) = tokio::time::timeout(Duration::from_secs(5), fut).await {
-            let line = String::from_utf8_lossy(&o.stdout).lines().next().unwrap_or("").trim().to_string();
+            let line = String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_string();
             if !line.is_empty() {
                 if let Ok(v) = line.parse::<f64>() {
                     out.push(json!({ "name": name, "value": v }));
@@ -382,4 +439,32 @@ pub async fn collect_report(cfg: &Config) -> Option<String> {
         "custom": custom,
     });
     Some(report.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn collect_mem_parses() {
+        let (used, total, swap) = collect_mem();
+        assert!(total > 0, "MemTotal 应可读");
+        assert!(used <= total, "已用不超过总量");
+        assert!(swap >= 0);
+    }
+
+    #[test]
+    fn collect_load_parses() {
+        let (l1, l5, l15, procs, uptime) = collect_load();
+        assert!(l1 >= 0.0 && l5 >= 0.0 && l15 >= 0.0);
+        assert!(uptime > 0, "uptime 应可读");
+        assert!(procs > 0);
+    }
+
+    #[test]
+    fn collect_conns_parses() {
+        let (tcp, udp) = collect_conns();
+        assert!(tcp > 0, "/proc/net/tcp 应可读");
+        assert!(udp > 0);
+    }
 }

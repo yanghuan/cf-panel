@@ -565,6 +565,53 @@ test('TerminalDO: user-pending 首帧鉴权后挂接 userWs，非法 token 断�
   assert.equal(good.attachment.role, 'user');
 });
 
+test('TerminalDO: user-pending 首帧鉴权接受 PAT（server:exec + 白名单）（M-01）', async () => {
+  const env = makeEnv();
+  await env.DB.prepare('INSERT INTO servers (agent_key_id, name, user_id, agent_key_hash) VALUES (?,?,?,?)').bind('k1', 's1', 1, 'h1').run();
+  const makeWs = () => ({
+    closed: false,
+    attachment: { role: 'user-pending', sid: '0-sid', serverId: 1, creatorUserId: 1, type: 'terminal', createdAt: Date.now() },
+    deserializeAttachment() { return this.attachment; },
+    serializeAttachment(a) { this.attachment = a; },
+    send() {},
+    close() { this.closed = true; },
+    readyState: 1,
+  });
+  const mkInst = () => {
+    const inst = new TerminalDO(mockState(), env);
+    inst.sessions.set('0-sid', { streamId: '0-sid', serverId: 1, creatorUserId: 1, createdAt: Date.now(), type: 'terminal', userWs: null, agentWs: null });
+    return inst;
+  };
+  const insertPat = async (name, scopes, serverIds) => {
+    const token = `cfp_pat-${name}`;
+    await env.DB.prepare('INSERT INTO api_tokens (user_id, name, token_hash, scopes, server_ids) VALUES (?,?,?,?,?)')
+      .bind(1, name, await I.hashSecret(token, env), JSON.stringify(scopes), JSON.stringify(serverIds)).run();
+    return token;
+  };
+
+  // 白名单内 + exec scope → 放行
+  const okToken = await insertPat('pat-exec', ['server:read', 'server:exec'], [1]);
+  const inst = mkInst();
+  const ok = makeWs();
+  await inst.webSocketMessage(ok, JSON.stringify({ type: 'auth', token: okToken }));
+  assert.equal(ok.closed, false, '白名单内 PAT（exec）放行');
+  assert.equal(inst.sessions.get('0-sid').userWs, ok);
+
+  // 白名单外（[999]）→ 拒绝
+  const noToken = await insertPat('pat-no', ['server:read', 'server:exec'], [999]);
+  const inst2 = mkInst();
+  const denied = makeWs();
+  await inst2.webSocketMessage(denied, JSON.stringify({ type: 'auth', token: noToken }));
+  assert.equal(denied.closed, true, '白名单外 PAT 拒绝');
+
+  // 无 exec scope → 拒绝
+  const roToken = await insertPat('pat-read', ['server:read'], [1]);
+  const inst3 = mkInst();
+  const ro = makeWs();
+  await inst3.webSocketMessage(ro, JSON.stringify({ type: 'auth', token: roToken }));
+  assert.equal(ro.closed, true, '无 exec scope PAT 拒绝');
+});
+
 test('TerminalDO: 浏览器鉴权前 agent 输出缓冲，鉴权后补发（初始提示符不丢）', async () => {
   const env = makeEnv();
   const token = await I.signJwt({ uid: 1, username: 'admin', role: 1, exp: Math.floor(Date.now() / 1000) + 3600 }, env);

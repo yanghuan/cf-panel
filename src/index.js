@@ -1334,9 +1334,25 @@ export class TerminalDO {
       let j = null;
       try { j = JSON.parse(typeof message === 'string' ? message : ''); } catch { /* 非 JSON */ }
       const token = j && j.type === 'auth' ? String(j.token || '') : '';
-      const payload = token ? await verifyJwt(token, this.env) : null;
+      // M-01：WS 首帧鉴权与 REST 一致（JWT 管理员直接放行；PAT/member 需服务器存在且可执行/为创建者）
+      const user = token ? await authUserByToken(token, this.env) : null;
       const sess = await this.hydrateSession(att.sid);
-      if (!payload || !payload.uid || !sess || !(payload.role === 1 || payload.uid === sess.creatorUserId)) {
+      if (!user || !sess) {
+        try { ws.close(1008, 'unauthorized'); } catch { /* ignore */ }
+        return;
+      }
+      let allowed = isAdmin(user);
+      if (!allowed) {
+        const server = await this.env.DB.prepare('SELECT * FROM servers WHERE id = ?').bind(sess.serverId).first();
+        if (user.pat) {
+          // PAT：必须服务器存在且 canExec（exec scope + server_ids 白名单），不享受 creatorUserId 兜底
+          allowed = !!server && canExec(user, server);
+        } else {
+          // JWT member：会话创建者
+          allowed = !!server && user.id === sess.creatorUserId;
+        }
+      }
+      if (!allowed) {
         try { ws.close(1008, 'unauthorized'); } catch { /* ignore */ }
         return;
       }

@@ -605,7 +605,7 @@
   }
 
   // 分段上传：1MB 一段，最后一块 commit=true（agent 端原子写）。
-  // H-06：stop-and-wait——每块等 write_result 确认后才发下一块，队列有界（1 块），
+  // stop-and-wait——每块等 write_result 确认后才发下一块，队列有界（1 块），
   // 大文件不再形成数百 MB 的浏览器/网络队列；acked 为已确认写入字节。
   function uploadFile(file) {
     if (file.size > FILE_MAX) { $('#file-msg').textContent = '文件超过 500MB 限制'; return; }
@@ -637,7 +637,7 @@
       fileSend({ type: 'list', path: fileCwd }); // 刷新列表（此时文件已完整写入）
     } else {
       $('#file-msg').textContent = `上传中：${Math.round((fileUpload.acked / fileUpload.size) * 100)}%`;
-      if (fileUpload.sendNext) fileUpload.sendNext(); // H-06：确认后发下一块
+      if (fileUpload.sendNext) fileUpload.sendNext(); // 确认后发下一块
     }
   }
 

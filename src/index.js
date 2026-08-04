@@ -9,8 +9,8 @@
 
 const SHARDS = 4; // 终端 DO 分片数（改大后旧会话不可达，一般不用动）
 const SESSION_TTL_MS = 10 * 60 * 1000; // 会话两端都断开超过 10 分钟 → 回收
-const MAX_SESSIONS_PER_SERVER = 8; // H-04：每服务器并发会话上限（超限 429，防 PTY/bash/FD 耗尽）
-const SESSION_ABS_MS = 4 * 60 * 60 * 1000; // H-04：会话绝对最长时长（含活跃连接，到期强制回收）
+const MAX_SESSIONS_PER_SERVER = 8; // 每服务器并发会话上限（超限 429，防 PTY/bash/FD 耗尽）
+const SESSION_ABS_MS = 4 * 60 * 60 * 1000; // 会话绝对最长时长（含活跃连接，到期强制回收）
 const PAT_PREFIX = 'cfp_'; // PAT token 前缀
 const SCOPE_READ = 'server:read';
 const SCOPE_EXEC = 'server:exec';
@@ -1108,7 +1108,7 @@ export class TerminalDO {
         // 先确认 agent 在线，离线时不创建/不落盘（避免失败会话残留）
         const agentWs = this.agents.get(body.serverId);
         if (!agentWs) return json({ error: 'agent offline' }, 502);
-        // H-04：每服务器并发会话上限（防批量创建耗尽 PTY/bash/FD/WebSocket）
+        // 每服务器并发会话上限（防批量创建耗尽 PTY/bash/FD/WebSocket）
         let active = 0;
         for (const s of this.sessions.values()) {
           if (s.serverId === body.serverId) active += 1;
@@ -1268,7 +1268,7 @@ export class TerminalDO {
     const now = Date.now();
     let next = Infinity;
     for (const [sid, sess] of this.sessions) {
-      // H-04：绝对最长会话时长——即使两端有连接，到期也强制回收（防活跃会话长期占用 PTY/FD/WS）
+      // 绝对最长会话时长——即使两端有连接，到期也强制回收（防活跃会话长期占用 PTY/FD/WS）
       if (now - sess.createdAt > SESSION_ABS_MS) {
         if (sess.userWs) { try { sess.userWs.close(); } catch { /* ignore */ } }
         if (sess.agentWs) { try { sess.agentWs.close(); } catch { /* ignore */ } }

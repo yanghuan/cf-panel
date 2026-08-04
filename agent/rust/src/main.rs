@@ -163,10 +163,11 @@ async fn dispatch(
             let mut w = write.lock().await;
             let _ = w.send(Message::Text(format!(r#"{{"type":"terminal_ready","stream_id":"{sid}"}}"#))).await;
             drop(w);
-            // 启动数据流（独立任务，随 WS 断开自动清理）
+            // 启动数据流（独立任务；结束时自动 cleanup + 从 sessions 移除）
             let cfg2 = cfg.clone();
+            let sessions2 = sessions.clone();
             tokio::spawn(async move {
-                session::run_terminal(&cfg2, term).await;
+                session::run_terminal(&cfg2, term, &sessions2).await;
             });
         }
         "open_file" => {

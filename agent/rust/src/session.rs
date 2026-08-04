@@ -8,7 +8,8 @@ use tokio::sync::Mutex;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message;
 
-const FILE_LIMIT: u64 = 500 * 1024 * 1024; // 500MB
+const FILE_LIMIT: u64 = 500 * 1024 * 1024; // 单文件总上限 500MB
+const MAX_BLOCK: usize = 32 * 1024 * 1024; // 单次 read/write 块上限 32MB（防大块内存尖峰；前端按 1MB 分块）
 
 fn b64e(data: &[u8]) -> String {
     base64::Engine::encode(&base64::engine::general_purpose::STANDARD, data)
@@ -72,7 +73,19 @@ impl TermSession {
 }
 
 // 终端数据流：连 /ws/agent/terminal?sid= （X-Agent-Key），双向透传
-pub async fn run_terminal(cfg: &Config, term: Arc<TermSession>) {
+// 无论成功/失败，退出时一律 cleanup（杀 bash 进程组）+ 从 sessions map 移除（防 fd/内存泄露）
+pub async fn run_terminal(
+    cfg: &Config,
+    term: Arc<TermSession>,
+    sessions: &Arc<Mutex<std::collections::HashMap<String, Arc<TermSession>>>>,
+) {
+    run_terminal_inner(cfg, &term).await;
+    term.cleanup().await;
+    sessions.lock().await.remove(&term.sid);
+    log(format!("terminal {} ended", term.sid));
+}
+
+async fn run_terminal_inner(cfg: &Config, term: &Arc<TermSession>) {
     let url = format!("{}/terminal?sid={}", cfg.wss, term.sid);
     let mut req = match url.into_client_request() {
         Ok(r) => r,
@@ -142,8 +155,6 @@ pub async fn run_terminal(cfg: &Config, term: Arc<TermSession>) {
         }
     }
     send_task.abort();
-    term.cleanup().await;
-    log(format!("terminal {} ended", term.sid));
 }
 
 // ---------------- 文件管理会话 ----------------
@@ -205,8 +216,21 @@ async fn handle_file_cmd(line: &str) -> String {
     }
 }
 
+// spawn_blocking + 超时：防止挂死的挂载点（NFS 等）永久占用 blocking 线程
+async fn blocking_with_timeout<F, T>(secs: u64, f: F) -> Option<T>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    let join = tokio::task::spawn_blocking(f);
+    match tokio::time::timeout(std::time::Duration::from_secs(secs), join).await {
+        Ok(Ok(v)) => Some(v),
+        _ => None,
+    }
+}
+
 async fn file_list(path: String) -> String {
-    let res = tokio::task::spawn_blocking(move || {
+    match blocking_with_timeout(10, move || {
         let mut entries = Vec::new();
         if let Ok(rd) = std::fs::read_dir(&path) {
             for e in rd.flatten() {
@@ -230,12 +254,15 @@ async fn file_list(path: String) -> String {
         }
         serde_json::json!({ "type": "list_result", "ok": true, "path": path, "entries": entries }).to_string()
     })
-    .await;
-    res.unwrap_or_else(|_| err_json("list failed"))
+    .await
+    {
+        Some(v) => v,
+        None => err_json("list timeout"),
+    }
 }
 
 async fn file_read(path: String, offset: u64, limit: u64) -> String {
-    let res = tokio::task::spawn_blocking(move || {
+    match blocking_with_timeout(30, move || {
         use std::io::{Read, Seek, SeekFrom};
         let meta = match std::fs::metadata(&path) {
             Ok(m) => m,
@@ -248,7 +275,9 @@ async fn file_read(path: String, offset: u64, limit: u64) -> String {
         if !meta.is_file() {
             return err_json("not a file or unreadable");
         }
-        let read_len = if limit == 0 { size } else { limit.min(size.saturating_sub(offset)) };
+        // 单次读取上限 MAX_BLOCK，防大块内存尖峰（前端按 1MB 分块）
+        let want = if limit == 0 { size } else { limit.min(size.saturating_sub(offset)) };
+        let read_len = (want as usize).min(MAX_BLOCK) as u64;
         let mut f = match std::fs::File::open(&path) {
             Ok(f) => f,
             Err(_) => return err_json("not a file or unreadable"),
@@ -271,20 +300,26 @@ async fn file_read(path: String, offset: u64, limit: u64) -> String {
         })
         .to_string()
     })
-    .await;
-    res.unwrap_or_else(|_| err_json("read failed"))
+    .await
+    {
+        Some(v) => v,
+        None => err_json("read timeout"),
+    }
 }
 
 async fn file_write(path: String, offset: u64, data: String) -> String {
-    let res = tokio::task::spawn_blocking(move || {
+    match blocking_with_timeout(30, move || {
         use std::io::Seek;
-        if let Some(parent) = std::path::Path::new(&path).parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
         let decoded = match b64d(&data) {
             Some(d) => d,
             None => return err_json("write failed"),
         };
+        if decoded.len() > MAX_BLOCK {
+            return err_json("chunk too large");
+        }
+        if let Some(parent) = std::path::Path::new(&path).parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
         let mut f = match std::fs::OpenOptions::new().create(true).write(true).open(&path) {
             Ok(f) => f,
             Err(_) => return err_json("write failed"),
@@ -306,6 +341,9 @@ async fn file_write(path: String, offset: u64, data: String) -> String {
         }
         serde_json::json!({ "type": "write_result", "ok": true, "path": path, "offset": offset }).to_string()
     })
-    .await;
-    res.unwrap_or_else(|_| err_json("write failed"))
+    .await
+    {
+        Some(v) => v,
+        None => err_json("write timeout"),
+    }
 }

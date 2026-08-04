@@ -25,6 +25,19 @@ fn read_file(path: &str) -> Option<String> {
     std::fs::read_to_string(path).ok()
 }
 
+// spawn_blocking + 超时：命令在阻塞线程池执行，防止挂死的挂载点/命令阻塞 async runtime
+async fn run_blocking<F, T>(secs: u64, f: F) -> Option<T>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    let join = tokio::task::spawn_blocking(f);
+    match tokio::time::timeout(Duration::from_secs(secs), join).await {
+        Ok(Ok(v)) => Some(v),
+        _ => None,
+    }
+}
+
 // CPU：两次采样（间隔 200ms）求差值，对齐 shell awk 算法
 async fn collect_cpu() -> f64 {
     let s1 = read_file("/proc/stat").and_then(|s| s.lines().next().map(|l| l.to_string()));
@@ -113,11 +126,11 @@ fn collect_conns() -> (u64, u64) {
     (tcp, udp)
 }
 
-// 磁盘：df -Pk（挂载点以 / 开头）
-fn collect_disk() -> Vec<serde_json::Value> {
-    let out = std::process::Command::new("df").args(["-Pk"]).output().ok();
+// 磁盘：df -Pk（挂载点以 / 开头）；阻塞命令放线程池 + 超时（df 撞挂死挂载点不阻塞 runtime）
+async fn collect_disk() -> Vec<serde_json::Value> {
+    let out = run_blocking(5, || std::process::Command::new("df").args(["-Pk"]).output()).await;
     let mut disk = Vec::new();
-    if let Some(out) = out {
+    if let Some(Ok(out)) = out {
         let text = String::from_utf8_lossy(&out.stdout);
         for line in text.lines().skip(1) {
             let mut it = line.split_whitespace();
@@ -173,8 +186,8 @@ async fn collect_net() -> (u64, u64) {
     (in_rate, out_rate)
 }
 
-// 系统信息：OS / 内核 / IP
-fn collect_info() -> serde_json::Value {
+// 系统信息：OS / 内核 / IP（uname/hostname 放线程池+超时）
+async fn collect_info() -> serde_json::Value {
     let os = read_file("/etc/os-release")
         .and_then(|s| {
             s.lines().find(|l| l.starts_with("PRETTY_NAME=")).and_then(|l| {
@@ -182,10 +195,12 @@ fn collect_info() -> serde_json::Value {
             })
         })
         .unwrap_or_else(|| std::env::consts::OS.to_string());
-    let kern = std::process::Command::new("uname").arg("-r").output().ok()
+    let kern = run_blocking(5, || std::process::Command::new("uname").arg("-r").output()).await
+        .and_then(|r| r.ok())
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .unwrap_or_default();
-    let host = std::process::Command::new("hostname").arg("-I").output().ok()
+    let host = run_blocking(5, || std::process::Command::new("hostname").arg("-I").output()).await
+        .and_then(|r| r.ok())
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .unwrap_or_default();
     let mut ip4 = String::new();
@@ -318,7 +333,12 @@ async fn collect_custom(cfg: &Config) -> Vec<serde_json::Value> {
         if name.is_empty() || cmd.is_empty() {
             continue;
         }
-        let fut = tokio::process::Command::new("sh").arg("-c").arg(&cmd).output();
+        // kill_on_drop + process_group(0)：超时取消时杀掉整个子进程组，防孤儿残留
+        let mut c = tokio::process::Command::new("sh");
+        c.arg("-c").arg(&cmd).kill_on_drop(true);
+        #[cfg(unix)]
+        c.process_group(0);
+        let fut = c.output();
         if let Ok(Ok(o)) = tokio::time::timeout(Duration::from_secs(5), fut).await {
             let line = String::from_utf8_lossy(&o.stdout).lines().next().unwrap_or("").trim().to_string();
             if !line.is_empty() {
@@ -338,9 +358,10 @@ pub async fn collect_report(cfg: &Config) -> Option<String> {
     let (l1, l5, l15, procs, uptime) = collect_load();
     let (tcp, udp) = collect_conns();
     let (net_in, net_out) = collect_net().await;
-    let info = collect_info();
+    let info = collect_info().await;
     let probes = collect_probes(cfg).await;
     let custom = collect_custom(cfg).await;
+    let disk = collect_disk().await;
     let report = json!({
         "type": "report",
         "cpu": cpu,
@@ -350,7 +371,7 @@ pub async fn collect_report(cfg: &Config) -> Option<String> {
         "net_out": net_out,
         "extra": {
             "swap": swap,
-            "disk": collect_disk(),
+            "disk": disk,
             "load1": l1, "load5": l5, "load15": l15,
             "temp": collect_temp(),
             "procs": procs, "tcp": tcp, "udp": udp,

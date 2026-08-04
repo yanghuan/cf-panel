@@ -193,7 +193,8 @@ wrangler secret put PANEL_USERS      # 回车后粘贴值，如 alice:pass1,bob:
 
 > 告警支持：CPU/内存/磁盘（根分区）/负载超阈值 + 机器离线/恢复通知。内存告警依赖 agent 上报 `mem_total`。
 
-本地调试：`wrangler dev --local`（本地 SQLite 自动应用 migrations；手动建表：`wrangler d1 migrations apply cf-panel --local`）。
+本地调试：`npm run dev`（`predev` 钩子自动生成 `.dev.vars` 随机密钥，若不存在；本地 SQLite 自动应用 migrations）。手动建表：`npm run migrate:local`。
+> ⚠️ 生产环境密钥（`JWT_SECRET`/`HASH_SECRET`/`PANEL_PASSWORD`）**不要**用本地随机生成：请固定配置为 dashboard secrets 或 `wrangler secret put`（随机生成后丢失无法找回）。
 
 ## 二、添加服务器并安装 agent
 

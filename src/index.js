@@ -1523,13 +1523,11 @@ export class MetricsDO {
     }
   }
 
-  // 归档默认开启（ARCHIVE_TO_D1=0 关闭）或告警启用时，注册 alarm
+  // 无条件注册 alarm：alarm 负责 storage 热区过期行清理 + D1 保留期清理（audit_logs 90 天等）+ 离线告警。
+  // 归档开关（ARCHIVE_TO_D1）仅控制"过期行是否落 D1"，不控制清理本身——否则归档关闭时
+  // storage 热区与 audit_logs 会无限增长。
   async scheduleArchive() {
-    const archiveOn = this.env.ARCHIVE_TO_D1 !== '0';
-    const alertOn = (await getAlertCfg(this.env)).enabled;
-    if (archiveOn || alertOn) {
-      this.state.storage.setAlarm(Date.now() + ARCHIVE_INTERVAL_MS);
-    }
+    this.state.storage.setAlarm(Date.now() + ARCHIVE_INTERVAL_MS);
   }
 
   // 指标阈值告警（CPU/内存/磁盘/负载），带冷却去抖。
@@ -1647,19 +1645,15 @@ export class MetricsDO {
     }
   }
 
-  // alarm：归档（超过 1 小时数据批量落 D1 + 每天清理保留期）+ 离线/恢复告警
+  // alarm：过期热区行清理（超 1 小时；归档开启时落 D1）+ 每天 D1 保留期清理 + 离线/恢复告警。
+  // 过期行删除与保留期清理无条件执行，防止 ARCHIVE_TO_D1=0 时 storage 热区 / audit_logs 无限增长。
   async alarm() {
     const archiveOn = this.env.ARCHIVE_TO_D1 !== '0';
     const alertOn = (await getAlertCfg(this.env)).enabled;
     if (alertOn) await this.checkOfflineAlerts();
-    if (!archiveOn) {
-      if (alertOn) this.state.storage.setAlarm(Date.now() + ARCHIVE_INTERVAL_MS);
-      return;
-    }
     const cutoff = Math.floor(Date.now() / 1000 / 60) - ARCHIVE_AFTER_MIN;
     const stmts = [];
     const dels = [];
-    // 归档：从 storage 读取超过 1 小时的行 → 落 D1 → 删除 storage 行（删除即天然防重复归档）
     try {
       const keys = await this.listStorage('m:');
       for (const k of keys) {
@@ -1669,19 +1663,22 @@ export class MetricsDO {
         const serverId = Number(rest.slice(0, sep));
         const ts = Number(rest.slice(sep + 1));
         if (ts <= cutoff) {
-          const v = JSON.parse(k.value);
-          stmts.push(
-            this.env.DB.prepare(
-              'INSERT OR IGNORE INTO metrics_min (server_id, ts, cpu, mem_used, net_in, net_out, extra) VALUES (?,?,?,?,?,?,?)'
-            ).bind(serverId, ts, v.cpu, v.mem_used, v.net_in, v.net_out, v.extra ? JSON.stringify(v.extra) : null)
-          );
+          // 归档开启才落 D1；过期行无论归档开关一律从 storage 删除（防无限增长）
+          if (archiveOn) {
+            const v = JSON.parse(k.value);
+            stmts.push(
+              this.env.DB.prepare(
+                'INSERT OR IGNORE INTO metrics_min (server_id, ts, cpu, mem_used, net_in, net_out, extra) VALUES (?,?,?,?,?,?,?)'
+              ).bind(serverId, ts, v.cpu, v.mem_used, v.net_in, v.net_out, v.extra ? JSON.stringify(v.extra) : null)
+            );
+          }
           dels.push(this.state.storage.delete(k.name));
         }
       }
-    } catch { /* storage 不可用则跳过本次归档（行保留，下次重试） */ }
+    } catch { /* storage 不可用则跳过本次清理（行保留，下次重试） */ }
     if (stmts.length) await this.env.DB.batch(stmts);
     await Promise.all(dels);
-    // 同步清理内存缓存中的已归档数据
+    // 同步清理内存缓存中的已清理数据
     for (const [, m] of this.data) {
       for (const ts of [...m.keys()]) {
         if (ts <= cutoff) m.delete(ts);

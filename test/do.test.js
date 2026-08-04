@@ -96,7 +96,7 @@ test('MetricsDO: trim 只保留最近 720 分钟', async () => {
   assert.equal([...m.keys()][0], nowMin - 10);
 });
 
-test('MetricsDO: scheduleArchive 按 ARCHIVE_TO_D1 与告警开关注册 alarm', async () => {
+test('MetricsDO: scheduleArchive 无条件注册 alarm（清理/保留期不依赖归档开关）', async () => {
   const env1 = makeEnv();
   const st1 = mockState();
   const { inst: inst1 } = mkMetrics(env1, st1);
@@ -107,7 +107,7 @@ test('MetricsDO: scheduleArchive 按 ARCHIVE_TO_D1 与告警开关注册 alarm',
   const st2 = mockState();
   const { inst: inst2 } = mkMetrics(env2, st2);
   await inst2.scheduleArchive();
-  assert.equal(st2.storage.alarmTs, undefined, '归档关闭且无告警 → 不注册');
+  assert.ok(st2.storage.alarmTs > 0, '归档关闭也注册 alarm（防 storage 热区 / audit_logs 无限增长）');
 });
 
 // ---------------- MetricsDO：归档 / 保留期 ----------------
@@ -133,6 +133,39 @@ test('MetricsDO: alarm 归档超 1 小时数据到 D1 并清理内存，不重�
   await inst.alarm();
   const rows2 = await env.DB.prepare('SELECT * FROM metrics_min WHERE server_id = 1').all();
   assert.equal(rows2.results.length, 1);
+});
+
+test('MetricsDO: ARCHIVE_TO_D1=0 时 alarm 仍清理 storage 过期热区（防无限增长）', async () => {
+  const env = makeEnv({ ARCHIVE_TO_D1: '0' });
+  const st = mockState();
+  const { inst, call } = mkMetrics(env, st);
+  const nowMin = Math.floor(Date.now() / 1000 / 60);
+  await call('/report', { method: 'POST', body: JSON.stringify({ serverId: 1, minTs: nowMin - 90, cpu: 5 }) });
+  await call('/report', { method: 'POST', body: JSON.stringify({ serverId: 1, minTs: nowMin - 5, cpu: 6 }) });
+  assert.ok(st.storage.map.has(`m:1:${nowMin - 90}`), '过期行已写入 storage');
+  assert.ok(st.storage.map.has(`m:1:${nowMin - 5}`), '新行已写入 storage');
+
+  await inst.alarm();
+
+  // 归档关闭：过期行仍从 storage 删除（不落 D1），新行保留
+  assert.equal(st.storage.map.has(`m:1:${nowMin - 90}`), false, '过期行被清理');
+  assert.ok(st.storage.map.has(`m:1:${nowMin - 5}`), '新行保留');
+  const rows = await env.DB.prepare('SELECT * FROM metrics_min WHERE server_id = 1').all();
+  assert.equal(rows.results.length, 0, '归档关闭不写 D1');
+  assert.ok(st.storage.alarmTs > 0, 'alarm 重新注册');
+});
+
+test('MetricsDO: ARCHIVE_TO_D1=0 时 alarm 仍执行 D1 保留期清理（audit_logs 90 天）', async () => {
+  const env = makeEnv({ ARCHIVE_TO_D1: '0' });
+  const st = mockState();
+  const { inst } = mkMetrics(env, st);
+  await env.DB.prepare("INSERT INTO audit_logs (user_id, action, created_at) VALUES (1, 'old', datetime('now', '-100 days'))").run();
+  await env.DB.prepare("INSERT INTO audit_logs (user_id, action, created_at) VALUES (1, 'recent', datetime('now', '-5 days'))").run();
+
+  await inst.alarm();
+
+  const rows = await env.DB.prepare('SELECT action FROM audit_logs').all();
+  assert.deepEqual(rows.results.map((r) => r.action), ['recent']);
 });
 
 test('MetricsDO: alarm 按 30 天保留期清理过期行', async () => {

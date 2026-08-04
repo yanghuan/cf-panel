@@ -1228,6 +1228,44 @@
     if (dl) downloadFile(dl.dataset.path, Number(dl.dataset.size) || 0);
   });
 
+  // ---------- 弹窗可访问性（role/aria + Esc 关闭 + 焦点管理） ----------
+  // 对所有 .modal 注入 dialog 语义；用 MutationObserver 统一做"打开聚焦首个可聚焦元素、
+  // 关闭恢复焦点到触发元素"，无需改造各弹窗的打开/关闭调用。
+  {
+    const modals = [...document.querySelectorAll('.modal')];
+    modals.forEach((m) => {
+      m.setAttribute('role', 'dialog');
+      m.setAttribute('aria-modal', 'true');
+    });
+    let lastFocus = null;
+    const mo = new MutationObserver((muts) => {
+      for (const m of muts) {
+        const el = m.target;
+        if (el.classList.contains('hidden')) {
+          if (lastFocus && lastFocus.focus) lastFocus.focus(); // 关闭：恢复焦点
+        } else {
+          lastFocus = document.activeElement; // 打开：记录触发元素
+          const f = el.querySelector('input,button,select,textarea,[tabindex]');
+          if (f && !f.disabled) f.focus();
+        }
+      }
+    });
+    modals.forEach((m) => mo.observe(m, { attributes: true, attributeFilter: ['class'] }));
+    // Esc 关闭当前打开的弹窗：模拟点击其"关闭"按钮，走既有清理逻辑（如终端 ws/resize），
+    // 焦点恢复由上面的 MutationObserver 统一处理
+    document.addEventListener('keydown', (e) => {
+      if (e.key !== 'Escape') return;
+      const open = modals.find((m) => !m.classList.contains('hidden'));
+      if (!open) return;
+      const closeBtn = open.querySelector('.modal-head button');
+      if (closeBtn) closeBtn.click();
+      else {
+        open.classList.add('hidden');
+        unlockScroll();
+      }
+    });
+  }
+
   // ---------- 启动 ----------
   (async function boot() {
     loadPublic();

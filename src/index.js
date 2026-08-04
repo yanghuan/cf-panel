@@ -71,10 +71,10 @@ const MCP_TOOLS = [
 
 // ---------------- 通用工具 ----------------
 
-function json(data, status = 200) {
+function json(data, status = 200, headers = {}) {
   return new Response(JSON.stringify(data), {
     status,
-    headers: { 'content-type': 'application/json; charset=utf-8' },
+    headers: { 'content-type': 'application/json; charset=utf-8', ...headers },
   });
 }
 function err(message, status = 400) {
@@ -514,22 +514,80 @@ async function hasPanelViewers(env) {
 
 // ---------------- REST API ----------------
 
+// H-09：登录失败限流（应用层纵深防御）。内存窗口按 IP 计数，缓解单 IP 爆破；
+// 注意多边缘实例间非全局一致，生产仍建议 Cloudflare Access / Rate Limiting。
+const LOGIN_FAIL_LIMIT = 5; // 15 分钟窗口内失败上限
+const LOGIN_FAIL_WINDOW_MS = 15 * 60 * 1000;
+const LOGIN_LOCK_MS = 15 * 60 * 1000; // 超限锁定时长
+const loginFails = new Map(); // ip -> { count, firstAt, lockedUntil }
+
+function clientIp(request) {
+  return (
+    request.headers.get('cf-connecting-ip') ||
+    (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() ||
+    'unknown'
+  );
+}
+
+// 返回剩余锁定秒数；未锁定返回 null（并惰性清理过期窗口）
+function loginLockRemaining(ip) {
+  const now = Date.now();
+  const rec = loginFails.get(ip);
+  if (!rec) return null;
+  if (rec.lockedUntil && now < rec.lockedUntil) {
+    return Math.ceil((rec.lockedUntil - now) / 1000);
+  }
+  if (now - rec.firstAt > LOGIN_FAIL_WINDOW_MS || (rec.lockedUntil && now >= rec.lockedUntil)) {
+    loginFails.delete(ip);
+  }
+  return null;
+}
+
+function recordLoginFail(ip) {
+  const now = Date.now();
+  let rec = loginFails.get(ip);
+  if (!rec || now - rec.firstAt > LOGIN_FAIL_WINDOW_MS) {
+    rec = { count: 0, firstAt: now, lockedUntil: 0 };
+    loginFails.set(ip, rec);
+  }
+  rec.count += 1;
+  if (rec.count >= LOGIN_FAIL_LIMIT) {
+    rec.lockedUntil = now + LOGIN_LOCK_MS;
+  }
+  // 防 Map 无限增长：超阈值条数时清理过期窗口
+  if (loginFails.size > 10000) {
+    for (const [k, v] of loginFails) {
+      if (Date.now() - v.firstAt > LOGIN_FAIL_WINDOW_MS) loginFails.delete(k);
+    }
+  }
+}
+
 async function handleApi(request, env) {
   const url = new URL(request.url);
   const path = url.pathname;
   const method = request.method;
 
   // POST /api/login —— 面板登录（PANEL_USERS 多用户 或 PANEL_PASSWORD 单管理员）
-  // 暴力破解防护由前置的 Cloudflare Access 承担（服务部署在 Access 之后），此处不再内置限流
+  // 暴力破解防护：应用层按 IP 失败限流（H-09，纵深防御，默认生效）；
+  // 生产仍强烈建议前置 Cloudflare Access / Rate Limiting（跨边缘实例更一致）。
   if (method === 'POST' && path === '/api/login') {
     const configError = requireJwtSecret(env);
     if (configError) return configError;
+    const ip = clientIp(request);
+    const lockRemain = loginLockRemaining(ip);
+    if (lockRemain != null) {
+      return json({ error: `too many failed logins, retry in ${lockRemain}s` }, 429, { 'retry-after': String(lockRemain) });
+    }
     const body = await request.json().catch(() => ({}));
     const password = String(body.password || '');
     const users = parsePanelUsers(env);
     if (!users.length) return err('server misconfigured: PANEL_USERS/PANEL_PASSWORD not set', 500);
     const userIdx = users.findIndex((u) => u.password === password);
-    if (userIdx < 0) return err('bad password', 401);
+    if (userIdx < 0) {
+      recordLoginFail(ip);
+      return err('bad password', 401);
+    }
+    loginFails.delete(ip); // 登录成功：清零该 IP 失败计数
     const uid = userIdx + 1;
     const username = users[userIdx].username;
     const token = await signJwt({ uid, username, role: 1, exp: Math.floor(Date.now() / 1000) + 86400 }, env);
@@ -1872,5 +1930,6 @@ export const __internals = {
   // 注：告警冷却/探活去重状态在 MetricsDO 实例内存，由各测试实例自行隔离
   __reset() {
     SETTINGS_CACHE.clear();
+    loginFails.clear();
   },
 };

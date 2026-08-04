@@ -79,6 +79,31 @@ test('缺少 JWT_SECRET 时登录和受保护入口均 fail closed → 503', asy
   assert.equal(wsRes.status, 503);
 });
 
+test('登录：连续失败 5 次后 429 锁定，其他 IP 不受影响（H-09）', async () => {
+  const env = makeEnv();
+  for (let i = 0; i < 5; i++) {
+    const r = await call(env, { method: 'POST', path: '/api/login', body: { password: 'bad' }, ip: '9.9.9.77' });
+    assert.equal(r.status, 401, `第 ${i + 1} 次失败应 401`);
+  }
+  const locked = await call(env, { method: 'POST', path: '/api/login', body: { password: 'admin123' }, ip: '9.9.9.77' });
+  assert.equal(locked.status, 429, '超限后即使密码正确也 429');
+  assert.ok(locked.headers.get('retry-after'), '带 Retry-After 头');
+  // 其他 IP 不受影响
+  const other = await call(env, { method: 'POST', path: '/api/login', body: { password: 'admin123' }, ip: '9.9.9.78' });
+  assert.equal(other.status, 200);
+});
+
+test('登录：失败后成功登录重置计数（H-09）', async () => {
+  const env = makeEnv();
+  for (let i = 0; i < 4; i++) {
+    await call(env, { method: 'POST', path: '/api/login', body: { password: 'bad' }, ip: '9.9.9.79' });
+  }
+  const ok = await call(env, { method: 'POST', path: '/api/login', body: { password: 'admin123' }, ip: '9.9.9.79' });
+  assert.equal(ok.status, 200, '未超限时可正常登录');
+  const again = await call(env, { method: 'POST', path: '/api/login', body: { password: 'bad' }, ip: '9.9.9.79' });
+  assert.equal(again.status, 401, '成功登录后计数清零，再失败回到 1 次');
+});
+
 test('登录：PANEL_USERS 优先级高于 PANEL_PASSWORD', async () => {
   const env = makeEnv({ PANEL_USERS: 'alice:wonder' });
   // PANEL_PASSWORD 不再生效
@@ -90,14 +115,14 @@ test('登录：PANEL_USERS 优先级高于 PANEL_PASSWORD', async () => {
   assert.equal(user.username, 'alice');
 });
 
-test('登录：错误密码连续多次仍只返回 401（暴力破解由前置 CF Access 防护）', async () => {
+test('登录：阈值内连续失败仍 401，超阈值 429 锁定（H-09）', async () => {
   const env = makeEnv();
-  for (let i = 0; i < 10; i++) {
-    const res = await call(env, { method: 'POST', path: '/api/login', body: { password: 'no' } });
-    assert.equal(res.status, 401);
+  for (let i = 0; i < 3; i++) {
+    const res = await call(env, { method: 'POST', path: '/api/login', body: { password: 'no' }, ip: '9.9.9.10' });
+    assert.equal(res.status, 401, '阈值内不限流');
   }
-  // 正确密码不受影响
-  const ok = await call(env, { method: 'POST', path: '/api/login', body: { password: 'admin123' } });
+  // 阈值内正确密码仍可登录
+  const ok = await call(env, { method: 'POST', path: '/api/login', body: { password: 'admin123' }, ip: '9.9.9.10' });
   assert.equal(ok.status, 200);
 });
 

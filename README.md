@@ -93,7 +93,7 @@ wrangler deploy
 
 ### 密钥配置详解（Secrets）
 
-**自动创建（幂等）**：`CLOUDFLARE_API_TOKEN=xxx CLOUDFLARE_ACCOUNT_ID=yyy npm run secrets` —— 缺失的 `JWT_SECRET`/`HASH_SECRET`/`PANEL_PASSWORD` 自动随机生成并写入 Worker secrets，**创建后可在 Cloudflare 后台（Worker → Settings → Variables and Secrets）查看**（含面板登录密码）。已存在的密钥**不会覆盖**（避免 JWT/HASH 变更使 token/agent 失效）。Token 需 **Workers Scripts: Edit** 权限；`PANEL_PASSWORD` 可用环境变量 `PANEL_PASSWORD=xxx` 指定而非随机。
+**配置方式**：在 Cloudflare 后台 Worker → **Settings → Variables and Secrets** 手动创建一次即可（首次部署时配置，之后无需再动）。`JWT_SECRET`/`HASH_SECRET` 建议用 `openssl rand -hex 32` 生成；`PANEL_PASSWORD` 自定面板登录密码。密钥仅首次部署时配置一次，**已配置的密钥不会被部署流程覆盖**（避免 JWT/HASH 变更使 token/agent 失效）。
 
 | 变量 | 是否必配 | 作用 |
 | --- | --- | --- |

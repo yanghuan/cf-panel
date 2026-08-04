@@ -417,6 +417,34 @@ test('PAT：scopes 白名单校验（非法值 400，混合值只留合法项）
   assert.deepEqual(JSON.parse(rows2.scopes), ['server:read']);
 });
 
+test('PAT：server_ids 语义 — 未提供=全量，空数组=空集（H-08）', async () => {
+  const env = makeEnv();
+  const adminToken = await login(env);
+  await addServer(env, adminToken, { name: 'a1' });
+
+  // 未提供 server_ids（NULL）→ 全量
+  const all = await (await call(env, { method: 'POST', path: '/api/tokens', token: adminToken, body: { name: 'all', scopes: ['server:read'] } })).json();
+  const allList = await (await call(env, { path: '/api/servers', token: all.token })).json();
+  assert.equal(allList.length, 1, '未限制 → 全量');
+
+  // 空数组白名单 → 空集（不再返回全量，与 canAccessServer 拒绝语义一致）
+  const empty = await (await call(env, {
+    method: 'POST', path: '/api/tokens', token: adminToken,
+    body: { name: 'empty', scopes: ['server:read'], server_ids: [] },
+  })).json();
+  const emptyList = await (await call(env, { path: '/api/servers', token: empty.token })).json();
+  assert.deepEqual(emptyList, [], '空白名单返回空集');
+  assert.equal((await call(env, { path: '/api/me', token: empty.token })).status, 200, 'PAT 本身仍有效');
+
+  // 白名单命中
+  const scoped = await (await call(env, {
+    method: 'POST', path: '/api/tokens', token: adminToken,
+    body: { name: 'scoped', scopes: ['server:read'], server_ids: [1] },
+  })).json();
+  const scopedList = await (await call(env, { path: '/api/servers', token: scoped.token })).json();
+  assert.equal(scopedList.length, 1);
+});
+
 test('审计日志：管理员可查（倒序 + limit），非管理员 403', async () => {
   const env = makeEnv();
   const adminToken = await login(env);

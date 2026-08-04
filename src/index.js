@@ -490,12 +490,14 @@ async function queryServersForUser(env, user) {
   if (user.pat) {
     // 只读 scope 是 PAT 访问服务器的前提
     if (!user.pat.scopes.includes(SCOPE_READ)) return { results: [] };
-    if (user.pat.serverIDs && user.pat.serverIDs.length) {
-      const ids = [...new Set(user.pat.serverIDs.map(Number).filter((n) => n > 0))];
-      if (!ids.length) return { results: [] };
-      return env.DB.prepare(`SELECT * FROM servers WHERE id IN (${ids.map(() => '?').join(',')}) ORDER BY "group", display_index, id`).bind(...ids).all();
+    if (user.pat.serverIDs == null) {
+      // server_ids 为 NULL：未限制 → 全部服务器
+      return env.DB.prepare('SELECT * FROM servers ORDER BY "group", display_index, id').all();
     }
-    return env.DB.prepare('SELECT * FROM servers ORDER BY "group", display_index, id').all();
+    // 白名单模式（H-08）：空数组 → 空集（不再返回全量，与 canAccessServer 的拒绝语义一致）
+    const ids = [...new Set(user.pat.serverIDs.map(Number).filter((n) => n > 0))];
+    if (!ids.length) return { results: [] };
+    return env.DB.prepare(`SELECT * FROM servers WHERE id IN (${ids.map(() => '?').join(',')}) ORDER BY "group", display_index, id`).bind(...ids).all();
   }
   return env.DB.prepare('SELECT * FROM servers WHERE user_id = ? ORDER BY "group", display_index, id').bind(user.id).all();
 }

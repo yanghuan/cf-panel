@@ -80,8 +80,19 @@ function json(data, status = 200) {
 function err(message, status = 400) {
   return json({ error: message }, status);
 }
+const JWT_SECRET_CONFIG_ERROR = 'server misconfigured: JWT_SECRET not set';
 function secret(env) {
-  return env.JWT_SECRET || 'dev-secret'; // 生产务必 wrangler secret put JWT_SECRET
+  const value = env && env.JWT_SECRET;
+  if (typeof value !== 'string' || value.trim() === '') throw new Error(JWT_SECRET_CONFIG_ERROR);
+  return value;
+}
+function requireJwtSecret(env) {
+  try {
+    secret(env);
+    return null;
+  } catch {
+    return err(JWT_SECRET_CONFIG_ERROR, 503);
+  }
 }
 
 function b64u(input) {
@@ -488,6 +499,8 @@ async function handleApi(request, env) {
   // POST /api/login —— 面板登录（PANEL_USERS 多用户 或 PANEL_PASSWORD 单管理员）
   // 暴力破解防护由前置的 Cloudflare Access 承担（服务部署在 Access 之后），此处不再内置限流
   if (method === 'POST' && path === '/api/login') {
+    const configError = requireJwtSecret(env);
+    if (configError) return configError;
     const body = await request.json().catch(() => ({}));
     const password = String(body.password || '');
     const users = parsePanelUsers(env);
@@ -531,6 +544,9 @@ async function handleApi(request, env) {
   }
 
   // ---- 以下全部需要登录（JWT 或 PAT）----
+  // JWT_SECRET 是整个面板鉴权的必需安全边界；缺失时 PAT 也不得绕过配置错误继续访问。
+  const configError = requireJwtSecret(env);
+  if (configError) return configError;
   const user = await authUser(request, env);
   if (!user) return err('unauthorized', 401);
 
@@ -819,6 +835,8 @@ async function mcpGetMonitor(user, env, args) {
 async function handleMcp(request, env) {
   const url = new URL(request.url);
   if (request.method !== 'POST') return new Response(null, { status: 405 });
+  const configError = requireJwtSecret(env);
+  if (configError) return configError;
 
   // Origin 校验（防 DNS rebinding，2026-07-28 修订要求）
   const origin = request.headers.get('origin');
@@ -886,6 +904,11 @@ async function handleMcp(request, env) {
 async function handleWs(request, env) {
   const url = new URL(request.url);
   const path = url.pathname;
+  const isPanelSocket = path === '/ws/push' || path.startsWith('/ws/terminal/') || path.startsWith('/ws/file/');
+  if (isPanelSocket) {
+    const configError = requireJwtSecret(env);
+    if (configError) return configError;
+  }
 
   // 面板实时推送：服务器列表每 3 秒广播给在线前端（单实例 PanelDO，非分片）
   if (path === '/ws/push') {

@@ -45,9 +45,12 @@ test('verifyJwt 拒绝过期 token', async () => {
   assert.equal(await I.verifyJwt(token, env), null);
 });
 
-test('secret 回退 dev-secret', () => {
-  assert.equal(I.secret({}), 'dev-secret');
+test('secret 缺失或为空时拒绝启动鉴权，不使用固定默认值', async () => {
+  assert.throws(() => I.secret({}), /JWT_SECRET not set/);
+  assert.throws(() => I.secret({ JWT_SECRET: '   ' }), /JWT_SECRET not set/);
   assert.equal(I.secret({ JWT_SECRET: 'x' }), 'x');
+  await assert.rejects(() => I.signJwt({ uid: 1 }, {}), /JWT_SECRET not set/);
+  assert.equal(await I.verifyJwt('a.b.c', {}), null);
 });
 
 // ---------------- 用户解析 ----------------

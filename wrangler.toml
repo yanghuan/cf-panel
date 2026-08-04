@@ -40,5 +40,5 @@ not_found_handling = "single-page-application"
 
 # ---------- 运行变量 ----------
 [vars]
-# JWT_SECRET 请用 secret 设置：wrangler secret put JWT_SECRET
-# 未设置时回退为 "dev-secret"，仅限本地调试
+# JWT_SECRET 必须用 secret 设置：wrangler secret put JWT_SECRET
+# 未设置时登录及所有受保护接口返回 503（包括本地调试）

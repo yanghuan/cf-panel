@@ -63,6 +63,22 @@ test('登录：未配置任何凭据 → 500', async () => {
   assert.equal(res.status, 500);
 });
 
+test('缺少 JWT_SECRET 时登录和受保护入口均 fail closed → 503', async () => {
+  const env = makeEnv({ JWT_SECRET: undefined });
+  const loginRes = await call(env, { method: 'POST', path: '/api/login', body: { password: 'admin123' } });
+  assert.equal(loginRes.status, 503);
+  assert.match((await loginRes.json()).error, /JWT_SECRET not set/);
+
+  // 即使攻击者按旧固定值 dev-secret 伪造 JWT，也不能通过任何面板鉴权入口。
+  const forged = await I.signJwt({ uid: 1, username: 'admin', role: 1 }, { JWT_SECRET: 'dev-secret' });
+  const apiRes = await call(env, { path: '/api/me', token: forged });
+  assert.equal(apiRes.status, 503);
+  const mcpRes = await call(env, { method: 'POST', path: '/mcp', token: forged, body: { jsonrpc: '2.0', id: 1, method: 'ping' } });
+  assert.equal(mcpRes.status, 503);
+  const wsRes = await call(env, { path: '/ws/push' });
+  assert.equal(wsRes.status, 503);
+});
+
 test('登录：PANEL_USERS 优先级高于 PANEL_PASSWORD', async () => {
   const env = makeEnv({ PANEL_USERS: 'alice:wonder' });
   // PANEL_PASSWORD 不再生效

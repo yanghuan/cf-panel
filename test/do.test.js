@@ -338,6 +338,61 @@ test('MetricsDO: /report 探活 down/recovered/冷却抑制', async () => {
   }
 });
 
+test('MetricsDO: 告警冷却状态持久化，新实例恢复不重复告警（M-07）', async () => {
+  const env = makeEnv();
+  await env.DB.prepare("INSERT INTO kv_json (key, value) VALUES ('settings', ?)")
+    .bind(JSON.stringify({ alerts: { webhook_url: 'https://example.com/hook', cpu_pct: 90, cooldown_min: 30 } })).run();
+  const st = mockState();
+  const cap = captureFetch();
+  try {
+    const { call: call1 } = mkMetrics(env, st);
+    const nowMin = Math.floor(Date.now() / 1000 / 60);
+    await call1('/report', { method: 'POST', body: JSON.stringify({ serverId: 1, serverName: 's1', minTs: nowMin, cpu: 95 }) });
+    assert.equal(cap.calls.length, 1, '首次超阈值触发告警');
+    assert.ok(st.storage.map.has('alert:1:cpu'), '冷却状态已持久化');
+
+    // 模拟 evict：新实例共享同一 storage → 恢复冷却状态，冷却期内不重复告警
+    const { call: call2 } = mkMetrics(env, st);
+    await call2('/report', { method: 'POST', body: JSON.stringify({ serverId: 1, serverName: 's1', minTs: nowMin, cpu: 98 }) });
+    assert.equal(cap.calls.length, 1, '新实例恢复冷却，不重复告警');
+  } finally { cap.restore(); }
+});
+
+test('MetricsDO: 探活状态持久化，新实例恢复去重（M-07）', async () => {
+  const env = makeEnv();
+  await env.DB.prepare("INSERT INTO kv_json (key, value) VALUES ('settings', ?)")
+    .bind(JSON.stringify({ alerts: { webhook_url: 'https://example.com/hook', cooldown_min: 30 } })).run();
+  const st = mockState();
+  const cap = captureFetch();
+  try {
+    const { call: call1 } = mkMetrics(env, st);
+    const nowMin = Math.floor(Date.now() / 1000 / 60);
+    await call1('/report', { method: 'POST', body: JSON.stringify({ serverId: 1, serverName: 's1', minTs: nowMin, probes: [{ name: 'web', ok: false }] }) });
+    assert.equal(cap.calls.length, 1, '首次失败触发 probe_down');
+    assert.ok(st.storage.map.has('probe:1:web'), '探活状态已持久化');
+
+    // 新实例 → 恢复失败状态，冷却期内再次失败不重复告警
+    const { call: call2 } = mkMetrics(env, st);
+    await call2('/report', { method: 'POST', body: JSON.stringify({ serverId: 1, serverName: 's1', minTs: nowMin, probes: [{ name: 'web', ok: false }] }) });
+    assert.equal(cap.calls.length, 1, '新实例恢复探活状态，冷却内不重复告警');
+  } finally { cap.restore(); }
+});
+
+test('MetricsDO: /drop 清理 storage 告警/探活状态（M-07）', async () => {
+  const env = makeEnv();
+  await env.DB.prepare("INSERT INTO kv_json (key, value) VALUES ('settings', ?)")
+    .bind(JSON.stringify({ alerts: { webhook_url: 'https://example.com/hook', cpu_pct: 90, cooldown_min: 30 } })).run();
+  const st = mockState();
+  const { call } = mkMetrics(env, st);
+  const nowMin = Math.floor(Date.now() / 1000 / 60);
+  await call('/report', { method: 'POST', body: JSON.stringify({ serverId: 1, serverName: 's1', minTs: nowMin, cpu: 95, probes: [{ name: 'web', ok: false }] }) });
+  assert.ok(st.storage.map.has('alert:1:cpu'), '告警状态已写入');
+  assert.ok(st.storage.map.has('probe:1:web'), '探活状态已写入');
+  await call('/drop', { method: 'POST', body: JSON.stringify({ server_id: 1 }) });
+  assert.equal(st.storage.map.has('alert:1:cpu'), false, 'drop 清理告警状态');
+  assert.equal(st.storage.map.has('probe:1:web'), false, 'drop 清理探活状态');
+});
+
 // ---------------- PanelDO ----------------
 test('PanelDO: /viewers 只统计已鉴权观看者；其他路径 404', async () => {
   const env = makeEnv();

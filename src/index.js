@@ -1542,9 +1542,34 @@ export class MetricsDO {
     // 内存缓存仅加速当前实例生命周期内的读写（原纯内存热区在实例 evict 后即丢）。
     this.data = new Map();
     this.lastPrune = 0; // 上次执行保留期清理的时间
-    // 告警去重状态（单实例全局一致，随 DO 生命周期；重启清零——与旧 Worker 内存行为等价）
+    // 告警去重状态：内存为主，关键变更时持久化到 DO Storage（M-07），实例 evict/重启后恢复，避免重复告警
     this.alertLast = new Map(); // `${serverId}:kind` -> 上次触发时间
     this.probeState = new Map(); // `${serverId}:probeName` -> {ok, lastFail}
+    this.alertLoaded = false;
+    this.probeLoaded = false;
+  }
+
+  // M-07：从 DO Storage 惰性恢复告警冷却 / 探活去重状态（实例 evict 后首次使用时加载一次）
+  async ensureAlertLoaded() {
+    if (this.alertLoaded) return;
+    this.alertLoaded = true;
+    try {
+      const keys = await this.listStorage('alert:');
+      for (const k of keys) {
+        this.alertLast.set(k.name.slice('alert:'.length), Number(k.value));
+      }
+    } catch { /* 加载失败按空状态处理 */ }
+  }
+  async ensureProbeLoaded() {
+    if (this.probeLoaded) return;
+    this.probeLoaded = true;
+    try {
+      const keys = await this.listStorage('probe:');
+      for (const k of keys) {
+        const v = JSON.parse(k.value);
+        this.probeState.set(k.name.slice('probe:'.length), { ok: !!v.ok, lastFail: Number(v.lastFail) || 0 });
+      }
+    } catch { /* 加载失败按空状态处理 */ }
   }
 
   // ---- DO Storage 行式热区（key: m:{serverId}:{minTs}，value: JSON 字符串）----
@@ -1656,7 +1681,15 @@ export class MetricsDO {
         await Promise.all(keys.map((k) => this.state.storage.delete(k.name)));
       } catch { /* storage 不可用则仅清内存 */ }
       this.data.delete(serverId);
-      // 清理该服务器的告警冷却与探活状态（键前缀 serverId:）
+      // 清理该服务器的告警冷却与探活状态（内存 + storage，M-07）
+      try {
+        const ak = await this.listStorage(`alert:${serverId}:`);
+        const pk = await this.listStorage(`probe:${serverId}:`);
+        await Promise.all([
+          ...ak.map((k) => this.state.storage.delete(k.name)),
+          ...pk.map((k) => this.state.storage.delete(k.name)),
+        ]);
+      } catch { /* storage 不可用则仅清内存 */ }
       for (const k of [...this.alertLast.keys()]) {
         if (k.startsWith(`${serverId}:`)) this.alertLast.delete(k);
       }
@@ -1695,33 +1728,36 @@ export class MetricsDO {
   async checkAlerts(b) {
     const cfg = await getAlertCfg(this.env);
     if (!cfg.enabled) return;
+    await this.ensureAlertLoaded(); // M-07：恢复持久化冷却状态
     const now = Date.now();
     const cooldown = cfg.cooldown_min * 60 * 1000;
-    const cooled = (key) => {
+    const cooled = async (key) => {
       const last = this.alertLast.get(key);
       if (last && now - last < cooldown) return false;
       this.alertLast.set(key, now);
+      // M-07：冷却触发即持久化，实例 evict/重启后不重复告警
+      try { await this.state.storage.put('alert:' + key, String(now)); } catch { /* 持久化失败仅内存 */ }
       return true;
     };
     const alerts = [];
     // CPU
-    if (b.cpu != null && b.cpu >= cfg.cpu_pct && cooled(`${b.serverId}:cpu`)) {
+    if (b.cpu != null && b.cpu >= cfg.cpu_pct && await cooled(`${b.serverId}:cpu`)) {
       alerts.push(`CPU ${b.cpu.toFixed(1)}% >= ${cfg.cpu_pct}%`);
     }
     // 内存（需要 agent 上报 mem_total）
     if (b.mem_used != null && b.mem_total != null && b.mem_total > 0) {
       const memPct = (b.mem_used / b.mem_total) * 100;
-      if (memPct >= cfg.mem_pct && cooled(`${b.serverId}:mem`)) {
+      if (memPct >= cfg.mem_pct && await cooled(`${b.serverId}:mem`)) {
         alerts.push(`内存 ${memPct.toFixed(1)}% >= ${cfg.mem_pct}%`);
       }
     }
     // 磁盘（根分区）
     const rootDisk = b.extra && b.extra.disk && b.extra.disk.find((d) => d.m === '/');
-    if (rootDisk && rootDisk.u != null && rootDisk.u >= cfg.disk_pct && cooled(`${b.serverId}:disk`)) {
+    if (rootDisk && rootDisk.u != null && rootDisk.u >= cfg.disk_pct && await cooled(`${b.serverId}:disk`)) {
       alerts.push(`磁盘 / ${rootDisk.u}% >= ${cfg.disk_pct}%`);
     }
     // 负载（可选，未设置则不启用）
-    if (cfg.load > 0 && b.extra && b.extra.load1 != null && b.extra.load1 >= cfg.load && cooled(`${b.serverId}:load`)) {
+    if (cfg.load > 0 && b.extra && b.extra.load1 != null && b.extra.load1 >= cfg.load && await cooled(`${b.serverId}:load`)) {
       alerts.push(`负载 ${b.extra.load1} >= ${cfg.load}`);
     }
     if (alerts.length) {
@@ -1740,6 +1776,7 @@ export class MetricsDO {
   async checkProbeAlerts(serverId, serverName, probes) {
     const cfg = await getAlertCfg(this.env);
     if (!cfg.enabled || !Array.isArray(probes)) return;
+    await this.ensureProbeLoaded(); // M-07：恢复持久化探活状态
     const now = Date.now();
     const cooldown = cfg.cooldown_min * 60 * 1000;
     for (const p of probes) {
@@ -1749,6 +1786,7 @@ export class MetricsDO {
       if (p.ok) {
         if (!st.ok) {
           this.probeState.set(key, { ok: true, lastFail: 0 });
+          try { await this.state.storage.put('probe:' + key, JSON.stringify({ ok: true, lastFail: 0 })); } catch { /* 持久化失败仅内存 */ }
           await sendWebhook(cfg, {
             event: 'probe_recovered',
             title: `[cf-panel] ${serverName} 服务恢复：${p.name}`,
@@ -1759,6 +1797,7 @@ export class MetricsDO {
         }
       } else if (st.ok || now - st.lastFail >= cooldown) {
         this.probeState.set(key, { ok: false, lastFail: now });
+        try { await this.state.storage.put('probe:' + key, JSON.stringify({ ok: false, lastFail: now })); } catch { /* 持久化失败仅内存 */ }
         await sendWebhook(cfg, {
           event: 'probe_down',
           title: `[cf-panel] ${serverName} 服务异常：${p.name}`,

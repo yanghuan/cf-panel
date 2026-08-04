@@ -232,24 +232,45 @@ function doPanel(env) {
   return env.PANEL.get(env.PANEL.idFromName('main')); // 单实例：服务器列表实时推送
 }
 
-// 监控历史查询（/api/monitor 与 MCP 共用）：≤12h 走内存热区秒回，更长走 D1 归档（超长 SQL 抽样）
+// 监控历史查询（/api/monitor 与 MCP 共用）：统一合并「MetricsDO 热区（最近 ≤12h）」与
+// 「D1 归档（≥1h 前）」后按时间戳去重（热区优先，补齐最近未归档数据），超上限时 JS 降采样。
+// H-03：热区不再只保留 1h，≤12h 查询完整；长区间查询不再缺最近 ~1h 数据。
+const MONITOR_D1_MAX_ROWS = 1500; // 长区间 SQL 抽样上限，防响应/解析放大
 async function queryMonitorRows(env, serverId, hours) {
-  if (hours <= 12) {
-    const resp = await doMetrics(env).fetch(`https://do.internal/query?server_id=${serverId}&limit=${Math.max(1, Math.round(hours * 60))}`);
-    return resp.json();
-  }
   const minutes = hours * 60;
-  const sinceMin = Math.floor(Date.now() / 1000 / 60) - minutes;
-  const MONITOR_D1_MAX_ROWS = 1500; // 长区间 SQL 抽样上限，防响应/解析放大
-  const q = 'SELECT ts, cpu, mem_used, net_in, net_out, extra FROM metrics_min WHERE server_id = ? AND ts >= ?';
-  let r;
-  if (minutes > MONITOR_D1_MAX_ROWS) {
-    const step = Math.ceil(minutes / MONITOR_D1_MAX_ROWS);
-    r = await env.DB.prepare(`${q} AND ts % ? = 0 ORDER BY ts`).bind(serverId, sinceMin, step).all();
-  } else {
-    r = await env.DB.prepare(`${q} ORDER BY ts`).bind(serverId, sinceMin).all();
+  const nowMin = Math.floor(Date.now() / 1000 / 60);
+  const sinceMin = nowMin - minutes;
+  // 1) 热区：最近数据（MetricsDO 保留 12h 上限），补齐尚未归档的最近 ~1h
+  let hot = [];
+  try {
+    const resp = await doMetrics(env).fetch(`https://do.internal/query?server_id=${serverId}&limit=${Math.max(1, Math.round(minutes))}`);
+    hot = await resp.json();
+  } catch { hot = []; }
+  // 2) D1 归档：查询 sinceMin ~ 归档线（归档线之后的数据仍在热区，避免重复且无需 D1 读）
+  let rows = [];
+  if (minutes > ARCHIVE_AFTER_MIN) {
+    const archiveSince = Math.max(sinceMin, nowMin - ARCHIVE_AFTER_MIN);
+    const q = 'SELECT ts, cpu, mem_used, net_in, net_out, extra FROM metrics_min WHERE server_id = ? AND ts >= ? AND ts < ?';
+    let r;
+    if (minutes > MONITOR_D1_MAX_ROWS) {
+      const step = Math.ceil(minutes / MONITOR_D1_MAX_ROWS);
+      r = await env.DB.prepare(`${q} AND ts % ? = 0 ORDER BY ts`).bind(serverId, sinceMin, archiveSince, step).all();
+    } else {
+      r = await env.DB.prepare(`${q} ORDER BY ts`).bind(serverId, sinceMin, archiveSince).all();
+    }
+    rows = r.results.map((x) => ({ ...x, extra: safeJson(x.extra) }));
   }
-  return r.results.map((x) => ({ ...x, extra: safeJson(x.extra) }));
+  // 3) 合并去重：热区优先（同 ts 覆盖 D1，取最近上报值）
+  const merged = new Map();
+  for (const x of rows) merged.set(x.ts, x);
+  for (const x of hot) merged.set(x.ts, x);
+  let arr = [...merged.values()].sort((a, b) => a.ts - b.ts);
+  // 4) 超上限时均匀降采样
+  if (arr.length > MONITOR_D1_MAX_ROWS) {
+    const step = Math.ceil(arr.length / MONITOR_D1_MAX_ROWS);
+    arr = arr.filter((_, i) => i % step === 0);
+  }
+  return arr;
 }
 
 // 自定义监控项查询：按时间段读 D1（低频直写，无需热区），超长区间 SQL 抽样
@@ -1549,8 +1570,13 @@ export class MetricsDO {
   // 无条件注册 alarm：alarm 负责 storage 热区过期行清理 + D1 保留期清理（audit_logs 90 天等）+ 离线告警。
   // 归档开关（ARCHIVE_TO_D1）仅控制"过期行是否落 D1"，不控制清理本身——否则归档关闭时
   // storage 热区与 audit_logs 会无限增长。
+  // H-01：不后推已存在的 alarm（仅无 alarm 或新时间更早时设置），防高频上报把归档/清理/告警无限推迟。
   async scheduleArchive() {
-    this.state.storage.setAlarm(Date.now() + ARCHIVE_INTERVAL_MS);
+    const existing = await this.state.storage.getAlarm();
+    const next = Date.now() + ARCHIVE_INTERVAL_MS;
+    if (existing == null || next < existing) {
+      this.state.storage.setAlarm(next);
+    }
   }
 
   // 指标阈值告警（CPU/内存/磁盘/负载），带冷却去抖。
@@ -1668,15 +1694,18 @@ export class MetricsDO {
     }
   }
 
-  // alarm：过期热区行清理（超 1 小时；归档开启时落 D1）+ 每天 D1 保留期清理 + 离线/恢复告警。
-  // 过期行删除与保留期清理无条件执行，防止 ARCHIVE_TO_D1=0 时 storage 热区 / audit_logs 无限增长。
+  // alarm：热区行归档（超 60min 落 D1，热区行保留至 12h 供 ≤12h 查询）+ 删除超 12h 的热区行
+  // + 每天 D1 保留期清理 + 离线/恢复告警。归档与删除无条件执行，防 ARCHIVE_TO_D1=0 时
+  // storage 热区 / audit_logs 无限增长。
   async alarm() {
     const archiveOn = this.env.ARCHIVE_TO_D1 !== '0';
     const alertOn = (await getAlertCfg(this.env)).enabled;
     if (alertOn) await this.checkOfflineAlerts();
-    const cutoff = Math.floor(Date.now() / 1000 / 60) - ARCHIVE_AFTER_MIN;
+    // 归档线（60min）：此前的数据落 D1；热区上限（METRICS_KEEP_MIN=720min）：此前的热区行删除
+    const archiveCutoff = Math.floor(Date.now() / 1000 / 60) - ARCHIVE_AFTER_MIN;
+    const keepCutoff = Math.floor(Date.now() / 1000 / 60) - METRICS_KEEP_MIN;
     const stmts = [];
-    const dels = [];
+    const keysToDelete = [];
     try {
       const keys = await this.listStorage('m:');
       for (const k of keys) {
@@ -1685,26 +1714,26 @@ export class MetricsDO {
         if (sep <= 0) continue;
         const serverId = Number(rest.slice(0, sep));
         const ts = Number(rest.slice(sep + 1));
-        if (ts <= cutoff) {
-          // 归档开启才落 D1；过期行无论归档开关一律从 storage 删除（防无限增长）
-          if (archiveOn) {
-            const v = JSON.parse(k.value);
-            stmts.push(
-              this.env.DB.prepare(
-                'INSERT OR IGNORE INTO metrics_min (server_id, ts, cpu, mem_used, net_in, net_out, extra) VALUES (?,?,?,?,?,?,?)'
-              ).bind(serverId, ts, v.cpu, v.mem_used, v.net_in, v.net_out, v.extra ? JSON.stringify(v.extra) : null)
-            );
-          }
-          dels.push(this.state.storage.delete(k.name));
+        // 归档线以上：写 D1（OR IGNORE 幂等）；热区行保留（H-03：不再删 60min 内的行，≤12h 查询完整）
+        if (ts <= archiveCutoff && archiveOn) {
+          const v = JSON.parse(k.value);
+          stmts.push(
+            this.env.DB.prepare(
+              'INSERT OR IGNORE INTO metrics_min (server_id, ts, cpu, mem_used, net_in, net_out, extra) VALUES (?,?,?,?,?,?,?)'
+            ).bind(serverId, ts, v.cpu, v.mem_used, v.net_in, v.net_out, v.extra ? JSON.stringify(v.extra) : null)
+          );
         }
+        // 超过热区上限（12h）：删除 storage 行（防无限增长；D1 已含归档数据）
+        if (ts <= keepCutoff) keysToDelete.push(k.name);
       }
     } catch { /* storage 不可用则跳过本次清理（行保留，下次重试） */ }
+    // H-02：D1 写入成功后才删除 storage 行（防 D1 失败时两端数据丢失）
     if (stmts.length) await this.env.DB.batch(stmts);
-    await Promise.all(dels);
-    // 同步清理内存缓存中的已清理数据
+    await Promise.all(keysToDelete.map((name) => this.state.storage.delete(name)));
+    // 同步清理内存缓存中超过热区上限的数据
     for (const [, m] of this.data) {
       for (const ts of [...m.keys()]) {
-        if (ts <= cutoff) m.delete(ts);
+        if (ts <= keepCutoff) m.delete(ts);
       }
     }
     // 保留期清理（每天一次）：删除超过 METRICS_RETENTION_DAYS 的旧数据，以及超过

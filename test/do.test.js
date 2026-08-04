@@ -32,6 +32,9 @@ function mockState(store = {}) {
     setAlarm(ts) {
       this.alarmTs = ts;
     },
+    async getAlarm() {
+      return this.alarmTs == null ? null : this.alarmTs;
+    },
   };
   return { storage };
 }
@@ -111,9 +114,10 @@ test('MetricsDO: scheduleArchive 无条件注册 alarm（清理/保留期不依�
 });
 
 // ---------------- MetricsDO：归档 / 保留期 ----------------
-test('MetricsDO: alarm 归档超 1 小时数据到 D1 并清理内存，不重复归档', async () => {
+test('MetricsDO: alarm 归档超 1 小时数据到 D1；热区保留 12h，不重复归档', async () => {
   const env = makeEnv();
-  const { inst, call } = mkMetrics(env, mockState());
+  const st = mockState();
+  const { inst, call } = mkMetrics(env, st);
   const nowMin = Math.floor(Date.now() / 1000 / 60);
   const oldTs = nowMin - 90;
   const recentTs = nowMin - 5;
@@ -123,36 +127,51 @@ test('MetricsDO: alarm 归档超 1 小时数据到 D1 并清理内存，不重�
   await inst.alarm();
 
   const rows = await env.DB.prepare('SELECT * FROM metrics_min WHERE server_id = 1').all();
-  assert.equal(rows.results.length, 1);
+  assert.equal(rows.results.length, 1, '归档：仅 >60min 的行写入 D1');
   assert.equal(rows.results[0].ts, oldTs);
   assert.equal(rows.results[0].cpu, 5);
 
+  // H-03：热区保留 12h（60min 前的行仍在热区，≤12h 查询完整）
   const q = await (await call('/query?server_id=1&limit=100')).json();
-  assert.deepEqual(q.map((x) => x.ts), [recentTs]);
+  assert.deepEqual(q.map((x) => x.ts).sort((a, b) => a - b), [oldTs, recentTs], '热区保留归档前数据');
 
   await inst.alarm();
   const rows2 = await env.DB.prepare('SELECT * FROM metrics_min WHERE server_id = 1').all();
-  assert.equal(rows2.results.length, 1);
+  assert.equal(rows2.results.length, 1, '二次归档不重复写 D1（OR IGNORE）');
 });
 
-test('MetricsDO: ARCHIVE_TO_D1=0 时 alarm 仍清理 storage 过期热区（防无限增长）', async () => {
+test('MetricsDO: ARCHIVE_TO_D1=0 时 alarm 仍清理超 12h 的 storage 热区（防无限增长）', async () => {
   const env = makeEnv({ ARCHIVE_TO_D1: '0' });
   const st = mockState();
   const { inst, call } = mkMetrics(env, st);
   const nowMin = Math.floor(Date.now() / 1000 / 60);
-  await call('/report', { method: 'POST', body: JSON.stringify({ serverId: 1, minTs: nowMin - 90, cpu: 5 }) });
+  await call('/report', { method: 'POST', body: JSON.stringify({ serverId: 1, minTs: nowMin - 730, cpu: 5 }) });
   await call('/report', { method: 'POST', body: JSON.stringify({ serverId: 1, minTs: nowMin - 5, cpu: 6 }) });
-  assert.ok(st.storage.map.has(`m:1:${nowMin - 90}`), '过期行已写入 storage');
+  assert.ok(st.storage.map.has(`m:1:${nowMin - 730}`), '超 12h 行已写入 storage');
   assert.ok(st.storage.map.has(`m:1:${nowMin - 5}`), '新行已写入 storage');
 
   await inst.alarm();
 
-  // 归档关闭：过期行仍从 storage 删除（不落 D1），新行保留
-  assert.equal(st.storage.map.has(`m:1:${nowMin - 90}`), false, '过期行被清理');
-  assert.ok(st.storage.map.has(`m:1:${nowMin - 5}`), '新行保留');
+  // 归档关闭：超 12h 行仍从 storage 删除（不落 D1），12h 内行保留（供 ≤12h 查询）
+  assert.equal(st.storage.map.has(`m:1:${nowMin - 730}`), false, '超 12h 行被清理');
+  assert.ok(st.storage.map.has(`m:1:${nowMin - 5}`), '12h 内行保留');
   const rows = await env.DB.prepare('SELECT * FROM metrics_min WHERE server_id = 1').all();
   assert.equal(rows.results.length, 0, '归档关闭不写 D1');
   assert.ok(st.storage.alarmTs > 0, 'alarm 重新注册');
+});
+
+test('MetricsDO: 高频 report 不后推已有 alarm（归档按期执行）', async () => {
+  const env = makeEnv();
+  const st = mockState();
+  const { inst, call } = mkMetrics(env, st);
+  const nowMin = Math.floor(Date.now() / 1000 / 60);
+  await call('/report', { method: 'POST', body: JSON.stringify({ serverId: 1, minTs: nowMin, cpu: 1 }) });
+  assert.ok(st.storage.alarmTs > 0, '首次 report 注册 alarm');
+  const t1 = st.storage.alarmTs;
+  await call('/report', { method: 'POST', body: JSON.stringify({ serverId: 1, minTs: nowMin, cpu: 2 }) });
+  assert.equal(st.storage.alarmTs, t1, '再次 report 不后推 alarm');
+  await inst.alarm();
+  assert.ok(st.storage.alarmTs >= Date.now(), 'alarm 执行后固定重排');
 });
 
 test('MetricsDO: ARCHIVE_TO_D1=0 时 alarm 仍执行 D1 保留期清理（audit_logs 90 天）', async () => {

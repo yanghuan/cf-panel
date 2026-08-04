@@ -24,34 +24,6 @@ fn err_json(msg: &str) -> String {
     serde_json::json!({ "type": "error", "ok": false, "message": msg }).to_string()
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn b64e_roundtrip() {
-        assert_eq!(b64e(b"hello cf-panel"), "aGVsbG8gY2YtcGFuZWw=");
-        assert_eq!(b64e(b""), "");
-    }
-
-    #[test]
-    fn err_json_shape() {
-        let v: serde_json::Value = serde_json::from_str(&err_json("boom")).unwrap();
-        assert_eq!(v["type"], "error");
-        assert_eq!(v["ok"], false);
-        assert_eq!(v["message"], "boom");
-    }
-
-    #[test]
-    fn buffer_constants() {
-        // 固定缓冲重构的常量约束（与前端分块解耦的服务端固定缓冲）
-        assert_eq!(READ_BLOCK, 512 * 1024);
-        assert_eq!(WRITE_BUF, 64 * 1024);
-        assert_eq!(WS_MSG_LIMIT, 8 * 1024 * 1024);
-        assert_eq!(FILE_LIMIT, 500 * 1024 * 1024);
-    }
-}
-
 // ---------------- 终端会话 ----------------
 pub struct TermSession {
     pub sid: String,
@@ -461,5 +433,33 @@ async fn file_write(path: String, offset: u64, data: String, commit: bool) -> St
     {
         Some(v) => v,
         None => err_json("write timeout"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn b64e_roundtrip() {
+        assert_eq!(b64e(b"hello cf-panel"), "aGVsbG8gY2YtcGFuZWw=");
+        assert_eq!(b64e(b""), "");
+    }
+
+    #[test]
+    fn err_json_shape() {
+        let v: serde_json::Value = serde_json::from_str(&err_json("boom")).unwrap();
+        assert_eq!(v["type"], "error");
+        assert_eq!(v["ok"], false);
+        assert_eq!(v["message"], "boom");
+    }
+
+    #[test]
+    fn buffer_constants() {
+        // 固定缓冲重构的常量约束（与前端分块解耦的服务端固定缓冲）
+        assert_eq!(READ_BLOCK, 512 * 1024);
+        assert_eq!(WRITE_BUF, 64 * 1024);
+        assert_eq!(WS_MSG_LIMIT, 8 * 1024 * 1024);
+        assert_eq!(FILE_LIMIT, 500 * 1024 * 1024);
     }
 }

@@ -447,10 +447,9 @@ mod tests {
 
     #[test]
     fn collect_mem_parses() {
-        let (used, total, swap) = collect_mem();
+        let (used, total, _swap) = collect_mem();
         assert!(total > 0, "MemTotal 应可读");
         assert!(used <= total, "已用不超过总量");
-        assert!(swap >= 0);
     }
 
     #[test]

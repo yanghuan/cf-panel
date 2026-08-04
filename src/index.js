@@ -614,7 +614,7 @@ async function handleApi(request, env) {
   // GET /api/public/settings —— 公开配置（D1 kv_json，无需登录）
   if (method === 'GET' && path === '/api/public/settings') {
     const settings = (await kvGet(env, 'settings', {})) || {};
-    return json({ site_name: settings.site_name || 'cf-panel', notice: settings.notice || '' });
+    return json({ site_name: settings.site_name || 'cf-panel', notice: settings.notice || '', geo_lookup: !!settings.geo_lookup });
   }
 
   // POST /api/report —— agent 监控上报（key 指纹定位 + hash 校验，无需登录）
@@ -849,6 +849,8 @@ async function handleApi(request, env) {
       site_name: body.site_name !== undefined ? String(body.site_name).trim() : current.site_name,
       notice: body.notice !== undefined ? String(body.notice).trim() : current.notice,
       alerts: body.alerts !== undefined ? sanitizeAlerts(body.alerts) : current.alerts,
+      // M-18：IP 归属地第三方查询开关（默认关闭，避免服务器公网 IP 泄露给 ipapi.co/ipwho.is）
+      geo_lookup: body.geo_lookup !== undefined ? !!body.geo_lookup : !!current.geo_lookup,
     };
     await kvPut(env, 'settings', next);
     kvClearCache('settings'); // 告警配置立即生效

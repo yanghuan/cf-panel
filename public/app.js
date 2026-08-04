@@ -43,10 +43,12 @@
   }
 
   // ---------- 公开设置（公告/站点名，存 D1 kv_json） ----------
+  let geoEnabled = false; // M-18：IP 归属地第三方查询开关（默认关闭）
   async function loadPublic() {
     try {
       const s = await api('/api/public/settings');
       if (s.site_name) document.title = s.site_name;
+      geoEnabled = !!s.geo_lookup;
       const bar = $('#notice-bar');
       if (s.notice) {
         bar.textContent = s.notice;
@@ -213,8 +215,9 @@
     geoCache.set(ip, label);
     return label;
   }
-  // 渲染后异步补充卡片 IP 归属地
+  // 渲染后异步补充卡片 IP 归属地（M-18：默认不查询第三方，保护服务器公网 IP 隐私）
   async function lookupGeo() {
+    if (!geoEnabled) return;
     const els = [...document.querySelectorAll('#servers .card .meta[data-ip]')];
     for (const el of els) {
       const ip = el.dataset.ip;
@@ -898,6 +901,7 @@
       // 直接回填实际存储值（不再硬编码默认名判断，避免用户真的设成 "cf-panel" 时显示为空）
       $('#set-site-name').value = s.site_name || '';
       $('#set-notice').value = s.notice || '';
+      $('#set-geo').checked = !!s.geo_lookup;
     }).catch(() => { /* ignore */ });
   }
 
@@ -943,7 +947,7 @@
     try {
       await api('/api/settings', {
         method: 'PUT',
-        body: JSON.stringify({ site_name: $('#set-site-name').value, notice: $('#set-notice').value }),
+        body: JSON.stringify({ site_name: $('#set-site-name').value, notice: $('#set-notice').value, geo_lookup: $('#set-geo').checked }),
       });
       toast('站点信息已保存');
       loadPublic();

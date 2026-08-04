@@ -139,6 +139,11 @@
       <div class="settings-row">
         <input id="set-notice" type="text" placeholder="公告（留空隐藏）" />
       </div>
+      <div class="settings-row" style="display:flex;align-items:center;gap:8px">
+        <!-- M-18：IP 归属地第三方查询开关（默认关，防服务器公网 IP 泄露给 ipapi.co/ipwho.is） -->
+        <input id="set-geo" type="checkbox" style="width:auto" />
+        <label for="set-geo" style="font-size:13px;color:var(--muted)">IP 归属地查询（将公网 IP 发送到第三方地理服务）</label>
+      </div>
       <div class="settings-row">
         <button id="btn-save-site">保存站点信息</button>
       </div>

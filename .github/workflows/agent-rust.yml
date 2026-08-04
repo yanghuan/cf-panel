@@ -10,14 +10,13 @@ on:
       - '.github/workflows/agent-rust.yml'
   workflow_dispatch:
 
-permissions:
-  contents: write
-
 jobs:
   test:
+    permissions:
+      contents: read # M-17：最小权限
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4.2.2 # M-17：固定具体版本（防 supply chain 变更）
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -33,9 +32,11 @@ jobs:
 
   build-release:
     needs: test
+    permissions:
+      contents: write # M-17：仅发布 job 需要写权限（创建 Release）
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4.2.2 # M-17：固定具体版本
         with:
           fetch-depth: 0 # Release 更新日志取自 git 提交历史/tags，浅克隆拿不到
 
@@ -52,6 +53,11 @@ jobs:
           CC_x86_64_unknown_linux_musl: musl-gcc
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS: -C linker=musl-gcc -C strip=symbols
         run: cargo build --release --target x86_64-unknown-linux-musl
+
+      - name: 生成 Release 校验和（sha256，M-17 供应链）
+        run: |
+          cd agent/rust/target/x86_64-unknown-linux-musl/release
+          sha256sum cf-panel-agent > cf-panel-agent.sha256
 
       - name: 生成 Release 标题（cf-panel-agent + 时间）
         id: release
@@ -92,7 +98,9 @@ jobs:
       - name: 发布到 GitHub Releases
         uses: softprops/action-gh-release@v2
         with:
-          files: agent/rust/target/x86_64-unknown-linux-musl/release/cf-panel-agent
+          files: |
+            agent/rust/target/x86_64-unknown-linux-musl/release/cf-panel-agent
+            agent/rust/target/x86_64-unknown-linux-musl/release/cf-panel-agent.sha256
           name: ${{ steps.release.outputs.title }}
           tag_name: ${{ steps.release.outputs.tag }}
           body_path: /tmp/release-body.md

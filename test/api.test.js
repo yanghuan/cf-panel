@@ -534,6 +534,24 @@ test('设置：告警配置被清洗；非管理员 403', async () => {
   assert.equal((await call(env, { method: 'PUT', path: '/api/settings', token: pat.token, body: {} })).status, 403);
 });
 
+test('设置：geo_lookup 开关默认关闭，可开启并在 public settings 返回（M-18）', async () => {
+  const env = makeEnv();
+  const token = await login(env);
+  // 默认关闭（不把服务器公网 IP 发第三方）
+  const pub = await (await call(env, { path: '/api/public/settings' })).json();
+  assert.equal(pub.geo_lookup, false, '默认关闭');
+
+  // 管理员开启 → public settings 返回 true
+  await call(env, { method: 'PUT', path: '/api/settings', token, body: { geo_lookup: true } });
+  const pub2 = await (await call(env, { path: '/api/public/settings' })).json();
+  assert.equal(pub2.geo_lookup, true, '开启后返回 true');
+
+  // 关闭
+  await call(env, { method: 'PUT', path: '/api/settings', token, body: { geo_lookup: false } });
+  const pub3 = await (await call(env, { path: '/api/public/settings' })).json();
+  assert.equal(pub3.geo_lookup, false, '可关闭');
+});
+
 // ---------------- 终端 / 文件 会话 ----------------
 test('终端与文件会话：需要 exec 权限 + 服务器归属', async () => {
   const env = makeEnv();

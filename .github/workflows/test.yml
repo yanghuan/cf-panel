@@ -15,7 +15,7 @@ jobs:
         # node:sqlite 内置模块需 Node >= 22；24 为稳定版
         node-version: [22, 24]
     steps:
-      - uses: actions/checkout@v4.2.2 # M-17：固定具体版本（防 supply chain 变更）
+      - uses: actions/checkout@v4.2.2 # 固定具体版本（防 supply chain 变更）
 
       - uses: actions/setup-node@v4.2.0
         with:
@@ -27,7 +27,7 @@ jobs:
   e2e:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4.2.2 # M-17：固定具体版本
+      - uses: actions/checkout@v4.2.2 # 固定具体版本
 
       - uses: actions/setup-node@v4.2.0
         with:
@@ -37,7 +37,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y socat jq
-          # M-17：--fail 确保下载成功才继续（失败即构建失败，不静默用坏二进制）
+          # --fail 确保下载成功才继续（失败即构建失败，不静默用坏二进制）
           curl -f --retry 2 -sSL -o /usr/local/bin/websocat https://github.com/vi/websocat/releases/download/v1.14.0/websocat.x86_64-unknown-linux-musl
           chmod +x /usr/local/bin/websocat
 

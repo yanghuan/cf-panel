@@ -43,7 +43,7 @@
   }
 
   // ---------- 公开设置（公告/站点名，存 D1 kv_json） ----------
-  let geoEnabled = false; // M-18：IP 归属地第三方查询开关（默认关闭）
+  let geoEnabled = false; // IP 归属地第三方查询开关（默认关闭）
   async function loadPublic() {
     try {
       const s = await api('/api/public/settings');
@@ -215,7 +215,7 @@
     geoCache.set(ip, label);
     return label;
   }
-  // 渲染后异步补充卡片 IP 归属地（M-18：默认不查询第三方，保护服务器公网 IP 隐私）
+  // 渲染后异步补充卡片 IP 归属地（默认不查询第三方，保护服务器公网 IP 隐私）
   async function lookupGeo() {
     if (!geoEnabled) return;
     const els = [...document.querySelectorAll('#servers .card .meta[data-ip]')];
@@ -404,7 +404,7 @@
       term.dispose();
       $('#term-modal').classList.add('hidden');
       unlockScroll();
-      // L-02：移除 resize 监听器，防多次开关终端累积内存泄漏
+      // 移除 resize 监听器，防多次开关终端累积内存泄漏
       window.removeEventListener('resize', onResize);
     };
     $('#btn-term-close').onclick = close;
@@ -571,12 +571,12 @@
       return;
     }
     if (j.got === 0) {
-      // M-11：读取到 EOF 但未达预期 size → 文件已缩短/被替换，中止避免无限循环
+      // 读取到 EOF 但未达预期 size → 文件已缩短/被替换，中止避免无限循环
       $('#file-msg').textContent = `文件已变化或缩短，中止下载（已完成 ${fileDownload.received}/${fileDownload.size} 字节）`;
       fileDownload = null;
       return;
     }
-    // M-10：每块立即解码为 Uint8Array（避免字符串积累 + 完成时 join/二次复制），内存峰值显著下降
+    // 每块立即解码为 Uint8Array（避免字符串积累 + 完成时 join/二次复制），内存峰值显著下降
     const bin = atob(j.data);
     const bytes = new Uint8Array(bin.length);
     for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
@@ -614,7 +614,7 @@
       const chunk = file.slice(fileUpload.sent, Math.min(fileUpload.sent + FILE_CHUNK, file.size));
       reader.onload = () => {
         const b64 = String(reader.result).split(',')[1] || '';
-        // H-07 原子写：最后一块 commit=true，agent 端 fsync + rename 原子替换目标文件
+        // 原子写：最后一块 commit=true，agent 端 fsync + rename 原子替换目标文件
         const commit = fileUpload.sent + chunk.size >= file.size;
         fileSend({ type: 'write', path: fileJoin(fileCwd, file.name), offset: fileUpload.sent, data: b64, commit });
         fileUpload.sent += chunk.size;

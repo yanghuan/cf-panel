@@ -44,7 +44,7 @@ mod tests {
 
     #[test]
     fn buffer_constants() {
-        // H-07/固定缓冲重构的常量约束（与前端分块解耦的服务端固定缓冲）
+        // 固定缓冲重构的常量约束（与前端分块解耦的服务端固定缓冲）
         assert_eq!(READ_BLOCK, 512 * 1024);
         assert_eq!(WRITE_BUF, 64 * 1024);
         assert_eq!(WS_MSG_LIMIT, 8 * 1024 * 1024);
@@ -289,7 +289,7 @@ where
 
 async fn file_list(path: String) -> String {
     match blocking_with_timeout(10, move || {
-        // L-03：目录列表最大条目数，防超大目录物化全部条目/生成巨型 JSON
+        // 目录列表最大条目数，防超大目录物化全部条目/生成巨型 JSON
         const FILE_LIST_MAX: usize = 1000;
         let mut entries = Vec::new();
         let mut truncated = false;
@@ -388,7 +388,7 @@ async fn file_read(path: String, offset: u64, limit: u64) -> String {
 async fn file_write(path: String, offset: u64, data: String, commit: bool) -> String {
     match blocking_with_timeout(30, move || {
         use std::io::{Seek, SeekFrom};
-        // H-07 原子写：写同目录临时文件 {path}.upload，commit（最后一块）时 fsync + rename
+        // 原子写：写同目录临时文件 {path}.upload，commit（最后一块）时 fsync + rename
         // 原子替换目标文件。失败/中断只留下临时文件残留，目标文件不被破坏；
         // 多块上传必须首块 offset=0 且最后一块 commit=true（前端协议约定）。
         let tmp = format!("{}.upload", path);

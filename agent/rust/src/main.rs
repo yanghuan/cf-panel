@@ -58,7 +58,7 @@ fn read_config() -> Config {
     }
 }
 
-// M-12：校验控制通道 URL scheme——远程必须 wss://，明文 ws:// 仅限本地回环或 ALLOW_INSECURE_WS=1
+// 校验控制通道 URL scheme——远程必须 wss://，明文 ws:// 仅限本地回环或 ALLOW_INSECURE_WS=1
 fn validate_wss(wss: &str) -> Result<(), String> {
     if wss.starts_with("wss://") {
         return Ok(());
@@ -318,7 +318,7 @@ async fn main() {
         eprintln!("AGENT_WSS_URL 与 AGENT_KEY 必须设置（./cf-panel-agent --help 查看全部配置）");
         std::process::exit(1);
     }
-    // M-12：明文 ws:// 仅允许本地回环（本地调试/E2E）或显式 ALLOW_INSECURE_WS=1；
+    // 明文 ws:// 仅允许本地回环（本地调试/E2E）或显式 ALLOW_INSECURE_WS=1；
     // 远程连接强制 wss://，防 Agent key 经明文链路被窃听
     if let Err(e) = validate_wss(&cfg.wss) {
         eprintln!("{e}");

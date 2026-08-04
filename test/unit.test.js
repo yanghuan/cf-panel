@@ -187,7 +187,7 @@ test('parseHeaders 支持对象与 JSON 字符串并做占位符替换', () => {
   assert.deepEqual(I.parseHeaders(123, vars), {});
 });
 
-test('sendWebhook：非 2xx / 网络异常记错误日志并返回 false（M-08）', async () => {
+test('sendWebhook：非 2xx / 网络异常记错误日志并返回 false', async () => {
   const origFetch = globalThis.fetch;
   const origErr = console.error;
   const errs = [];
@@ -211,7 +211,7 @@ test('sendWebhook：非 2xx / 网络异常记错误日志并返回 false（M-08�
     assert.equal(await I.sendWebhook(cfg, { event: 'alert' }), true, '2xx 返回 true');
     assert.equal(errs.length, 2, '成功不记日志');
 
-    // M-09：PUT 方法透传，不再被改写成 POST；GET 无 body
+    // PUT 方法透传，不再被改写成 POST；GET 无 body
     let lastInit = null;
     globalThis.fetch = async (url, init) => { lastInit = init; return new Response('ok'); };
     await I.sendWebhook({ webhook_url: 'https://x/hook', enabled: true, method: 'PUT' }, { event: 'alert' });

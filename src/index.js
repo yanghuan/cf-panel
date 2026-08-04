@@ -71,7 +71,7 @@ const MCP_TOOLS = [
 
 // ---------------- 通用工具 ----------------
 
-// L-01：API 响应统一附加的安全响应头（防点击劫持/嗅探/Referrer 泄露）
+// API 响应统一附加的安全响应头（防点击劫持/嗅探/Referrer 泄露）
 const SECURITY_HEADERS = {
   'x-content-type-options': 'nosniff',
   'referrer-policy': 'no-referrer',
@@ -241,7 +241,7 @@ function doPanel(env) {
 
 // 监控历史查询（/api/monitor 与 MCP 共用）：统一合并「MetricsDO 热区（最近 ≤12h）」与
 // 「D1 归档（≥1h 前）」后按时间戳去重（热区优先，补齐最近未归档数据），超上限时 JS 降采样。
-// H-03：热区不再只保留 1h，≤12h 查询完整；长区间查询不再缺最近 ~1h 数据。
+// 热区不再只保留 1h，≤12h 查询完整；长区间查询不再缺最近 ~1h 数据。
 const MONITOR_D1_MAX_ROWS = 1500; // 长区间 SQL 抽样上限，防响应/解析放大
 async function queryMonitorRows(env, serverId, hours) {
   const minutes = hours * 60;
@@ -357,7 +357,7 @@ function parseHeaders(s, vars) {
 
 // 发送告警 Webhook（模板化）：method/url/body/headers 均支持占位符；
 // token 仅作为 {token} 占位符变量，由用户放在 URL/header/body 任意位置。
-// M-08：检查 HTTP 状态，失败/异常记 console.error（Cloudflare 后台 Worker 日志可见，便于排查丢失的告警）。
+// 检查 HTTP 状态，失败/异常记 console.error（Cloudflare 后台 Worker 日志可见，便于排查丢失的告警）。
 async function sendWebhook(cfg, payload) {
   if (!cfg.enabled || !cfg.webhook_url) return false;
   const vars = {
@@ -370,7 +370,7 @@ async function sendWebhook(cfg, payload) {
     time: payload.time,
     token: cfg.webhook_token,
   };
-  // M-09：统一允许的 HTTP 方法（GET/POST/PUT），不再把 PUT 静默当 POST
+  // 统一允许的 HTTP 方法（GET/POST/PUT），不再把 PUT 静默当 POST
   const method = ['GET', 'POST', 'PUT'].includes(cfg.method) ? cfg.method : 'POST';
   const url = renderTemplate(cfg.webhook_url, vars);
   const headers = parseHeaders(cfg.headers, vars);
@@ -511,7 +511,7 @@ async function queryServersForUser(env, user) {
       // server_ids 为 NULL：未限制 → 全部服务器
       return env.DB.prepare('SELECT * FROM servers ORDER BY "group", display_index, id').all();
     }
-    // 白名单模式（H-08）：空数组 → 空集（不再返回全量，与 canAccessServer 的拒绝语义一致）
+    // 白名单模式：空数组 → 空集（不再返回全量，与 canAccessServer 的拒绝语义一致）
     const ids = [...new Set(user.pat.serverIDs.map(Number).filter((n) => n > 0))];
     if (!ids.length) return { results: [] };
     return env.DB.prepare(`SELECT * FROM servers WHERE id IN (${ids.map(() => '?').join(',')}) ORDER BY "group", display_index, id`).bind(...ids).all();
@@ -531,7 +531,7 @@ async function hasPanelViewers(env) {
 
 // ---------------- REST API ----------------
 
-// H-09：登录失败限流（应用层纵深防御）。内存窗口按 IP 计数，缓解单 IP 爆破；
+// 登录失败限流（应用层纵深防御）。内存窗口按 IP 计数，缓解单 IP 爆破；
 // 注意多边缘实例间非全局一致，生产仍建议 Cloudflare Access / Rate Limiting。
 const LOGIN_FAIL_LIMIT = 5; // 15 分钟窗口内失败上限
 const LOGIN_FAIL_WINDOW_MS = 15 * 60 * 1000;
@@ -585,7 +585,7 @@ async function handleApi(request, env) {
   const method = request.method;
 
   // POST /api/login —— 面板登录（PANEL_USERS 多用户 或 PANEL_PASSWORD 单管理员）
-  // 暴力破解防护：应用层按 IP 失败限流（H-09，纵深防御，默认生效）；
+  // 暴力破解防护：应用层按 IP 失败限流（纵深防御，默认生效）；
   // 生产仍强烈建议前置 Cloudflare Access / Rate Limiting（跨边缘实例更一致）。
   if (method === 'POST' && path === '/api/login') {
     const configError = requireJwtSecret(env);
@@ -849,7 +849,7 @@ async function handleApi(request, env) {
       site_name: body.site_name !== undefined ? String(body.site_name).trim() : current.site_name,
       notice: body.notice !== undefined ? String(body.notice).trim() : current.notice,
       alerts: body.alerts !== undefined ? sanitizeAlerts(body.alerts) : current.alerts,
-      // M-18：IP 归属地第三方查询开关（默认关闭，避免服务器公网 IP 泄露给 ipapi.co/ipwho.is）
+      // IP 归属地第三方查询开关（默认关闭，避免服务器公网 IP 泄露给 ipapi.co/ipwho.is）
       geo_lookup: body.geo_lookup !== undefined ? !!body.geo_lookup : !!current.geo_lookup,
     };
     await kvPut(env, 'settings', next);
@@ -1103,7 +1103,7 @@ export class TerminalDO {
       const body = await request.json();
       if (body.op === 'create' || body.op === 'open_file') {
         const isFile = body.op === 'open_file';
-        // M-04：先确认 agent 在线，离线时不创建/不落盘（避免失败会话残留）
+        // 先确认 agent 在线，离线时不创建/不落盘（避免失败会话残留）
         const agentWs = this.agents.get(body.serverId);
         if (!agentWs) return json({ error: 'agent offline' }, 502);
         const createdAt = Date.now();
@@ -1116,7 +1116,7 @@ export class TerminalDO {
           userWs: null,
           agentWs: null,
           userBuf: [], // 浏览器鉴权挂接前缓冲 agent 输出（如初始 bash 提示符），鉴权后补发
-          agentBuf: [], // M-03：agent 数据流挂接前缓冲浏览器输入，挂接后按序补发
+          agentBuf: [], // agent 数据流挂接前缓冲浏览器输入，挂接后按序补发
         });
         // 会话元数据持久化到 DO Storage：防 DO 休眠后、浏览器/agent WS 挂接前会话丢失
         // （否则前端会先看到"连接断开"，重连才成功）
@@ -1129,7 +1129,7 @@ export class TerminalDO {
             type: isFile ? 'file' : 'terminal',
           });
         } catch { /* 持久化失败则降级为纯内存会话 */ }
-        // M-04：安排 TTL 回收 alarm（两端都无连接时由 maybeSweep 按时回收）
+        // 安排 TTL 回收 alarm（两端都无连接时由 maybeSweep 按时回收）
         try {
           const existing = await this.state.storage.getAlarm();
           const next = createdAt + SESSION_TTL_MS + 1000;
@@ -1213,7 +1213,7 @@ export class TerminalDO {
       if (hash !== server.agent_key_hash) return new Response('bad key', { status: 401 });
       const pair = new WebSocketPair();
       this.state.acceptWebSocket(pair[1]);
-      // M-03：挂接 agent 数据流并按序补发缓冲的浏览器输入
+      // 挂接 agent 数据流并按序补发缓冲的浏览器输入
       this.attachAgentFlow(sess, pair[1]);
       // 附件随连接持久化：休眠唤醒后靠它重建会话索引
       pair[1].serializeAttachment({
@@ -1287,7 +1287,7 @@ export class TerminalDO {
 
   // open_terminal 确认重发：下发后 5s 未收到 agent 的 terminal_ready 则重发，最多 3 次
   // 解决 agent 控制通道重连窗口内指令丢失导致的终端"打不开"
-  // 记录 serverId + agentWs 归属：cleanup 断开时只清理关联项（M-02），不影响其他服务器/会话
+  // 记录 serverId + agentWs 归属：cleanup 断开时只清理关联项，不影响其他服务器/会话
   scheduleTermAck(agentWs, streamId, serverId) {
     if (this.pendingTerm.has(streamId)) return;
     const rec = { tries: 0, timer: null, serverId, agentWs };
@@ -1346,7 +1346,7 @@ export class TerminalDO {
     }
   }
 
-  // 挂接 agent 数据流：赋值 agentWs + 按序补发挂接前缓冲的浏览器输入（M-03，防静默丢弃）
+  // 挂接 agent 数据流：赋值 agentWs + 按序补发挂接前缓冲的浏览器输入（防静默丢弃）
   attachAgentFlow(sess, ws) {
     sess.agentWs = ws;
     if (sess.agentBuf && sess.agentBuf.length) {
@@ -1375,7 +1375,7 @@ export class TerminalDO {
       let j = null;
       try { j = JSON.parse(typeof message === 'string' ? message : ''); } catch { /* 非 JSON */ }
       const token = j && j.type === 'auth' ? String(j.token || '') : '';
-      // M-01：WS 首帧鉴权与 REST 一致（JWT 管理员直接放行；PAT/member 需服务器存在且可执行/为创建者）
+      // WS 首帧鉴权与 REST 一致（JWT 管理员直接放行；PAT/member 需服务器存在且可执行/为创建者）
       const user = token ? await authUserByToken(token, this.env) : null;
       const sess = await this.hydrateSession(att.sid);
       if (!user || !sess) {
@@ -1474,7 +1474,7 @@ export class TerminalDO {
       }
       if (sess.agentWs) sess.agentWs.send(message);
       else if (sess.agentBuf && sess.agentBuf.length < 128) {
-        // M-03：agent 数据流尚未挂接 → 缓冲浏览器输入（有上限），挂接后按序补发，避免静默丢弃
+        // agent 数据流尚未挂接 → 缓冲浏览器输入（有上限），挂接后按序补发，避免静默丢弃
         sess.agentBuf.push(message);
       }
     } else if (ws === sess.agentWs) {
@@ -1523,7 +1523,7 @@ export class TerminalDO {
         if (sess.userWs) {
           try { sess.userWs.close(); } catch { /* ignore */ }
         }
-        // M-02：会话数据流断开 → 仅清理该会话的 open_terminal 待确认（数据流已不可用）
+        // 会话数据流断开 → 仅清理该会话的 open_terminal 待确认（数据流已不可用）
         const r = this.pendingTerm.get(sid);
         if (r && r.timer) clearTimeout(r.timer);
         this.pendingTerm.delete(sid);
@@ -1536,7 +1536,7 @@ export class TerminalDO {
     for (const [serverId, w] of this.agents) {
       if (w === ws) {
         this.agents.delete(serverId);
-        // M-02：控制通道断开 → 仅清理该 agent（serverId）的待确认，不影响其他服务器/会话
+        // 控制通道断开 → 仅清理该 agent（serverId）的待确认，不影响其他服务器/会话
         for (const [sid, r] of [...this.pendingTerm]) {
           if (r.serverId === serverId) {
             if (r.timer) clearTimeout(r.timer);
@@ -1561,14 +1561,14 @@ export class MetricsDO {
     // 内存缓存仅加速当前实例生命周期内的读写（原纯内存热区在实例 evict 后即丢）。
     this.data = new Map();
     this.lastPrune = 0; // 上次执行保留期清理的时间
-    // 告警去重状态：内存为主，关键变更时持久化到 DO Storage（M-07），实例 evict/重启后恢复，避免重复告警
+    // 告警去重状态：内存为主，关键变更时持久化到 DO Storage，实例 evict/重启后恢复，避免重复告警
     this.alertLast = new Map(); // `${serverId}:kind` -> 上次触发时间
     this.probeState = new Map(); // `${serverId}:probeName` -> {ok, lastFail}
     this.alertLoaded = false;
     this.probeLoaded = false;
   }
 
-  // M-07：从 DO Storage 惰性恢复告警冷却 / 探活去重状态（实例 evict 后首次使用时加载一次）
+  // 从 DO Storage 惰性恢复告警冷却 / 探活去重状态（实例 evict 后首次使用时加载一次）
   async ensureAlertLoaded() {
     if (this.alertLoaded) return;
     this.alertLoaded = true;
@@ -1700,7 +1700,7 @@ export class MetricsDO {
         await Promise.all(keys.map((k) => this.state.storage.delete(k.name)));
       } catch { /* storage 不可用则仅清内存 */ }
       this.data.delete(serverId);
-      // 清理该服务器的告警冷却与探活状态（内存 + storage，M-07）
+      // 清理该服务器的告警冷却与探活状态（内存 + storage）
       try {
         const ak = await this.listStorage(`alert:${serverId}:`);
         const pk = await this.listStorage(`probe:${serverId}:`);
@@ -1732,7 +1732,7 @@ export class MetricsDO {
   // 无条件注册 alarm：alarm 负责 storage 热区过期行清理 + D1 保留期清理（audit_logs 90 天等）+ 离线告警。
   // 归档开关（ARCHIVE_TO_D1）仅控制"过期行是否落 D1"，不控制清理本身——否则归档关闭时
   // storage 热区与 audit_logs 会无限增长。
-  // H-01：不后推已存在的 alarm（仅无 alarm 或新时间更早时设置），防高频上报把归档/清理/告警无限推迟。
+  // 不后推已存在的 alarm（仅无 alarm 或新时间更早时设置），防高频上报把归档/清理/告警无限推迟。
   async scheduleArchive() {
     const existing = await this.state.storage.getAlarm();
     const next = Date.now() + ARCHIVE_INTERVAL_MS;
@@ -1747,14 +1747,14 @@ export class MetricsDO {
   async checkAlerts(b) {
     const cfg = await getAlertCfg(this.env);
     if (!cfg.enabled) return;
-    await this.ensureAlertLoaded(); // M-07：恢复持久化冷却状态
+    await this.ensureAlertLoaded(); // 恢复持久化冷却状态
     const now = Date.now();
     const cooldown = cfg.cooldown_min * 60 * 1000;
     const cooled = async (key) => {
       const last = this.alertLast.get(key);
       if (last && now - last < cooldown) return false;
       this.alertLast.set(key, now);
-      // M-07：冷却触发即持久化，实例 evict/重启后不重复告警
+      // 冷却触发即持久化，实例 evict/重启后不重复告警
       try { await this.state.storage.put('alert:' + key, String(now)); } catch { /* 持久化失败仅内存 */ }
       return true;
     };
@@ -1795,7 +1795,7 @@ export class MetricsDO {
   async checkProbeAlerts(serverId, serverName, probes) {
     const cfg = await getAlertCfg(this.env);
     if (!cfg.enabled || !Array.isArray(probes)) return;
-    await this.ensureProbeLoaded(); // M-07：恢复持久化探活状态
+    await this.ensureProbeLoaded(); // 恢复持久化探活状态
     const now = Date.now();
     const cooldown = cfg.cooldown_min * 60 * 1000;
     for (const p of probes) {
@@ -1882,7 +1882,7 @@ export class MetricsDO {
         if (sep <= 0) continue;
         const serverId = Number(rest.slice(0, sep));
         const ts = Number(rest.slice(sep + 1));
-        // 归档线以上：写 D1（OR IGNORE 幂等）；热区行保留（H-03：不再删 60min 内的行，≤12h 查询完整）
+        // 归档线以上：写 D1（OR IGNORE 幂等）；热区行保留（不再删 60min 内的行，≤12h 查询完整）
         if (ts <= archiveCutoff && archiveOn) {
           const v = JSON.parse(k.value);
           stmts.push(
@@ -1895,8 +1895,8 @@ export class MetricsDO {
         if (ts <= keepCutoff) keysToDelete.push(k.name);
       }
     } catch { /* storage 不可用则跳过本次清理（行保留，下次重试） */ }
-    // H-02：D1 写入成功后才删除 storage 行（防 D1 失败时两端数据丢失）；
-    // M-05：D1 batch 单次最多 100 条，分批提交（防归档积压/服务器增多后单次超大 batch 超限）
+    // D1 写入成功后才删除 storage 行（防 D1 失败时两端数据丢失）；
+    // D1 batch 单次最多 100 条，分批提交（防归档积压/服务器增多后单次超大 batch 超限）
     for (let i = 0; i < stmts.length; i += 100) {
       await this.env.DB.batch(stmts.slice(i, i + 100));
     }

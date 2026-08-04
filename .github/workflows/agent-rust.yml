@@ -13,16 +13,16 @@ on:
 jobs:
   test:
     permissions:
-      contents: read # M-17：最小权限
+      contents: read # 最小权限
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4.2.2 # M-17：固定具体版本（防 supply chain 变更）
+      - uses: actions/checkout@v4.2.2 # 固定具体版本（防 supply chain 变更）
 
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
 
-      # M-13：发布前必须通过格式/静态检查/单元测试（避免"可编译但有缺陷"的版本成为正式产物）
+      # 发布前必须通过格式/静态检查/单元测试（避免"可编译但有缺陷"的版本成为正式产物）
       - name: 格式检查 / 静态检查 / 单元测试
         run: |
           cd agent/rust
@@ -33,10 +33,10 @@ jobs:
   build-release:
     needs: test
     permissions:
-      contents: write # M-17：仅发布 job 需要写权限（创建 Release）
+      contents: write # 仅发布 job 需要写权限（创建 Release）
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4.2.2 # M-17：固定具体版本
+      - uses: actions/checkout@v4.2.2 # 固定具体版本
         with:
           fetch-depth: 0 # Release 更新日志取自 git 提交历史/tags，浅克隆拿不到
 
@@ -54,7 +54,7 @@ jobs:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS: -C linker=musl-gcc -C strip=symbols
         run: cargo build --release --target x86_64-unknown-linux-musl
 
-      - name: 生成 Release 校验和（sha256，M-17 供应链）
+      - name: 生成 Release 校验和（sha256）
         run: |
           cd agent/rust/target/x86_64-unknown-linux-musl/release
           sha256sum cf-panel-agent > cf-panel-agent.sha256

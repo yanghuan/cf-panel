@@ -79,7 +79,7 @@ test('缺少 JWT_SECRET 时登录和受保护入口均 fail closed → 503', asy
   assert.equal(wsRes.status, 503);
 });
 
-test('登录：连续失败 5 次后 429 锁定，其他 IP 不受影响（H-09）', async () => {
+test('登录：连续失败 5 次后 429 锁定，其他 IP 不受影响', async () => {
   const env = makeEnv();
   for (let i = 0; i < 5; i++) {
     const r = await call(env, { method: 'POST', path: '/api/login', body: { password: 'bad' }, ip: '9.9.9.77' });
@@ -93,7 +93,7 @@ test('登录：连续失败 5 次后 429 锁定，其他 IP 不受影响（H-09�
   assert.equal(other.status, 200);
 });
 
-test('登录：失败后成功登录重置计数（H-09）', async () => {
+test('登录：失败后成功登录重置计数', async () => {
   const env = makeEnv();
   for (let i = 0; i < 4; i++) {
     await call(env, { method: 'POST', path: '/api/login', body: { password: 'bad' }, ip: '9.9.9.79' });
@@ -115,7 +115,7 @@ test('登录：PANEL_USERS 优先级高于 PANEL_PASSWORD', async () => {
   assert.equal(user.username, 'alice');
 });
 
-test('登录：阈值内连续失败仍 401，超阈值 429 锁定（H-09）', async () => {
+test('登录：阈值内连续失败仍 401，超阈值 429 锁定', async () => {
   const env = makeEnv();
   for (let i = 0; i < 3; i++) {
     const res = await call(env, { method: 'POST', path: '/api/login', body: { password: 'no' }, ip: '9.9.9.10' });
@@ -316,7 +316,7 @@ test('agent 上报：key 指纹定位 + 哈希校验 + 落库', async () => {
   assert.equal(after[0].online, true);
 });
 
-// ---------------- 安全响应头（L-01） ----------------
+// ---------------- 安全响应头 ----------------
 test('安全响应头：API 响应带 nosniff/referrer/frame/CSP 头', async () => {
   const env = makeEnv();
   const res = await call(env, { path: '/api/public/settings' });
@@ -362,11 +362,11 @@ test('监控：不存在的服务器 404；长区间 3d 合并 D1 + 热区查询
   assert.equal(res.status, 200);
   const body = await res.json();
   assert.deepEqual(body, { system: [], custom: {} });
-  // H-03：长区间也查热区（合并补齐最近未归档数据）+ D1 归档
+  // 长区间也查热区（合并补齐最近未归档数据）+ D1 归档
   assert.ok(env.METRICS.calls.some((c) => c.path === '/query'), '长区间合并查询热区');
 });
 
-test('监控：1d 合并 D1 归档与热区，补齐最近未归档数据（H-03）', async () => {
+test('监控：1d 合并 D1 归档与热区，补齐最近未归档数据', async () => {
   const nowMin = Math.floor(Date.now() / 1000 / 60);
   const env = makeEnv({ METRICS: makeMetricsStub({ query: [{ ts: nowMin - 30, cpu: 2 }] }) });
   const token = await login(env);
@@ -383,7 +383,7 @@ test('监控：1d 合并 D1 归档与热区，补齐最近未归档数据（H-03
   assert.ok(tsList.includes(nowMin - 5 * 60), '包含 D1 归档数据');
   assert.ok(tsList.includes(nowMin - 30), '包含热区最近数据（修复 12h+ 查询缺最近 ~1h 空洞）');
   const d1Row = body.system.find((x) => x.ts === nowMin - 5 * 60);
-  assert.equal(d1Row.mem_total, 16384, 'D1 归档查询返回 mem_total（M-06）');
+  assert.equal(d1Row.mem_total, 16384, 'D1 归档查询返回 mem_total');
 });
 
 // ---------------- PAT ----------------
@@ -454,7 +454,7 @@ test('PAT：scopes 白名单校验（非法值 400，混合值只留合法项）
   assert.deepEqual(JSON.parse(rows2.scopes), ['server:read']);
 });
 
-test('PAT：server_ids 语义 — 未提供=全量，空数组=空集（H-08）', async () => {
+test('PAT：server_ids 语义 — 未提供=全量，空数组=空集', async () => {
   const env = makeEnv();
   const adminToken = await login(env);
   await addServer(env, adminToken, { name: 'a1' });
@@ -534,7 +534,7 @@ test('设置：告警配置被清洗；非管理员 403', async () => {
   assert.equal((await call(env, { method: 'PUT', path: '/api/settings', token: pat.token, body: {} })).status, 403);
 });
 
-test('设置：geo_lookup 开关默认关闭，可开启并在 public settings 返回（M-18）', async () => {
+test('设置：geo_lookup 开关默认关闭，可开启并在 public settings 返回', async () => {
   const env = makeEnv();
   const token = await login(env);
   // 默认关闭（不把服务器公网 IP 发第三方）

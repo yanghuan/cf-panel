@@ -130,9 +130,9 @@ test('MetricsDO: alarm 归档超 1 小时数据到 D1；热区保留 12h，不�
   assert.equal(rows.results.length, 1, '归档：仅 >60min 的行写入 D1');
   assert.equal(rows.results[0].ts, oldTs);
   assert.equal(rows.results[0].cpu, 5);
-  assert.equal(rows.results[0].mem_total, 8000, '归档保留 mem_total（M-06）');
+  assert.equal(rows.results[0].mem_total, 8000, '归档保留 mem_total');
 
-  // H-03：热区保留 12h（60min 前的行仍在热区，≤12h 查询完整）
+  // 热区保留 12h（60min 前的行仍在热区，≤12h 查询完整）
   const q = await (await call('/query?server_id=1&limit=100')).json();
   assert.deepEqual(q.map((x) => x.ts).sort((a, b) => a - b), [oldTs, recentTs], '热区保留归档前数据');
 
@@ -338,7 +338,7 @@ test('MetricsDO: /report 探活 down/recovered/冷却抑制', async () => {
   }
 });
 
-test('MetricsDO: 告警冷却状态持久化，新实例恢复不重复告警（M-07）', async () => {
+test('MetricsDO: 告警冷却状态持久化，新实例恢复不重复告警', async () => {
   const env = makeEnv();
   await env.DB.prepare("INSERT INTO kv_json (key, value) VALUES ('settings', ?)")
     .bind(JSON.stringify({ alerts: { webhook_url: 'https://example.com/hook', cpu_pct: 90, cooldown_min: 30 } })).run();
@@ -358,7 +358,7 @@ test('MetricsDO: 告警冷却状态持久化，新实例恢复不重复告警（
   } finally { cap.restore(); }
 });
 
-test('MetricsDO: 探活状态持久化，新实例恢复去重（M-07）', async () => {
+test('MetricsDO: 探活状态持久化，新实例恢复去重', async () => {
   const env = makeEnv();
   await env.DB.prepare("INSERT INTO kv_json (key, value) VALUES ('settings', ?)")
     .bind(JSON.stringify({ alerts: { webhook_url: 'https://example.com/hook', cooldown_min: 30 } })).run();
@@ -378,7 +378,7 @@ test('MetricsDO: 探活状态持久化，新实例恢复去重（M-07）', async
   } finally { cap.restore(); }
 });
 
-test('MetricsDO: /drop 清理 storage 告警/探活状态（M-07）', async () => {
+test('MetricsDO: /drop 清理 storage 告警/探活状态', async () => {
   const env = makeEnv();
   await env.DB.prepare("INSERT INTO kv_json (key, value) VALUES ('settings', ?)")
     .bind(JSON.stringify({ alerts: { webhook_url: 'https://example.com/hook', cpu_pct: 90, cooldown_min: 30 } })).run();
@@ -485,7 +485,7 @@ test('TerminalDO: /rpc/wakeup 给本分片全部 agent 下发快采间隔', asyn
   ]);
 });
 
-test('TerminalDO: /rpc create 时 agent 离线 → 502 且不残留会话（M-04）', async () => {
+test('TerminalDO: /rpc create 时 agent 离线 → 502 且不残留会话', async () => {
   const env = makeEnv();
   const st = mockState();
   const inst = new TerminalDO(st, env);
@@ -495,7 +495,7 @@ test('TerminalDO: /rpc create 时 agent 离线 → 502 且不残留会话（M-04
   }));
   assert.equal(res.status, 502);
   assert.equal((await res.json()).error, 'agent offline');
-  // M-04：失败路径不落盘（内存 + storage 均无残留）
+  // 失败路径不落盘（内存 + storage 均无残留）
   assert.equal(inst.sessions.has('0-abc'), false, '不残留内存会话');
   assert.equal(st.storage.map.has('sess:0-abc'), false, '不残留持久化会话');
 });
@@ -625,7 +625,7 @@ test('TerminalDO: user-pending 首帧鉴权后挂接 userWs，非法 token 断�
   assert.equal(good.attachment.role, 'user');
 });
 
-test('TerminalDO: user-pending 首帧鉴权接受 PAT（server:exec + 白名单）（M-01）', async () => {
+test('TerminalDO: user-pending 首帧鉴权接受 PAT（server:exec + 白名单）', async () => {
   const env = makeEnv();
   await env.DB.prepare('INSERT INTO servers (agent_key_id, name, user_id, agent_key_hash) VALUES (?,?,?,?)').bind('k1', 's1', 1, 'h1').run();
   const makeWs = () => ({
@@ -758,7 +758,7 @@ test('TerminalDO: 控制通道上报后回复心跳 ping（30s 限频）', async
   assert.equal(pingCount(), 1, '30s 内限频只发一次心跳');
 });
 
-test('TerminalDO: agent 流挂接前浏览器输入缓冲，挂接后按序补发（M-03）', async () => {
+test('TerminalDO: agent 流挂接前浏览器输入缓冲，挂接后按序补发', async () => {
   const env = makeEnv();
   const inst = new TerminalDO(mockState(), env);
   const browserWs = { send() {}, readyState: 1 };
@@ -780,7 +780,7 @@ test('TerminalDO: agent 流挂接前浏览器输入缓冲，挂接后按序补�
   assert.equal(sess.agentBuf.length, 0, '补发后清空');
 });
 
-test('MetricsDO: 归档超过 100 行分批 batch 落 D1（M-05）', async () => {
+test('MetricsDO: 归档超过 100 行分批 batch 落 D1', async () => {
   const env = makeEnv();
   const st = mockState();
   const { inst, call } = mkMetrics(env, st);
@@ -808,7 +808,7 @@ test('TerminalDO: 控制通道重连时关闭该服务器旧会话流（dropAgen
   assert.equal(inst.sessions.get('2-c').agentWs.closed, false, '其他服务器会话不受影响');
 });
 
-test('TerminalDO: cleanup 按归属清理 pendingTerm，跨服务器/会话隔离（M-02）', async () => {
+test('TerminalDO: cleanup 按归属清理 pendingTerm，跨服务器/会话隔离', async () => {
   const env = makeEnv();
   const ctl1 = { send() {}, readyState: 1 }; // server 1 控制通道
   const ctl2 = { send() {}, readyState: 1 }; // server 2 控制通道

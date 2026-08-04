@@ -326,6 +326,22 @@ test('安全响应头：API 响应带 nosniff/referrer/frame/CSP 头', async () 
   assert.match(res.headers.get('content-security-policy'), /frame-ancestors 'none'/);
 });
 
+test('删除后 in-flight 上报不写指标（H-11 存在性复核）', async () => {
+  const env = makeEnv();
+  await env.DB.prepare('INSERT INTO servers (agent_key_id, name, user_id, agent_key_hash) VALUES (?,?,?,?)').bind('k1', 's1', 1, 'h1').run();
+  // 服务器存在：上报写入 custom
+  await I.handleReport(env, { serverId: 1, custom: [{ name: 'x', value: 1 }] });
+  let rows = await env.DB.prepare('SELECT * FROM metrics_custom WHERE server_id = 1').all();
+  assert.equal(rows.results.length, 1, '存在时写入');
+  // 并发删除（读取 server 后完成删除）
+  await env.DB.prepare('DELETE FROM servers WHERE id = 1').run();
+  // 在途上报：存在性复核被拒，不写入孤儿指标
+  await I.handleReport(env, { serverId: 1, custom: [{ name: 'y', value: 2 }] });
+  rows = await env.DB.prepare('SELECT * FROM metrics_custom WHERE server_id = 1').all();
+  assert.equal(rows.results.length, 1, '删除后不再写入');
+  assert.equal(rows.results[0].name, 'x', '仅保留删除前数据');
+});
+
 // ---------------- 监控 ----------------
 test('监控：短区间走内存热区（METRICS /query），非法 range 回退 12h', async () => {
   const env = makeEnv();

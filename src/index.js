@@ -399,6 +399,9 @@ async function handleReport(env, payload) {
   const minTs = Math.floor(ts / 60);
   const server = await env.DB.prepare('SELECT info_json, probe_json, name FROM servers WHERE id = ?').bind(payload.serverId).first();
   if (!server) return;
+  // 写指标前复核服务器仍存在：并发删除场景丢弃在途上报，防孤儿指标重新写入 metrics_custom/热区
+  const alive = await env.DB.prepare('SELECT id FROM servers WHERE id = ?').bind(payload.serverId).first();
+  if (!alive) return;
   // 探活状态：变更才写 probe_json（告警去重状态在 MetricsDO 顺风车处理）
   if (Array.isArray(payload.probes)) {
     const probeJson = JSON.stringify(payload.probes);
@@ -2054,7 +2057,7 @@ export const __internals = {
   parseRangeHours, safeJson, sanitizeAlerts, hashSecret,
   renderTemplate, parseHeaders, sendWebhook,
   shardForServerId, makeStreamId, shardFromStreamId,
-  isAdmin, canAccessServer, canExec,
+  isAdmin, canAccessServer, canExec, handleReport,
   // 重置模块级可变状态（设置缓存），保证测试间隔离
   // 注：告警冷却/探活去重状态在 MetricsDO 实例内存，由各测试实例自行隔离
   __reset() {

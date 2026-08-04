@@ -1383,12 +1383,45 @@ export class MetricsDO {
   constructor(state, env) {
     this.state = state;
     this.env = env;
-    this.data = new Map(); // serverId -> Map(minTs -> {cpu, mem_used, net_in, net_out})
-    this.archived = new Map(); // serverId -> Set(minTs) 已归档标记（避免重复写 D1）
+    // 读缓存：serverId -> Map(minTs -> {cpu, mem_used, ...})。
+    // 数据唯一事实源在 DO Storage（行级 KV），实例被 evict/重启后可从 storage 全量恢复，
+    // 内存缓存仅加速当前实例生命周期内的读写（原纯内存热区在实例 evict 后即丢）。
+    this.data = new Map();
     this.lastPrune = 0; // 上次执行保留期清理的时间
     // 告警去重状态（单实例全局一致，随 DO 生命周期；重启清零——与旧 Worker 内存行为等价）
     this.alertLast = new Map(); // `${serverId}:kind` -> 上次触发时间
     this.probeState = new Map(); // `${serverId}:probeName` -> {ok, lastFail}
+  }
+
+  // ---- DO Storage 行式热区（key: m:{serverId}:{minTs}，value: JSON 字符串）----
+  hotKey(serverId, minTs) {
+    return `m:${serverId}:${minTs}`;
+  }
+  hotPrefix(serverId) {
+    return `m:${serverId}:`;
+  }
+  // 兼容 storage.list 返回格式：CF 生产为 {keys:[{name,value}]}，wrangler dev --local 为 Map
+  async listStorage(prefix) {
+    const res = await this.state.storage.list({ prefix });
+    if (res instanceof Map) return [...res.entries()].map(([name, value]) => ({ name, value }));
+    if (Array.isArray(res)) return res;
+    if (Array.isArray(res && res.keys)) return res.keys;
+    return [];
+  }
+  // 从 storage 加载某服务器热区到内存缓存（实例 evict 后首次访问时恢复）
+  async loadHot(serverId) {
+    const items = await this.listStorage(this.hotPrefix(serverId));
+    const m = new Map();
+    for (const k of items) {
+      const ts = Number(k.name.slice(this.hotPrefix(serverId).length));
+      m.set(ts, JSON.parse(k.value));
+    }
+    this.data.set(serverId, m);
+    return m;
+  }
+  async ensureHot(serverId) {
+    if (!this.data.has(serverId)) await this.loadHot(serverId);
+    return this.data.get(serverId);
   }
 
   async fetch(request) {
@@ -1396,13 +1429,15 @@ export class MetricsDO {
 
     if (url.pathname === '/report' && request.method === 'POST') {
       const b = await request.json();
-      let m = this.data.get(b.serverId);
-      if (!m) {
-        m = new Map();
-        this.data.set(b.serverId, m);
-      }
-      m.set(b.minTs, { cpu: b.cpu, mem_used: b.mem_used, mem_total: b.mem_total, net_in: b.net_in, net_out: b.net_out, extra: b.extra });
-      this.trim(m);
+      const minTs = Number(b.minTs);
+      const v = { cpu: b.cpu, mem_used: b.mem_used, mem_total: b.mem_total, net_in: b.net_in, net_out: b.net_out, extra: b.extra };
+      // 内存缓存 + storage 持久（storage 为唯一事实源；写失败降级仅内存，不阻断上报）
+      try {
+        const m = await this.ensureHot(b.serverId);
+        m.set(minTs, v);
+        this.trim(m);
+        await this.state.storage.put(this.hotKey(b.serverId, minTs), JSON.stringify(v));
+      } catch { /* storage 不可用时降级为纯内存（仅当前实例生命周期） */ }
       this.scheduleArchive();
       // 告警/探活去重判定搭本次 /report 调用顺风车（零额外请求）；失败不影响监控存储
       try {
@@ -1415,8 +1450,8 @@ export class MetricsDO {
     if (url.pathname === '/query' && request.method === 'GET') {
       const serverId = Number(url.searchParams.get('server_id')) || 0;
       const limit = Number(url.searchParams.get('limit')) || METRICS_KEEP_MIN;
-      const m = this.data.get(serverId);
-      if (!m) return json([]);
+      // 从 storage 恢复（实例 evict 后 data 缓存为空），保证热区查询不丢数据
+      const m = await this.ensureHot(serverId);
       const arr = [...m.entries()]
         .sort((a, b) => a[0] - b[0])
         .slice(-limit)
@@ -1427,7 +1462,9 @@ export class MetricsDO {
     // 返回所有服务器的最新一条指标（面板卡片实时指标用）
     if (url.pathname === '/latest' && request.method === 'GET') {
       const out = {};
+      const seen = new Set(); // 已从缓存读过的 serverId
       for (const [serverId, m] of this.data) {
+        seen.add(serverId);
         if (!m.size) continue;
         let lastTs = -1;
         let lastV = null;
@@ -1438,15 +1475,33 @@ export class MetricsDO {
           out[serverId] = { ts: lastTs, cpu: lastV.cpu, mem_used: lastV.mem_used, mem_total: lastV.mem_total, net_in: lastV.net_in, net_out: lastV.net_out, extra: lastV.extra };
         }
       }
+      // 从 storage 补齐缓存外的服务器（实例 evict 后 latest 不丢）
+      const keys = await this.listStorage('m:');
+      for (const k of keys) {
+        const rest = k.name.slice(2); // 去掉 'm:'
+        const sep = rest.indexOf(':');
+        if (sep <= 0) continue;
+        const serverId = Number(rest.slice(0, sep));
+        if (seen.has(serverId)) continue;
+        const ts = Number(rest.slice(sep + 1));
+        const cur = out[serverId];
+        if (!cur || ts > cur.ts) {
+          const v = JSON.parse(k.value);
+          out[serverId] = { ts, cpu: v.cpu, mem_used: v.mem_used, mem_total: v.mem_total, net_in: v.net_in, net_out: v.net_out, extra: v.extra };
+        }
+      }
       return json(out);
     }
 
-    // 删除服务器时清理内存热区与归档标记（防止残留数据被 alarm 重新归档回 D1）
+    // 删除服务器时清理 storage 热区与内存缓存（防残留数据被 alarm 重新归档回 D1）
     if (url.pathname === '/drop' && request.method === 'POST') {
       const b = await request.json();
       const serverId = Number(b.server_id) || 0;
+      try {
+        const keys = await this.listStorage(this.hotPrefix(serverId));
+        await Promise.all(keys.map((k) => this.state.storage.delete(k.name)));
+      } catch { /* storage 不可用则仅清内存 */ }
       this.data.delete(serverId);
-      this.archived.delete(serverId);
       // 清理该服务器的告警冷却与探活状态（键前缀 serverId:）
       for (const k of [...this.alertLast.keys()]) {
         if (k.startsWith(`${serverId}:`)) this.alertLast.delete(k);
@@ -1603,21 +1658,30 @@ export class MetricsDO {
     }
     const cutoff = Math.floor(Date.now() / 1000 / 60) - ARCHIVE_AFTER_MIN;
     const stmts = [];
-    for (const [serverId, m] of this.data) {
-      const done = this.archived.get(serverId) || new Set();
-      for (const [ts, v] of m) {
-        if (ts <= cutoff && !done.has(ts)) {
+    const dels = [];
+    // 归档：从 storage 读取超过 1 小时的行 → 落 D1 → 删除 storage 行（删除即天然防重复归档）
+    try {
+      const keys = await this.listStorage('m:');
+      for (const k of keys) {
+        const rest = k.name.slice(2); // 去掉 'm:'
+        const sep = rest.indexOf(':');
+        if (sep <= 0) continue;
+        const serverId = Number(rest.slice(0, sep));
+        const ts = Number(rest.slice(sep + 1));
+        if (ts <= cutoff) {
+          const v = JSON.parse(k.value);
           stmts.push(
             this.env.DB.prepare(
               'INSERT OR IGNORE INTO metrics_min (server_id, ts, cpu, mem_used, net_in, net_out, extra) VALUES (?,?,?,?,?,?,?)'
             ).bind(serverId, ts, v.cpu, v.mem_used, v.net_in, v.net_out, v.extra ? JSON.stringify(v.extra) : null)
           );
-          done.add(ts);
+          dels.push(this.state.storage.delete(k.name));
         }
       }
-      if (done.size) this.archived.set(serverId, done);
-    }
+    } catch { /* storage 不可用则跳过本次归档（行保留，下次重试） */ }
     if (stmts.length) await this.env.DB.batch(stmts);
+    await Promise.all(dels);
+    // 同步清理内存缓存中的已归档数据
     for (const [, m] of this.data) {
       for (const ts of [...m.keys()]) {
         if (ts <= cutoff) m.delete(ts);

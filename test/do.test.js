@@ -21,6 +21,14 @@ function mockState(store = {}) {
     async delete(k) {
       map.delete(k);
     },
+    async list(opts = {}) {
+      const prefix = opts.prefix || '';
+      const keys = [];
+      for (const [k, v] of map) {
+        if (k.startsWith(prefix)) keys.push({ name: k, value: v });
+      }
+      return { keys };
+    },
     setAlarm(ts) {
       this.alarmTs = ts;
     },

@@ -597,7 +597,9 @@
       const chunk = file.slice(fileUpload.sent, Math.min(fileUpload.sent + FILE_CHUNK, file.size));
       reader.onload = () => {
         const b64 = String(reader.result).split(',')[1] || '';
-        fileSend({ type: 'write', path: fileJoin(fileCwd, file.name), offset: fileUpload.sent, data: b64 });
+        // H-07 原子写：最后一块 commit=true，agent 端 fsync + rename 原子替换目标文件
+        const commit = fileUpload.sent + chunk.size >= file.size;
+        fileSend({ type: 'write', path: fileJoin(fileCwd, file.name), offset: fileUpload.sent, data: b64, commit });
         fileUpload.sent += chunk.size;
         if (fileUpload.sent < file.size) readNext();
         else $('#file-msg').textContent = '已全部发送，等待写入确认...';

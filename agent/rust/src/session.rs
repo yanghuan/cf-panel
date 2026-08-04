@@ -218,7 +218,8 @@ async fn handle_file_cmd(line: &str) -> String {
         "write" => {
             let offset = v.get("offset").and_then(|x| x.as_u64()).unwrap_or(0);
             let data = v.get("data").and_then(|x| x.as_str()).unwrap_or("").to_string();
-            file_write(path, offset, data).await
+            let commit = v.get("commit").and_then(|x| x.as_bool()).unwrap_or(false);
+            file_write(path, offset, data, commit).await
         }
         _ => err_json("unknown cmd"),
     }
@@ -316,21 +317,31 @@ async fn file_read(path: String, offset: u64, limit: u64) -> String {
     }
 }
 
-async fn file_write(path: String, offset: u64, data: String) -> String {
+async fn file_write(path: String, offset: u64, data: String, commit: bool) -> String {
     match blocking_with_timeout(30, move || {
         use std::io::{Seek, SeekFrom};
+        // H-07 原子写：写同目录临时文件 {path}.upload，commit（最后一块）时 fsync + rename
+        // 原子替换目标文件。失败/中断只留下临时文件残留，目标文件不被破坏；
+        // 多块上传必须首块 offset=0 且最后一块 commit=true（前端协议约定）。
+        let tmp = format!("{}.upload", path);
         if let Some(parent) = std::path::Path::new(&path).parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        let mut f = match std::fs::OpenOptions::new().create(true).write(true).open(&path) {
+        let cleanup = |tmp: &str| {
+            let _ = std::fs::remove_file(tmp);
+        };
+        let mut f = match std::fs::OpenOptions::new().create(true).write(true).open(&tmp) {
             Ok(f) => f,
             Err(_) => return err_json("write failed"),
         };
+        // 首块（offset=0）清空残留临时文件；其余块续写到指定偏移
         if offset == 0 {
             if f.set_len(0).is_err() || f.seek(SeekFrom::Start(0)).is_err() {
+                cleanup(&tmp);
                 return err_json("write failed");
             }
         } else if f.seek(SeekFrom::Start(offset)).is_err() {
+            cleanup(&tmp);
             return err_json("write failed");
         }
         // 流式 base64 解码：边解边写，内部缓冲固定 WRITE_BUF，内存不随入站块大小增长。
@@ -345,18 +356,30 @@ async fn file_write(path: String, offset: u64, data: String) -> String {
                 Ok(0) => break,
                 Ok(n) => {
                     if f.write_all(&buf[..n]).is_err() {
+                        cleanup(&tmp);
                         return err_json("write failed");
                     }
                 }
-                Err(_) => return err_json("write failed"),
+                Err(_) => {
+                    cleanup(&tmp);
+                    return err_json("write failed");
+                }
             }
         }
-        let cur = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        // 大小校验（针对临时文件）
+        let cur = std::fs::metadata(&tmp).map(|m| m.len()).unwrap_or(0);
         if cur > FILE_LIMIT {
-            let _ = std::fs::remove_file(&path);
+            cleanup(&tmp);
             return err_json("file exceeds 500MB limit, aborted");
         }
-        serde_json::json!({ "type": "write_result", "ok": true, "path": path, "offset": offset }).to_string()
+        // commit：fsync + 原子 rename 覆盖目标文件
+        if commit {
+            if f.sync_all().is_err() || std::fs::rename(&tmp, &path).is_err() {
+                cleanup(&tmp);
+                return err_json("write failed");
+            }
+        }
+        serde_json::json!({ "type": "write_result", "ok": true, "path": path, "offset": offset, "commit": commit }).to_string()
     })
     .await
     {

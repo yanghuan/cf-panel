@@ -31,7 +31,7 @@ if [ -z "${E2E_PASSWORD:-}" ] && [ -f "$ROOT/.dev.vars" ]; then
 fi
 E2E_PASSWORD="${E2E_PASSWORD:-}"
 # agent 启动命令（默认 Shell 版；可用 AGENT_CMD 换成其他实现，如 Rust 版）
-AGENT_CMD="${AGENT_CMD:-bash $ROOT/agent/agent.sh}"
+AGENT_CMD="${AGENT_CMD:-bash $ROOT/agent/shell/agent.sh}"
 
 cleanup() {
   # 只清理本次启动的进程（按进程组 kill，避免全局 pkill 误杀同机其他 wrangler/agent）

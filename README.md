@@ -16,8 +16,9 @@ cf-panel/
 ├── schema.sql           # D1 数据库表（含 kv_json 键值表）
 ├── src/index.js         # Worker：REST API + 鉴权 + TerminalDO 双端对拷 + PanelDO 实时推送
 ├── public/              # 前端（index.html / app.js / style.css）
-├── agent/               # 被控机 agent（agent.sh 含监控上报 / systemd 模板）
-│   └── rust/            # Rust 版 agent（同协议对等实现，低内存设备可选）
+├── agent/               # 被控机 agent（README / systemd 模板）
+│   ├── rust/            # ✅ Rust 版 agent（推荐：内存低、单进程、全静态任意发行版直跑）
+│   └── shell/           # ⚠️ Shell 版 agent（已废弃，保留参考/过渡）
 └── docs/architecture.md # 架构设计文档
 ```
 
@@ -177,37 +178,37 @@ wrangler secret put PANEL_USERS      # 回车后粘贴值，如 alice:pass1,bob:
 }
 ```
 
-> 告警支持：CPU/内存/磁盘（根分区）/负载超阈值 + 机器离线/恢复通知。内存告警依赖 agent `mem_total` 上报（新版 agent.sh）。
+> 告警支持：CPU/内存/磁盘（根分区）/负载超阈值 + 机器离线/恢复通知。内存告警依赖 agent 上报 `mem_total`。
 
 本地调试：`wrangler dev --local`（本地 SQLite 建表：`wrangler d1 execute cf-panel --local --file=schema.sql`）。
 
 ## 二、添加服务器并安装 agent
 
 1. 在面板点「添加服务器」→ 填名称（可选填分组）→ 弹出一次性 agent 配置（WSS 地址 / KEY），**妥善保存**。KEY 是 agent 的唯一身份 + 凭证（uuid 已废弃）。
-2. 在目标 Linux 机器上安装依赖：
-   ```bash
-   # websocat（必装）：https://github.com/vi/websocat/releases 下载静态二进制
-   # socat / jq（一般发行版自带）
-   apt install -y socat jq   # Debian/Ubuntu
-   ```
-3. 放置脚本并配置环境：
+2. 部署 agent（**推荐 Rust 版**：单文件、无依赖、任意 Linux 直跑；可构建或从 GitHub Releases 下载全静态二进制）：
    ```bash
    mkdir -p /opt/cf-panel-agent
-   cp agent/agent.sh /opt/cf-panel-agent/
-   chmod +x /opt/cf-panel-agent/agent.sh
-  cat > /etc/cf-panel-agent.env <<EOF
-  AGENT_WSS_URL=wss://<面板域名>/ws/agent
-  AGENT_KEY=<你的 key>
-  DISABLE_EXEC=0   # 设为 1 可全局禁止命令执行（终端不可用，仅保留监控）
-  EOF
+   # 方式一：GitHub Releases 下载（CI 自动发布）
+   # curl -L -o /opt/cf-panel-agent/cf-panel-agent <Releases 下载地址>
+   # 方式二：本地构建（agent/rust）
+   #   cd agent/rust && cargo build --release
+   #   cp target/release/cf-panel-agent /opt/cf-panel-agent/
+   chmod +x /opt/cf-panel-agent/cf-panel-agent
+   cat > /etc/cf-panel-agent.env <<EOF
+   AGENT_WSS_URL=wss://<面板域名>/ws/agent
+   AGENT_KEY=<你的 key>
+   DISABLE_EXEC=0   # 设为 1 可全局禁止命令执行（终端不可用，仅保留监控）
+   EOF
    ```
-4. 注册 systemd 服务：
+   > 全部可配置环境变量及默认值：`/opt/cf-panel-agent/cf-panel-agent --help`
+3. 注册 systemd 服务：
    ```bash
    cp agent/cf-panel-agent.service /etc/systemd/system/
    systemctl daemon-reload && systemctl enable --now cf-panel-agent
    journalctl -u cf-panel-agent -f   # 看日志
    ```
-5. 监控上报已内置：agent.sh 经控制通道 WS 上报 CPU / 内存 / Swap / 磁盘 / 负载 / 温度 / 进程数 / TCP-UDP 连接数 / 网络速率 / 系统信息（无需 crontab）。**省配额策略**：有面板观看者时约 3 秒上报（服务端动态下发），无人查看时 120 秒低频采样；`REPORT_INTERVAL` 可设默认值。
+   > 旧版 Shell agent（`agent/shell/agent.sh`）已废弃：需安装 websocat/socat/jq，环境变量与 Rust 版一致，仅作过渡/参考。
+5. 监控上报已内置：agent 经控制通道 WS 上报 CPU / 内存 / Swap / 磁盘 / 负载 / 温度 / 进程数 / TCP-UDP 连接数 / 网络速率 / 系统信息（无需 crontab）。**省配额策略**：有面板观看者时约 3 秒上报（服务端动态下发），无人查看时 120 秒低频采样；`REPORT_INTERVAL` 可设默认值。
 6. 可选：服务探活（agent 上配置 `PROBES` 探测本机 HTTP/TCP 服务，结果随上报展示在卡片 + 失败告警）：
    ```bash
    # 追加到 /etc/cf-panel-agent.env
@@ -228,7 +229,7 @@ wrangler secret put PANEL_USERS      # 回车后粘贴值，如 alice:pass1,bob:
 - **自定义监控项**：agent 配置 `CUSTOM_METRICS`（JSON：`name`+`cmd`）后，执行任意命令采集数值指标；监控图中以独立曲线展示（按 ts 对齐系统时间轴，共用右轴看趋势），数据直写 D1 `metrics_custom` 表（30 天保留）。
 - **实时列表**：登录后前端与 `/ws/push` 保持 WebSocket，客户端每 3 秒发一次 sync 请求，服务端（PanelDO，Hibernation 休眠态，费用趋近普通 Worker）按权限返回服务器列表（在线状态自动更新），无需手动刷新。
 - **终端**：面板服务器卡片点「终端」→ xterm.js 弹出 → 按键实时到达被控机 shell；窗口拉伸自动 resize（经控制通道 `stty` 下发）；断线自动重连（最多 3 次）。
-- **文件管理**：面板服务器卡片点「文件」→ 弹出文件管理器，可浏览目录（点击进入/上级/路径跳转）、**上传**（本地文件写入 agent）、**下载**（agent 文件回传浏览器）；文件经独立 WS 会话**分段传输**（1MB/段，base64），**单文件上限 500MB**（需 GNU coreutils 的 `find -printf`/`tail -c`/`base64 -w0`）。
+- **文件管理**：面板服务器卡片点「文件」→ 弹出文件管理器，可浏览目录（点击进入/上级/路径跳转）、**上传**（本地文件写入 agent）、**下载**（agent 文件回传浏览器）；文件经独立 WS 会话**分段传输**（1MB/段，base64），**单文件上限 500MB**（Rust 版无额外依赖；Shell 版需 GNU coreutils）。
 - **监控**：点「监控」默认看近 12 小时分钟数据（内存 DO 热区，秒回）；可切 1小时/3天/7天/30天查看 D1 归档历史（分钟粒度，超长区间自动降采样）。指标：CPU / 内存 / Swap / 磁盘（根分区）/ 负载 / 温度 / 进程数；服务器卡片显示 OS / 内核 / IP 系统信息。
 - **分组与排序**：添加服务器可填「分组」和「序号」，列表按分组展示、组内按序号排序（未填归入「未分组」）。
 - **登录**：`PANEL_USERS` 多用户（`user:pass,user:pass`）或单管理员（`PANEL_PASSWORD`），登录即管理员。**暴力破解防护推荐用前置的 Cloudflare Access**（面板整体放在 Access 之后，登录密码作为第二层）；应用内置不再限流。

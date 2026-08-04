@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
 # ============================================================
+# ⚠️ 已废弃（DEPRECATED）——推荐使用 Rust 版：agent/rust（cargo build --release 或 Releases 下载）
+#    Rust 版优势：内存更低（实测 1.9MB vs 11MB）、单进程、无外部二进制依赖（websocat/socat/jq）、
+#    全静态编译任意发行版直跑、协议完全一致可无缝替换。本 Shell 版保留供参考/旧环境过渡，不再演进。
+# ============================================================
 # cf-panel agent —— 纯 Shell 实现（websocat + socat + jq）
 # 对齐 docs/architecture.md §3.5
 # 依赖: websocat(必装), socat(resize 需要), jq, pgrep(会话结束清理进程组), bash, stty

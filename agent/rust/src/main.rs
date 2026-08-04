@@ -223,11 +223,32 @@ async fn report_loop(cfg: &Config, write: &Arc<Mutex<Sink>>, interval: &Arc<Atom
 }
 
 // ---------------- 入口 ----------------
+fn print_help() {
+    println!("cf-panel agent（Rust 版）——与 agent.sh 同协议的对等实现");
+    println!("用法：AGENT_WSS_URL=wss://<面板>/ws/agent AGENT_KEY=<key> ./cf-panel-agent [--help]");
+    println!();
+    println!("可配置环境变量：");
+    println!("  AGENT_WSS_URL     必填  面板 agent WebSocket 地址（wss://<域名>/ws/agent）");
+    println!("  AGENT_KEY         必填  agent 身份 + 凭证（面板「添加服务器」时生成）");
+    println!("  REPORT_INTERVAL   默认 120   默认上报间隔（秒）；有观看者时服务端动态下发 3s");
+    println!("  DISABLE_EXEC      默认 0     设为 1 禁用终端/文件管理（仅保留监控）");
+    println!("  PROBES            默认 空    服务探活：\"name:http:URL,name:tcp:host:port,...\"");
+    println!("  CUSTOM_METRICS    默认 空    自定义指标 JSON：[{{\"name\":\"x\",\"cmd\":\"命令\"}}]");
+    println!("  AGENT_TMPDIR      默认 /tmp/cfpanel-<key前8位>   临时目录");
+    println!("  AGENT_LOG         默认 /tmp/cfpanel-<key前8位>-agent.log   日志文件");
+    println!("  AGENT_LOG_MAX     默认 262144   日志轮转上限（字节）");
+}
+
 #[tokio::main]
 async fn main() {
+    // --help：打印配置说明
+    if std::env::args().any(|a| a == "--help" || a == "-h" || a == "help") {
+        print_help();
+        std::process::exit(0);
+    }
     let cfg = read_config();
     if cfg.wss.is_empty() || cfg.key.is_empty() {
-        eprintln!("AGENT_WSS_URL 与 AGENT_KEY 必须设置");
+        eprintln!("AGENT_WSS_URL 与 AGENT_KEY 必须设置（./cf-panel-agent --help 查看全部配置）");
         std::process::exit(1);
     }
     let _ = CONFIG.set(cfg.clone());

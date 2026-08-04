@@ -111,9 +111,11 @@ DO 是整个设计的心脏，对应哪吒 Dashboard 里那两个 `io.Copy` 的�
   3. `pty.Start(shell)` 起一个真实 PTY；
   4. 起两个协程：`producePTYOutput`（PTY 输出 → WS 发回 DO）、`receiveInput`（WS 收字节 → 写 PTY stdin）。
 
-### 3.5 外部 Agent 实现选型（2026-08-02 确定：纯 Shell）
+### 3.5 外部 Agent 实现选型
 
-采用**纯 Shell 脚本**实现 agent，不依赖 Python / 编译型二进制，方便任意机器直接部署：
+> **现状（2026-08）**：已完成 **Rust 版实现（`agent/rust/`，推荐）**，与协议完全对齐；初版 **Shell 版（`agent/shell/agent.sh`，已废弃）** 保留供参考/过渡。两者环境变量与协议一致，可无缝替换。
+
+**初版（2026-08-02 确定）为纯 Shell**，不依赖 Python / 编译型二进制，方便任意机器直接部署：
 
 **依赖清单**
 
@@ -195,7 +197,7 @@ done
 - 上报内容：固定列（CPU/内存/网络速率）+ `extra` JSON（Swap/磁盘/负载/温度/进程数/TCP-UDP 连接数，紧凑短 key 不压缩）+ `info`（OS/内核/IP，服务端比对变化才更新 `servers.info_json`）。网络速率由 agent 对 `/proc/net/dev` 累计值做差分，避免累计值当速率。
 - **省配额策略**：PanelDO 暴露 `/viewers` RPC（`state.getWebSockets().length` 统计在线前端）；TerminalDO 在 agent 控制通道建立与每次上报后查询它，通过 `{type:"set_report_interval", interval}` 下发间隔（仅变化时）：有观看者 3s 快采、无人 120s 低频采样——配额从"时刻满采"降到"只在有人看时满采"。首位观看者上线时 PanelDO 还会向各分片广播 `/rpc/wakeup`，agent 立即切快采（免等下一次上报）。agent 端把下发的间隔写入 `$TMP_DIR/report-interval`，上报循环每次唤醒后读取。
 - **文件管理**：与终端同构的独立会话——面板 `POST /api/file/open` 创建会话并下发 `open_file` 指令，agent 用 `websocat` 连回 `/ws/agent/file` 跑 `file-server.sh`（JSON 行协议：`list`/`read`/`write`，文件内容 base64）；浏览器经 `/ws/file/{sid}` 透传。服务端复用 TerminalDO 会话注册表/权限/清理，DO 只做双向透传。
-- 权衡：零解释器依赖、部署极简；并发能力弱于编译型 agent，适合个人/小规模；协议不变，后续可无缝迁移 Go/Rust agent。
+- 权衡：Shell 版零解释器依赖、部署极简；但并发弱、进程多、每终端 +9MB。已实现 **Rust 版（`agent/rust/`）替代**：实测内存 1.9MB（全静态 musl）、单进程、无外部二进制依赖，协议一致可无缝替换；Shell 版废弃保留参考。
 
 #### 3.5.1 内存占用对比（低内存设备选型）
 
@@ -239,7 +241,7 @@ agent 可能运行在低内存设备（OpenWrt 路由器 / 树莓派 Zero 等）
 - **综合性价比 Go 最优**：内存仅比 Rust 多 ~2 MB（同处几 MB 级），但开发效率、交叉编译（一条命令）、生态成熟度全面占优。
 - 多终端场景 Shell 因"每终端 +9MB + 进程爆炸"在 64MB 设备上最脆弱；Go/Rust 单进程是"低内存 + 常开多终端"的正解。
 - **保留 Shell 的真正理由不是内存，而是运维/部署**：零编译、脚本即改即用、无需任何工具链、对已有机器直接跑（`apt install socat jq` + 下载 websocat）。
-- 决策建议：目标设备 ≥256MB 且终端并发少 → 维持 Shell；目标含 64~128MB 低端设备或常开多终端 → 优先迁移 **Go**（若团队熟悉 Rust 且追求极限内存 → Rust；协议不变，见 §3.5 权衡）。
+- 决策建议：**Rust 版已实现（`agent/rust/`）为推荐默认**（内存最省、全静态单文件、任意发行版直跑）；Shell 版废弃。若团队 Rust 维护成本高且设备内存 ≥256MB，可用 Go 重写（协议不变，见 §3.5 权衡）。
 
 ### 3.6 PTY（伪终端）
 - 用 `creack/pty`（Go）或等价的 PTY 库（其它语言）在 slave 端启动 shell，`TERM=xterm`。

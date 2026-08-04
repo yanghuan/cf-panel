@@ -168,31 +168,40 @@ fi
 # 6) 终端双向透传（需 socat；本地无 socat 时跳过）
 echo "[6/6] 终端会话 ..."
 if command -v socat >/dev/null 2>&1; then
-  TERM_RES=$(curl -s -X POST "$BASE/api/terminal" \
-    -H "authorization: Bearer $TOKEN" \
-    -H 'content-type: application/json' \
-    -d '{"server_id":1}' || true)
-  SID=$(jq -r .session_id <<<"$TERM_RES" 2>/dev/null || true)
-  if [ -z "$SID" ] || [ "$SID" = "null" ]; then
-    bad "创建终端会话失败：$TERM_RES"
-  else
+  # 终端用例允许失败重试（最多 3 次）：DO 会话水合 / agent WS 就绪存在时序竞态，
+  # CI runner 负载高时偶发首连被拒（websocat 立即退出 → 无回显），重试可自愈
+  TERM_OK=0
+  for attempt in 1 2 3; do
+    TERM_RES=$(curl -s -X POST "$BASE/api/terminal" \
+      -H "authorization: Bearer $TOKEN" \
+      -H 'content-type: application/json' \
+      -d '{"server_id":1}' || true)
+    SID=$(jq -r .session_id <<<"$TERM_RES" 2>/dev/null || true)
+    if [ -z "$SID" ] || [ "$SID" = "null" ]; then
+      bad "创建终端会话失败：$TERM_RES"
+      break
+    fi
     # 等待 agent 侧 spawn（socat+websocat）就绪，避免首字节被丢弃
     sleep 3
     # agent 数据流可能晚于浏览器 WS 注册，重复发送 echo 覆盖竞态窗口（DO 对未注册前
     # 的浏览器输入会直接丢弃，因此发到 agent 就绪后的那条 echo 必然产生回显）
-    # 鉴权走首帧 {type:"auth"}（token 不进 URL）
+    # 鉴权走首帧 {type:"auth"}（token 不进 URL）；websocat 提前退出时 printf 静音防 Broken pipe 噪音
     OUT=$(
       {
         printf '{"type":"auth","token":"%s"}\n' "$TOKEN"
-        for _ in 1 2 3 4 5 6 7 8 9 10; do printf 'echo E2E_TERM_OK\n'; sleep 1; done
+        for _ in 1 2 3 4 5 6 7 8 9 10; do printf 'echo E2E_TERM_OK\n' 2>/dev/null || true; sleep 1; done
       } | timeout 30 websocat -t "ws://127.0.0.1:$PORT/ws/terminal/$SID" 2>/dev/null || true
     )
     if grep -q "E2E_TERM_OK" <<<"$OUT"; then
       ok "终端双向透传正常（收到 shell 回显）"
-    else
-      bad "终端无回显（socat/websocat 可能未安装或 PTY 未就绪）"
-      tail -10 "$AGENT_LOG" 2>/dev/null || true
+      TERM_OK=1
+      break
     fi
+    echo "  终端尝试 $attempt/3 未回显，重建会话重试..."
+  done
+  if [ "$TERM_OK" -eq 0 ]; then
+    bad "终端无回显（socat/websocat 可能未安装或 PTY 未就绪）"
+    tail -10 "$AGENT_LOG" 2>/dev/null || true
   fi
 else
   echo "  （跳过：未检测到 socat，终端用例仅在 CI 运行）"

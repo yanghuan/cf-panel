@@ -699,6 +699,42 @@ test('TerminalDO: 控制通道上报后回复心跳 ping（30s 限频）', async
   assert.equal(pingCount(), 1, '30s 内限频只发一次心跳');
 });
 
+test('TerminalDO: agent 流挂接前浏览器输入缓冲，挂接后按序补发（M-03）', async () => {
+  const env = makeEnv();
+  const inst = new TerminalDO(mockState(), env);
+  const browserWs = { send() {}, readyState: 1 };
+  inst.sessions.set('0-sid', {
+    streamId: '0-sid', serverId: 1, creatorUserId: 1, createdAt: Date.now(), type: 'terminal',
+    userWs: browserWs, agentWs: null, userBuf: [], agentBuf: [],
+  });
+  // agent 数据流尚未挂接：输入被缓冲，不丢弃
+  await inst.webSocketMessage(browserWs, 'echo hi');
+  await inst.webSocketMessage(browserWs, 'echo bye');
+  const sess = inst.sessions.get('0-sid');
+  assert.deepEqual(sess.agentBuf, ['echo hi', 'echo bye'], '输入被缓冲');
+
+  // 挂接 agent 数据流 → 按序补发并清空
+  const sent = [];
+  const agentFlow = { send: (m) => sent.push(m), readyState: 1 };
+  inst.attachAgentFlow(sess, agentFlow);
+  assert.deepEqual(sent, ['echo hi', 'echo bye'], '挂接后按序补发');
+  assert.equal(sess.agentBuf.length, 0, '补发后清空');
+});
+
+test('MetricsDO: 归档超过 100 行分批 batch 落 D1（M-05）', async () => {
+  const env = makeEnv();
+  const st = mockState();
+  const { inst, call } = mkMetrics(env, st);
+  const nowMin = Math.floor(Date.now() / 1000 / 60);
+  for (let i = 0; i < 150; i++) {
+    // 全部 >60min 归档线（且 <12h 热区上限），确保 150 行都归档
+    await call('/report', { method: 'POST', body: JSON.stringify({ serverId: 1, minTs: nowMin - 220 + i, cpu: i }) });
+  }
+  await inst.alarm();
+  const rows = await env.DB.prepare('SELECT COUNT(*) AS c FROM metrics_min WHERE server_id = 1').all();
+  assert.equal(rows.results[0].c, 150, '分批归档全部落 D1');
+});
+
 test('TerminalDO: 控制通道重连时关闭该服务器旧会话流（dropAgentSessions）', async () => {
   const inst = new TerminalDO(mockState(), makeEnv());
   const oldWs = { closed: false, close() { this.closed = true; } };

@@ -1094,6 +1094,7 @@ export class TerminalDO {
           userWs: null,
           agentWs: null,
           userBuf: [], // 浏览器鉴权挂接前缓冲 agent 输出（如初始 bash 提示符），鉴权后补发
+          agentBuf: [], // M-03：agent 数据流挂接前缓冲浏览器输入，挂接后按序补发
         });
         // 会话元数据持久化到 DO Storage：防 DO 休眠后、浏览器/agent WS 挂接前会话丢失
         // （否则前端会先看到"连接断开"，重连才成功）
@@ -1186,7 +1187,8 @@ export class TerminalDO {
       if (hash !== server.agent_key_hash) return new Response('bad key', { status: 401 });
       const pair = new WebSocketPair();
       this.state.acceptWebSocket(pair[1]);
-      sess.agentWs = pair[1];
+      // M-03：挂接 agent 数据流并按序补发缓冲的浏览器输入
+      this.attachAgentFlow(sess, pair[1]);
       // 附件随连接持久化：休眠唤醒后靠它重建会话索引
       pair[1].serializeAttachment({
         role: 'agent', sid, serverId: sess.serverId,
@@ -1216,7 +1218,7 @@ export class TerminalDO {
     try {
       const raw = await this.state.storage.get('sess:' + streamId);
       if (raw) {
-        sess = { ...raw, userWs: null, agentWs: null, userBuf: [] };
+        sess = { ...raw, userWs: null, agentWs: null, userBuf: [], agentBuf: [] };
         this.sessions.set(streamId, sess);
       }
     } catch { /* 水合失败按不存在处理 */ }
@@ -1308,12 +1310,24 @@ export class TerminalDO {
             userWs: null,
             agentWs: null,
             userBuf: [],
+            agentBuf: [],
           };
           this.sessions.set(att.sid, sess);
         }
         if (att.role === 'user') sess.userWs = ws;
         else sess.agentWs = ws;
       }
+    }
+  }
+
+  // 挂接 agent 数据流：赋值 agentWs + 按序补发挂接前缓冲的浏览器输入（M-03，防静默丢弃）
+  attachAgentFlow(sess, ws) {
+    sess.agentWs = ws;
+    if (sess.agentBuf && sess.agentBuf.length) {
+      for (const m of sess.agentBuf) {
+        try { ws.send(m); } catch { /* ignore */ }
+      }
+      sess.agentBuf = [];
     }
   }
 
@@ -1433,6 +1447,10 @@ export class TerminalDO {
         }
       }
       if (sess.agentWs) sess.agentWs.send(message);
+      else if (sess.agentBuf && sess.agentBuf.length < 128) {
+        // M-03：agent 数据流尚未挂接 → 缓冲浏览器输入（有上限），挂接后按序补发，避免静默丢弃
+        sess.agentBuf.push(message);
+      }
     } else if (ws === sess.agentWs) {
       // agent → DO → 浏览器（纯字节透传）
       if (sess.userWs) {
@@ -1812,8 +1830,11 @@ export class MetricsDO {
         if (ts <= keepCutoff) keysToDelete.push(k.name);
       }
     } catch { /* storage 不可用则跳过本次清理（行保留，下次重试） */ }
-    // H-02：D1 写入成功后才删除 storage 行（防 D1 失败时两端数据丢失）
-    if (stmts.length) await this.env.DB.batch(stmts);
+    // H-02：D1 写入成功后才删除 storage 行（防 D1 失败时两端数据丢失）；
+    // M-05：D1 batch 单次最多 100 条，分批提交（防归档积压/服务器增多后单次超大 batch 超限）
+    for (let i = 0; i < stmts.length; i += 100) {
+      await this.env.DB.batch(stmts.slice(i, i + 100));
+    }
     await Promise.all(keysToDelete.map((name) => this.state.storage.delete(name)));
     // 同步清理内存缓存中超过热区上限的数据
     for (const [, m] of this.data) {

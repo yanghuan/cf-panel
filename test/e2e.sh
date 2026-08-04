@@ -81,14 +81,14 @@ wait_for() { # wait_for 描述 秒数 命令...
 
 echo "== cf-panel E2E（port=$PORT，临时目录 $TMP）=="
 
-# 1) 先应用 D1 schema（避免与 dev 服务器并发打开 SQLite 的竞态）
-echo "[1/6] 初始化 D1 schema ..."
-if ! npx wrangler d1 execute cf-panel --local --persist-to "$STATE" --file="$ROOT/schema.sql" >>"$WRANGLER_LOG" 2>&1; then
-  bad "D1 schema 初始化失败"
+# 1) 先应用 D1 migrations（与部署流水线同一路径，避免与 dev 服务器并发打开 SQLite 的竞态）
+echo "[1/6] 初始化 D1 migrations ..."
+if ! npx wrangler d1 migrations apply cf-panel --local --persist-to "$STATE" >>"$WRANGLER_LOG" 2>&1; then
+  bad "D1 migrations 应用失败"
   tail -20 "$WRANGLER_LOG" 2>/dev/null || true
   exit 1
 fi
-ok "D1 schema 已建表"
+ok "D1 migrations 已应用"
 
 # 2) 启动 wrangler dev --local（独立 persist 目录，不影响仓库 .wrangler）
 echo "[2/6] 启动 wrangler dev --local ..."

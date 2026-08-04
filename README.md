@@ -29,8 +29,13 @@ cf-panel/
 利用 Cloudflare **Workers Builds**（Git 集成）在 Dashboard 直连 GitHub 仓库，push 即自动部署；`wrangler.toml` 中的 D1 / Durable Objects / assets 绑定由仓库配置驱动，构建时自动生效。
 
 1. **创建 D1 数据库（网页端）**：Dashboard → Workers & Pages → **D1** → Create database，名称 `cf-panel`；把 Overview 页的 **database_id** 填入 `wrangler.toml` 的 `[[d1_databases]]`（当前为占位符 `REPLACE_WITH_D1_DATABASE_ID`），提交并推送。
-2. **建表（网页端）**：在该 D1 数据库页 → **Console** 粘贴执行 `schema.sql` 全部内容（或 **Import** 上传该文件）。
-3. **连接 GitHub 自动部署**：Workers & Pages → Create application → **Import a repository** → Get started → 授权 GitHub 并选择仓库。项目名须与 `wrangler.toml` 的 `name = "cf-panel"` **完全一致**，根目录 `/`，Save and Deploy。之后每次 `git push` 自动重新部署，可在 Worker 的 **Deployments** 页查看构建历史。
+2. **建表/迁移**：数据库 schema 由 **`wrangler d1 migrations`** 管理（`migrations/0001_create_tables.sql` 初始建表 + 后续增量迁移）。新库可在该 D1 数据库页 → **Console** 执行 `wrangler d1 migrations apply` 一次，或直接走下面的 Builds 自动迁移。
+3. **连接 GitHub 自动部署**：Workers & Pages → Create application → **Import a repository** → Get started → 授权 GitHub 并选择仓库。项目名须与 `wrangler.toml` 的 `name = "cf-panel"` **完全一致**，根目录 `/`，Save and Deploy。
+   - **自动迁移建表**（推荐）：在该 Worker → **Builds → Build configuration → Deploy command** 配置为：
+     ```
+     npx wrangler d1 migrations apply cf-panel --remote && npx wrangler deploy
+     ```
+     之后每次 `git push` 自动「迁移建表 + 部署」，**无需手动执行 SQL**（`apply` 按 `migrations/` 序号幂等执行，见下方迁移说明）。
 4. **配置密钥（网页端）**：该 Worker → Settings → Variables and Secrets → 添加 `JWT_SECRET`（必）、`PANEL_USERS` 或 `PANEL_PASSWORD`（必）、`HASH_SECRET`（推荐，见下方密钥详解）。
    > ⚠️ Cloudflare 规则：Worker 配置过 dashboard secret 后，`wrangler deploy` 会被拒绝，只能走 Builds/CI 部署——因此本方式同时是配密钥后的**唯一部署路径**。
    > 告警配置**不需要环境变量**：登录面板 → 设置弹窗 → 「告警」区直接填 Webhook 地址与阈值（存 D1，见下方告警配置）。
@@ -44,8 +49,8 @@ cf-panel/
 # 1. 创建 D1 数据库，把返回的 database_id 填入 wrangler.toml
 wrangler d1 create cf-panel
 
-# 2. 建表（远程库）
-wrangler d1 execute cf-panel --remote --file=schema.sql
+# 2. 建表/迁移（远程库，migrations 管理）
+wrangler d1 migrations apply cf-panel --remote
 
 # 3. 设置密钥（必做，生产安全）
 wrangler secret put JWT_SECRET        # JWT 签名密钥
@@ -57,6 +62,8 @@ wrangler secret put PANEL_PASSWORD    # 单管理员密码（未配置 PANEL_USE
 wrangler deploy
 ```
 
+> **数据库迁移（migrations）**：schema 由 `migrations/` 目录版本化管理，`wrangler d1 migrations apply cf-panel --remote` 幂等执行全部未应用迁移（新库自动建全表，旧库自动补齐增量）。以下为历史旧库的增量对齐命令（已用 migrations 的库无需手动执行）。
+>
 > 已部署过旧版（无 `"group"` 列 / 无 `kv_json` 表）？执行迁移：
 > ```
 > wrangler d1 execute cf-panel --remote --command 'ALTER TABLE servers ADD COLUMN "group" TEXT NOT NULL DEFAULT "";'
@@ -186,7 +193,7 @@ wrangler secret put PANEL_USERS      # 回车后粘贴值，如 alice:pass1,bob:
 
 > 告警支持：CPU/内存/磁盘（根分区）/负载超阈值 + 机器离线/恢复通知。内存告警依赖 agent 上报 `mem_total`。
 
-本地调试：`wrangler dev --local`（本地 SQLite 建表：`wrangler d1 execute cf-panel --local --file=schema.sql`）。
+本地调试：`wrangler dev --local`（本地 SQLite 自动应用 migrations；手动建表：`wrangler d1 migrations apply cf-panel --local`）。
 
 ## 二、添加服务器并安装 agent
 

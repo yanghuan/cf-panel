@@ -30,8 +30,14 @@ if [ -z "${E2E_PASSWORD:-}" ] && [ -f "$ROOT/.dev.vars" ]; then
   E2E_PASSWORD=$(grep -E '^PANEL_PASSWORD=' "$ROOT/.dev.vars" | cut -d= -f2-)
 fi
 E2E_PASSWORD="${E2E_PASSWORD:-}"
-# agent 启动命令（默认 Shell 版；可用 AGENT_CMD 换成其他实现，如 Rust 版）
-AGENT_CMD="${AGENT_CMD:-bash $ROOT/agent/shell/agent.sh}"
+# agent 启动命令（默认 Rust 版；可用 AGENT_CMD 覆盖为其他实现）
+AGENT_CMD="${AGENT_CMD:-$ROOT/agent/rust/target/release/cf-panel-agent}"
+# Shell 版 agent 已废弃：Rust 二进制缺失时给出构建提示，不静默回退
+if [ ! -x "${AGENT_CMD%% *}" ]; then
+  echo "Rust agent 二进制不存在：$AGENT_CMD" >&2
+  echo "请先构建：cd agent/rust && cargo build --release（或设置 AGENT_CMD 指向其他实现）" >&2
+  exit 1
+fi
 
 cleanup() {
   # 只清理本次启动的进程（按进程组 kill，避免全局 pkill 误杀同机其他 wrangler/agent）

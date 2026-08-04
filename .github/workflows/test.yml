@@ -48,5 +48,9 @@ jobs:
           echo "JWT_SECRET=e2e-secret-$(openssl rand -hex 16)" > .dev.vars
           echo "PANEL_PASSWORD=e2e-pass-$(openssl rand -hex 8)" >> .dev.vars
 
-      - name: 运行 E2E（wrangler dev + agent.sh 真实联调）
+      - name: 构建 Rust agent（E2E 默认使用；Shell 版已废弃）
+        uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release --manifest-path agent/rust/Cargo.toml
+
+      - name: 运行 E2E（wrangler dev + Rust agent 真实联调）
         run: bash test/e2e.sh

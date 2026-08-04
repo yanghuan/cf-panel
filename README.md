@@ -63,7 +63,7 @@ wrangler deploy
 > wrangler d1 execute cf-panel --remote --command 'CREATE TABLE IF NOT EXISTS kv_json (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL DEFAULT (datetime("now")));'
 > ```
 >
-> 已按旧版（带 `uuid` 列）添加过服务器？`agent_key_id`（key 指纹）无法从旧数据回填，需要重建 `servers` 表或在面板删除旧服务器后重新添加，agent 端改用新版 `agent.sh`（只配 `AGENT_KEY`，监控上报已内置）：
+> 已按旧版（带 `uuid` 列）添加过服务器？`agent_key_id`（key 指纹）无法从旧数据回填，需要重建 `servers` 表或在面板删除旧服务器后重新添加，agent 端改用 Rust 版 `cf-panel-agent`（只配 `AGENT_KEY`，监控上报已内置）：
 > ```
 > wrangler d1 execute cf-panel --remote --command 'DROP TABLE servers;'
 > # 再执行 wrangler d1 execute cf-panel --remote --file=schema.sql 重建

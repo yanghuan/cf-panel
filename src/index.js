@@ -269,10 +269,13 @@ async function queryMonitorRows(env, serverId, hours) {
     }
     rows = r.results.map((x) => ({ ...x, extra: safeJson(x.extra) }));
   }
-  // 3) 合并去重：热区优先（同 ts 覆盖 D1，取最近上报值）
+  // 3) 合并去重：热区优先（同 ts 覆盖 D1，取最近上报值）；
+  //    并按 sinceMin 过滤：热区 /query 按"最后 N 条"返回，数据缺口时可能含更早数据
   const merged = new Map();
   for (const x of rows) merged.set(x.ts, x);
-  for (const x of hot) merged.set(x.ts, x);
+  for (const x of hot) {
+    if (x.ts >= sinceMin) merged.set(x.ts, x);
+  }
   let arr = [...merged.values()].sort((a, b) => a.ts - b.ts);
   // 4) 超上限时均匀降采样
   if (arr.length > MONITOR_D1_MAX_ROWS) {

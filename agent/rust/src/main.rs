@@ -70,15 +70,25 @@ fn validate_wss(wss: &str) -> Result<(), String> {
         if allow {
             return Ok(());
         }
-        let host = wss
+        // 正式解析 authority（防 userinfo 风格绕过，如 ws://127.0.0.1:9999@evil.com/...）：
+        // authority = strip 协议后到第一个 '/' 前；host:port 取 @ 后、剥离端口/方括号。
+        let authority = wss
             .strip_prefix("ws://")
             .unwrap_or("")
             .split('/')
             .next()
             .unwrap_or("");
-        // IPv6 ::1 用 ':' 分割首段为空，故用完整 host 判断
-        let host_only = host.split(':').next().unwrap_or(host);
-        if host_only == "127.0.0.1" || host_only == "localhost" || host == "::1" {
+        // 去掉 userinfo（'@' 前的部分）——防 userinfo 里伪装 loopback
+        let host_port = authority.rsplit('@').next().unwrap_or(authority);
+        // 处理 host:port、IPv6 [::1]:port 与裸 IPv6（::1，无端口时冒号多于 1 个）
+        let host = if host_port.starts_with('[') {
+            host_port[1..].split(']').next().unwrap_or("")
+        } else if host_port.matches(':').count() > 1 {
+            host_port
+        } else {
+            host_port.split(':').next().unwrap_or(host_port)
+        };
+        if host == "127.0.0.1" || host == "localhost" || host == "::1" {
             return Ok(()); // 本地回环调试/E2E
         }
         return Err(
@@ -391,9 +401,19 @@ mod tests {
         assert!(validate_wss("ws://127.0.0.1:8787/ws/agent").is_ok());
         assert!(validate_wss("ws://localhost/ws/agent").is_ok());
         assert!(validate_wss("ws://::1/ws/agent").is_ok());
+        assert!(validate_wss("ws://[::1]:8787/ws/agent").is_ok());
         assert!(
             validate_wss("ws://example.com/ws/agent").is_err(),
             "无 ALLOW_INSECURE_WS 时远程明文拒绝"
+        );
+        // userinfo 风格绕过：@ 前的 127.0.0.1:9999 是 userinfo，真实 host 是 evil.com，必须拒绝
+        assert!(
+            validate_wss("ws://127.0.0.1:9999@evil.com/ws/agent").is_err(),
+            "userinfo 伪装 loopback 拒绝"
+        );
+        assert!(
+            validate_wss("ws://user:pass@127.0.0.1/ws/agent").is_ok(),
+            "userinfo@真实 loopback 放行（host 解析正确）"
         );
         std::env::set_var("ALLOW_INSECURE_WS", "1");
         assert!(

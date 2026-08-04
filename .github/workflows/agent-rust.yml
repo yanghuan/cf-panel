@@ -18,6 +18,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # Release 更新日志取自 git 提交历史/tags，浅克隆拿不到
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -40,21 +42,41 @@ jobs:
           echo "title=cf-panel-agent ${TS}" >> "$GITHUB_OUTPUT"
           echo "tag=cf-panel-agent-${TS}" >> "$GITHUB_OUTPUT"
 
+      - name: 组装 Release body（固定用法 + git 提交更新日志）
+        run: |
+          # 固定用法文本
+          cat > /tmp/release-body.md <<'EOF'
+          Rust 版 cf-panel agent 全静态二进制（musl，仅依赖系统调用，任意 Linux 发行版直跑）。
+
+          用法：
+          ```
+          AGENT_WSS_URL=wss://<面板域名>/ws/agent \
+          AGENT_KEY=<agent key> \
+          ./cf-panel-agent
+          ```
+          环境变量与 agent.sh 一致：AGENT_WSS_URL / AGENT_KEY / REPORT_INTERVAL / PROBES / CUSTOM_METRICS / DISABLE_EXEC / AGENT_TMPDIR / AGENT_LOG。
+
+          ## 更新日志
+          EOF
+          # 上次发布 tag → 列出其间 agent/rust 提交（不重复）；无 tag（首次发布）则最近 20 条
+          PREV_TAG=$(git tag -l 'cf-panel-agent-*' | sort -V | tail -1 || true)
+          if [ -n "$PREV_TAG" ]; then
+            LOG=$(git --no-pager log --oneline "$PREV_TAG"..HEAD -- agent/rust/ || true)
+          else
+            LOG=$(git --no-pager log --oneline -20 -- agent/rust/ || true)
+          fi
+          if [ -n "$LOG" ]; then
+            echo "$LOG" | sed -E 's#^([0-9a-f]{7}) (.*)#- \2 ([`\1`](https://github.com/yanghuan/cf-panel/commit/\1))#' >> /tmp/release-body.md
+          else
+            echo "- 本次无新的 agent 提交" >> /tmp/release-body.md
+          fi
+
       - name: 发布到 GitHub Releases
         uses: softprops/action-gh-release@v2
         with:
           files: agent/rust/target/x86_64-unknown-linux-musl/release/cf-panel-agent
           name: ${{ steps.release.outputs.title }}
           tag_name: ${{ steps.release.outputs.tag }}
-          body: |
-            Rust 版 cf-panel agent 全静态二进制（musl，仅依赖系统调用，任意 Linux 发行版直跑）。
-
-            用法：
-            ```
-            AGENT_WSS_URL=wss://<面板域名>/ws/agent \
-            AGENT_KEY=<agent key> \
-            ./cf-panel-agent
-            ```
-            环境变量与 agent.sh 一致：AGENT_WSS_URL / AGENT_KEY / REPORT_INTERVAL / PROBES / CUSTOM_METRICS / DISABLE_EXEC / AGENT_TMPDIR / AGENT_LOG。
+          body_path: /tmp/release-body.md
           draft: false
           prerelease: false

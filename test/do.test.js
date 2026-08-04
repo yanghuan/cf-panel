@@ -712,19 +712,32 @@ test('TerminalDO: 控制通道重连时关闭该服务器旧会话流（dropAgen
   assert.equal(inst.sessions.get('2-c').agentWs.closed, false, '其他服务器会话不受影响');
 });
 
-test('TerminalDO: cleanup 断开后清空 agents/sessions/pendingTerm', async () => {
+test('TerminalDO: cleanup 按归属清理 pendingTerm，跨服务器/会话隔离（M-02）', async () => {
   const env = makeEnv();
-  const ws1 = { send() {}, readyState: 1 };
-  const ws2 = { send() {}, readyState: 1 };
+  const ctl1 = { send() {}, readyState: 1 }; // server 1 控制通道
+  const ctl2 = { send() {}, readyState: 1 }; // server 2 控制通道
+  const agentFlow = { send() {}, readyState: 1 }; // 会话 agent 数据流
   const inst = new TerminalDO(mockState(), env);
-  inst.agents.set(1, ws1);
-  inst.sessions.set('0-x', { streamId: '0-x', userWs: ws2, agentWs: null, createdAt: Date.now() });
-  inst.pendingTerm.set('0-x', { tries: 0, timer: null });
+  inst.agents.set(1, ctl1);
+  inst.agents.set(2, ctl2);
+  inst.sessions.set('1-a', { streamId: '1-a', serverId: 1, creatorUserId: 1, createdAt: Date.now(), userWs: null, agentWs: agentFlow, userBuf: [] });
+  inst.sessions.set('2-b', { streamId: '2-b', serverId: 2, creatorUserId: 1, createdAt: Date.now(), userWs: null, agentWs: null, userBuf: [] });
+  inst.pendingTerm.set('1-a', { tries: 0, timer: null, serverId: 1, agentWs: ctl1 });
+  inst.pendingTerm.set('2-b', { tries: 0, timer: null, serverId: 2, agentWs: ctl2 });
 
-  inst.cleanup(ws1);
+  // server1 控制通道断开 → 只清 server1 的待确认
+  inst.cleanup(ctl1);
+  assert.equal(inst.agents.has(1), false);
+  assert.equal(inst.pendingTerm.has('1-a'), false, 'server1 待确认被清理');
+  assert.equal(inst.pendingTerm.has('2-b'), true, 'server2 待确认不受影响');
+
+  // 会话 1-a 的 agent 数据流断开 → 清该会话待确认并回收会话，不影响 server2
+  inst.cleanup(agentFlow);
+  assert.equal(inst.sessions.has('1-a'), false, '1-a 两端断开被回收');
+  assert.equal(inst.pendingTerm.has('2-b'), true, 'server2 待确认仍保留');
+
+  // server2 控制通道断开 → 全部清空
+  inst.cleanup(ctl2);
   assert.equal(inst.agents.size, 0);
-  assert.equal(inst.pendingTerm.size, 0);
-
-  inst.cleanup(ws2);
-  assert.equal(inst.sessions.size, 0);
+  assert.equal(inst.pendingTerm.size, 0, 'server2 断开后 pendingTerm 清空');
 });

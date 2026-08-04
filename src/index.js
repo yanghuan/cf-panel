@@ -1111,7 +1111,7 @@ export class TerminalDO {
         agentWs.send(JSON.stringify({ type: isFile ? 'open_file' : 'open_terminal', stream_id: body.streamId }));
         // 终端会话：确认重发机制——agent 收到并 spawn 后回 terminal_ready，
         // 未确认则定时重发（最多 3 次），避免控制通道重连窗口丢指令
-        if (!isFile) this.scheduleTermAck(agentWs, body.streamId);
+        if (!isFile) this.scheduleTermAck(agentWs, body.streamId, body.serverId);
         return json({ ok: true });
       }
       return err('bad op');
@@ -1259,9 +1259,10 @@ export class TerminalDO {
 
   // open_terminal 确认重发：下发后 5s 未收到 agent 的 terminal_ready 则重发，最多 3 次
   // 解决 agent 控制通道重连窗口内指令丢失导致的终端"打不开"
-  scheduleTermAck(agentWs, streamId) {
+  // 记录 serverId + agentWs 归属：cleanup 断开时只清理关联项（M-02），不影响其他服务器/会话
+  scheduleTermAck(agentWs, streamId, serverId) {
     if (this.pendingTerm.has(streamId)) return;
-    const rec = { tries: 0, timer: null };
+    const rec = { tries: 0, timer: null, serverId, agentWs };
     this.pendingTerm.set(streamId, rec);
     const retry = () => {
       const r = this.pendingTerm.get(streamId);
@@ -1478,6 +1479,10 @@ export class TerminalDO {
         if (sess.userWs) {
           try { sess.userWs.close(); } catch { /* ignore */ }
         }
+        // M-02：会话数据流断开 → 仅清理该会话的 open_terminal 待确认（数据流已不可用）
+        const r = this.pendingTerm.get(sid);
+        if (r && r.timer) clearTimeout(r.timer);
+        this.pendingTerm.delete(sid);
       }
       if (!sess.userWs && !sess.agentWs) {
         this.sessions.delete(sid);
@@ -1485,13 +1490,17 @@ export class TerminalDO {
       }
     }
     for (const [serverId, w] of this.agents) {
-      if (w === ws) this.agents.delete(serverId);
+      if (w === ws) {
+        this.agents.delete(serverId);
+        // M-02：控制通道断开 → 仅清理该 agent（serverId）的待确认，不影响其他服务器/会话
+        for (const [sid, r] of [...this.pendingTerm]) {
+          if (r.serverId === serverId) {
+            if (r.timer) clearTimeout(r.timer);
+            this.pendingTerm.delete(sid);
+          }
+        }
+      }
     }
-    // 控制通道断开：清除该 agent 的 open_terminal 待确认（定时器停止，重连后前端自愈兜底）
-    for (const [, r] of this.pendingTerm) {
-      if (r.timer) clearTimeout(r.timer);
-    }
-    this.pendingTerm.clear();
   }
 }
 

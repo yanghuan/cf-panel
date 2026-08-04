@@ -561,6 +561,12 @@
       fileDownload = null;
       return;
     }
+    if (j.got === 0) {
+      // M-11：读取到 EOF 但未达预期 size → 文件已缩短/被替换，中止避免无限循环
+      $('#file-msg').textContent = `文件已变化或缩短，中止下载（已完成 ${fileDownload.received}/${fileDownload.size} 字节）`;
+      fileDownload = null;
+      return;
+    }
     fileDownload.parts.push(atob(j.data));
     fileDownload.received += j.got;
     const pct = fileDownload.size ? Math.min(100, Math.round((fileDownload.received / fileDownload.size) * 100)) : 0;

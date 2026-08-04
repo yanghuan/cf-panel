@@ -46,6 +46,7 @@ CREATE TABLE IF NOT EXISTS metrics_min (
   ts        INTEGER NOT NULL,                -- unix 分钟戳
   cpu       REAL,
   mem_used  REAL,
+  mem_total REAL,                            -- 当时总内存（历史内存百分比计算用；旧库需 ALTER 补列，见 README 迁移）
   net_in    REAL,                            -- 网络速率（字节/秒，agent 差分）
   net_out   REAL,
   extra     TEXT,                            -- 扩展监控项 JSON（swap/disk/load/temp/procs/tcp/udp，紧凑不压缩）

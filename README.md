@@ -63,6 +63,11 @@ wrangler deploy
 > wrangler d1 execute cf-panel --remote --command 'CREATE TABLE IF NOT EXISTS kv_json (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL DEFAULT (datetime("now")));'
 > ```
 >
+> 旧库缺 `metrics_min.mem_total` 列（历史内存百分比计算用）？执行：
+> ```
+> wrangler d1 execute cf-panel --remote --command 'ALTER TABLE metrics_min ADD COLUMN mem_total REAL;'
+> ```
+>
 > 已按旧版（带 `uuid` 列）添加过服务器？`agent_key_id`（key 指纹）无法从旧数据回填，需要重建 `servers` 表或在面板删除旧服务器后重新添加，agent 端改用 Rust 版 `cf-panel-agent`（只配 `AGENT_KEY`，监控上报已内置）：
 > ```
 > wrangler d1 execute cf-panel --remote --command 'DROP TABLE servers;'

@@ -364,7 +364,7 @@ test('监控：1d 合并 D1 归档与热区，补齐最近未归档数据（H-03
   const list = await (await call(env, { path: '/api/servers', token })).json();
   const id = list[0].id;
   // 5 小时前（>60min 归档线，在 1d 查询范围内且不触发 SQL 抽样）
-  await env.DB.prepare('INSERT OR IGNORE INTO metrics_min (server_id, ts, cpu) VALUES (?,?,?)').bind(id, nowMin - 5 * 60, 1).run();
+  await env.DB.prepare('INSERT OR IGNORE INTO metrics_min (server_id, ts, cpu, mem_total) VALUES (?,?,?,?)').bind(id, nowMin - 5 * 60, 1, 16384).run();
 
   const res = await call(env, { path: `/api/monitor?server_id=${id}&range=1d`, token });
   assert.equal(res.status, 200);
@@ -372,6 +372,8 @@ test('监控：1d 合并 D1 归档与热区，补齐最近未归档数据（H-03
   const tsList = body.system.map((x) => x.ts).sort((a, b) => a - b);
   assert.ok(tsList.includes(nowMin - 5 * 60), '包含 D1 归档数据');
   assert.ok(tsList.includes(nowMin - 30), '包含热区最近数据（修复 12h+ 查询缺最近 ~1h 空洞）');
+  const d1Row = body.system.find((x) => x.ts === nowMin - 5 * 60);
+  assert.equal(d1Row.mem_total, 16384, 'D1 归档查询返回 mem_total（M-06）');
 });
 
 // ---------------- PAT ----------------

@@ -250,7 +250,7 @@ async function queryMonitorRows(env, serverId, hours) {
   let rows = [];
   if (minutes > ARCHIVE_AFTER_MIN) {
     const archiveSince = Math.max(sinceMin, nowMin - ARCHIVE_AFTER_MIN);
-    const q = 'SELECT ts, cpu, mem_used, net_in, net_out, extra FROM metrics_min WHERE server_id = ? AND ts >= ? AND ts < ?';
+    const q = 'SELECT ts, cpu, mem_used, mem_total, net_in, net_out, extra FROM metrics_min WHERE server_id = ? AND ts >= ? AND ts < ?';
     let r;
     if (minutes > MONITOR_D1_MAX_ROWS) {
       const step = Math.ceil(minutes / MONITOR_D1_MAX_ROWS);
@@ -1804,8 +1804,8 @@ export class MetricsDO {
           const v = JSON.parse(k.value);
           stmts.push(
             this.env.DB.prepare(
-              'INSERT OR IGNORE INTO metrics_min (server_id, ts, cpu, mem_used, net_in, net_out, extra) VALUES (?,?,?,?,?,?,?)'
-            ).bind(serverId, ts, v.cpu, v.mem_used, v.net_in, v.net_out, v.extra ? JSON.stringify(v.extra) : null)
+              'INSERT OR IGNORE INTO metrics_min (server_id, ts, cpu, mem_used, mem_total, net_in, net_out, extra) VALUES (?,?,?,?,?,?,?,?)'
+            ).bind(serverId, ts, v.cpu, v.mem_used, v.mem_total, v.net_in, v.net_out, v.extra ? JSON.stringify(v.extra) : null)
           );
         }
         // 超过热区上限（12h）：删除 storage 行（防无限增长；D1 已含归档数据）

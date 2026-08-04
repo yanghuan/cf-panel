@@ -121,7 +121,7 @@ test('MetricsDO: alarm 归档超 1 小时数据到 D1；热区保留 12h，不�
   const nowMin = Math.floor(Date.now() / 1000 / 60);
   const oldTs = nowMin - 90;
   const recentTs = nowMin - 5;
-  await call('/report', { method: 'POST', body: JSON.stringify({ serverId: 1, minTs: oldTs, cpu: 5 }) });
+  await call('/report', { method: 'POST', body: JSON.stringify({ serverId: 1, minTs: oldTs, cpu: 5, mem_used: 1000, mem_total: 8000 }) });
   await call('/report', { method: 'POST', body: JSON.stringify({ serverId: 1, minTs: recentTs, cpu: 6 }) });
 
   await inst.alarm();
@@ -130,6 +130,7 @@ test('MetricsDO: alarm 归档超 1 小时数据到 D1；热区保留 12h，不�
   assert.equal(rows.results.length, 1, '归档：仅 >60min 的行写入 D1');
   assert.equal(rows.results[0].ts, oldTs);
   assert.equal(rows.results[0].cpu, 5);
+  assert.equal(rows.results[0].mem_total, 8000, '归档保留 mem_total（M-06）');
 
   // H-03：热区保留 12h（60min 前的行仍在热区，≤12h 查询完整）
   const q = await (await call('/query?server_id=1&limit=100')).json();

@@ -567,17 +567,19 @@
       fileDownload = null;
       return;
     }
-    fileDownload.parts.push(atob(j.data));
+    // M-10：每块立即解码为 Uint8Array（避免字符串积累 + 完成时 join/二次复制），内存峰值显著下降
+    const bin = atob(j.data);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    fileDownload.parts.push(bytes);
     fileDownload.received += j.got;
     const pct = fileDownload.size ? Math.min(100, Math.round((fileDownload.received / fileDownload.size) * 100)) : 0;
     $('#file-msg').textContent = `下载中：${pct}%`;
     if (fileDownload.received >= fileDownload.size) {
       try {
-        const full = fileDownload.parts.join('');
-        const bytes = new Uint8Array(full.length);
-        for (let i = 0; i < full.length; i++) bytes[i] = full.charCodeAt(i);
+        // Blob 直接引用分块数组（不复制），避免 500MB 级文件的二次内存拷贝
         const a = document.createElement('a');
-        a.href = URL.createObjectURL(new Blob([bytes]));
+        a.href = URL.createObjectURL(new Blob(fileDownload.parts));
         a.download = fileDownload.path.split('/').pop() || 'download';
         document.body.appendChild(a);
         a.click();

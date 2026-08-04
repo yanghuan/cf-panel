@@ -211,6 +211,18 @@ test('sendWebhook：非 2xx / 网络异常记错误日志并返回 false（M-08�
     assert.equal(await I.sendWebhook(cfg, { event: 'alert' }), true, '2xx 返回 true');
     assert.equal(errs.length, 2, '成功不记日志');
 
+    // M-09：PUT 方法透传，不再被改写成 POST；GET 无 body
+    let lastInit = null;
+    globalThis.fetch = async (url, init) => { lastInit = init; return new Response('ok'); };
+    await I.sendWebhook({ webhook_url: 'https://x/hook', enabled: true, method: 'PUT' }, { event: 'alert' });
+    assert.equal(lastInit.method, 'PUT', 'PUT 透传');
+    assert.ok(lastInit.body, 'PUT 携带 body');
+    await I.sendWebhook({ webhook_url: 'https://x/hook', enabled: true, method: 'GET' }, { event: 'alert' });
+    assert.equal(lastInit.method, 'GET', 'GET 透传');
+    assert.equal(lastInit.body, undefined, 'GET 无 body');
+    await I.sendWebhook({ webhook_url: 'https://x/hook', enabled: true, method: 'bogus' }, { event: 'alert' });
+    assert.equal(lastInit.method, 'POST', '非法方法回退 POST');
+
     // 未启用/无 URL → false
     assert.equal(await I.sendWebhook({ enabled: false }, { event: 'alert' }), false);
     assert.equal(await I.sendWebhook({ enabled: true }, { event: 'alert' }), false);

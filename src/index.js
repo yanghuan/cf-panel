@@ -363,7 +363,8 @@ async function sendWebhook(cfg, payload) {
     time: payload.time,
     token: cfg.webhook_token,
   };
-  const method = cfg.method === 'GET' ? 'GET' : 'POST';
+  // M-09：统一允许的 HTTP 方法（GET/POST/PUT），不再把 PUT 静默当 POST
+  const method = ['GET', 'POST', 'PUT'].includes(cfg.method) ? cfg.method : 'POST';
   const url = renderTemplate(cfg.webhook_url, vars);
   const headers = parseHeaders(cfg.headers, vars);
   if (!headers['content-type']) headers['content-type'] = cfg.content_type || 'application/json';

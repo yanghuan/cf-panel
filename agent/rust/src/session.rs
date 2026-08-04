@@ -9,15 +9,16 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message;
 
 const FILE_LIMIT: u64 = 500 * 1024 * 1024; // 单文件总上限 500MB
-// 单次 read/write 块上限。前端固定按 1MB 分块，4MB 已是 4 倍余量。
-// 注意峰值内存 ≈ 块大小×3.7（buf + base64 1.33× + JSON 序列化副本），32MB 块会到 ~118MB、64MB 设备 OOM。
-const MAX_BLOCK: usize = 4 * 1024 * 1024;
+// 服务端固定内部缓冲（与客户端分块解耦）：
+// - READ_BLOCK：单次 read 最多读取并返回的字节（前端按返回的 got 累加续传，自动适配任意值）
+// - WRITE_BUF：写路径流式 base64 解码的缓冲（边解边写，内存不随块大小增长）
+const READ_BLOCK: usize = 512 * 1024;
+const WRITE_BUF: usize = 64 * 1024;
+// 文件 WS 入站消息大小上限（防恶意超大 data 整包占内存；正常前端 1MB 分块远小于此）
+const WS_MSG_LIMIT: usize = 8 * 1024 * 1024;
 
 fn b64e(data: &[u8]) -> String {
     base64::Engine::encode(&base64::engine::general_purpose::STANDARD, data)
-}
-fn b64d(s: &str) -> Option<Vec<u8>> {
-    base64::Engine::decode(&base64::engine::general_purpose::STANDARD, s).ok()
 }
 fn err_json(msg: &str) -> String {
     serde_json::json!({ "type": "error", "ok": false, "message": msg }).to_string()
@@ -170,7 +171,12 @@ pub async fn run_file_session(cfg: Config, sid: String) {
         }
     };
     req.headers_mut().insert("X-Agent-Key", cfg.key.parse().unwrap());
-    let (ws, _) = match tokio_tungstenite::connect_async(req).await {
+    // 限制入站消息大小，防恶意超大 data 整包占内存
+    let cfg_ws = tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
+        max_message_size: Some(WS_MSG_LIMIT),
+        ..Default::default()
+    };
+    let (ws, _) = match tokio_tungstenite::connect_async_with_config(req, Some(cfg_ws), false).await {
         Ok(x) => x,
         Err(e) => {
             log(format!("file {sid} connect failed: {e}"));
@@ -277,9 +283,10 @@ async fn file_read(path: String, offset: u64, limit: u64) -> String {
         if !meta.is_file() {
             return err_json("not a file or unreadable");
         }
-        // 单次读取上限 MAX_BLOCK，防大块内存尖峰（前端按 1MB 分块）
+        // 单次读取上限 READ_BLOCK：服务端固定 512KB 内部缓冲，与前端分块解耦。
+        // 即使 limit=0（读全文件），也最多返回 READ_BLOCK，前端按返回的 got 累加 offset 续传，自动适配任意块大小。
         let want = if limit == 0 { size } else { limit.min(size.saturating_sub(offset)) };
-        let read_len = (want as usize).min(MAX_BLOCK) as u64;
+        let read_len = (want as usize).min(READ_BLOCK) as u64;
         let mut f = match std::fs::File::open(&path) {
             Ok(f) => f,
             Err(_) => return err_json("not a file or unreadable"),
@@ -311,14 +318,7 @@ async fn file_read(path: String, offset: u64, limit: u64) -> String {
 
 async fn file_write(path: String, offset: u64, data: String) -> String {
     match blocking_with_timeout(30, move || {
-        use std::io::Seek;
-        let decoded = match b64d(&data) {
-            Some(d) => d,
-            None => return err_json("write failed"),
-        };
-        if decoded.len() > MAX_BLOCK {
-            return err_json("chunk too large");
-        }
+        use std::io::{Seek, SeekFrom};
         if let Some(parent) = std::path::Path::new(&path).parent() {
             let _ = std::fs::create_dir_all(parent);
         }
@@ -327,14 +327,29 @@ async fn file_write(path: String, offset: u64, data: String) -> String {
             Err(_) => return err_json("write failed"),
         };
         if offset == 0 {
-            if f.set_len(0).is_err() || f.seek(std::io::SeekFrom::Start(0)).is_err() {
+            if f.set_len(0).is_err() || f.seek(SeekFrom::Start(0)).is_err() {
                 return err_json("write failed");
             }
-        } else if f.seek(std::io::SeekFrom::Start(offset)).is_err() {
+        } else if f.seek(SeekFrom::Start(offset)).is_err() {
             return err_json("write failed");
         }
-        if f.write_all(&decoded).is_err() {
-            return err_json("write failed");
+        // 流式 base64 解码：边解边写，内部缓冲固定 WRITE_BUF，内存不随入站块大小增长。
+        // 入站消息大小已由 WS_MSG_LIMIT 兜底，不再做块大小硬校验。
+        let mut dec = base64::read::DecoderReader::new(
+            std::io::Cursor::new(data.into_bytes()),
+            &base64::engine::general_purpose::STANDARD,
+        );
+        let mut buf = vec![0u8; WRITE_BUF];
+        loop {
+            match dec.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if f.write_all(&buf[..n]).is_err() {
+                        return err_json("write failed");
+                    }
+                }
+                Err(_) => return err_json("write failed"),
+            }
         }
         let cur = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
         if cur > FILE_LIMIT {

@@ -595,6 +595,46 @@ test('TerminalDO: 僵尸会话超 TTL 由 alarm 清理，未到期安排下次 a
   assert.equal(st.storage.alarmTs, now - 1000 + TTL + 1000);
 });
 
+test('TerminalDO: 每服务器并发会话上限，超限 429（H-04）', async () => {
+  const env = makeEnv();
+  const inst = new TerminalDO(mockState(), env);
+  const agentWs = { send() {}, readyState: 1 };
+  inst.agents.set(1, agentWs);
+  for (let i = 0; i < 8; i++) {
+    const r = await inst.fetch(new Request('https://do.internal/rpc', {
+      method: 'POST',
+      body: JSON.stringify({ op: 'create', streamId: `0-s${i}`, serverId: 1, creatorUserId: 1 }),
+    }));
+    assert.equal(r.status, 200, `第 ${i + 1} 个创建成功`);
+  }
+  const over = await inst.fetch(new Request('https://do.internal/rpc', {
+    method: 'POST',
+    body: JSON.stringify({ op: 'create', streamId: '0-over', serverId: 1, creatorUserId: 1 }),
+  }));
+  assert.equal(over.status, 429, '超限返回 429');
+  // 其他服务器不受影响
+  inst.agents.set(2, { send() {}, readyState: 1 });
+  const other = await inst.fetch(new Request('https://do.internal/rpc', {
+    method: 'POST',
+    body: JSON.stringify({ op: 'create', streamId: '1-other', serverId: 2, creatorUserId: 1 }),
+  }));
+  assert.equal(other.status, 200, '其他服务器可创建');
+});
+
+test('TerminalDO: 活跃会话超绝对 TTL 强制回收（H-04）', async () => {
+  const env = makeEnv();
+  const st = mockState();
+  const inst = new TerminalDO(st, env);
+  const now = Date.now();
+  const userWs = { closed: false, close() { this.closed = true; } };
+  inst.sessions.set('0-old', { streamId: '0-old', serverId: 1, creatorUserId: 1, createdAt: now - 4 * 3600 * 1000 - 1000, userWs, agentWs: null, userBuf: [], agentBuf: [] });
+  inst.sessions.set('0-live', { streamId: '0-live', serverId: 1, creatorUserId: 1, createdAt: now - 1000, userWs: { close() {} }, agentWs: null, userBuf: [], agentBuf: [] });
+  inst.maybeSweep();
+  assert.equal(inst.sessions.has('0-old'), false, '超绝对 TTL 被回收（即使有连接）');
+  assert.equal(userWs.closed, true, '连接被关闭');
+  assert.equal(inst.sessions.has('0-live'), true, '未超 TTL 保留');
+});
+
 test('TerminalDO: user-pending 首帧鉴权后挂接 userWs，非法 token 断开', async () => {
   const env = makeEnv();
   const token = await I.signJwt({ uid: 1, username: 'admin', role: 1, exp: Math.floor(Date.now() / 1000) + 3600 }, env);

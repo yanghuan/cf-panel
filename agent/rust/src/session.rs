@@ -122,7 +122,15 @@ pub async fn run_terminal(
 ) {
     run_terminal_inner(cfg, &term).await;
     term.cleanup().await;
-    sessions.lock().await.remove(&term.sid);
+    // 仅当 Map 中仍指向本会话时才移除：防确认重发导致新旧并存时，旧任务结束误删新会话项
+    {
+        let mut map = sessions.lock().await;
+        if let Some(cur) = map.get(&term.sid) {
+            if Arc::ptr_eq(cur, &term) {
+                map.remove(&term.sid);
+            }
+        }
+    }
     log(format!("terminal {} ended", term.sid));
 }
 

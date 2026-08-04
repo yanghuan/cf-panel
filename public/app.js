@@ -604,26 +604,26 @@
     }
   }
 
-  // 分段上传：1MB 一段，首段清空写、后续追加
-  // sent = 已发送字节（连续发送不等确认）；acked = 已确认写入字节（按 write_result 累计）
+  // 分段上传：1MB 一段，最后一块 commit=true（agent 端原子写）。
+  // H-06：stop-and-wait——每块等 write_result 确认后才发下一块，队列有界（1 块），
+  // 大文件不再形成数百 MB 的浏览器/网络队列；acked 为已确认写入字节。
   function uploadFile(file) {
     if (file.size > FILE_MAX) { $('#file-msg').textContent = '文件超过 500MB 限制'; return; }
     fileUpload = { size: file.size, sent: 0, acked: 0 };
     const reader = new FileReader();
-    const readNext = () => {
+    const sendNext = () => {
+      if (!fileUpload || fileUpload.sent >= fileUpload.size) return;
       const chunk = file.slice(fileUpload.sent, Math.min(fileUpload.sent + FILE_CHUNK, file.size));
       reader.onload = () => {
         const b64 = String(reader.result).split(',')[1] || '';
-        // 原子写：最后一块 commit=true，agent 端 fsync + rename 原子替换目标文件
         const commit = fileUpload.sent + chunk.size >= file.size;
         fileSend({ type: 'write', path: fileJoin(fileCwd, file.name), offset: fileUpload.sent, data: b64, commit });
-        fileUpload.sent += chunk.size;
-        if (fileUpload.sent < file.size) readNext();
-        else $('#file-msg').textContent = '已全部发送，等待写入确认...';
+        fileUpload.sent += chunk.size; // 下一块在 onWriteResult 确认后发送
       };
       reader.readAsDataURL(chunk);
     };
-    readNext();
+    fileUpload.sendNext = sendNext;
+    sendNext();
   }
 
   // 只有所有块都收到 write_result 确认后才算完成，避免"已发送"误报成功
@@ -637,6 +637,7 @@
       fileSend({ type: 'list', path: fileCwd }); // 刷新列表（此时文件已完整写入）
     } else {
       $('#file-msg').textContent = `上传中：${Math.round((fileUpload.acked / fileUpload.size) * 100)}%`;
+      if (fileUpload.sendNext) fileUpload.sendNext(); // H-06：确认后发下一块
     }
   }
 

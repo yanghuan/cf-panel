@@ -194,6 +194,16 @@ async fn dispatch(
             if sid.is_empty() {
                 return Ok(());
             }
+            // 幂等：同 SID 会话已存在（DO 确认重发场景）则不重复 spawn，仅回执 ready
+            if sessions.lock().await.contains_key(&sid) {
+                let mut w = write.lock().await;
+                let _ = w
+                    .send(Message::Text(format!(
+                        r#"{{"type":"terminal_ready","stream_id":"{sid}"}}"#
+                    )))
+                    .await;
+                return Ok(());
+            }
             log(format!("open_terminal sid={sid}"));
             let term = match session::TermSession::spawn(&sid).await {
                 Ok(t) => t,

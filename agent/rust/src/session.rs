@@ -205,6 +205,8 @@ pub async fn run_file_session(cfg: Config, sid: String) {
         }
     };
     let (mut write, mut read) = ws.split();
+    // 会话创建的临时文件（.upload.{id}）：断线/结束时清理残留
+    let created: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
     while let Some(msg) = read.next().await {
         let msg = match msg {
             Ok(m) => m,
@@ -214,15 +216,22 @@ pub async fn run_file_session(cfg: Config, sid: String) {
             Message::Text(t) => t,
             _ => continue,
         };
-        let reply = handle_file_cmd(&line).await;
+        let reply = handle_file_cmd(&line, &created).await;
         if write.send(Message::Text(reply)).await.is_err() {
             break;
+        }
+    }
+    // 断线/会话结束：清理本会话创建的临时文件（防止 .upload.{id} 残留累积）
+    {
+        let tmp = created.lock().unwrap();
+        for p in tmp.iter() {
+            let _ = std::fs::remove_file(p);
         }
     }
     log(format!("file session {sid} ended"));
 }
 
-async fn handle_file_cmd(line: &str) -> String {
+async fn handle_file_cmd(line: &str, created: &Arc<std::sync::Mutex<Vec<String>>>) -> String {
     let v: serde_json::Value = match serde_json::from_str(line) {
         Ok(v) => v,
         Err(_) => return err_json("bad json"),
@@ -248,7 +257,20 @@ async fn handle_file_cmd(line: &str) -> String {
                 .unwrap_or("")
                 .to_string();
             let commit = v.get("commit").and_then(|x| x.as_bool()).unwrap_or(false);
-            file_write(path, offset, data, commit).await
+            let upload_id = v
+                .get("upload_id")
+                .and_then(|x| x.as_str())
+                .unwrap_or("default")
+                .to_string();
+            file_write(path, offset, data, commit, upload_id, created.clone()).await
+        }
+        "abort" => {
+            let upload_id = v
+                .get("upload_id")
+                .and_then(|x| x.as_str())
+                .unwrap_or("default")
+                .to_string();
+            file_abort(path, upload_id).await
         }
         _ => err_json("unknown cmd"),
     }
@@ -365,42 +387,59 @@ async fn file_read(path: String, offset: u64, limit: u64) -> String {
     }
 }
 
-async fn file_write(path: String, offset: u64, data: String, commit: bool) -> String {
+async fn file_write(
+    path: String,
+    offset: u64,
+    data: String,
+    commit: bool,
+    upload_id: String,
+    created: Arc<std::sync::Mutex<Vec<String>>>,
+) -> String {
     match blocking_with_timeout(30, move || {
         use std::io::{Seek, SeekFrom};
-        // 原子写：写同目录临时文件 {path}.upload，commit（最后一块）时 fsync + rename
-        // 原子替换目标文件。失败/中断只留下临时文件残留，目标文件不被破坏；
-        // 多块上传必须首块 offset=0 且最后一块 commit=true（前端协议约定）。
-        let tmp = format!("{}.upload", path);
+        // 原子写：临时文件 {path}.upload.{upload_id}（上传 ID 唯一，同路径并发上传互不冲突），
+        // commit（最后一块）时 fsync + rename 原子替换目标。失败/中断只留临时残留、不破坏目标。
+        // 严格 offset 校验：必须与临时文件当前长度一致（防丢块/乱序/并发块错写）。
+        let tmp = format!("{}.upload.{}", path, upload_id);
         if let Some(parent) = std::path::Path::new(&path).parent() {
             let _ = std::fs::create_dir_all(parent);
+        }
+        // 记录本会话创建的临时文件（会话结束/断线时清理）
+        if let Ok(mut c) = created.lock() {
+            c.push(tmp.clone());
         }
         let cleanup = |tmp: &str| {
             let _ = std::fs::remove_file(tmp);
         };
-        // 注意：create 时不 truncate（首块由 set_len(0) 清空，后续块续写），clippy 提示已评估
+        // offset 校验：期望 = 临时文件当前长度（首块为 0）
+        let cur_len = std::fs::metadata(&tmp).map(|m| m.len()).unwrap_or(0);
+        if offset != cur_len {
+            cleanup(&tmp);
+            return err_json(&format!(
+                "offset mismatch: got {offset}, expect {cur_len} (丢块或并发块错写)"
+            ));
+        }
+        // 注意：create 时不 truncate（upload_id 唯一，首块 offset=0 天然从空文件开始）
         #[allow(clippy::suspicious_open_options)]
-        let mut f = match std::fs::OpenOptions::new().create(true).write(true).open(&tmp) {
+        let mut f = match std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(&tmp)
+        {
             Ok(f) => f,
             Err(_) => return err_json("write failed"),
         };
-        // 首块（offset=0）清空残留临时文件；其余块续写到指定偏移
-        if offset == 0 {
-            if f.set_len(0).is_err() || f.seek(SeekFrom::Start(0)).is_err() {
-                cleanup(&tmp);
-                return err_json("write failed");
-            }
-        } else if f.seek(SeekFrom::Start(offset)).is_err() {
+        if f.seek(SeekFrom::Start(offset)).is_err() {
             cleanup(&tmp);
             return err_json("write failed");
         }
         // 流式 base64 解码：边解边写，内部缓冲固定 WRITE_BUF，内存不随入站块大小增长。
-        // 入站消息大小已由 WS_MSG_LIMIT 兜底，不再做块大小硬校验。
         let mut dec = base64::read::DecoderReader::new(
             std::io::Cursor::new(data.into_bytes()),
             &base64::engine::general_purpose::STANDARD,
         );
         let mut buf = vec![0u8; WRITE_BUF];
+        let mut written: u64 = 0;
         loop {
             match dec.read(&mut buf) {
                 Ok(0) => break,
@@ -409,6 +448,7 @@ async fn file_write(path: String, offset: u64, data: String, commit: bool) -> St
                         cleanup(&tmp);
                         return err_json("write failed");
                     }
+                    written += n as u64;
                 }
                 Err(_) => {
                     cleanup(&tmp);
@@ -427,12 +467,30 @@ async fn file_write(path: String, offset: u64, data: String, commit: bool) -> St
             cleanup(&tmp);
             return err_json("write failed");
         }
-        serde_json::json!({ "type": "write_result", "ok": true, "path": path, "offset": offset, "commit": commit }).to_string()
+        serde_json::json!({
+            "type": "write_result", "ok": true, "path": path,
+            "offset": offset, "written": written, "commit": commit,
+        })
+        .to_string()
     })
     .await
     {
         Some(v) => v,
         None => err_json("write timeout"),
+    }
+}
+
+// abort：取消上传，删除对应临时文件（{path}.upload.{upload_id}）
+async fn file_abort(path: String, upload_id: String) -> String {
+    match blocking_with_timeout(10, move || {
+        let tmp = format!("{}.upload.{}", path, upload_id);
+        let _ = std::fs::remove_file(&tmp);
+        serde_json::json!({ "type": "abort_result", "ok": true, "path": path }).to_string()
+    })
+    .await
+    {
+        Some(v) => v,
+        None => err_json("abort timeout"),
     }
 }
 

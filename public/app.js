@@ -605,11 +605,13 @@
   }
 
   // 分段上传：1MB 一段，最后一块 commit=true（agent 端原子写）。
-  // stop-and-wait——每块等 write_result 确认后才发下一块，队列有界（1 块），
-  // 大文件不再形成数百 MB 的浏览器/网络队列；acked 为已确认写入字节。
+  // stop-and-wait——每块等 write_result 确认后才发下一块，队列有界（1 块）。
+  // upload_id：唯一标识本次上传（临时文件 {path}.upload.{id}），并发/重复上传互不冲突；
+  // acked 按 agent 返回的真实 written 字节累计。
   function uploadFile(file) {
     if (file.size > FILE_MAX) { $('#file-msg').textContent = '文件超过 500MB 限制'; return; }
-    fileUpload = { size: file.size, sent: 0, acked: 0 };
+    const uploadId = (window.crypto && crypto.randomUUID) ? crypto.randomUUID() : String(Date.now()) + '-' + Math.random().toString(36).slice(2);
+    fileUpload = { size: file.size, sent: 0, acked: 0, uploadId, path: fileJoin(fileCwd, file.name) };
     const reader = new FileReader();
     const sendNext = () => {
       if (!fileUpload || fileUpload.sent >= fileUpload.size) return;
@@ -617,23 +619,34 @@
       reader.onload = () => {
         const b64 = String(reader.result).split(',')[1] || '';
         const commit = fileUpload.sent + chunk.size >= file.size;
-        fileSend({ type: 'write', path: fileJoin(fileCwd, file.name), offset: fileUpload.sent, data: b64, commit });
+        fileSend({ type: 'write', path: fileUpload.path, offset: fileUpload.sent, data: b64, commit, upload_id: fileUpload.uploadId });
         fileUpload.sent += chunk.size; // 下一块在 onWriteResult 确认后发送
       };
       reader.readAsDataURL(chunk);
     };
     fileUpload.sendNext = sendNext;
+    $('#btn-file-cancel').classList.remove('hidden');
     sendNext();
   }
 
-  // 只有所有块都收到 write_result 确认后才算完成，避免"已发送"误报成功
+  // 取消上传：发 abort 清理 agent 临时文件
+  function cancelUpload() {
+    if (!fileUpload) return;
+    fileSend({ type: 'abort', path: fileUpload.path, upload_id: fileUpload.uploadId });
+    fileUpload = null;
+    $('#file-msg').textContent = '已取消上传';
+    $('#btn-file-cancel').classList.add('hidden');
+  }
+
+  // 只有所有块都收到 write_result 确认后才算完成；acked 按真实 written 累计
   function onWriteResult(j) {
     if (!fileUpload) return; // 无进行中的上传任务，忽略
-    const acked = Math.min(fileUpload.size, (Number(j.offset) || 0) + FILE_CHUNK);
-    fileUpload.acked = Math.max(fileUpload.acked || 0, acked);
+    const w = Number(j.written) || 0;
+    fileUpload.acked = Math.min(fileUpload.size, fileUpload.acked + w);
     if (fileUpload.acked >= fileUpload.size) {
       fileUpload = null;
       $('#file-msg').textContent = '上传完成';
+      $('#btn-file-cancel').classList.add('hidden');
       fileSend({ type: 'list', path: fileCwd }); // 刷新列表（此时文件已完整写入）
     } else {
       $('#file-msg').textContent = `上传中：${Math.round((fileUpload.acked / fileUpload.size) * 100)}%`;
@@ -1217,6 +1230,7 @@
 
   // 文件管理操作
   $('#btn-file-close').onclick = closeFileModal;
+  $('#btn-file-cancel').onclick = cancelUpload;
   $('#file-refresh').onclick = () => fileSend({ type: 'list', path: fileCwd });
   $('#file-up').onclick = () => { fileCwd = fileParent(fileCwd); $('#file-path').value = fileCwd; fileSend({ type: 'list', path: fileCwd }); };
   $('#file-go').onclick = () => { const p = $('#file-path').value.trim(); if (!p) return; fileCwd = p; fileSend({ type: 'list', path: p }); };

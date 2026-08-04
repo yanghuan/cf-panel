@@ -4,7 +4,7 @@
 
 - 前端：Cloudflare Pages（纯静态 + xterm.js，零构建）
 - 后端：Cloudflare Workers + Durable Objects（WebSocket 双向中转）+ D1（面板核心数据 + kv_json 键值表）
-- Agent：纯 Shell 脚本（`websocat` + `socat` + `jq`），部署在每台目标机器上，与面板通过 WebSocket 通信
+- Agent：Rust 版（单进程、全静态 musl、任意 Linux 发行版直跑，无 websocat/socat/jq 依赖），部署在每台目标机器上，与面板通过 WebSocket 通信
 
 架构设计见 [docs/architecture.md](docs/architecture.md)。
 
@@ -24,7 +24,7 @@ cf-panel/
 
 ## 一、部署面板（Cloudflare）
 
-### 方式一：网页端部署（推荐，无需本地 CLI）
+### 方式一：Git 集成自动部署（推荐，无需本地 CLI）
 
 利用 Cloudflare **Workers Builds**（Git 集成）在 Dashboard 直连 GitHub 仓库，push 即自动部署；`wrangler.toml` 中的 D1 / Durable Objects / assets 绑定由仓库配置驱动，构建时自动生效。
 
@@ -340,5 +340,5 @@ curl -X POST https://<面板域名>/mcp -H "Authorization: Bearer <token>" \
   - 终端 DO 会话状态在内存（僵尸会话按 10 分钟 TTL 回收，DO alarm 兜底保证零流量时也会清理；实例迁移会中断活跃终端；可后续迁 DO Storage）。
   - D1 归档默认开启（保留 30 天）；若关闭（`ARCHIVE_TO_D1=0`），DO 重启会丢失 12 小时外的历史。
   - 监控图表为 CPU/内存双折线（Chart.js）；磁盘/温度/连接数等扩展项仅在数据层，图表展示可后续迭代。
-  - 纯 Shell agent 适合个人/小规模；并发大了可无缝换 Go/Rust agent（协议不变）。
+  - Rust agent 为推荐实现（内存低、全静态单文件、任意发行版直跑）；Shell 版（`agent/shell/`）已废弃仅作参考。
   - 多用户通过 `PANEL_USERS` 环境变量配置（`user:pass,user:pass`），所有用户同权限（管理员）；如需按用户分配服务器归属，可恢复 `users` 表逻辑。

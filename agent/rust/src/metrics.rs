@@ -1,6 +1,6 @@
 // 监控采集：/proc 指标 + 磁盘 + 网络差分 + 系统信息 + 探活 + 自定义指标
 // 与 agent.sh collect_report 对齐（字段名/结构一致）
-use crate::{log, Config};
+use crate::Config;
 use serde_json::json;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -381,6 +381,5 @@ pub async fn collect_report(cfg: &Config) -> Option<String> {
         "probes": probes,
         "custom": custom,
     });
-    log("report collected");
     Some(report.to_string())
 }

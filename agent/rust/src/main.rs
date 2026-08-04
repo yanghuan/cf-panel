@@ -203,8 +203,11 @@ async fn report_loop(cfg: &Config, write: &Arc<Mutex<Sink>>, interval: &Arc<Atom
         if let Some(r) = metrics::collect_report(cfg).await {
             let mut w = write.lock().await;
             if w.send(Message::Text(r)).await.is_err() {
+                log("report send failed, control channel closed");
                 return;
             }
+        } else {
+            log("report collect failed");
         }
         let mut waited: u64 = 0;
         loop {

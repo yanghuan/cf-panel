@@ -76,6 +76,24 @@ test('MetricsDO: report / query / latest 基本读写', async () => {
   assert.equal((await call('/nope')).status, 404);
 });
 
+test('MetricsDO: /latest 增量 Map evict 后从 storage 恢复并回填（降额优化）', async () => {
+  const env = makeEnv({ ARCHIVE_TO_D1: '0' });
+  const state = mockState();
+  const { call: callA } = mkMetrics(env, state);
+  const nowMin = Math.floor(Date.now() / 1000 / 60);
+  await callA('/report', { method: 'POST', body: JSON.stringify({ serverId: 1, minTs: nowMin, cpu: 42 }) });
+  // 模拟实例 evict：新建实例共享同一 storage，增量 Map 为空 → /latest 全量扫 storage 恢复
+  const { inst: instB, call: callB } = mkMetrics(env, state);
+  assert.equal(instB.latestByServer.size, 0, '新实例增量 Map 为空');
+  const latest = await (await callB('/latest')).json();
+  assert.equal(latest[1].cpu, 42, 'evict 后从 storage 恢复最新指标');
+  assert.ok(instB.latestByServer.has(1), '恢复结果回填增量 Map');
+  // 再次 /latest 直接走增量 Map，结果一致
+  const latest2 = await (await callB('/latest')).json();
+  assert.equal(latest2[1].cpu, 42);
+  assert.equal(Object.keys(latest2).length, 1);
+});
+
 test('MetricsDO: query limit 截断只返回最近 N 条', async () => {
   const env = makeEnv({ ARCHIVE_TO_D1: '0' });
   const { call } = mkMetrics(env, mockState());

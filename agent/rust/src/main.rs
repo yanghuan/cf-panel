@@ -123,17 +123,52 @@ pub fn log(msg: impl AsRef<str>) {
 }
 
 // ---------------- 控制通道（断线重连 + 指令分发 + 上报） ----------------
+// 重连退避：连续失败指数退避 3s→6s→...→300s 封顶（加抖动，防多 agent 重连风暴）；
+// 鉴权失败（401，key 失效/服务器已删除）直接使用长退避，避免每 3 秒打满 Worker/D1
+// （28,800 → ~288 请求/天，静默成本降约 99%）。正常断开（服务端关闭/网络抖动）重置回 3s 快速恢复。
+const RETRY_INITIAL_SECS: u64 = 3;
+const RETRY_MAX_SECS: u64 = 300;
+const AUTH_FAIL_SECS: u64 = 300;
+
 async fn run_control(
     cfg: &Config,
     sessions: &Arc<Mutex<std::collections::HashMap<String, Arc<session::TermSession>>>>,
 ) {
+    let mut backoff = RETRY_INITIAL_SECS;
     loop {
         match control_conn(cfg, sessions).await {
-            Ok(_) => log("control channel closed"),
-            Err(e) => log(format!("control channel error: {e}")),
+            Ok(_) => {
+                log("control channel closed");
+                backoff = RETRY_INITIAL_SECS;
+            }
+            Err(e) => {
+                log(format!("control channel error: {e}"));
+                if is_auth_error(&e) {
+                    log("auth failed (401): retrying slowly");
+                    backoff = AUTH_FAIL_SECS;
+                } else {
+                    backoff = (backoff * 2).min(RETRY_MAX_SECS);
+                }
+            }
         }
-        sleep(Duration::from_secs(3)).await;
+        // 抖动 0~50%：避免多 agent 同时失败后同步重连形成请求尖峰
+        let ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0) as u64;
+        let jitter = ns % (backoff / 2 + 1);
+        sleep(Duration::from_secs(backoff + jitter)).await;
     }
+}
+
+// 判断是否 401 鉴权失败（tungstenite 对非 101 升级响应返回 Error::Http）
+fn is_auth_error(e: &Box<dyn Error + Send + Sync>) -> bool {
+    if let Some(we) = e.downcast_ref::<tokio_tungstenite::tungstenite::Error>() {
+        if let tokio_tungstenite::tungstenite::Error::Http(resp) = we {
+            return resp.status().as_u16() == 401;
+        }
+    }
+    false
 }
 
 async fn control_conn(
@@ -392,6 +427,29 @@ mod tests {
     #[test]
     fn validate_wss_accepts_wss() {
         assert!(validate_wss("wss://panel.example.com/ws/agent").is_ok());
+    }
+
+    #[test]
+    fn is_auth_error_detects_401_http() {
+        use tokio_tungstenite::tungstenite::http::{Response, StatusCode};
+        // HTTP 401（key 失效/服务器删除）→ 判为鉴权失败，走长退避
+        let err: Box<dyn Error + Send + Sync> = Box::new(
+            tokio_tungstenite::tungstenite::Error::Http(
+                Response::builder().status(StatusCode::UNAUTHORIZED).body(None).unwrap(),
+            ),
+        );
+        assert!(is_auth_error(&err));
+        // 其他状态码（如 404 反代不存在）→ 非鉴权失败，走指数退避
+        let err404: Box<dyn Error + Send + Sync> = Box::new(
+            tokio_tungstenite::tungstenite::Error::Http(
+                Response::builder().status(StatusCode::NOT_FOUND).body(None).unwrap(),
+            ),
+        );
+        assert!(!is_auth_error(&err404));
+        // 非 Http 错误 → 非鉴权失败
+        let io_err: Box<dyn Error + Send + Sync> =
+            Box::new(std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "refused"));
+        assert!(!is_auth_error(&io_err));
     }
 
     // env 操作集中在单个测试内顺序执行（Rust 测试并行，避免 ALLOW_INSECURE_WS 竞争）

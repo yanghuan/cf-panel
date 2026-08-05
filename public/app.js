@@ -293,6 +293,18 @@
     }
   }
 
+  // 每 3 秒发 sync 的定时器；后台标签页隐藏时暂停（省 Worker/DO/D1 配额），恢复可见立即拉取一次
+  function startPushTimer() {
+    if (pushTimer) clearInterval(pushTimer);
+    try { if (pushWs && pushWs.readyState === WebSocket.OPEN) pushWs.send('sync'); } catch { /* ignore */ }
+    pushTimer = setInterval(() => {
+      try { if (pushWs && pushWs.readyState === WebSocket.OPEN) pushWs.send('sync'); } catch { /* ignore */ }
+    }, 3000);
+  }
+  function stopPushTimer() {
+    if (pushTimer) { clearInterval(pushTimer); pushTimer = null; }
+  }
+
   // ---------- 服务器列表实时刷新（WS /ws/push，客户端每 3 秒发 sync 请求一次） ----------
   function startPush() {
     if (pushWs && (pushWs.readyState === WebSocket.CONNECTING || pushWs.readyState === WebSocket.OPEN)) return;
@@ -305,10 +317,7 @@
     ws.onopen = () => {
       pushRetries = 0;
       try { ws.send(JSON.stringify({ type: 'auth', token })); } catch { /* ignore */ }
-      if (pushTimer) clearInterval(pushTimer);
-      pushTimer = setInterval(() => {
-        try { if (ws.readyState === WebSocket.OPEN) ws.send('sync'); } catch { /* ignore */ }
-      }, 3000);
+      startPushTimer();
     };
     ws.onmessage = (ev) => {
       try {
@@ -320,7 +329,7 @@
       } catch { /* 忽略非 JSON 帧 */ }
     };
     ws.onclose = () => {
-      if (pushTimer) { clearInterval(pushTimer); pushTimer = null; }
+      stopPushTimer();
       if (pushWs !== ws) return; // 已被 stopPush 主动关闭
       if (!token) return;
       if (pushRetries < 5) {
@@ -334,12 +343,22 @@
   }
 
   function stopPush() {
-    if (pushTimer) { clearInterval(pushTimer); pushTimer = null; }
+    stopPushTimer();
     if (!pushWs) return;
     const w = pushWs;
     pushWs = null;
     try { w.close(); } catch { /* ignore */ }
   }
+
+  // 后台标签页隐藏时暂停 sync（恢复可见时立即拉取一次 + 恢复 3s 定时）
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) {
+      stopPushTimer();
+    } else if (token) {
+      startPush();      // 连接已断开则重建；仍连接则 no-op
+      startPushTimer(); // 立即拉取一次 + 恢复定时
+    }
+  });
 
   // ---------- 弹窗滚动锁定：打开时锁住页面滚动，避免滚动穿透到背景 ----------
   function lockScroll() { document.body.style.overflow = 'hidden'; }

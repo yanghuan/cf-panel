@@ -398,6 +398,9 @@ async function sendWebhook(cfg, payload) {
 // 在线宽限 ONLINE_GRACE_FAST_S=15，10s 节流最旧 ~12s 仍低于宽限（留余量）；慢采间隔本就 >10s，不受影响。
 const LAST_SEEN_THROTTLE_S = 10;
 const lastSeenWrite = new Map(); // serverId -> 上次落盘秒（跨实例 evict 丢失后仅偶发多写一次，无害）
+// serverId -> { minTs, names: Set }：metrics_custom 分钟去重（同分钟同指标只写一次 D1；
+// 跨实例 evict 丢失后仅偶发多写一次，INSERT OR IGNORE 幂等无害）
+const customWritten = new Map();
 
 // agent 监控上报落库：更新 last_seen（在线判定唯一依据；系统信息变更才写 info_json，探活变更才写 probe_json），
 // 时序写入 MetricsDO 热区（供 /api/report 与控制通道复用）。
@@ -405,11 +408,11 @@ const lastSeenWrite = new Map(); // serverId -> 上次落盘秒（跨实例 evic
 async function handleReport(env, payload) {
   const ts = Math.floor(Date.now() / 1000);
   const minTs = Math.floor(ts / 60);
+  // 单条 SELECT 同时完成数据读取与存在性复核（D1 读 2 → 1 行/上报，快采省 28,800 行/天/机）。
+  // 并发删除窗口（SELECT 后删除发生）：metrics_custom 孤儿行无害（INSERT OR IGNORE、无外键、删除时已清空）、
+  // last_seen/probe 为 WHERE id=? 条件写 0 影响行、热区由 MetricsDO /drop + alarm 清理兜底。
   const server = await env.DB.prepare('SELECT info_json, probe_json, name FROM servers WHERE id = ?').bind(payload.serverId).first();
   if (!server) return;
-  // 写指标前复核服务器仍存在：并发删除场景丢弃在途上报，防孤儿指标重新写入 metrics_custom/热区
-  const alive = await env.DB.prepare('SELECT id FROM servers WHERE id = ?').bind(payload.serverId).first();
-  if (!alive) return;
   // 探活状态：变更才写 probe_json（告警去重状态在 MetricsDO 顺风车处理）
   if (Array.isArray(payload.probes)) {
     const probeJson = JSON.stringify(payload.probes);
@@ -417,14 +420,25 @@ async function handleReport(env, payload) {
       await env.DB.prepare('UPDATE servers SET probe_json = ? WHERE id = ?').bind(probeJson, payload.serverId).run();
     }
   }
-  // 自定义监控项：低频直写 D1（分钟级，无需内存热区）
+  // 自定义监控项：分钟粒度直写 D1；同分钟同指标只写一次（快采同分钟重复上报不再执行 INSERT，D1 写查询约 −95%）
   if (Array.isArray(payload.custom)) {
-    const stmts = payload.custom
-      .filter((c) => c && c.name && c.value != null)
-      .map((c) => env.DB.prepare(
+    const items = payload.custom.filter((c) => c && c.name && c.value != null);
+    const rec = customWritten.get(payload.serverId);
+    const isNewMinute = !rec || rec.minTs !== minTs;
+    const fresh = isNewMinute ? items : items.filter((c) => !rec.names.has(String(c.name)));
+    if (fresh.length) {
+      const stmts = fresh.map((c) => env.DB.prepare(
         'INSERT OR IGNORE INTO metrics_custom (server_id, name, ts, value) VALUES (?,?,?,?)'
       ).bind(payload.serverId, String(c.name), minTs, Number(c.value)));
-    if (stmts.length) await env.DB.batch(stmts);
+      await env.DB.batch(stmts);
+      if (isNewMinute) {
+        customWritten.set(payload.serverId, { minTs, names: new Set(fresh.map((c) => String(c.name))) });
+      } else {
+        for (const c of fresh) rec.names.add(String(c.name));
+      }
+    } else if (isNewMinute) {
+      customWritten.set(payload.serverId, { minTs, names: new Set() }); // 推进分钟水位，避免下次视为新分钟
+    }
   }
   if (payload.info) {
     const infoJson = JSON.stringify(payload.info);
@@ -1616,6 +1630,8 @@ export class MetricsDO {
     this.arcCache = new Map(); // serverId -> 已归档水位（分钟），实例内缓存，evict 后从 storage 恢复
     this.sweepCount = 0; // 全量 sweep 计数（每 6 次 alarm ≈ 1 小时做一次）
     this.lastSeenSec = new Map(); // serverId -> 最后上报秒（内存，/latest 在线判定用；evict 后由 D1 last_seen 兜底）
+    this.alarmCached = null; // 实例内已知的下一次 alarm 时间戳；避免每帧上报都 getAlarm（DO Storage 读）
+    this.latestByServer = new Map(); // serverId -> 最新指标 {ts, ..., last_seen_s}（/report 热写 O(1) 维护，/latest 直接 O(S) 返回）
   }
 
   // 从 DO Storage 惰性恢复告警冷却 / 探活去重状态（实例 evict 后首次使用时加载一次）
@@ -1718,15 +1734,24 @@ export class MetricsDO {
       const b = await request.json();
       const minTs = Number(b.minTs);
       const v = { cpu: b.cpu, mem_used: b.mem_used, mem_total: b.mem_total, net_in: b.net_in, net_out: b.net_out, extra: b.extra };
-      // 内存缓存 + storage 持久（storage 为唯一事实源；写失败降级仅内存，不阻断上报）
+      // 内存缓存 + storage 持久（storage 为唯一事实源；写失败降级仅内存，不阻断上报）。
+      // 热写不加载历史：evict 后缺省空 Map + 新分钟 key 即可，避免每帧全量 loadHot（~720 行 storage 读）；
+      // 历史恢复仅 /query、/latest、fullSweep 需要时进行（正确性由 storage 唯一事实源保证）。
       try {
-        const m = await this.ensureHot(b.serverId);
+        let m = this.data.get(b.serverId);
+        if (!m) { m = new Map(); this.data.set(b.serverId, m); }
         m.set(minTs, v);
+        // 增量 latest：O(1) 维护每机最新指标，/latest 无需扫描分钟 Map
+        this.latestByServer.set(b.serverId, {
+          ts: minTs, cpu: v.cpu, mem_used: v.mem_used, mem_total: v.mem_total,
+          net_in: v.net_in, net_out: v.net_out, extra: v.extra,
+          last_seen_s: Math.floor(Date.now() / 1000),
+        });
         this.trim(m);
         await this.state.storage.put(this.hotKey(b.serverId, minTs), JSON.stringify(v));
         // 秒级最后上报时间（内存，/latest 在线判定用，比 D1 last_seen 节流更实时）
         this.lastSeenSec.set(b.serverId, Math.floor(Date.now() / 1000));
-        // 增量归档：水位之后、归档线之前的行落 D1（消除 alarm 全量重复 INSERT）
+        // 增量归档：依赖内存历史行；evict 后空 Map 时水位区间无行可归档，由 fullSweep（≈1h）兜底
         await this.archiveIncrement(b.serverId, m, minTs);
       } catch { /* storage 不可用时降级为纯内存（仅当前实例生命周期） */ }
       this.scheduleArchive();
@@ -1753,35 +1778,28 @@ export class MetricsDO {
     // 返回所有服务器的最新一条指标（面板卡片实时指标用）
     if (url.pathname === '/latest' && request.method === 'GET') {
       const out = {};
-      const seen = new Set(); // 已从缓存读过的 serverId
-      for (const [serverId, m] of this.data) {
-        seen.add(serverId);
-        if (!m.size) continue;
-        let lastTs = -1;
-        let lastV = null;
-        for (const [ts, v] of m) {
-          if (ts > lastTs) { lastTs = ts; lastV = v; }
+      // 增量 latest Map：/report 热写 O(1) 维护，此处 O(S) 直接返回（避免对分钟 Map 扫描）
+      if (this.latestByServer.size > 0) {
+        for (const [serverId, l] of this.latestByServer) {
+          if (l) out[serverId] = l;
         }
-        if (lastV) {
-          out[serverId] = { ts: lastTs, cpu: lastV.cpu, mem_used: lastV.mem_used, mem_total: lastV.mem_total, net_in: lastV.net_in, net_out: lastV.net_out, extra: lastV.extra, last_seen_s: this.lastSeenSec.get(serverId) };
-        }
+        return json(out);
       }
-      // 仅实例 evict 后（内存缓存为空）才全量扫 storage 恢复；活跃期直接读内存，
+      // 仅实例 evict 后（增量 Map 为空）才全量扫 storage 恢复；恢复结果同时回填增量 Map，
       // 避免面板 3s 轮询对 DO Storage 的全量读取放大（机器多时收益明显）
-      if (this.data.size === 0) {
-        const keys = await this.listStorage('m:');
-        for (const k of keys) {
-          const rest = k.name.slice(2); // 去掉 'm:'
-          const sep = rest.indexOf(':');
-          if (sep <= 0) continue;
-          const serverId = Number(rest.slice(0, sep));
-          if (seen.has(serverId)) continue;
-          const ts = Number(rest.slice(sep + 1));
-          const cur = out[serverId];
-          if (!cur || ts > cur.ts) {
-            const v = JSON.parse(k.value);
-            out[serverId] = { ts, cpu: v.cpu, mem_used: v.mem_used, mem_total: v.mem_total, net_in: v.net_in, net_out: v.net_out, extra: v.extra, last_seen_s: this.lastSeenSec.get(serverId) };
-          }
+      const keys = await this.listStorage('m:');
+      for (const k of keys) {
+        const rest = k.name.slice(2); // 去掉 'm:'
+        const sep = rest.indexOf(':');
+        if (sep <= 0) continue;
+        const serverId = Number(rest.slice(0, sep));
+        const ts = Number(rest.slice(sep + 1));
+        const cur = out[serverId];
+        if (!cur || ts > cur.ts) {
+          const v = JSON.parse(k.value);
+          const l = { ts, cpu: v.cpu, mem_used: v.mem_used, mem_total: v.mem_total, net_in: v.net_in, net_out: v.net_out, extra: v.extra, last_seen_s: this.lastSeenSec.get(serverId) };
+          out[serverId] = l;
+          this.latestByServer.set(serverId, l);
         }
       }
       return json(out);
@@ -1796,6 +1814,8 @@ export class MetricsDO {
         await Promise.all(keys.map((k) => this.state.storage.delete(k.name)));
       } catch { /* storage 不可用则仅清内存 */ }
       this.data.delete(serverId);
+      this.latestByServer.delete(serverId);
+      this.lastSeenSec.delete(serverId);
       // 清理该服务器的告警冷却与探活状态（内存 + storage）
       try {
         const ak = await this.listStorage(`alert:${serverId}:`);
@@ -1829,11 +1849,16 @@ export class MetricsDO {
   // 归档开关（ARCHIVE_TO_D1）仅控制"过期行是否落 D1"，不控制清理本身——否则归档关闭时
   // storage 热区与 audit_logs 会无限增长。
   // 不后推已存在的 alarm（仅无 alarm 或新时间更早时设置），防高频上报把归档/清理/告警无限推迟。
+  // alarmCached 缓存实例内已知的下一次 alarm：仅在无缓存或缓存过期时才 getAlarm（每帧 1 次 → 每周期 1 次）
   async scheduleArchive() {
-    const existing = await this.state.storage.getAlarm();
     const next = Date.now() + ARCHIVE_INTERVAL_MS;
+    if (this.alarmCached != null && this.alarmCached <= next) return; // 已有不晚于 next 的 alarm，无需查 storage
+    const existing = await this.state.storage.getAlarm();
     if (existing == null || next < existing) {
       this.state.storage.setAlarm(next);
+      this.alarmCached = next;
+    } else {
+      this.alarmCached = existing;
     }
   }
 
@@ -1987,7 +2012,8 @@ export class MetricsDO {
     }
     } finally {
       // 无论是否异常都续排下一次 alarm：防归档/清理/告警因单次失败永久停摆
-      this.state.storage.setAlarm(Date.now() + ARCHIVE_INTERVAL_MS);
+      this.alarmCached = Date.now() + ARCHIVE_INTERVAL_MS;
+      this.state.storage.setAlarm(this.alarmCached);
     }
   }
 
@@ -2208,12 +2234,13 @@ export const __internals = {
   renderTemplate, parseHeaders, sendWebhook,
   shardForServerId, makeStreamId, shardFromStreamId,
   isAdmin, canAccessServer, canExec, handleReport,
-  lastSeenWrite, LAST_SEEN_THROTTLE_S,
+  lastSeenWrite, LAST_SEEN_THROTTLE_S, customWritten,
   // 重置模块级可变状态（设置缓存），保证测试间隔离
   // 注：告警冷却/探活去重状态在 MetricsDO 实例内存，由各测试实例自行隔离
   __reset() {
     SETTINGS_CACHE.clear();
     loginFails.clear();
     lastSeenWrite.clear();
+    customWritten.clear();
   },
 };

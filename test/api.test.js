@@ -364,6 +364,48 @@ test('last_seen 节流：10s 内重复上报只写一次（降额优化）', asy
   assert.equal(row.last_seen, I.lastSeenWrite.get(1));
 });
 
+test('metrics_custom 分钟去重：同分钟同指标不执行 INSERT，跨分钟/记录丢失重新写（降额优化）', async () => {
+  const env = makeEnv();
+  await env.DB.prepare('INSERT INTO servers (agent_key_id, name, user_id, agent_key_hash) VALUES (?,?,?,?)').bind('k1', 's1', 1, 'h1').run();
+  I.__reset();
+  // 包装 prepare 统计 metrics_custom 的 INSERT 执行次数（降额核心：省 D1 写查询）
+  let customInserts = 0;
+  const origPrepare = env.DB.prepare.bind(env.DB);
+  env.DB.prepare = (sql) => {
+    const stmt = origPrepare(sql);
+    if (sql.includes('INSERT OR IGNORE INTO metrics_custom')) {
+      const origBind = stmt.bind.bind(stmt);
+      stmt.bind = (...args) => {
+        const bound = origBind(...args);
+        const origRun = bound.run.bind(bound);
+        bound.run = async (...a) => { customInserts += 1; return origRun(...a); };
+        return bound;
+      };
+    }
+    return stmt;
+  };
+  // 首次上报 x=1 → 1 次 INSERT
+  await I.handleReport(env, { serverId: 1, custom: [{ name: 'x', value: 1 }] });
+  assert.equal(customInserts, 1, '首次上报执行 INSERT');
+  // 同分钟重复上报同指标 → 不再执行 INSERT（行数与值不变）
+  await I.handleReport(env, { serverId: 1, custom: [{ name: 'x', value: 2 }] });
+  assert.equal(customInserts, 1, '同分钟同指标不重复执行 INSERT');
+  let rows = await env.DB.prepare('SELECT * FROM metrics_custom WHERE server_id = 1').all();
+  assert.equal(rows.results.length, 1);
+  assert.equal(rows.results[0].value, 1, '保留首写值');
+  // 同分钟新指标 → 追加 INSERT
+  await I.handleReport(env, { serverId: 1, custom: [{ name: 'y', value: 5 }] });
+  assert.equal(customInserts, 2, '同分钟新指标追加 INSERT');
+  rows = await env.DB.prepare('SELECT * FROM metrics_custom WHERE server_id = 1').all();
+  assert.equal(rows.results.length, 2);
+  // 跨分钟/记录丢失（模拟上一分钟或 evict）：同指标重新执行 INSERT（同分钟 ts 下幂等 IGNORE 无害）
+  const rec = I.customWritten.get(1);
+  rec.minTs -= 1;
+  await I.handleReport(env, { serverId: 1, custom: [{ name: 'x', value: 3 }] });
+  assert.equal(customInserts, 3, '跨分钟重新执行 INSERT');
+  assert.equal(I.customWritten.get(1).minTs, Math.floor(Date.now() / 1000 / 60), '记录推进到当前分钟');
+});
+
 // ---------------- 监控 ----------------
 test('监控：短区间走内存热区（METRICS /query），非法 range 回退 12h', async () => {
   const env = makeEnv();

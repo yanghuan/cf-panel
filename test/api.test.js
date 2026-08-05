@@ -300,10 +300,12 @@ test('agent 上报：key 指纹定位 + 哈希校验 + 落库', async () => {
   assert.equal(custom.results.length, 1);
   assert.equal(custom.results[0].value, 42);
 
-  // MetricsDO 桩收到 /report（含 serverId/minTs/serverName/probes，告警判定在 DO 顺带执行）
+  // MetricsDO 桩收到 /report（批量 frames，含 serverId/minTs/serverName/probes，告警判定在 DO 顺带执行）
   const reportCalls = env.METRICS.calls.filter((c) => c.path === '/report');
   assert.equal(reportCalls.length, 1);
-  assert.equal(reportCalls[0].init.body, JSON.stringify({
+  const repBody = JSON.parse(reportCalls[0].init.body);
+  assert.equal(repBody.frames.length, 1, '单机单帧批量');
+  assert.deepEqual(repBody.frames[0], {
     serverId: id,
     serverName: 'node-1',
     minTs: Math.floor(Date.now() / 1000 / 60),
@@ -314,7 +316,7 @@ test('agent 上报：key 指纹定位 + 哈希校验 + 落库', async () => {
     net_out: 2000,
     extra: { load1: 0.5 },
     probes: [{ name: 'web', ok: true, ms: 5 }],
-  }));
+  });
 
   // 上报后列表显示在线 + 指标（列表短 TTL 缓存：上报后显式失效再断言）
   I.serverListCache.clear();
@@ -331,17 +333,35 @@ test('B8/B9：服务器行缓存 + MetricsDO 转发节流（降额）', async ()
   await call(env, { method: 'POST', path: '/api/report', body: { key: agent_key, cpu: 1 } });
   assert.equal(reportCalls(), 1, '首帧转发 MetricsDO');
   assert.ok(I.serverRowCache.has(1), '服务器行已缓存（B8）');
-  // 同分钟 + 10s 内重复上报：B9 节流不转发 MetricsDO（D1 写仍执行）
+  // 5s 窗口内重复上报：入队（覆盖本机帧），不触发 flush → MetricsDO 转发次数不变
   await call(env, { method: 'POST', path: '/api/report', body: { key: agent_key, cpu: 2 } });
   await call(env, { method: 'POST', path: '/api/report', body: { key: agent_key, cpu: 3 } });
-  assert.equal(reportCalls(), 1, '同分钟 10s 内不重复转发（B9）');
-  // 超过 10s（时间戳拨回）→ 重新转发
-  I.reportFwd.set(1, { ts: Math.floor(Date.now() / 1000) - 11, minTs: Math.floor(Date.now() / 1000 / 60) });
+  assert.equal(reportCalls(), 1, '5s 窗口内不重复转发（B9 批量）');
+  // 超过 5s（flush 时间拨回）→ 重新 flush
+  I.setReportFlushAt(Date.now() - 6000);
   await call(env, { method: 'POST', path: '/api/report', body: { key: agent_key, cpu: 4 } });
-  assert.equal(reportCalls(), 2, '超过 10s 重新转发');
+  assert.equal(reportCalls(), 2, '超过 5s 重新转发');
   // D1 数据仍正常落库（节流只影响 DO 转发）
   const row = await env.DB.prepare('SELECT last_seen FROM servers WHERE id = 1').first();
   assert.ok(row.last_seen > 0, 'last_seen 仍落库');
+});
+
+test('B9+批量：同隔离实例多机上报聚合为一次 fetch', async () => {
+  const env = makeEnv();
+  const token = await login(env);
+  await addServer(env, token, { name: 'n1' });
+  await addServer(env, token, { name: 'n2' });
+  I.setReportFlushAt(Date.now()); // 设为现在 → 首帧入队不 flush
+  await I.handleReport(env, { serverId: 1, cpu: 1 });
+  await I.handleReport(env, { serverId: 2, cpu: 2 });
+  I.setReportFlushAt(Date.now() - 6000); // 拨回 → 下一帧触发 flush
+  await I.handleReport(env, { serverId: 1, cpu: 3 });
+  const reports = env.METRICS.calls.filter((c) => c.path === '/report');
+  assert.equal(reports.length, 1, '两机聚合为一次 fetch');
+  const body = JSON.parse(reports[0].init.body);
+  assert.equal(body.frames.length, 2, '一次 fetch 含两机帧');
+  assert.equal(body.frames.find((f) => f.serverId === 1).cpu, 3, '同机窗口内保留最新帧');
+  assert.equal(body.frames.find((f) => f.serverId === 2).cpu, 2);
 });
 
 // ---------------- 安全响应头 ----------------

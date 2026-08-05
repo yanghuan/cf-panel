@@ -241,6 +241,30 @@ test('B10: PanelDO latest_push 按观看者权限广播（不查 /latest）', as
   assert.equal(list[0].online, true, '最近上报在线');
 });
 
+test('MetricsDO: /report 批量接口（frames 数组）多机聚合处理', async () => {
+  const env = makeEnv();
+  const st = mockState();
+  const { call } = mkMetrics(env, st);
+  const nowMin = Math.floor(Date.now() / 1000 / 60);
+  await call('/report', { method: 'POST', body: JSON.stringify({ frames: [
+    { serverId: 1, minTs: nowMin, cpu: 10 },
+    { serverId: 2, minTs: nowMin, cpu: 20 },
+    { serverId: 3, minTs: nowMin, cpu: 30 },
+  ] }) });
+  // 三台热写 + latest 全部就绪
+  const latest = await (await call('/latest')).json();
+  assert.equal(latest[1].cpu, 10);
+  assert.equal(latest[2].cpu, 20);
+  assert.equal(latest[3].cpu, 30);
+  assert.ok(st.storage.map.has(`m:1:${nowMin}`), 'server1 storage 行');
+  assert.ok(st.storage.map.has(`m:2:${nowMin}`), 'server2 storage 行');
+  assert.ok(st.storage.map.has(`m:3:${nowMin}`), 'server3 storage 行');
+  // 单帧兼容（非 frames 数组）
+  await call('/report', { method: 'POST', body: JSON.stringify({ serverId: 4, minTs: nowMin, cpu: 40 }) });
+  const latest2 = await (await call('/latest')).json();
+  assert.equal(latest2[4].cpu, 40, '单帧格式兼容');
+});
+
 test('MetricsDO: /usage 用量计数，alarm 汇总到 storage 跨 evict 保留', async () => {
   const env = makeEnv({ ARCHIVE_TO_D1: '0' });
   const state = mockState();

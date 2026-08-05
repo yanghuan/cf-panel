@@ -424,12 +424,15 @@ async function getServerRow(env, serverId) {
   if (row) serverRowCache.set(serverId, { ...row, ts: Date.now() });
   return row;
 }
-// B9：MetricsDO /report 转发节流（仅分钟切换或 ≥5s 才转发；与快采 5s 对齐后每帧转发，
-// 该限速主要兜底 agent 未按服务端间隔上报的异常情况；快采 MetricsDO 事件 ≤17,280/天/机）。
+// B9+批量：MetricsDO /report 转发节流（每 5s flush 一次）。
+// 同一隔离实例（TerminalDO 分片 / Worker）内把 5s 窗口内多台机器的上报聚合为一次 fetch
+//（reportFwd 单机节流升级为队列）：5 机分布 4 分片 fetch 36,000→28,800（−20%），同分片多机 −50%；
+// 单机行为与 B9 5s 节流等价。flush 由上报驱动触发（每帧检查距上次 ≥5s），不引入定时器。
 // 告警/探活判定搭 /report 顺风车，随之 ~5s 一次（冷却 30min 不受影响，探活判定延迟 ≤5s）；
 // 卡片新鲜度 ≤5s，last_seen_s 最旧 ~6s 远低于 15s 快宽限（余量充足）
 const REPORT_FWD_THROTTLE_S = 5;
-const reportFwd = new Map(); // serverId -> {ts, minTs}（跨实例 evict 丢失后仅偶发多转发一次，无害）
+const reportBatch = new Map(); // serverId -> 待批量转发的帧（跨实例 evict 丢失后仅偶发丢一帧，无害）
+let reportFlushAt = 0; // 上次 flush 时刻（ms；隔离实例内共享，上报驱动触发）
 
 // agent 监控上报落库：更新 last_seen（在线判定唯一依据；系统信息变更才写 info_json，探活变更才写 probe_json），
 // 时序写入 MetricsDO 热区（供 /api/report 与控制通道复用）。
@@ -493,28 +496,32 @@ async function handleReport(env, payload) {
     }
   }
   // 时序写入 MetricsDO 热区；告警/探活判定也在该调用内顺带完成（零额外请求）。
-  // B9：转发节流——仅分钟切换或 ≥5s 才调用 MetricsDO（限速兜底，防异常高频上报 1:1 打穿 MetricsDO）
-  const mdo = doMetrics(env);
-  const fwd = reportFwd.get(payload.serverId);
-  const shouldFwd = !fwd || fwd.minTs !== minTs || ts - fwd.ts >= REPORT_FWD_THROTTLE_S;
-  if (!shouldFwd) return;
-  reportFwd.set(payload.serverId, { ts, minTs });
-  await mdo.fetch('https://do.internal/report', {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({
-      serverId: payload.serverId,
-      serverName: server.name,
-      minTs,
-      cpu: payload.cpu ?? null,
-      mem_used: payload.mem_used ?? null,
-      mem_total: payload.mem_total ?? null,
-      net_in: payload.net_in ?? null,   // 网络速率（字节/秒）
-      net_out: payload.net_out ?? null,
-      extra: payload.extra ?? null,     // 扩展监控项对象 → 序列化存入 extra 列
-      probes: payload.probes ?? null,
-    }),
+  // B9+批量：入队本机最新帧（同机 5s 窗口内保留最后一帧），距上次 flush ≥5s 时
+  // 把队列内所有机器聚合一次 fetch（同隔离实例多机合并，见 reportBatch 注释）
+  reportBatch.set(payload.serverId, {
+    serverId: payload.serverId,
+    serverName: server.name,
+    minTs,
+    cpu: payload.cpu ?? null,
+    mem_used: payload.mem_used ?? null,
+    mem_total: payload.mem_total ?? null,
+    net_in: payload.net_in ?? null,   // 网络速率（字节/秒）
+    net_out: payload.net_out ?? null,
+    extra: payload.extra ?? null,     // 扩展监控项对象 → 序列化存入 extra 列
+    probes: payload.probes ?? null,
   });
+  const flushNow = Date.now();
+  if (flushNow - reportFlushAt >= REPORT_FWD_THROTTLE_S * 1000) {
+    reportFlushAt = flushNow;
+    const frames = [...reportBatch.values()];
+    reportBatch.clear();
+    const mdo = doMetrics(env);
+    await mdo.fetch('https://do.internal/report', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ frames }),
+    });
+  }
 }
 
 // ---------------- 鉴权（JWT 或 PAT） ----------------
@@ -1904,70 +1911,77 @@ export class MetricsDO {
     }
   }
 
+  // 处理单帧上报（/report 批量接口每帧调用）：热写 + 增量归档 + 告警/探活 + B10 推送
+  async processReportFrame(b) {
+    const minTs = Number(b.minTs);
+    const v = { cpu: b.cpu, mem_used: b.mem_used, mem_total: b.mem_total, net_in: b.net_in, net_out: b.net_out, extra: b.extra };
+    // 内存缓存 + storage 持久（storage 为唯一事实源；写失败降级仅内存，不阻断上报）。
+    // 热写不加载历史：evict 后缺省空 Map + 新分钟 key 即可，避免每帧全量 loadHot（~720 行 storage 读）
+    try {
+      const fresh = !this.data.has(b.serverId); // 本实例内该机首帧热写（归档兜底仅首帧语义，见 archiveIncrement）
+      let m = this.data.get(b.serverId);
+      if (!m) { m = new Map(); this.data.set(b.serverId, m); }
+      m.set(minTs, v);
+      // 增量 latest：O(1) 维护每机最新指标，/latest 无需扫描分钟 Map
+      this.latestByServer.set(b.serverId, {
+        ts: minTs, cpu: v.cpu, mem_used: v.mem_used, mem_total: v.mem_total,
+        net_in: v.net_in, net_out: v.net_out, extra: v.extra,
+        last_seen_s: Math.floor(Date.now() / 1000),
+      });
+      this.trim(m);
+      // A1：storage.put 按分钟去重——同分钟多帧只写 1 次；put 失败不更新 putMin，下帧自动重试
+      if (this.putMin.get(b.serverId) !== minTs) {
+        await this.state.storage.put(this.hotKey(b.serverId, minTs), JSON.stringify(v));
+        this.putMin.set(b.serverId, minTs);
+      }
+      // 秒级最后上报时间（内存，/latest 在线判定用，比 D1 last_seen 节流更实时）
+      this.lastSeenSec.set(b.serverId, Math.floor(Date.now() / 1000));
+      // 增量归档：依赖内存历史行；evict 后空 Map 时水位区间无行可归档，由 fullSweep（≈1h）兜底
+      await this.archiveIncrement(b.serverId, m, minTs, fresh);
+    } catch { /* storage 不可用时降级为纯内存（仅当前实例生命周期） */ }
+    this.scheduleArchive();
+    // 告警/探活去重判定搭本次 /report 调用顺风车（零额外请求）；失败不影响监控存储
+    try {
+      if (b.serverName) await this.checkAlerts(b);
+      if (Array.isArray(b.probes)) await this.checkProbeAlerts(b.serverId, b.serverName, b.probes);
+    } catch { /* 告警失败不影响监控存储 */ }
+    // B10：上报驱动聚合推送——有观看者且距上次 ≥5s 时，把全部 latest 一次推给 PanelDO 广播。
+    // 上报驱动不引入定时器（MetricsDO 休眠不受影响）；PanelDO → 前端为出站消息不计费
+    if (this.pushOn) {
+      const pushNow = Date.now();
+      if (pushNow - this.lastPushAt >= LATEST_PUSH_INTERVAL_MS) {
+        this.lastPushAt = pushNow;
+        try {
+          await doPanel(this.env).fetch('https://do.internal/rpc/latest_push', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ latest: Object.fromEntries(this.latestByServer) }),
+          });
+        } catch { /* 推送失败下个周期重试 */ }
+      }
+    } else if (Date.now() - this.lastPushProbeAt >= PUSH_PROBE_INTERVAL_MS) {
+      // 自愈：pushOn 是实例内存，MetricsDO 无 WS 可能在 PanelDO set_push(1) 之后被 evict，
+      // 新实例不知道有人观看 → 面板数据冻结。低频（30s）反查 /viewers，有人看则恢复推送
+      this.lastPushProbeAt = Date.now();
+      try {
+        const vResp = await doPanel(this.env).fetch('https://do.internal/viewers');
+        const v = await vResp.json();
+        if ((v.count || 0) > 0) this.pushOn = true;
+      } catch { /* 反查失败下次再试 */ }
+    }
+  }
+
   async fetch(request) {
     const url = new URL(request.url);
 
     if (url.pathname === '/report' && request.method === 'POST') {
-      this.usage.report += 1; // 用量观测
+      // 批量接口（B9+批量）：body 为 {frames:[...]}（同隔离实例多机聚合）或单帧字段，循环处理
       const b = await request.json();
-      const minTs = Number(b.minTs);
-      const v = { cpu: b.cpu, mem_used: b.mem_used, mem_total: b.mem_total, net_in: b.net_in, net_out: b.net_out, extra: b.extra };
-      // 内存缓存 + storage 持久（storage 为唯一事实源；写失败降级仅内存，不阻断上报）。
-      // 热写不加载历史：evict 后缺省空 Map + 新分钟 key 即可，避免每帧全量 loadHot（~720 行 storage 读）；
-      // 历史恢复仅 /query、/latest、fullSweep 需要时进行（正确性由 storage 唯一事实源保证）。
-      try {
-        const fresh = !this.data.has(b.serverId); // 本实例内该机首帧热写（归档兜底仅首帧语义，见 archiveIncrement）
-        let m = this.data.get(b.serverId);
-        if (!m) { m = new Map(); this.data.set(b.serverId, m); }
-        m.set(minTs, v);
-        // 增量 latest：O(1) 维护每机最新指标，/latest 无需扫描分钟 Map
-        this.latestByServer.set(b.serverId, {
-          ts: minTs, cpu: v.cpu, mem_used: v.mem_used, mem_total: v.mem_total,
-          net_in: v.net_in, net_out: v.net_out, extra: v.extra,
-          last_seen_s: Math.floor(Date.now() / 1000),
-        });
-        this.trim(m);
-        // A1：storage.put 按分钟去重——同分钟多帧只写 1 次（快采 28,800 → 1,440 写/天/机）；
-        // put 失败不更新 putMin，下帧自动重试（保持「写失败降级仅内存」语义）
-        if (this.putMin.get(b.serverId) !== minTs) {
-          await this.state.storage.put(this.hotKey(b.serverId, minTs), JSON.stringify(v));
-          this.putMin.set(b.serverId, minTs);
-        }
-        // 秒级最后上报时间（内存，/latest 在线判定用，比 D1 last_seen 节流更实时）
-        this.lastSeenSec.set(b.serverId, Math.floor(Date.now() / 1000));
-        // 增量归档：依赖内存历史行；evict 后空 Map 时水位区间无行可归档，由 fullSweep（≈1h）兜底
-        await this.archiveIncrement(b.serverId, m, minTs, fresh);
-      } catch { /* storage 不可用时降级为纯内存（仅当前实例生命周期） */ }
-      this.scheduleArchive();
-      // 告警/探活去重判定搭本次 /report 调用顺风车（零额外请求）；失败不影响监控存储
-      try {
-        if (b.serverName) await this.checkAlerts(b);
-        if (Array.isArray(b.probes)) await this.checkProbeAlerts(b.serverId, b.serverName, b.probes);
-      } catch { /* 告警失败不影响监控存储 */ }
-      // B10：上报驱动聚合推送——有观看者且距上次 ≥3s 时，把全部 latest 一次推给 PanelDO 广播。
-      // 上报驱动不引入定时器（MetricsDO 休眠不受影响）；推送频率与观看者数/机器数解耦（≤28,800/天）；
-      // PanelDO → 前端为出站消息不计费；PanelDO 收到后 per-ws 权限过滤组装（不查 /latest，省 DO 事件）
-      if (this.pushOn) {
-        const pushNow = Date.now();
-        if (pushNow - this.lastPushAt >= LATEST_PUSH_INTERVAL_MS) {
-          this.lastPushAt = pushNow;
-          try {
-            await doPanel(this.env).fetch('https://do.internal/rpc/latest_push', {
-              method: 'POST',
-              headers: { 'content-type': 'application/json' },
-              body: JSON.stringify({ latest: Object.fromEntries(this.latestByServer) }),
-            });
-          } catch { /* 推送失败下个周期重试 */ }
-        }
-      } else if (Date.now() - this.lastPushProbeAt >= PUSH_PROBE_INTERVAL_MS) {
-        // 自愈：pushOn 是实例内存，MetricsDO 无 WS 可能在 PanelDO set_push(1) 之后被 evict，
-        // 新实例不知道有人观看 → 面板数据冻结。低频（30s）反查 /viewers，有人看则恢复推送
-        this.lastPushProbeAt = Date.now();
-        try {
-          const vResp = await doPanel(this.env).fetch('https://do.internal/viewers');
-          const v = await vResp.json();
-          if ((v.count || 0) > 0) this.pushOn = true;
-        } catch { /* 反查失败下次再试 */ }
+      const frames = Array.isArray(b) ? b : (Array.isArray(b.frames) ? b.frames : [b]);
+      this.usage.report += frames.length; // 用量观测（按帧数计）
+      for (const f of frames) {
+        if (!f || !f.serverId) continue;
+        try { await this.processReportFrame(f); } catch { /* 单帧失败不影响其他帧 */ }
       }
       return json({ ok: true });
     }
@@ -2595,9 +2609,10 @@ export const __internals = {
   renderTemplate, parseHeaders, sendWebhook,
   shardForServerId, makeStreamId, shardFromStreamId,
   isAdmin, canAccessServer, canExec, handleReport,
-  lastSeenWrite, LAST_SEEN_THROTTLE_S, customWritten, serverListCache, apiCounts, serverRowCache, reportFwd,
+  lastSeenWrite, LAST_SEEN_THROTTLE_S, customWritten, serverListCache, apiCounts, serverRowCache, reportBatch,
   // 重置模块级可变状态（设置缓存），保证测试间隔离
   // 注：告警冷却/探活去重状态在 MetricsDO 实例内存，由各测试实例自行隔离
+  setReportFlushAt(v) { reportFlushAt = v; }, // let 原始值无法经对象属性赋值，测试用 setter 操纵 flush 时刻
   __reset() {
     SETTINGS_CACHE.clear();
     loginFails.clear();
@@ -2606,6 +2621,7 @@ export const __internals = {
     serverListCache.clear();
     apiCounts.clear();
     serverRowCache.clear();
-    reportFwd.clear();
+    reportBatch.clear();
+    reportFlushAt = 0;
   },
 };

@@ -532,6 +532,25 @@
   const FILE_MAX = 500 * 1024 * 1024;  // 单文件大小上限 500MB
   let fileUpload = null;               // { size, sent } 上传进度
   let fileDownload = null;             // { path, size, parts, received } 下载进度
+  let fileEntries = [];                // 当前目录全量条目（供文件名通配符过滤）
+
+  // 通配符 → 正则：* 匹配任意（含空），? 匹配单字符；其余字符正则转义
+  function fileFilterToRegex(pat) {
+    let re = '';
+    for (const ch of String(pat)) {
+      if (ch === '*') re += '.*';
+      else if (ch === '?') re += '.';
+      else re += ch.replace(/[.+^${}()|[\]\\]/g, '\\$&');
+    }
+    return new RegExp('^' + re + '$', 'i');
+  }
+  // 应用过滤输入框：从当前目录全量条目中筛选并渲染
+  function applyFileFilter() {
+    const pat = $('#file-filter').value.trim();
+    if (!pat) { renderFileList(fileEntries); return; }
+    const re = fileFilterToRegex(pat);
+    renderFileList(fileEntries.filter((e) => re.test(e.name)));
+  }
 
   function fileParent(p) {
     const t = String(p || '/').replace(/\/+$/, '');
@@ -548,6 +567,8 @@
       fileCwd = '/';
       $('#file-title').textContent = `文件管理 · ${serverName}`;
       $('#file-path').value = '/';
+      $('#file-filter').value = '';
+      fileEntries = [];
       $('#file-msg').textContent = '';
       $('#file-list').innerHTML = '<tr><td colspan="4" class="muted">连接中...</td></tr>';
       $('#file-modal').classList.remove('hidden');
@@ -561,7 +582,8 @@
       ws.onmessage = (ev) => {
         let j; try { j = JSON.parse(ev.data); } catch { return; }
         if (j.type === 'list_result' && j.ok) {
-          renderFileList(j.entries);
+          fileEntries = j.entries;
+          applyFileFilter(); // 应用当前过滤输入框
           if (j.truncated) $('#file-msg').textContent = '目录条目过多，仅显示前 1000 项';
         }
         else if (j.type === 'read_result' && j.ok) onReadResult(j);
@@ -1316,6 +1338,7 @@
   $('#file-go').onclick = () => { const p = $('#file-path').value.trim(); if (!p) return; fileCwd = p; fileSend({ type: 'list', path: p }); };
   $('#file-path').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('#file-go').click(); });
   $('#file-input').addEventListener('change', (e) => { const f = e.target.files[0]; if (f) uploadFile(f); e.target.value = ''; });
+  $('#file-filter').addEventListener('input', applyFileFilter); // 文件名通配符过滤（即时）
   $('#file-list').addEventListener('click', (e) => {
     const dir = e.target.closest('.f-dir');
     if (dir) { fileCwd = dir.dataset.path; $('#file-path').value = fileCwd; fileSend({ type: 'list', path: fileCwd }); return; }

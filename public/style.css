@@ -469,6 +469,8 @@ button.danger:hover { background: rgba(248, 113, 113, .12); }
   box-shadow: 0 2px 12px rgba(99, 102, 241, .28);
 }
 .file-upload:hover { filter: brightness(1.12); }
+/* 文件名通配符过滤输入框（type=text 基础外观继承全局样式） */
+.file-filter { width: 100%; margin-bottom: 12px; }
 .file-table { width: 100%; border-collapse: collapse; font-size: 13px; }
 .file-table th, .file-table td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); }
 .file-table th { color: var(--muted); font-weight: 600; font-size: 12px; }

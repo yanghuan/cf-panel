@@ -249,6 +249,25 @@ test('MetricsDO: evict 后热写空 Map 不误判已加载，/query 完整恢复
   assert.deepEqual(tsList, [nowMin - 30, nowMin - 5, nowMin], '热写空 Map 后 /query 仍完整恢复 storage 数据');
 });
 
+test('MetricsDO: evict 后首帧跨线行推进水位前兜底归档滞后 Storage 行（窄时序）', async () => {
+  const env = makeEnv();
+  const nowMin = Math.floor(Date.now() / 1000 / 60);
+  const xTs = nowMin - 200; // 仅存在于 Storage 的滞后历史行（arcTs < xTs < minTs <= cutoff）
+  const minTs = nowMin - 61; // 新实例首帧上报的跨线行
+  const state = mockState({
+    [`m:1:${xTs}`]: JSON.stringify({ cpu: 11 }),
+    'arc:1': String(nowMin - 300), // 旧水位（更早）
+  });
+  const { call } = mkMetrics(env, state);
+  // 新实例（空 Map，未完整加载）首帧跨线行：推进水位前必须兜底 (arcTs, minTs] 的 Storage 滞后行
+  await call('/report', { method: 'POST', body: JSON.stringify({ serverId: 1, minTs, cpu: 22 }) });
+  const rows = await env.DB.prepare('SELECT * FROM metrics_min WHERE server_id = 1').all();
+  assert.equal(rows.results.length, 2, '滞后 Storage 行与跨线行均归档');
+  assert.equal(rows.results.find((r) => r.ts === xTs).cpu, 11);
+  assert.equal(rows.results.find((r) => r.ts === minTs).cpu, 22);
+  assert.equal(Number(await state.storage.get('arc:1')), minTs, '水位推进到跨线行');
+});
+
 test('MetricsDO: 新服务器 arcTs=0 水位不误推进，避免大区间空循环（回归修复）', async () => {
   const env = makeEnv();
   const state = mockState(); // 无 arc key → arcTs=0（新服务器）

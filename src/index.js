@@ -1782,6 +1782,22 @@ export class MetricsDO {
         if (row) { stmts.push(mk(t, row)); maxArchived = t; }
       }
     }
+    // 兜底滞后区间（窄时序边界）：仅当本次要推进水位、且该服务器内存热区未完整加载
+    // （evict 后空 Map，hotLoaded 无）时，从 Storage 补归档 (arcTs, maxArchived] 中
+    // 仅存在于 Storage 的滞后行——否则 evict 后首帧上报跨线行（minTs<=cutoff，时钟回拨/补报）
+    // 会把水位从旧位置直接推进到该行，而 (arcTs, minTs) 之间的 Storage 历史行会被跳过。
+    // 正常运行时 hotLoaded 已置位 → 跳过此分支，零额外读；此分支仅在 evict 后首帧跨线时执行一次。
+    if (maxArchived > arcTs && !this.hotLoaded.has(serverId)) {
+      try {
+        const items = await this.listStorage(this.hotPrefix(serverId));
+        for (const k of items) {
+          const t = Number(k.name.slice(this.hotPrefix(serverId).length));
+          if (t > arcTs && t <= maxArchived) {
+            stmts.push(mk(t, JSON.parse(k.value)));
+          }
+        }
+      } catch { /* Storage 不可用：跳过兜底，fullSweep 仍会全扫兜底 */ }
+    }
     // D1 写入成功后才推进水位（失败保持，下次重试）；首次水位=0 时区间可能很大，分批防超 batch 上限
     for (let i = 0; i < stmts.length; i += 100) {
       await this.env.DB.batch(stmts.slice(i, i + 100));

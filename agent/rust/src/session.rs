@@ -280,7 +280,12 @@ async fn handle_file_cmd(line: &str, created: &Arc<std::sync::Mutex<Vec<String>>
         .unwrap_or("")
         .to_string();
     match ty {
-        "list" => file_list(path).await,
+        "list" => {
+            // 可选通配符过滤规则（由前端输入框传递；过滤在 agent 端完成，避免大目录
+            // 截断（FILE_LIST_MAX=1000）后前端只拿到截断区间子集而遗漏匹配文件）
+            let pattern = v.get("pattern").and_then(|x| x.as_str()).map(String::from);
+            file_list(path, pattern).await
+        }
         "read" => {
             let offset = v.get("offset").and_then(|x| x.as_u64()).unwrap_or(0);
             let limit = v.get("limit").and_then(|x| x.as_u64()).unwrap_or(0);
@@ -326,19 +331,55 @@ where
     }
 }
 
-async fn file_list(path: String) -> String {
+// 通配符匹配：* 匹配任意（含空），? 匹配单字符（大小写由调用方归一）
+fn wildcard_match(pattern: &str, name: &str) -> bool {
+    let p = pattern.as_bytes();
+    let n = name.as_bytes();
+    let (mut pi, mut ni) = (0usize, 0usize);
+    let mut star_p = None; // 最近一次 * 的位置（用于回溯）
+    let mut star_n = 0;
+    while ni < n.len() {
+        if pi < p.len() && (p[pi] == n[ni] || p[pi] == b'?') {
+            pi += 1;
+            ni += 1;
+        } else if pi < p.len() && p[pi] == b'*' {
+            star_p = Some(pi);
+            star_n = ni;
+            pi += 1;
+        } else if let Some(sp) = star_p {
+            pi = sp + 1;
+            star_n += 1;
+            ni = star_n;
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == b'*' {
+        pi += 1;
+    }
+    pi == p.len()
+}
+
+async fn file_list(path: String, pattern: Option<String>) -> String {
     match blocking_with_timeout(10, move || {
-        // 目录列表最大条目数，防超大目录物化全部条目/生成巨型 JSON
+        // 目录列表最大条目数，防超大目录物化全部条目/生成巨型 JSON。
+        // 通配符过滤先于截断：确保大目录下匹配的文件都在结果中（前端只过滤会遗漏截断区间）
         const FILE_LIST_MAX: usize = 1000;
+        let matcher = pattern.as_deref().filter(|p| !p.is_empty()).map(|p| p.to_ascii_lowercase());
         let mut entries = Vec::new();
         let mut truncated = false;
         if let Ok(rd) = std::fs::read_dir(&path) {
             for e in rd.flatten() {
+                let name = e.file_name().to_string_lossy().into_owned();
+                if let Some(m) = &matcher {
+                    if !wildcard_match(m, &name.to_ascii_lowercase()) {
+                        continue;
+                    }
+                }
                 if entries.len() >= FILE_LIST_MAX {
                     truncated = true;
                     break;
                 }
-                let name = e.file_name().to_string_lossy().into_owned();
                 let meta = e.metadata();
                 let is_dir = meta.as_ref().map(|m| m.is_dir()).unwrap_or(false);
                 let size = if is_dir {
@@ -547,6 +588,23 @@ mod tests {
         assert_eq!(v["type"], "error");
         assert_eq!(v["ok"], false);
         assert_eq!(v["message"], "boom");
+    }
+
+    #[test]
+    fn wildcard_match_basic() {
+        // 大小写已由调用方 to_ascii_lowercase 归一，此处 pattern/name 均传小写
+        assert!(wildcard_match("*.log", "app.log"));
+        assert!(wildcard_match("*.log", "a.log"));
+        assert!(!wildcard_match("*.log", "app.txt"));
+        assert!(wildcard_match("a?.txt", "a1.txt"));
+        assert!(!wildcard_match("a?.txt", "abc.txt"));
+        assert!(wildcard_match("a*b*c", "axbyc"));
+        assert!(!wildcard_match("a*b*c", "axby"));
+        assert!(wildcard_match("src/*.rs", "src/main.rs"));
+        assert!(wildcard_match("src/*.rs", "src/lib/main.rs")); // * 为贪婪匹配（file_list 只对 basename 匹配，无跨路径场景）
+        assert!(wildcard_match("", ""));
+        assert!(!wildcard_match("", "x"));
+        assert!(wildcard_match("*", "anything"));
     }
 
     #[test]

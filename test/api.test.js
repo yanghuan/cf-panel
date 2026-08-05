@@ -324,7 +324,7 @@ test('agent 上报：key 指纹定位 + 哈希校验 + 落库', async () => {
   assert.equal(after[0].online, true);
 });
 
-test('B8/B9：服务器行缓存 + MetricsDO 转发节流（降额）', async () => {
+test('服务器行缓存 + MetricsDO 转发节流（降额）', async () => {
   const env = makeEnv();
   const token = await login(env);
   const { agent_key } = await addServer(env, token, { name: 'node-1' });
@@ -332,11 +332,11 @@ test('B8/B9：服务器行缓存 + MetricsDO 转发节流（降额）', async ()
   // 首帧上报：缓存 miss 查 D1，转发 MetricsDO 1 次
   await call(env, { method: 'POST', path: '/api/report', body: { key: agent_key, cpu: 1 } });
   assert.equal(reportCalls(), 1, '首帧转发 MetricsDO');
-  assert.ok(I.serverRowCache.has(1), '服务器行已缓存（B8）');
+  assert.ok(I.serverRowCache.has(1), '服务器行已缓存');
   // 5s 窗口内重复上报：入队（覆盖本机帧），不触发 flush → MetricsDO 转发次数不变
   await call(env, { method: 'POST', path: '/api/report', body: { key: agent_key, cpu: 2 } });
   await call(env, { method: 'POST', path: '/api/report', body: { key: agent_key, cpu: 3 } });
-  assert.equal(reportCalls(), 1, '5s 窗口内不重复转发（B9 批量）');
+  assert.equal(reportCalls(), 1, '5s 窗口内不重复转发（批量）');
   // 超过 5s（flush 时间拨回）→ 重新 flush
   I.setReportFlushAt(Date.now() - 6000);
   await call(env, { method: 'POST', path: '/api/report', body: { key: agent_key, cpu: 4 } });
@@ -346,7 +346,7 @@ test('B8/B9：服务器行缓存 + MetricsDO 转发节流（降额）', async ()
   assert.ok(row.last_seen > 0, 'last_seen 仍落库');
 });
 
-test('B9+批量：同隔离实例多机上报聚合为一次 fetch', async () => {
+test('批量上报：同隔离实例多机上报聚合为一次 fetch', async () => {
   const env = makeEnv();
   const token = await login(env);
   await addServer(env, token, { name: 'n1' });
@@ -383,7 +383,7 @@ test('删除后 in-flight 上报不写指标（H-11 存在性复核）', async (
   assert.equal(rows.results.length, 1, '存在时写入');
   // 并发删除（读取 server 后完成删除；DELETE /api/servers 路径会同步清 serverRowCache，此处模拟）
   await env.DB.prepare('DELETE FROM servers WHERE id = 1').run();
-  I.serverRowCache.clear(); // 生产 DELETE 路径清行缓存（B8），后续上报缓存 miss → D1 复核拒绝
+  I.serverRowCache.clear(); // 生产 DELETE 路径清行缓存，后续上报缓存 miss → D1 复核拒绝
   // 在途上报：存在性复核被拒，不写入孤儿指标
   await I.handleReport(env, { serverId: 1, custom: [{ name: 'y', value: 2 }] });
   rows = await env.DB.prepare('SELECT * FROM metrics_custom WHERE server_id = 1').all();
@@ -672,7 +672,7 @@ test('设置：告警配置被清洗；非管理员 403', async () => {
   assert.equal(got.site_name, 'ops');
   assert.equal(got.alerts.cpu_pct, 88);
 
-  // B3：保存后通知 MetricsDO 清设置缓存（DO 隔离实例的告警/探活配置立即生效）
+  // 保存后通知 MetricsDO 清设置缓存（DO 隔离实例的告警/探活配置立即生效）
   assert.ok(env.METRICS.calls.some((c) => c.path === '/rpc/clear_settings_cache'), '设置保存触发 MetricsDO 清缓存 RPC');
 
   // PAT 不能读写设置

@@ -15,8 +15,8 @@ const LIST_CACHE_TTL_MS = 4500; // PanelDO 服务器列表缓存 TTL：> 前端 
 const LATEST_CACHE_TTL_MS = 4000; // MetricsDO /latest 共享缓存 TTL（多观看者 sync 共享，DO 事件 −50%）
 const SYNC_MIN_INTERVAL_MS = 2000; // PanelDO sync 频率下限（<2s 忽略，防任意消息/高频触发全链路）
 const ARCHIVE_IDLE_INTERVAL_MS = 60 * 60 * 1000; // 闲置（无数据且告警关闭）时 alarm 退避间隔（1h）
-const PAT_CHECK_INTERVAL_MS = 10 * 1000; // PAT 终端连接重校验间隔（B4：每条消息 → 10s 一次，−98%）
-const LATEST_PUSH_INTERVAL_MS = 5000; // B10：上报驱动聚合推送间隔（有观看者时 ≥5s 推一次全部 latest 给 PanelDO；
+const PAT_CHECK_INTERVAL_MS = 10 * 1000; // PAT 终端连接重校验间隔（每条消息 → 10s 一次，−98%）
+const LATEST_PUSH_INTERVAL_MS = 5000; // 上报驱动聚合推送间隔（有观看者时 ≥5s 推一次全部 latest 给 PanelDO；
 // 单机时被 REPORT_FWD_THROTTLE_S=5s 钳制（MetricsDO 每 5s 收帧），多机时聚合多台上报防推送风暴）
 const PUSH_PROBE_INTERVAL_MS = 30 * 1000; // pushOn 自愈反查 /viewers 的间隔（MetricsDO evict 丢失 pushOn 时）
 const PANEL_SWITCH_GRACE_MS = 30 * 1000; // 观看者 0→1 后在线判定用慢宽限的过渡期：Agent 切快采并完成首帧上报前，
@@ -314,7 +314,7 @@ async function queryCustomMetrics(env, serverId, hours) {
   return custom;
 }
 
-// 设置缓存（避免告警检查每次上报读 D1），TTL 300s（B3：> 慢采间隔 120s，慢采每帧不再必 miss），
+// 设置缓存（避免告警检查每次上报读 D1），TTL 300s（> 慢采间隔 120s，慢采每帧不再必 miss），
 // 保存设置时清除（Worker 侧）+ MetricsDO RPC 清除（DO 隔离实例侧）
 // 注意：告警冷却（ALERT_LAST）与探活去重（PROBE_STATE）状态已移至 MetricsDO 实例内存
 // （单实例全局一致，且复用每次上报已有的 /report 调用，零额外请求），见 MetricsDO.checkAlerts/checkProbeAlerts
@@ -412,7 +412,7 @@ const lastSeenWrite = new Map(); // serverId -> 上次落盘秒（跨实例 evic
 // serverId -> { minTs, names: Set }：metrics_custom 分钟去重（同分钟同指标只写一次 D1；
 // 跨实例 evict 丢失后仅偶发多写一次，INSERT OR IGNORE 幂等无害）
 const customWritten = new Map();
-// B8：服务器行缓存（handleReport 每帧 SELECT 1 行 → 60s TTL，快采 −28,800 D1 读/天/机）。
+// 服务器行缓存（handleReport 每帧 SELECT 1 行 → 60s TTL，快采 −28,800 D1 读/天/机）。
 // 按隔离实例分布（Worker HTTP 上报 / TerminalDO 控制通道上报各自一份）；删除路径清 Worker 侧，
 // TerminalDO 侧 60s 自动过期，缓存窗口内的孤儿写无害（INSERT OR IGNORE / 条件写）
 const serverRowCache = new Map(); // serverId -> {info_json, probe_json, name, ts}
@@ -424,10 +424,10 @@ async function getServerRow(env, serverId) {
   if (row) serverRowCache.set(serverId, { ...row, ts: Date.now() });
   return row;
 }
-// B9+批量：MetricsDO /report 转发节流（每 5s flush 一次）。
+// MetricsDO /report 转发节流（每 5s flush 一次）：
 // 同一隔离实例（TerminalDO 分片 / Worker）内把 5s 窗口内多台机器的上报聚合为一次 fetch
-//（reportFwd 单机节流升级为队列）：5 机分布 4 分片 fetch 36,000→28,800（−20%），同分片多机 −50%；
-// 单机行为与 B9 5s 节流等价。flush 由上报驱动触发（每帧检查距上次 ≥5s），不引入定时器。
+//（单机节流升级为队列）：5 机分布 4 分片 fetch 36,000→28,800（−20%），同分片多机 −50%；
+// 单机行为与 5s 节流等价。flush 由上报驱动触发（每帧检查距上次 ≥5s），不引入定时器。
 // 告警/探活判定搭 /report 顺风车，随之 ~5s 一次（冷却 30min 不受影响，探活判定延迟 ≤5s）；
 // 卡片新鲜度 ≤5s，last_seen_s 最旧 ~6s 远低于 15s 快宽限（余量充足）
 const REPORT_FWD_THROTTLE_S = 5;
@@ -440,7 +440,7 @@ let reportFlushAt = 0; // 上次 flush 时刻（ms；隔离实例内共享，上
 async function handleReport(env, payload) {
   const ts = Math.floor(Date.now() / 1000);
   const minTs = Math.floor(ts / 60);
-  // 服务器行读缓存（B8）同时承担存在性复核（缓存未命中才查 D1；删除窗口孤儿写无害，
+  // 服务器行读缓存同时承担存在性复核（缓存未命中才查 D1；删除窗口孤儿写无害，
   // 见 getServerRow 注释；热区由 MetricsDO /drop + alarm 清理兜底）。
   const server = await getServerRow(env, payload.serverId);
   if (!server) return;
@@ -496,7 +496,7 @@ async function handleReport(env, payload) {
     }
   }
   // 时序写入 MetricsDO 热区；告警/探活判定也在该调用内顺带完成（零额外请求）。
-  // B9+批量：入队本机最新帧（同机 5s 窗口内保留最后一帧），距上次 flush ≥5s 时
+  // 批量上报：入队本机最新帧（同机 5s 窗口内保留最后一帧），距上次 flush ≥5s 时
   // 把队列内所有机器聚合一次 fetch（同隔离实例多机合并，见 reportBatch 注释）
   reportBatch.set(payload.serverId, {
     serverId: payload.serverId,
@@ -806,7 +806,7 @@ async function handleApi(request, env) {
       .run();
     await env.DB.prepare('INSERT INTO audit_logs (user_id, action) VALUES (?,?)').bind(user.id, 'server.create').run();
     serverListCache.clear(); // 服务器增删改后立即使列表缓存失效
-    serverRowCache.clear(); // 行缓存同步失效（B8）
+    serverRowCache.clear(); // 行缓存同步失效
     return json({
       agent_key: key,
       wss_base: `wss://${url.host}/ws/agent`,
@@ -828,7 +828,7 @@ async function handleApi(request, env) {
     // 2) 删除服务器本体（agent key 随之失效，重连返回 401）
     await env.DB.prepare('DELETE FROM servers WHERE id = ?').bind(id).run();
     serverListCache.clear(); // 服务器增删改后立即使列表缓存失效
-    serverRowCache.clear(); // 行缓存同步失效（B8）
+    serverRowCache.clear(); // 行缓存同步失效
     // 3) 审计日志
     await env.DB.prepare('INSERT INTO audit_logs (user_id, action, target_server_id, detail) VALUES (?,?,?,?)')
       .bind(user.id, 'server.delete', id, server.name).run();
@@ -997,7 +997,7 @@ async function handleApi(request, env) {
     };
     await kvPut(env, 'settings', next);
     kvClearCache('settings'); // 告警配置立即生效（Worker 侧）
-    // B3：MetricsDO 是独立隔离实例，其 SETTINGS_CACHE 需 RPC 清除（否则告警/探活判定最长滞后 300s）
+    // MetricsDO 是独立隔离实例，其 SETTINGS_CACHE 需 RPC 清除（否则告警/探活判定最长滞后 300s）
     try {
       await doMetrics(env).fetch('https://do.internal/rpc/clear_settings_cache', { method: 'POST' });
     } catch { /* 清缓存失败：MetricsDO 侧按 300s TTL 自然过期 */ }
@@ -1559,7 +1559,7 @@ export class TerminalDO {
       // 鉴权通过 → 挂接为会话用户端；附件升级为 user 角色（供休眠唤醒重建索引）。
       // patToken 随附件持久化：PAT 撤销后每次浏览器消息重校验，撤销即关闭（JWT 不存，保持零 D1 读）
       sess.userWs = ws;
-      sess.lastPatCheck = Date.now(); // 首帧已校验，PAT 重校验节流起点（B4）
+      sess.lastPatCheck = Date.now(); // 首帧已校验，PAT 重校验节流起点
       ws.serializeAttachment({
         role: 'user', sid: att.sid, serverId: sess.serverId,
         creatorUserId: sess.creatorUserId, type: sess.type, createdAt: sess.createdAt,
@@ -1619,7 +1619,7 @@ export class TerminalDO {
     }
 
     if (ws === sess.userWs) {
-      // PAT 撤销校验（B4 节流）：每 10s 重查一次 D1（打字 2~5 消息/s → 10s 一次，−98%；
+      // PAT 撤销校验（节流）：每 10s 重查一次 D1（打字 2~5 消息/s → 10s 一次，−98%；
       // 撤销后最迟 10s 内的一次输入即关闭连接；挂机连接由会话 TTL/绝对 TTL 兜底回收）
       const uatt = ws.deserializeAttachment?.();
       if (uatt && uatt.patToken) {
@@ -1737,15 +1737,15 @@ export class MetricsDO {
     // 数据唯一事实源在 DO Storage（行级 KV），实例被 evict/重启后可从 storage 全量恢复，
     // 内存缓存仅加速当前实例生命周期内的读写（原纯内存热区在实例 evict 后即丢）。
     this.data = new Map();
-    this.putMin = new Map(); // serverId -> 已持久化到 storage 的分钟 ts（A1：storage.put 按分钟去重）
+    this.putMin = new Map(); // serverId -> 已持久化到 storage 的分钟 ts（storage.put 按分钟去重）
     // 告警去重状态：内存为主，关键变更时持久化到 DO Storage，实例 evict/重启后恢复，避免重复告警
     this.alertLast = new Map(); // `${serverId}:kind` -> 上次触发时间
     this.probeState = new Map(); // `${serverId}:probeName` -> {ok, lastFail}
     this.alertLoaded = false;
     this.probeLoaded = false;
     this.arcCache = new Map(); // serverId -> 已归档水位（分钟），实例内缓存，evict 后从 storage 恢复
-    this.lastSweepAt = 0; // 上次 fullSweep 时间戳（ms；A3：持久化跨 evict，见 ensureHousekeepLoaded）
-    this.lastPruneAt = 0; // 上次保留期清理时间戳（ms；A3：同上，替代易被 evict 重置的内存计数）
+    this.lastSweepAt = 0; // 上次 fullSweep 时间戳（ms；持久化跨 evict，见 ensureHousekeepLoaded）
+    this.lastPruneAt = 0; // 上次保留期清理时间戳（ms；同上，替代易被 evict 重置的内存计数）
     this.housekeepLoaded = false; // 家政状态（fullSweep/prune 时间）是否已从 storage 恢复
     this.lastSeenSec = new Map(); // serverId -> 最后上报秒（内存，/latest 在线判定用；evict 后由 D1 last_seen 兜底）
     this.alarmCached = null; // 实例内已知的下一次 alarm 时间戳；避免每帧上报都 getAlarm（DO Storage 读）
@@ -1754,13 +1754,13 @@ export class MetricsDO {
     this.offlineState = new Map(); // serverId -> 'on'|'off'（内存副本，避免每机逐个 getAlarm）
     this.usage = { report: 0, latest: 0, query: 0, alarm: 0 }; // 用量观测：本周期（10min）计数，alarm 时累计到 storage
     this.hotLoaded = new Set(); // serverId 已从 storage 完整加载热区的标记（见 ensureHot）
-    this.pushOn = false; // B10：是否有观看者（PanelDO 0→1/1→0 通知），开启时才推送 latest
+    this.pushOn = false; // 是否有观看者（PanelDO 0→1/1→0 通知），开启时才推送 latest
     this.lastPushAt = 0; // 上次推送 latest 给 PanelDO 的时刻（ms）；上报驱动节流，不引入定时器
     this.lastPushProbeAt = 0; // 上次反查 /viewers 的时刻（pushOn 因 evict 丢失时的自愈兜底）
-    this.pendingArcRetry = new Set(); // serverId：首帧兜底 list 失败后待重试（A2 极窄回退加固）
+    this.pendingArcRetry = new Set(); // serverId：首帧兜底 list 失败后待重试（正确性加固）
   }
 
-  // 家政状态（lastSweepAt/lastPruneAt）从 storage 惰性恢复（A3：持久化跨实例 evict，
+  // 家政状态（lastSweepAt/lastPruneAt）从 storage 惰性恢复（持久化跨实例 evict，
   // 避免慢采/空闲下实例频繁 evict 导致 fullSweep 停摆（>12h 热区无限增长）与 prune 每天 144 次全表扫）
   async ensureHousekeepLoaded() {
     if (this.housekeepLoaded) return;
@@ -1836,7 +1836,7 @@ export class MetricsDO {
   // 由 /report 热写路径顺带调用（水位 < 归档线时才执行，正常每 ~10 分钟一次），
   // 取代 alarm 每 10 分钟全量 list + 重复 INSERT（消除 DO Storage 读与 D1 重复写）。
   // 本次上报行本身若已跨过归档线则直接归档（不依赖水位，防回溯/补报漏归档）。
-  // fresh：本实例内该机首帧热写标记（evict 后），仅首帧推进水位时做 Storage 兜底（见下方 A2 注释）
+  // fresh：本实例内该机首帧热写标记（evict 后），仅首帧推进水位时做 Storage 兜底（见下方注释）
   async archiveIncrement(serverId, m, minTs, fresh = false) {
     if (this.env.ARCHIVE_TO_D1 === '0') return;
     const arcKey = `arc:${serverId}`;
@@ -1874,10 +1874,10 @@ export class MetricsDO {
         if (row) { stmts.push(mk(t, row)); maxArchived = t; }
       }
     }
-    // 兜底滞后区间（窄时序边界，A2）：仅限本实例内该机「首帧热写」（fresh=true，即 evict 后）
+    // 兜底滞后区间（窄时序边界）：仅限本实例内该机「首帧热写」（fresh=true，即 evict 后）
     // 且本次推进水位时，从 Storage 补归档 (arcTs, maxArchived] 中仅存在于 Storage 的滞后行——
     // 否则 evict 后首帧跨线行（minTs<=cutoff）会把水位从旧位置直接推进到该行而跳过中间历史行。
-    // 此后内存 Map 已覆盖本实例写入区间，滞后行由区间循环或 fullSweep（A3 修复后每 ~1h 可靠执行）
+    // 此后内存 Map 已覆盖本实例写入区间，滞后行由区间循环或 fullSweep（每 ~1h 可靠执行）
     // 兜底——避免「hotLoaded 仅 /query 置位」导致的每 60 秒一次全量 listStorage 读（~1.04M 行/天/机）。
     // 兜底读取失败（Storage 瞬时不可用）时不得推进水位：否则水位越过未归档行后，
     // fullSweep（仅扫 ts>arcTs）也会永久跳过它们——正确性优先，失败时保持水位。
@@ -1911,7 +1911,7 @@ export class MetricsDO {
     }
   }
 
-  // 处理单帧上报（/report 批量接口每帧调用）：热写 + 增量归档 + 告警/探活 + B10 推送
+  // 处理单帧上报（/report 批量接口每帧调用）：热写 + 增量归档 + 告警/探活 + 推送
   async processReportFrame(b) {
     const minTs = Number(b.minTs);
     const v = { cpu: b.cpu, mem_used: b.mem_used, mem_total: b.mem_total, net_in: b.net_in, net_out: b.net_out, extra: b.extra };
@@ -1929,7 +1929,7 @@ export class MetricsDO {
         last_seen_s: Math.floor(Date.now() / 1000),
       });
       this.trim(m);
-      // A1：storage.put 按分钟去重——同分钟多帧只写 1 次；put 失败不更新 putMin，下帧自动重试
+      // storage.put 按分钟去重——同分钟多帧只写 1 次；put 失败不更新 putMin，下帧自动重试
       if (this.putMin.get(b.serverId) !== minTs) {
         await this.state.storage.put(this.hotKey(b.serverId, minTs), JSON.stringify(v));
         this.putMin.set(b.serverId, minTs);
@@ -1945,7 +1945,7 @@ export class MetricsDO {
       if (b.serverName) await this.checkAlerts(b);
       if (Array.isArray(b.probes)) await this.checkProbeAlerts(b.serverId, b.serverName, b.probes);
     } catch { /* 告警失败不影响监控存储 */ }
-    // B10：上报驱动聚合推送——有观看者且距上次 ≥5s 时，把全部 latest 一次推给 PanelDO 广播。
+    // 上报驱动聚合推送——有观看者且距上次 ≥5s 时，把全部 latest 一次推给 PanelDO 广播。
     // 上报驱动不引入定时器（MetricsDO 休眠不受影响）；PanelDO → 前端为出站消息不计费
     if (this.pushOn) {
       const pushNow = Date.now();
@@ -1975,7 +1975,7 @@ export class MetricsDO {
     const url = new URL(request.url);
 
     if (url.pathname === '/report' && request.method === 'POST') {
-      // 批量接口（B9+批量）：body 为 {frames:[...]}（同隔离实例多机聚合）或单帧字段，循环处理
+      // 批量接口：body 为 {frames:[...]}（同隔离实例多机聚合）或单帧字段，循环处理
       const b = await request.json();
       const frames = Array.isArray(b) ? b : (Array.isArray(b.frames) ? b.frames : [b]);
       this.usage.report += frames.length; // 用量观测（按帧数计）
@@ -1986,7 +1986,7 @@ export class MetricsDO {
       return json({ ok: true });
     }
 
-    // 内部 RPC：PanelDO 观看者 0→1/1→0 时通知（B10：仅在有人观看时推送 latest）
+    // 内部 RPC：PanelDO 观看者 0→1/1→0 时通知（仅在有人观看时推送 latest）
     if (url.pathname === '/rpc/set_push' && request.method === 'POST') {
       const pb = await request.json();
       this.pushOn = !!pb.on;
@@ -2076,7 +2076,7 @@ export class MetricsDO {
       return json({ counters: this.usage, persisted });
     }
 
-    // 内部 RPC：面板保存设置后清本隔离实例的 SETTINGS_CACHE（B3：告警/探活配置立即生效）
+    // 内部 RPC：面板保存设置后清本隔离实例的 SETTINGS_CACHE（告警/探活配置立即生效）
     if (url.pathname === '/rpc/clear_settings_cache' && request.method === 'POST') {
       SETTINGS_CACHE.clear();
       return json({ ok: true });
@@ -2255,7 +2255,7 @@ export class MetricsDO {
     let alertOn = false; // 提升到函数级：finally 的闲置退避判定需要（try 内 const 不可见）
     try {
     // 用量观测：本周期计数累计到 storage（跨实例 evict 保留近似量级），随后清零内存。
-    // B5：按「本期增量」判断全零才跳过 put（累计值 prev+本期 只要历史有过流量就永远非零，
+    // 按「本期增量」判断全零才跳过 put（累计值 prev+本期 只要历史有过流量就永远非零，
     // 用累计值判断会使跳过成为死代码）——闲置/无流量 alarm 不再无条件写 storage
     try {
       const prev = JSON.parse(await this.state.storage.get('usage:total') || '{}');
@@ -2307,7 +2307,7 @@ export class MetricsDO {
     }
     } finally {
       // 无论是否异常都续排下一次 alarm：防归档/清理/告警因单次失败永久停摆。
-      // B7：闲置（无热区数据且告警关闭）时退避 +1h（零服务器/无上报面板不再 10min 空转 144 次/天）；
+      // 闲置（无热区数据且告警关闭）时退避 +1h（零服务器/无上报面板不再 10min 空转 144 次/天）；
       // 新上报经 scheduleArchive 提前拉回（alarmCached 失效后 getAlarm 发现更早需求重新设置）
       const idle = this.data.size === 0 && !alertOn;
       this.alarmCached = Date.now() + (idle ? ARCHIVE_IDLE_INTERVAL_MS : ARCHIVE_INTERVAL_MS);
@@ -2382,9 +2382,9 @@ export class PanelDO {
   constructor(state, env) {
     this.state = state;
     this.env = env;
-    this.listCache = null; // {rows, ts} 服务器列表缓存（B1：TTL 4500ms，多观看者共享，降 D1 读）
-    this.latestCache = null; // {data, ts} MetricsDO /latest 共享缓存（B2：TTL 4s，sync 链 DO 事件 −50%）
-    this.syncAt = new Map(); // ws -> 上次 sync 时间（B6：频率下限 <2s 忽略，防刷）
+    this.listCache = null; // {rows, ts} 服务器列表缓存（TTL 4500ms，多观看者共享，降 D1 读）
+    this.latestCache = null; // {data, ts} MetricsDO /latest 共享缓存（TTL 4s，sync 链 DO 事件 −50%）
+    this.syncAt = new Map(); // ws -> 上次 sync 时间（频率下限 <2s 忽略，防刷）
     this.authCache = new Map(); // token -> {user, ts} 鉴权缓存（5s TTL；PAT 删除后 ≤5s 失效）
     this.fastSince = 0; // 最近一次 0→1 切快采时刻（毫秒）；过渡期内在线判定用慢宽限，避免首次显示离线
   }
@@ -2434,7 +2434,7 @@ export class PanelDO {
       this.authCache.clear();
       return json({ ok: true });
     }
-    // 内部 RPC（B10）：MetricsDO 上报驱动推送全部最新指标 → 按观看者权限过滤组装后广播（出站不计费）
+    // 内部 RPC：MetricsDO 上报驱动推送全部最新指标 → 按观看者权限过滤组装后广播（出站不计费）
     if (url.pathname === '/rpc/latest_push' && request.method === 'POST') {
       const pb = await request.json();
       const latest = pb.latest || {};
@@ -2444,7 +2444,7 @@ export class PanelDO {
         const token = String(w.deserializeAttachment() || '');
         const user = await this.authUserCached(token);
         if (!user) {
-          // 已撤销：直接关闭连接（B10 后前端仅 onopen 发一次 sync，webSocketMessage 的
+          // 已撤销：直接关闭连接（前端仅 onopen 发一次 sync，webSocketMessage 的
           // 关闭分支不会再触发——必须在此兜底，否则撤销连接残留计数导致 agent 持续快采）
           try { w.close(1008, 'unauthorized'); } catch { /* ignore */ }
           return;
@@ -2494,12 +2494,12 @@ export class PanelDO {
       if (authed.length === 1) {
         this.fastSince = Date.now(); // 过渡期内（30s）在线判定用慢宽限，防切快采前短暂误判离线
         this.broadcastViewers(1);
-        this.setPush(1); // B10：开启上报驱动推送
+        this.setPush(1); // 开启上报驱动推送
       }
       return;
     }
     const token = ws.deserializeAttachment() || '';
-    // B6：仅响应 'sync'（任意其他消息不再触发全链路）；频率下限 <2s 忽略（防刷/异常放大）
+    // 仅响应 'sync'（任意其他消息不再触发全链路）；频率下限 <2s 忽略（防刷/异常放大）
     if (message !== 'sync') return;
     const syncNow = Date.now();
     const lastSync = this.syncAt.get(ws) || 0;
@@ -2513,7 +2513,7 @@ export class PanelDO {
       try { ws.close(1008, 'unauthorized'); } catch { /* ignore */ }
       return;
     }
-    // 附带每台机器的最新指标（卡片实时展示；B2：共享缓存 4s；B10 后 sync 仅首次/兜底触发，
+    // 附带每台机器的最新指标（卡片实时展示；共享缓存 4s；被动接收后 sync 仅首次/兜底触发，
     // 常态数据由 MetricsDO 上报驱动 latest_push 推送）
     let latest = {};
     const lcNow = Date.now();
@@ -2530,7 +2530,7 @@ export class PanelDO {
     if (list) { try { ws.send(JSON.stringify(list)); } catch { /* ignore */ } }
   }
 
-  // 组装服务器列表（sync 与 B10 latest_push 广播共用）。latest 由调用方提供：
+  // 组装服务器列表（sync 与推送广播共用）。latest 由调用方提供：
   // latest_push 直接使用 MetricsDO 推来的数据（不查 /latest，省 DO 事件）
   async buildList(user, latest) {
     let serverRows;
@@ -2558,7 +2558,7 @@ export class PanelDO {
     }));
   }
 
-  // 通知 MetricsDO 是否有人观看（B10：仅有人看时才推 latest；0→1 开 / 1→0 关）
+  // 通知 MetricsDO 是否有人观看（仅有人看时才推 latest；0→1 开 / 1→0 关）
   async setPush(on) {
     try {
       await doMetrics(this.env).fetch('https://do.internal/rpc/set_push', {
@@ -2575,7 +2575,7 @@ export class PanelDO {
     if (authed.length === 0) {
       this.fastSince = 0;
       this.broadcastViewers(0);
-      this.setPush(0); // B10：无人观看停止推送
+      this.setPush(0); // 无人观看停止推送
     }
   }
 

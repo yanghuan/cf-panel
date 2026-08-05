@@ -76,7 +76,7 @@ test('MetricsDO: report / query / latest 基本读写', async () => {
   assert.equal((await call('/nope')).status, 404);
 });
 
-test('MetricsDO: storage.put 按分钟去重，put 失败下帧重试（A1 降额）', async () => {
+test('MetricsDO: storage.put 按分钟去重，put 失败下帧重试（降额）', async () => {
   const env = makeEnv({ ARCHIVE_TO_D1: '0' });
   const st = mockState();
   const { call } = mkMetrics(env, st);
@@ -100,7 +100,7 @@ test('MetricsDO: storage.put 按分钟去重，put 失败下帧重试（A1 降�
   assert.equal(st.storage.map.has(`m:1:${nowMin + 2}`), true, 'put 失败下帧重试写入');
 });
 
-test('MetricsDO: 兜底 listStorage 仅本实例首帧执行（A2 降额）', async () => {
+test('MetricsDO: 兜底 listStorage 仅本实例首帧执行（降额）', async () => {
   const env = makeEnv();
   const nowMin = Math.floor(Date.now() / 1000 / 60);
   const st = mockState({
@@ -124,7 +124,7 @@ test('MetricsDO: 兜底 listStorage 仅本实例首帧执行（A2 降额）', as
   assert.equal(listCount, 1, '非首帧不再触发兜底 list');
 });
 
-test('MetricsDO: 家政状态持久化跨 evict（A3：fullSweep/prune 不因重置停摆）', async () => {
+test('MetricsDO: 家政状态持久化跨 evict（fullSweep/prune 不因重置停摆）', async () => {
   const env = makeEnv();
   const st = mockState();
   const { inst, call } = mkMetrics(env, st);
@@ -145,7 +145,7 @@ test('MetricsDO: 家政状态持久化跨 evict（A3：fullSweep/prune 不因重
   assert.equal(hAfter.lastPruneAt, hBefore.lastPruneAt, '未到期不重复 prune');
 });
 
-test('B10: MetricsDO 上报驱动聚合推送（set_push 开启 + 5s 节流）', async () => {
+test('MetricsDO 上报驱动聚合推送（set_push 开启 + 5s 节流）', async () => {
   // 自定义 Panel stub：记录 init（makePanelStub 不记录请求体）
   const pushCalls = [];
   const env = makeEnv({
@@ -178,7 +178,7 @@ test('B10: MetricsDO 上报驱动聚合推送（set_push 开启 + 5s 节流）',
   assert.equal(pushCount(), 2, '超过 5s 重新推送');
 });
 
-test('B10: latest_push 对已撤销观看者关闭连接（修复验证问题2）', async () => {
+test('latest_push 对已撤销观看者关闭连接（修复验证问题2）', async () => {
   const env = makeEnv();
   const ws = { closed: false, attachment: 'cfp_revoked_token', deserializeAttachment() { return this.attachment; }, send() {}, close() { this.closed = true; } };
   const inst = new PanelDO({ getWebSockets: () => [ws] }, env);
@@ -187,7 +187,7 @@ test('B10: latest_push 对已撤销观看者关闭连接（修复验证问题2�
   assert.equal(ws.closed, true, '已撤销观看者连接被关闭（不再残留计数维持快采）');
 });
 
-test('B10: pushOn evict 丢失后反查 /viewers 自愈（修复验证问题3）', async () => {
+test('pushOn evict 丢失后反查 /viewers 自愈（修复验证问题3）', async () => {
   const env = makeEnv({ PANEL: makePanelStub({ viewers: 1 }) }); // 实际有人观看
   const st = mockState();
   const { inst, call } = mkMetrics(env, st);
@@ -224,7 +224,7 @@ test('MetricsDO: 首帧兜底失败置 pendingArcRetry，后续帧重试成功�
   assert.equal(rows.results.length, 2, '滞后行与跨线行均归档');
 });
 
-test('B10: PanelDO latest_push 按观看者权限广播（不查 /latest）', async () => {
+test('PanelDO latest_push 按观看者权限广播（不查 /latest）', async () => {
   const env = makeEnv();
   const token = await I.signJwt({ uid: 1, username: 'admin', role: 1, exp: Math.floor(Date.now() / 1000) + 3600 }, env);
   await insertServer(env, 'k1', 'srv-a', { last_seen: Math.floor(Date.now() / 1000) - 5 });
@@ -285,7 +285,7 @@ test('MetricsDO: /usage 用量计数，alarm 汇总到 storage 跨 evict 保留'
   assert.equal(after.persisted.report, 2, '累计到 storage');
   assert.equal(after.persisted.latest, 1);
   assert.equal(after.persisted.query, 1);
-  assert.equal(after.persisted.alarm, undefined, 'alarm 次数不持久化（B5 全零跳过 put）');
+  assert.equal(after.persisted.alarm, undefined, 'alarm 次数不持久化（全零跳过 put）');
   // 新实例（共享 storage）能读到累计总量
   const { inst: instB } = mkMetrics(env, state);
   await instB.alarm();
@@ -457,7 +457,7 @@ test('MetricsDO: evict 后首帧跨线行推进水位前兜底归档滞后 Stora
   assert.equal(Number(await state.storage.get('arc:1')), minTs, '水位推进到跨线行');
 });
 
-test('MetricsDO: /query 已加载后跨线补报不跳过 (arcTs,minTs) 内存行（残余边界1）', async () => {
+test('MetricsDO: /query 已加载后跨线补报不跳过 (arcTs,minTs) 内存行（残余边界）', async () => {
   const env = makeEnv();
   const nowMin = Math.floor(Date.now() / 1000 / 60);
   const xTs = nowMin - 200; // (arcTs, minTs) 之间的历史行
@@ -477,7 +477,7 @@ test('MetricsDO: /query 已加载后跨线补报不跳过 (arcTs,minTs) 内存�
   assert.equal(rows.results.find((r) => r.ts === minTs).cpu, 22);
 });
 
-test('MetricsDO: 兜底 listStorage 瞬时失败不推进水位，恢复后 fullSweep 归档（残余边界2）', async () => {
+test('MetricsDO: 兜底 listStorage 瞬时失败不推进水位，恢复后 fullSweep 归档（残余边界）', async () => {
   const env = makeEnv();
   const nowMin = Math.floor(Date.now() / 1000 / 60);
   const xTs = nowMin - 200;
@@ -492,7 +492,7 @@ test('MetricsDO: 兜底 listStorage 瞬时失败不推进水位，恢复后 full
   state.storage.list = async () => { throw new Error('storage unavailable'); };
   await call('/report', { method: 'POST', body: JSON.stringify({ serverId: 1, minTs, cpu: 22 }) });
   assert.equal(Number(await state.storage.get('arc:1')), nowMin - 300, '兜底失败时不推进水位');
-  // 恢复后由 fullSweep（A3 修复后每 ~1h 可靠执行）兜底归档滞后行并推进水位
+  // 恢复后由 fullSweep（每 ~1h 可靠执行）兜底归档滞后行并推进水位
   state.storage.list = origList;
   await inst.fullSweep(true);
   assert.ok(Number(await state.storage.get('arc:1')) >= xTs, 'fullSweep 兜底推进水位');
@@ -854,7 +854,7 @@ test('TerminalDO: PAT 撤销后浏览器消息关闭连接（重校验）', asyn
   assert.equal(ws.closed, true, 'PAT 撤销后输入即关闭连接');
 });
 
-test('PanelDO: /latest 共享缓存 + sync 频率下限（B2/B6 降额）', async () => {
+test('PanelDO: /latest 共享缓存 + sync 频率下限（降额）', async () => {
   const env = makeEnv();
   const token = await I.signJwt({ uid: 1, username: 'admin', role: 1, exp: Math.floor(Date.now() / 1000) + 3600 }, env);
   await insertServer(env, 'k1', 'srv-a');
@@ -874,7 +874,7 @@ test('PanelDO: /latest 共享缓存 + sync 频率下限（B2/B6 降额）', asyn
   // 绕过频率下限后再 sync → 命中 /latest 共享缓存（仍不调 DO）
   inst.syncAt.delete(ws);
   await inst.webSocketMessage(ws, 'sync');
-  assert.equal(latestCalls(), 1, '/latest 共享缓存命中（B2）');
+  assert.equal(latestCalls(), 1, '/latest 共享缓存命中');
 });
 
 test('PanelDO: webSocketError 兜底执行下线检查（最后观看者残留防护）', async () => {
@@ -905,7 +905,7 @@ test('PanelDO: 切快采过渡期（30s 内）在线判定用慢宽限（防首�
   assert.equal(JSON.parse(ws.sent[0])[0].online, true, '过渡期慢宽限不误判离线');
   // 过渡期结束（fastSince 拨回 31s 前）→ 快宽限 15s → 60s 前上报判离线
   inst.fastSince = Date.now() - 31000;
-  inst.syncAt.delete(ws); // 绕过 <2s 频率下限（B6），模拟下一个 sync 周期
+  inst.syncAt.delete(ws); // 绕过 <2s 频率下限，模拟下一个 sync 周期
   await inst.webSocketMessage(ws, 'sync');
   assert.equal(JSON.parse(ws.sent[1])[0].online, false, '过渡期后快宽限生效');
 });

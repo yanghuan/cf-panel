@@ -216,5 +216,46 @@ else
   echo "  （跳过：未检测到 socat，终端用例仅在 CI 运行）"
 fi
 
+# 7) 文件上传/下载（10MB，验证文件管理链路：文件会话 → agent 写/读 → 内容一致性）
+echo "[7/7] 文件上传/下载（10MB）..."
+if command -v node >/dev/null 2>&1; then
+  head -c 10485760 /dev/urandom > "$TMP/upload.bin" || true
+  if [ ! -s "$TMP/upload.bin" ]; then
+    bad "无法生成 10MB 测试文件"
+  else
+    FILE_OK=0
+    for attempt in 1 2; do
+      FRES=$(curl -s -X POST "$BASE/api/file/open" \
+        -H "authorization: Bearer $TOKEN" -H 'content-type: application/json' \
+        -d '{"server_id":1}' || true)
+      FSID=$(jq -r .session_id <<<"$FRES" 2>/dev/null || true)
+      if [ -z "$FSID" ] || [ "$FSID" = "null" ]; then
+        bad "创建文件会话失败：$FRES"
+        break
+      fi
+      # 等待 agent 数据流挂接（open_file 指令经控制通道下发 + agent 连 /ws/agent/file）
+      sleep 2
+      # node 客户端：鉴权 → 20 × 512KB write（按 write_result 推进）→ 20 × read → 内容校验
+      NODE_RES=$(timeout 120 node "$ROOT/test/e2e-file.mjs" "$BASE" "$TOKEN" "$FSID" "$TMP/upload.bin" /tmp/e2e-upload.bin 2>&1 || true)
+      if [ -s /tmp/e2e-upload.bin ] && cmp -s "$TMP/upload.bin" /tmp/e2e-upload.bin \
+        && [ -s "$TMP/upload.bin.down" ] && cmp -s "$TMP/upload.bin" "$TMP/upload.bin.down"; then
+        ok "文件上传/下载 10MB 成功（上传与下载内容均与源一致）"
+        FILE_OK=1
+        break
+      fi
+      echo "  文件尝试 $attempt/2 失败：$NODE_RES"
+      rm -f /tmp/e2e-upload.bin
+    done
+    if [ "$FILE_OK" -eq 0 ]; then
+      bad "文件上传/下载失败（详见 agent/wrangler 日志）"
+      tail -10 "$AGENT_LOG" 2>/dev/null || true
+      tail -30 "$WRANGLER_LOG" 2>/dev/null || true
+    fi
+  fi
+else
+  echo "  （跳过：未检测到 node，文件用例仅在 CI 运行）"
+fi
+rm -f /tmp/e2e-upload.bin "$TMP/upload.bin.down"
+
 # 清理由 trap 统一处理
 exit 0

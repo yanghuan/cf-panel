@@ -1,0 +1,55 @@
+# cf-panel CI：单元测试（JS 100+ / Rust）+ 完整 E2E（wrangler dev --local + Rust agent）
+# E2E 依赖：node>=22、Rust、jq、socat、websocat（终端透传用例必需）
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: 安装系统依赖（socat / websocat / jq）
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y socat
+          curl -fsSL -o /usr/local/bin/websocat https://github.com/vi/websocat/releases/download/v1.13.0/websocat.x86_64-unknown-linux-musl
+          chmod +x /usr/local/bin/websocat
+          websocat --version
+          jq --version
+          socat -V | head -1
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: 安装 JS 依赖
+        run: npm ci
+
+      - name: 构建 Rust agent
+        run: cargo build --release --manifest-path agent/rust/Cargo.toml
+
+      - name: 准备本地开发变量（.dev.vars，wrangler dev --local 读取）
+        run: |
+          cat > .dev.vars <<'EOF'
+          JWT_SECRET=ci-jwt-secret-0123456789abcdef0123456789abcdef
+          HASH_SECRET=ci-hash-secret-0123456789abcdef0123456789abcdef
+          PANEL_PASSWORD=ci-test-password
+          EOF
+
+      - name: 单元测试（JS + Rust）
+        run: |
+          npm test
+          cargo test --manifest-path agent/rust/Cargo.toml
+
+      - name: E2E（wrangler dev --local + Rust agent + 终端透传）
+        run: bash test/e2e.sh
+        env:
+          E2E_PASSWORD: ci-test-password

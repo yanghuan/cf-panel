@@ -76,6 +76,75 @@ test('MetricsDO: report / query / latest 基本读写', async () => {
   assert.equal((await call('/nope')).status, 404);
 });
 
+test('MetricsDO: storage.put 按分钟去重，put 失败下帧重试（A1 降额）', async () => {
+  const env = makeEnv({ ARCHIVE_TO_D1: '0' });
+  const st = mockState();
+  const { call } = mkMetrics(env, st);
+  const nowMin = Math.floor(Date.now() / 1000 / 60);
+  const mKeys = () => [...st.storage.map.keys()].filter((k) => k.startsWith('m:1:')).length;
+  // 同分钟多帧 → 只写 1 次 storage（快采 ~20 帧/分钟 → 1 次）
+  for (let i = 0; i < 5; i++) {
+    await call('/report', { method: 'POST', body: JSON.stringify({ serverId: 1, minTs: nowMin, cpu: i }) });
+  }
+  assert.equal(mKeys(), 1, '同分钟多帧只 put 一次');
+  // 跨分钟 → 追加 put
+  await call('/report', { method: 'POST', body: JSON.stringify({ serverId: 1, minTs: nowMin + 1, cpu: 9 }) });
+  assert.equal(mKeys(), 2, '跨分钟追加 put');
+  // put 失败 → 不更新 putMin → 下帧重试写入
+  const origPut = st.storage.put.bind(st.storage);
+  let failNext = true;
+  st.storage.put = async (k, v) => { if (failNext) { failNext = false; throw new Error('put failed'); } return origPut(k, v); };
+  await call('/report', { method: 'POST', body: JSON.stringify({ serverId: 1, minTs: nowMin + 2, cpu: 1 }) });
+  assert.equal(st.storage.map.has(`m:1:${nowMin + 2}`), false, 'put 失败未写入');
+  await call('/report', { method: 'POST', body: JSON.stringify({ serverId: 1, minTs: nowMin + 2, cpu: 2 }) });
+  assert.equal(st.storage.map.has(`m:1:${nowMin + 2}`), true, 'put 失败下帧重试写入');
+});
+
+test('MetricsDO: 兜底 listStorage 仅本实例首帧执行（A2 降额）', async () => {
+  const env = makeEnv();
+  const nowMin = Math.floor(Date.now() / 1000 / 60);
+  const st = mockState({
+    [`m:1:${nowMin - 200}`]: JSON.stringify({ cpu: 11 }),
+    'arc:1': String(nowMin - 300),
+  });
+  const { call } = mkMetrics(env, st);
+  let listCount = 0;
+  const origList = st.storage.list.bind(st.storage);
+  st.storage.list = async (opts = {}) => {
+    if (String(opts.prefix || '').startsWith('m:1:')) listCount += 1;
+    return origList(opts);
+  };
+  // 首帧即跨线（fresh=true，推进水位）→ 兜底一次（补归档滞后 Storage 行）
+  await call('/report', { method: 'POST', body: JSON.stringify({ serverId: 1, minTs: nowMin - 61, cpu: 22 }) });
+  assert.equal(listCount, 1, '首帧跨线兜底一次');
+  assert.equal(Number(await st.storage.get('arc:1')), nowMin - 61, '水位推进到跨线行');
+  // 之后所有帧（含推进/跨线）不再触发兜底 listStorage（消除每 60 秒一次的全量读）
+  await call('/report', { method: 'POST', body: JSON.stringify({ serverId: 1, minTs: nowMin - 62, cpu: 23 }) });
+  await call('/report', { method: 'POST', body: JSON.stringify({ serverId: 1, minTs: nowMin, cpu: 24 }) });
+  assert.equal(listCount, 1, '非首帧不再触发兜底 list');
+});
+
+test('MetricsDO: 家政状态持久化跨 evict（A3：fullSweep/prune 不因重置停摆）', async () => {
+  const env = makeEnv();
+  const st = mockState();
+  const { inst, call } = mkMetrics(env, st);
+  const nowMin = Math.floor(Date.now() / 1000 / 60);
+  await call('/report', { method: 'POST', body: JSON.stringify({ serverId: 1, minTs: nowMin - 5, cpu: 1 }) });
+  await inst.alarm();
+  const h = JSON.parse(await st.storage.get('housekeep'));
+  assert.ok(h.lastSweepAt > 0, 'fullSweep 时间已持久化');
+  assert.ok(h.lastPruneAt > 0, 'prune 时间已持久化');
+  // 模拟 evict：新实例共享 storage → alarm 时惰性恢复时间戳，不再重复执行
+  const { inst: instB } = mkMetrics(env, st);
+  const hBefore = JSON.parse(await st.storage.get('housekeep'));
+  await instB.alarm(); // ensureHousekeepLoaded 恢复 lastSweepAt/lastPruneAt + 时间差判定
+  assert.equal(instB.lastSweepAt, hBefore.lastSweepAt, '新实例恢复 lastSweepAt');
+  assert.equal(instB.lastPruneAt, hBefore.lastPruneAt, '新实例恢复 lastPruneAt');
+  const hAfter = JSON.parse(await st.storage.get('housekeep'));
+  assert.equal(hAfter.lastSweepAt, hBefore.lastSweepAt, '未到期不重复 fullSweep');
+  assert.equal(hAfter.lastPruneAt, hBefore.lastPruneAt, '未到期不重复 prune');
+});
+
 test('MetricsDO: /usage 用量计数，alarm 汇总到 storage 跨 evict 保留', async () => {
   const env = makeEnv({ ARCHIVE_TO_D1: '0' });
   const state = mockState();
@@ -288,7 +357,7 @@ test('MetricsDO: /query 已加载后跨线补报不跳过 (arcTs,minTs) 内存�
   assert.equal(rows.results.find((r) => r.ts === minTs).cpu, 22);
 });
 
-test('MetricsDO: 兜底 listStorage 瞬时失败不推进水位，恢复后归档（残余边界2）', async () => {
+test('MetricsDO: 兜底 listStorage 瞬时失败不推进水位，恢复后 fullSweep 归档（残余边界2）', async () => {
   const env = makeEnv();
   const nowMin = Math.floor(Date.now() / 1000 / 60);
   const xTs = nowMin - 200;
@@ -297,18 +366,19 @@ test('MetricsDO: 兜底 listStorage 瞬时失败不推进水位，恢复后归�
     [`m:1:${xTs}`]: JSON.stringify({ cpu: 11 }),
     'arc:1': String(nowMin - 300),
   });
-  const { call } = mkMetrics(env, state);
-  // 模拟 Storage list 瞬时不可用
+  const { inst, call } = mkMetrics(env, state);
+  // 模拟 Storage list 瞬时不可用（兜底失败 → 不推进水位，正确性优先）
   const origList = state.storage.list.bind(state.storage);
   state.storage.list = async () => { throw new Error('storage unavailable'); };
   await call('/report', { method: 'POST', body: JSON.stringify({ serverId: 1, minTs, cpu: 22 }) });
   assert.equal(Number(await state.storage.get('arc:1')), nowMin - 300, '兜底失败时不推进水位');
-  // 恢复后再次跨线上报 → 兜底成功 → 滞后行归档 + 水位推进
+  // 恢复后由 fullSweep（A3 修复后每 ~1h 可靠执行）兜底归档滞后行并推进水位
   state.storage.list = origList;
-  await call('/report', { method: 'POST', body: JSON.stringify({ serverId: 1, minTs, cpu: 22 }) });
-  assert.equal(Number(await state.storage.get('arc:1')), minTs, '恢复后推进水位');
+  await inst.fullSweep(true);
+  assert.ok(Number(await state.storage.get('arc:1')) >= xTs, 'fullSweep 兜底推进水位');
   const rows = await env.DB.prepare('SELECT * FROM metrics_min WHERE server_id = 1').all();
   assert.equal(rows.results.length, 2, '滞后行与跨线行均归档');
+  assert.equal(rows.results.find((r) => r.ts === xTs).cpu, 11);
 });
 
 test('MetricsDO: 新服务器 arcTs=0 水位不误推进，避免大区间空循环（回归修复）', async () => {

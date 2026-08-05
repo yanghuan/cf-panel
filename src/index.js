@@ -1686,14 +1686,16 @@ export class MetricsDO {
     // 数据唯一事实源在 DO Storage（行级 KV），实例被 evict/重启后可从 storage 全量恢复，
     // 内存缓存仅加速当前实例生命周期内的读写（原纯内存热区在实例 evict 后即丢）。
     this.data = new Map();
-    this.lastPrune = 0; // 上次执行保留期清理的时间
+    this.putMin = new Map(); // serverId -> 已持久化到 storage 的分钟 ts（A1：storage.put 按分钟去重）
     // 告警去重状态：内存为主，关键变更时持久化到 DO Storage，实例 evict/重启后恢复，避免重复告警
     this.alertLast = new Map(); // `${serverId}:kind` -> 上次触发时间
     this.probeState = new Map(); // `${serverId}:probeName` -> {ok, lastFail}
     this.alertLoaded = false;
     this.probeLoaded = false;
     this.arcCache = new Map(); // serverId -> 已归档水位（分钟），实例内缓存，evict 后从 storage 恢复
-    this.sweepCount = 0; // 全量 sweep 计数（每 6 次 alarm ≈ 1 小时做一次）
+    this.lastSweepAt = 0; // 上次 fullSweep 时间戳（ms；A3：持久化跨 evict，见 ensureHousekeepLoaded）
+    this.lastPruneAt = 0; // 上次保留期清理时间戳（ms；A3：同上，替代易被 evict 重置的内存计数）
+    this.housekeepLoaded = false; // 家政状态（fullSweep/prune 时间）是否已从 storage 恢复
     this.lastSeenSec = new Map(); // serverId -> 最后上报秒（内存，/latest 在线判定用；evict 后由 D1 last_seen 兜底）
     this.alarmCached = null; // 实例内已知的下一次 alarm 时间戳；避免每帧上报都 getAlarm（DO Storage 读）
     this.latestByServer = new Map(); // serverId -> 最新指标 {ts, ..., last_seen_s}（/report 热写 O(1) 维护，/latest 直接 O(S) 返回）
@@ -1701,6 +1703,21 @@ export class MetricsDO {
     this.offlineState = new Map(); // serverId -> 'on'|'off'（内存副本，避免每机逐个 getAlarm）
     this.usage = { report: 0, latest: 0, query: 0, alarm: 0 }; // 用量观测：本周期（10min）计数，alarm 时累计到 storage
     this.hotLoaded = new Set(); // serverId 已从 storage 完整加载热区的标记（见 ensureHot）
+  }
+
+  // 家政状态（lastSweepAt/lastPruneAt）从 storage 惰性恢复（A3：持久化跨实例 evict，
+  // 避免慢采/空闲下实例频繁 evict 导致 fullSweep 停摆（>12h 热区无限增长）与 prune 每天 144 次全表扫）
+  async ensureHousekeepLoaded() {
+    if (this.housekeepLoaded) return;
+    this.housekeepLoaded = true;
+    try {
+      const raw = await this.state.storage.get('housekeep');
+      if (raw) {
+        const h = JSON.parse(raw);
+        this.lastSweepAt = Number(h.lastSweepAt) || 0;
+        this.lastPruneAt = Number(h.lastPruneAt) || 0;
+      }
+    } catch { /* 恢复失败按 0 处理（首次/损坏），下次 alarm 正常判定 */ }
   }
 
   // 从 DO Storage 惰性恢复告警冷却 / 探活去重状态（实例 evict 后首次使用时加载一次）
@@ -1764,7 +1781,8 @@ export class MetricsDO {
   // 由 /report 热写路径顺带调用（水位 < 归档线时才执行，正常每 ~10 分钟一次），
   // 取代 alarm 每 10 分钟全量 list + 重复 INSERT（消除 DO Storage 读与 D1 重复写）。
   // 本次上报行本身若已跨过归档线则直接归档（不依赖水位，防回溯/补报漏归档）。
-  async archiveIncrement(serverId, m, minTs) {
+  // fresh：本实例内该机首帧热写标记（evict 后），仅首帧推进水位时做 Storage 兜底（见下方 A2 注释）
+  async archiveIncrement(serverId, m, minTs, fresh = false) {
     if (this.env.ARCHIVE_TO_D1 === '0') return;
     const arcKey = `arc:${serverId}`;
     let arcTs = this.arcCache.get(serverId);
@@ -1801,15 +1819,15 @@ export class MetricsDO {
         if (row) { stmts.push(mk(t, row)); maxArchived = t; }
       }
     }
-    // 兜底滞后区间（窄时序边界）：仅当本次要推进水位、且该服务器内存热区未完整加载
-    // （evict 后空 Map，hotLoaded 无）时，从 Storage 补归档 (arcTs, maxArchived] 中
-    // 仅存在于 Storage 的滞后行——否则 evict 后首帧上报跨线行（minTs<=cutoff，时钟回拨/补报）
-    // 会把水位从旧位置直接推进到该行，而 (arcTs, minTs) 之间的 Storage 历史行会被跳过。
-    // 正常运行时 hotLoaded 已置位 → 跳过此分支，零额外读；此分支仅在 evict 后首帧跨线时执行一次。
+    // 兜底滞后区间（窄时序边界，A2）：仅限本实例内该机「首帧热写」（fresh=true，即 evict 后）
+    // 且本次推进水位时，从 Storage 补归档 (arcTs, maxArchived] 中仅存在于 Storage 的滞后行——
+    // 否则 evict 后首帧跨线行（minTs<=cutoff）会把水位从旧位置直接推进到该行而跳过中间历史行。
+    // 此后内存 Map 已覆盖本实例写入区间，滞后行由区间循环或 fullSweep（A3 修复后每 ~1h 可靠执行）
+    // 兜底——避免「hotLoaded 仅 /query 置位」导致的每 60 秒一次全量 listStorage 读（~1.04M 行/天/机）。
     // 兜底读取失败（Storage 瞬时不可用）时不得推进水位：否则水位越过未归档行后，
     // fullSweep（仅扫 ts>arcTs）也会永久跳过它们——正确性优先，失败时保持水位由下帧/fullSweep 重试。
     let fallbackOk = true;
-    if (maxArchived > arcTs && !this.hotLoaded.has(serverId)) {
+    if (maxArchived > arcTs && fresh) {
       try {
         const items = await this.listStorage(this.hotPrefix(serverId));
         for (const k of items) {
@@ -1844,6 +1862,7 @@ export class MetricsDO {
       // 热写不加载历史：evict 后缺省空 Map + 新分钟 key 即可，避免每帧全量 loadHot（~720 行 storage 读）；
       // 历史恢复仅 /query、/latest、fullSweep 需要时进行（正确性由 storage 唯一事实源保证）。
       try {
+        const fresh = !this.data.has(b.serverId); // 本实例内该机首帧热写（归档兜底仅首帧语义，见 archiveIncrement）
         let m = this.data.get(b.serverId);
         if (!m) { m = new Map(); this.data.set(b.serverId, m); }
         m.set(minTs, v);
@@ -1854,11 +1873,16 @@ export class MetricsDO {
           last_seen_s: Math.floor(Date.now() / 1000),
         });
         this.trim(m);
-        await this.state.storage.put(this.hotKey(b.serverId, minTs), JSON.stringify(v));
+        // A1：storage.put 按分钟去重——同分钟多帧只写 1 次（快采 28,800 → 1,440 写/天/机）；
+        // put 失败不更新 putMin，下帧自动重试（保持「写失败降级仅内存」语义）
+        if (this.putMin.get(b.serverId) !== minTs) {
+          await this.state.storage.put(this.hotKey(b.serverId, minTs), JSON.stringify(v));
+          this.putMin.set(b.serverId, minTs);
+        }
         // 秒级最后上报时间（内存，/latest 在线判定用，比 D1 last_seen 节流更实时）
         this.lastSeenSec.set(b.serverId, Math.floor(Date.now() / 1000));
         // 增量归档：依赖内存历史行；evict 后空 Map 时水位区间无行可归档，由 fullSweep（≈1h）兜底
-        await this.archiveIncrement(b.serverId, m, minTs);
+        await this.archiveIncrement(b.serverId, m, minTs, fresh);
       } catch { /* storage 不可用时降级为纯内存（仅当前实例生命周期） */ }
       this.scheduleArchive();
       // 告警/探活去重判定搭本次 /report 调用顺风车（零额外请求）；失败不影响监控存储
@@ -1922,6 +1946,7 @@ export class MetricsDO {
         await Promise.all(keys.map((k) => this.state.storage.delete(k.name)));
       } catch { /* storage 不可用则仅清内存 */ }
       this.data.delete(serverId);
+      this.putMin.delete(serverId);
       this.hotLoaded.delete(serverId);
       this.latestByServer.delete(serverId);
       this.lastSeenSec.delete(serverId);
@@ -2132,21 +2157,28 @@ export class MetricsDO {
       }));
     } catch { /* 用量汇总失败不影响主流程 */ }
     this.usage = { report: 0, latest: 0, query: 0, alarm: 0 };
+    await this.ensureHousekeepLoaded();
     const archiveOn = this.env.ARCHIVE_TO_D1 !== '0';
     const alertOn = (await getAlertCfg(this.env)).enabled;
     if (alertOn) await this.checkOfflineAlerts();
-    // 全量 sweep 降频：每 6 次 alarm（≈1 小时）做一次「>12h 行清理 + 兜底归档」；
-    // 常态归档已由 /report 增量完成，其余周期不再扫描 storage（消除全量 list 读与重复 INSERT 写）
-    this.sweepCount += 1;
-    if (this.sweepCount % 6 === 0) {
+    const now = Date.now();
+    let housekeepChanged = false;
+    // 全量 sweep：按时间差判定（每 6×10min ≈ 1 小时一次），时间戳持久化跨 evict——
+    // 慢采/空闲下 MetricsDO 无 WS、两次 alarm 间实例常被 evict，旧内存计数（sweepCount）
+    // 会停在 1 导致 fullSweep 永不执行（>12h 热区无限增长 + 兜底归档停摆）
+    if (now - this.lastSweepAt >= 6 * ARCHIVE_INTERVAL_MS) {
+      this.lastSweepAt = now;
+      housekeepChanged = true;
       await this.fullSweep(archiveOn);
     }
     // 保留期清理（每天一次）：删除超过 METRICS_RETENTION_DAYS 的旧数据，以及超过
     // AUDIT_RETENTION_DAYS 的审计日志（created_at 为 datetime('now') 文本，可直接比较）。
     // METRICS_RETENTION_DAYS 可用环境变量覆盖（默认 30）：缩小保留期可降低 D1 容量占用。
-    const now = Date.now();
-    if (now - this.lastPrune > PRUNE_INTERVAL_MS) {
-      this.lastPrune = now;
+    // 时间戳持久化跨 evict：避免慢采/空闲下 lastPrune 被重置为 0 导致每天 144 次全表扫
+    //（metrics_custom 无 ts 索引时最坏 6.2M×S×C 读/天，见迁移 0003 补索引）
+    if (now - this.lastPruneAt >= PRUNE_INTERVAL_MS) {
+      this.lastPruneAt = now;
+      housekeepChanged = true;
       const retention = Number(this.env.METRICS_RETENTION_DAYS) > 0
         ? Number(this.env.METRICS_RETENTION_DAYS) : METRICS_RETENTION_DAYS;
       const minTs = Math.floor(now / 1000 / 60) - retention * 1440;
@@ -2156,6 +2188,12 @@ export class MetricsDO {
         this.env.DB.prepare('DELETE FROM audit_logs WHERE created_at < datetime(\'now\', ?)')
           .bind(`-${AUDIT_RETENTION_DAYS} days`),
       ]);
+    }
+    // 家政状态持久化（仅变化时写）
+    if (housekeepChanged) {
+      try {
+        await this.state.storage.put('housekeep', JSON.stringify({ lastSweepAt: this.lastSweepAt, lastPruneAt: this.lastPruneAt }));
+      } catch { /* 持久化失败：下次 alarm 按当前值重新判定（可能提前执行，无害） */ }
     }
     } finally {
       // 无论是否异常都续排下一次 alarm：防归档/清理/告警因单次失败永久停摆

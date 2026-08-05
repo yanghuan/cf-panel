@@ -64,6 +64,9 @@ CREATE TABLE IF NOT EXISTS metrics_custom (
   PRIMARY KEY (server_id, name, ts)
 ) WITHOUT ROWID;
 
+-- A3：保留期清理（DELETE ... WHERE ts < ?）走 ts 范围扫描，避免全表扫（迁移 0003）
+CREATE INDEX IF NOT EXISTS idx_metrics_custom_ts ON metrics_custom(ts);
+
 -- 通用键值表（替代 Workers KV，value 直接存 JSON 字符串）
 -- 用途：站点设置/公告等低频键值（key = 'settings'）
 CREATE TABLE IF NOT EXISTS kv_json (

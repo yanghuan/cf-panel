@@ -145,6 +145,56 @@ test('MetricsDO: 家政状态持久化跨 evict（A3：fullSweep/prune 不因重
   assert.equal(hAfter.lastPruneAt, hBefore.lastPruneAt, '未到期不重复 prune');
 });
 
+test('B10: MetricsDO 上报驱动聚合推送（set_push 开启 + 3s 节流）', async () => {
+  // 自定义 Panel stub：记录 init（makePanelStub 不记录请求体）
+  const pushCalls = [];
+  const env = makeEnv({
+    PANEL: {
+      calls: pushCalls,
+      idFromName: () => 'panel-main',
+      get: () => ({ fetch: async (url, init) => { pushCalls.push({ url: String(url), init }); return new Response(JSON.stringify({ ok: true }), { status: 200 }); } }),
+    },
+  });
+  const st = mockState();
+  const { inst, call } = mkMetrics(env, st);
+  const nowMin = Math.floor(Date.now() / 1000 / 60);
+  const pushCount = () => pushCalls.filter((c) => c.url.includes('/rpc/latest_push')).length;
+  // 未开启 → 不推送
+  await call('/report', { method: 'POST', body: JSON.stringify({ serverId: 1, minTs: nowMin, cpu: 1 }) });
+  assert.equal(pushCount(), 0, '未开启推送不调用 PanelDO');
+  // 开启推送（PanelDO 0→1 时通知）
+  await call('/rpc/set_push', { method: 'POST', body: JSON.stringify({ on: true }) });
+  assert.equal(inst.pushOn, true, 'pushOn 已开启');
+  await call('/report', { method: 'POST', body: JSON.stringify({ serverId: 1, minTs: nowMin, cpu: 2 }) });
+  assert.equal(pushCount(), 1, '开启后 /report 触发 latest_push');
+  const body = JSON.parse(pushCalls.find((c) => c.url.includes('/rpc/latest_push')).init.body);
+  assert.equal(body.latest[1].cpu, 2, '推送包含最新指标');
+  // 3s 内再上报 → 节流不推送
+  await call('/report', { method: 'POST', body: JSON.stringify({ serverId: 1, minTs: nowMin, cpu: 3 }) });
+  assert.equal(pushCount(), 1, '3s 内不重复推送');
+  // 超过 3s → 重新推送
+  inst.lastPushAt = Date.now() - 3100;
+  await call('/report', { method: 'POST', body: JSON.stringify({ serverId: 1, minTs: nowMin, cpu: 4 }) });
+  assert.equal(pushCount(), 2, '超过 3s 重新推送');
+});
+
+test('B10: PanelDO latest_push 按观看者权限广播（不查 /latest）', async () => {
+  const env = makeEnv();
+  const token = await I.signJwt({ uid: 1, username: 'admin', role: 1, exp: Math.floor(Date.now() / 1000) + 3600 }, env);
+  await insertServer(env, 'k1', 'srv-a', { last_seen: Math.floor(Date.now() / 1000) - 5 });
+  const ws = { attachment: token, sent: [], deserializeAttachment() { return this.attachment; }, send(m) { this.sent.push(m); } };
+  const inst = new PanelDO({ getWebSockets: () => [ws] }, env);
+  const res = await inst.fetch(new Request('https://do.internal/rpc/latest_push', {
+    method: 'POST',
+    body: JSON.stringify({ latest: { 1: { cpu: 42, last_seen_s: Math.floor(Date.now() / 1000) } } }),
+  }));
+  assert.equal(res.status, 200);
+  assert.equal(ws.sent.length, 1, '广播给观看者');
+  const list = JSON.parse(ws.sent[0]);
+  assert.equal(list[0].metric.cpu, 42, '推送含最新指标');
+  assert.equal(list[0].online, true, '最近上报在线');
+});
+
 test('MetricsDO: /usage 用量计数，alarm 汇总到 storage 跨 evict 保留', async () => {
   const env = makeEnv({ ARCHIVE_TO_D1: '0' });
   const state = mockState();

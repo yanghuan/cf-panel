@@ -254,6 +254,15 @@
 
   function renderServers() {
     const box = $('#servers');
+    // B10 本地在线老化：服务端只在推送时算 online，两次推送之间由前端按 last_seen_s 倒计时判离线。
+    // 20s = 快宽限 15s + 5s 余量（有推送即有观看者快采；容忍时钟偏差与 ~3s 推送间隔）；
+    // 无最新指标（冷启动/D1 兜底）的服务器保留服务端判定不覆盖
+    const agingNow = Date.now() / 1000;
+    for (const s of serversCache) {
+      if (s.metric && s.metric.last_seen_s) {
+        s.online = agingNow - s.metric.last_seen_s < 20;
+      }
+    }
     renderOverview();
     if (!serversCache.length) {
       box.innerHTML = '<div class="empty"><p>还没有服务器</p><p class="muted">点「添加服务器」生成 agent 配置后开始监控</p></div>';
@@ -293,13 +302,16 @@
     }
   }
 
-  // 每 3 秒发 sync 的定时器；后台标签页隐藏时暂停（省 Worker/DO/D1 配额），恢复可见立即拉取一次
+  // B10：连接建立发一次 sync 拉初始列表，此后数据由服务端上报驱动推送（WS 被动接收，不再 3s 轮询）。
+  // pushTimer 改为「本地在线老化」：每秒重渲染（last_seen_s 随时间流逝自动判离线——
+  // 否则服务端不再轮询后，死机服务器会永远显示在线）
   function startPushTimer() {
     if (pushTimer) clearInterval(pushTimer);
     try { if (pushWs && pushWs.readyState === WebSocket.OPEN) pushWs.send('sync'); } catch { /* ignore */ }
     pushTimer = setInterval(() => {
-      try { if (pushWs && pushWs.readyState === WebSocket.OPEN) pushWs.send('sync'); } catch { /* ignore */ }
-    }, 3000);
+      if (document.hidden) return; // 后台由 visibilitychange 关 WS，无需老化
+      renderServers();
+    }, 1000);
   }
   function stopPushTimer() {
     if (pushTimer) { clearInterval(pushTimer); pushTimer = null; }

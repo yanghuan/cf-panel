@@ -16,6 +16,7 @@ const LATEST_CACHE_TTL_MS = 4000; // MetricsDO /latest 共享缓存 TTL（多观
 const SYNC_MIN_INTERVAL_MS = 2000; // PanelDO sync 频率下限（<2s 忽略，防任意消息/高频触发全链路）
 const ARCHIVE_IDLE_INTERVAL_MS = 60 * 60 * 1000; // 闲置（无数据且告警关闭）时 alarm 退避间隔（1h）
 const PAT_CHECK_INTERVAL_MS = 10 * 1000; // PAT 终端连接重校验间隔（B4：每条消息 → 10s 一次，−98%）
+const LATEST_PUSH_INTERVAL_MS = 3000; // B10：上报驱动聚合推送间隔（有观看者时 ≥3s 推一次全部 latest 给 PanelDO）
 const PANEL_SWITCH_GRACE_MS = 30 * 1000; // 观看者 0→1 后在线判定用慢宽限的过渡期：Agent 切快采并完成首帧上报前，
 // 用 15s 快宽限会把慢采周期中（120s 内无上报）的节点误判离线；30s 后快宽限正常生效
 const PAT_PREFIX = 'cfp_'; // PAT token 前缀
@@ -1743,6 +1744,8 @@ export class MetricsDO {
     this.offlineState = new Map(); // serverId -> 'on'|'off'（内存副本，避免每机逐个 getAlarm）
     this.usage = { report: 0, latest: 0, query: 0, alarm: 0 }; // 用量观测：本周期（10min）计数，alarm 时累计到 storage
     this.hotLoaded = new Set(); // serverId 已从 storage 完整加载热区的标记（见 ensureHot）
+    this.pushOn = false; // B10：是否有观看者（PanelDO 0→1/1→0 通知），开启时才推送 latest
+    this.lastPushAt = 0; // 上次推送 latest 给 PanelDO 的时刻（ms）；上报驱动节流，不引入定时器
   }
 
   // 家政状态（lastSweepAt/lastPruneAt）从 storage 惰性恢复（A3：持久化跨实例 evict，
@@ -1930,6 +1933,29 @@ export class MetricsDO {
         if (b.serverName) await this.checkAlerts(b);
         if (Array.isArray(b.probes)) await this.checkProbeAlerts(b.serverId, b.serverName, b.probes);
       } catch { /* 告警失败不影响监控存储 */ }
+      // B10：上报驱动聚合推送——有观看者且距上次 ≥3s 时，把全部 latest 一次推给 PanelDO 广播。
+      // 上报驱动不引入定时器（MetricsDO 休眠不受影响）；推送频率与观看者数/机器数解耦（≤28,800/天）；
+      // PanelDO → 前端为出站消息不计费；PanelDO 收到后 per-ws 权限过滤组装（不查 /latest，省 DO 事件）
+      if (this.pushOn) {
+        const pushNow = Date.now();
+        if (pushNow - this.lastPushAt >= LATEST_PUSH_INTERVAL_MS) {
+          this.lastPushAt = pushNow;
+          try {
+            await doPanel(this.env).fetch('https://do.internal/rpc/latest_push', {
+              method: 'POST',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ latest: Object.fromEntries(this.latestByServer) }),
+            });
+          } catch { /* 推送失败下个周期重试 */ }
+        }
+      }
+      return json({ ok: true });
+    }
+
+    // 内部 RPC：PanelDO 观看者 0→1/1→0 时通知（B10：仅在有人观看时推送 latest）
+    if (url.pathname === '/rpc/set_push' && request.method === 'POST') {
+      const pb = await request.json();
+      this.pushOn = !!pb.on;
       return json({ ok: true });
     }
 
@@ -2372,6 +2398,21 @@ export class PanelDO {
       this.authCache.clear();
       return json({ ok: true });
     }
+    // 内部 RPC（B10）：MetricsDO 上报驱动推送全部最新指标 → 按观看者权限过滤组装后广播（出站不计费）
+    if (url.pathname === '/rpc/latest_push' && request.method === 'POST') {
+      const pb = await request.json();
+      const latest = pb.latest || {};
+      const wss = this.state.getWebSockets?.() || [];
+      await Promise.all(wss.map(async (w) => {
+        if (!w.deserializeAttachment?.()) return; // 未鉴权连接跳过
+        const token = String(w.deserializeAttachment() || '');
+        const user = await this.authUserCached(token);
+        if (!user) return; // 已撤销：下个 sync 关闭（latest_push 只推数据，不做关闭决策）
+        const list = await this.buildList(user, latest);
+        if (list) { try { w.send(JSON.stringify(list)); } catch { /* ignore */ } }
+      }));
+      return json({ ok: true });
+    }
     if (url.pathname !== '/ws/push') return new Response('not found', { status: 404 });
     const pair = new WebSocketPair();
     this.state.acceptWebSocket(pair[1]);
@@ -2412,6 +2453,7 @@ export class PanelDO {
       if (authed.length === 1) {
         this.fastSince = Date.now(); // 过渡期内（30s）在线判定用慢宽限，防切快采前短暂误判离线
         this.broadcastViewers(1);
+        this.setPush(1); // B10：开启上报驱动推送
       }
       return;
     }
@@ -2430,13 +2472,8 @@ export class PanelDO {
       try { ws.close(1008, 'unauthorized'); } catch { /* ignore */ }
       return;
     }
-    let serverRows;
-    try {
-      serverRows = await this.filterServersCached(user);
-    } catch {
-      return; // D1 临时故障，下个周期再试
-    }
-    // 附带每台机器的最新指标（卡片实时展示；B2：共享缓存 4s，多观看者 sync 不再各自打 DO /latest）
+    // 附带每台机器的最新指标（卡片实时展示；B2：共享缓存 4s；B10 后 sync 仅首次/兜底触发，
+    // 常态数据由 MetricsDO 上报驱动 latest_push 推送）
     let latest = {};
     const lcNow = Date.now();
     if (this.latestCache && lcNow - this.latestCache.ts < LATEST_CACHE_TTL_MS) {
@@ -2448,35 +2485,56 @@ export class PanelDO {
         this.latestCache = { data: latest, ts: lcNow };
       } catch { /* 无最新指标 */ }
     }
+    const list = await this.buildList(user, latest);
+    if (list) { try { ws.send(JSON.stringify(list)); } catch { /* ignore */ } }
+  }
+
+  // 组装服务器列表（sync 与 B10 latest_push 广播共用）。latest 由调用方提供：
+  // latest_push 直接使用 MetricsDO 推来的数据（不查 /latest，省 DO 事件）
+  async buildList(user, latest) {
+    let serverRows;
+    try {
+      serverRows = await this.filterServersCached(user);
+    } catch {
+      return null; // D1 临时故障：调用方跳过本次发送
+    }
     const now = Math.floor(Date.now() / 1000);
     // 本 DO 内直接统计已鉴权观看者（无需额外 RPC）；切快采过渡期（0→1 后 30s 内）用慢宽限
     const hasViewers = (this.state.getWebSockets?.() || []).filter((w) => w.deserializeAttachment?.()).length > 0;
     const grace = (hasViewers && Date.now() - this.fastSince >= PANEL_SWITCH_GRACE_MS)
       ? ONLINE_GRACE_FAST_S : ONLINE_GRACE_SLOW_S;
-    const list = [];
-    for (const s of serverRows) {
-      list.push({
-        id: s.id,
-        name: s.name,
-        group: s.group || '',
-        display_index: s.display_index || 0,
-        // 在线判定优先用 MetricsDO 秒级 last_seen_s；D1 last_seen 节流写，仅冷启动兜底
-        online: now - (latest[s.id]?.last_seen_s || s.last_seen || 0) < grace,
-        wan_ip: s.wan_ip || '',
-        info: safeJson(s.info_json),
-        probes: safeJson(s.probe_json),
-        metric: latest[s.id] || null,
-      });
-    }
-    try { ws.send(JSON.stringify(list)); } catch { /* ignore */ }
+    return serverRows.map((s) => ({
+      id: s.id,
+      name: s.name,
+      group: s.group || '',
+      display_index: s.display_index || 0,
+      // 在线判定优先用 MetricsDO 秒级 last_seen_s；D1 last_seen 节流写，仅冷启动兜底
+      online: now - (latest[s.id]?.last_seen_s || s.last_seen || 0) < grace,
+      wan_ip: s.wan_ip || '',
+      info: safeJson(s.info_json),
+      probes: safeJson(s.probe_json),
+      metric: latest[s.id] || null,
+    }));
   }
 
-  // 观看者断开：最后一个已鉴权观看者下线（1→0）→ 广播慢采（事件驱动省配额）
+  // 通知 MetricsDO 是否有人观看（B10：仅有人看时才推 latest；0→1 开 / 1→0 关）
+  async setPush(on) {
+    try {
+      await doMetrics(this.env).fetch('https://do.internal/rpc/set_push', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ on }),
+      });
+    } catch { /* 通知失败：MetricsDO 保持旧状态（无人看时无上报 → 不推，无碍） */ }
+  }
+
+  // 观看者断开：最后一个已鉴权观看者下线（1→0）→ 广播慢采 + 关闭上报驱动推送（事件驱动省配额）
   async webSocketClose(ws) {
     const authed = (this.state.getWebSockets?.() || []).filter((w) => w !== ws && w.deserializeAttachment?.());
     if (authed.length === 0) {
       this.fastSince = 0;
       this.broadcastViewers(0);
+      this.setPush(0); // B10：无人观看停止推送
     }
   }
 

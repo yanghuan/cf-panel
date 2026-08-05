@@ -268,6 +268,49 @@ test('MetricsDO: evict 后首帧跨线行推进水位前兜底归档滞后 Stora
   assert.equal(Number(await state.storage.get('arc:1')), minTs, '水位推进到跨线行');
 });
 
+test('MetricsDO: /query 已加载后跨线补报不跳过 (arcTs,minTs) 内存行（残余边界1）', async () => {
+  const env = makeEnv();
+  const nowMin = Math.floor(Date.now() / 1000 / 60);
+  const xTs = nowMin - 200; // (arcTs, minTs) 之间的历史行
+  const minTs = nowMin - 61; // 跨线补报行
+  const state = mockState({
+    [`m:1:${xTs}`]: JSON.stringify({ cpu: 11 }),
+    'arc:1': String(nowMin - 300),
+  });
+  const { call } = mkMetrics(env, state);
+  // 先 /query 触发 loadHot → hotLoaded 置位（内存已完整，兜底分支不再介入）
+  await call('/query?server_id=1&limit=100');
+  // 随后跨线补报：区间循环必须覆盖 (arcTs, minTs)（不能从 maxArchived+1 起跳）
+  await call('/report', { method: 'POST', body: JSON.stringify({ serverId: 1, minTs, cpu: 22 }) });
+  const rows = await env.DB.prepare('SELECT * FROM metrics_min WHERE server_id = 1').all();
+  assert.equal(rows.results.length, 2, '历史行与跨线行均归档');
+  assert.equal(rows.results.find((r) => r.ts === xTs).cpu, 11);
+  assert.equal(rows.results.find((r) => r.ts === minTs).cpu, 22);
+});
+
+test('MetricsDO: 兜底 listStorage 瞬时失败不推进水位，恢复后归档（残余边界2）', async () => {
+  const env = makeEnv();
+  const nowMin = Math.floor(Date.now() / 1000 / 60);
+  const xTs = nowMin - 200;
+  const minTs = nowMin - 61;
+  const state = mockState({
+    [`m:1:${xTs}`]: JSON.stringify({ cpu: 11 }),
+    'arc:1': String(nowMin - 300),
+  });
+  const { call } = mkMetrics(env, state);
+  // 模拟 Storage list 瞬时不可用
+  const origList = state.storage.list.bind(state.storage);
+  state.storage.list = async () => { throw new Error('storage unavailable'); };
+  await call('/report', { method: 'POST', body: JSON.stringify({ serverId: 1, minTs, cpu: 22 }) });
+  assert.equal(Number(await state.storage.get('arc:1')), nowMin - 300, '兜底失败时不推进水位');
+  // 恢复后再次跨线上报 → 兜底成功 → 滞后行归档 + 水位推进
+  state.storage.list = origList;
+  await call('/report', { method: 'POST', body: JSON.stringify({ serverId: 1, minTs, cpu: 22 }) });
+  assert.equal(Number(await state.storage.get('arc:1')), minTs, '恢复后推进水位');
+  const rows = await env.DB.prepare('SELECT * FROM metrics_min WHERE server_id = 1').all();
+  assert.equal(rows.results.length, 2, '滞后行与跨线行均归档');
+});
+
 test('MetricsDO: 新服务器 arcTs=0 水位不误推进，避免大区间空循环（回归修复）', async () => {
   const env = makeEnv();
   const state = mockState(); // 无 arc key → arcTs=0（新服务器）

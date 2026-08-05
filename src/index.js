@@ -1788,11 +1788,14 @@ export class MetricsDO {
       if (row) { stmts.push(mk(minTs, row)); maxArchived = minTs; }
     }
     // 水位区间批量归档（水位之后、cutoff 之前；OR IGNORE 幂等，minTs 重复无害）。
+    // 起点不含 maxArchived+1：即使本次直接归档了跨线行（minTs>arcTs），区间仍从 arcTs+1 起扫
+    // ——否则跨线补报会把水位直接跳到 minTs，而 (arcTs, minTs) 之间已由 /query 载入内存的
+    // 历史行会被跳过（即使 hotLoaded 已置位，兜底分支也不会介入）。
     // 防大区间空循环：只扫内存 Map 可覆盖的区间尾部（最近 METRICS_KEEP_MIN 分钟，至多 720 次/帧；
     // 否则新服务器 arcTs=0 会从分钟 1 空循环到当前分钟约 4000 万次触发 CPU 尖峰），
     // 更早/未覆盖的部分由 fullSweep 兜底归档。
     if (arcTs < archiveCutoff) {
-      const start = Math.max(arcTs + 1, maxArchived + 1, archiveCutoff - METRICS_KEEP_MIN + 1);
+      const start = Math.max(arcTs + 1, archiveCutoff - METRICS_KEEP_MIN + 1);
       for (let t = start; t <= archiveCutoff; t++) {
         const row = m.get(t);
         if (row) { stmts.push(mk(t, row)); maxArchived = t; }
@@ -1803,6 +1806,9 @@ export class MetricsDO {
     // 仅存在于 Storage 的滞后行——否则 evict 后首帧上报跨线行（minTs<=cutoff，时钟回拨/补报）
     // 会把水位从旧位置直接推进到该行，而 (arcTs, minTs) 之间的 Storage 历史行会被跳过。
     // 正常运行时 hotLoaded 已置位 → 跳过此分支，零额外读；此分支仅在 evict 后首帧跨线时执行一次。
+    // 兜底读取失败（Storage 瞬时不可用）时不得推进水位：否则水位越过未归档行后，
+    // fullSweep（仅扫 ts>arcTs）也会永久跳过它们——正确性优先，失败时保持水位由下帧/fullSweep 重试。
+    let fallbackOk = true;
     if (maxArchived > arcTs && !this.hotLoaded.has(serverId)) {
       try {
         const items = await this.listStorage(this.hotPrefix(serverId));
@@ -1812,13 +1818,15 @@ export class MetricsDO {
             stmts.push(mk(t, JSON.parse(k.value)));
           }
         }
-      } catch { /* Storage 不可用：跳过兜底，fullSweep 仍会全扫兜底 */ }
+      } catch {
+        fallbackOk = false;
+      }
     }
     // D1 写入成功后才推进水位（失败保持，下次重试）；首次水位=0 时区间可能很大，分批防超 batch 上限
     for (let i = 0; i < stmts.length; i += 100) {
       await this.env.DB.batch(stmts.slice(i, i + 100));
     }
-    if (maxArchived > arcTs) {
+    if (maxArchived > arcTs && fallbackOk) {
       this.arcCache.set(serverId, maxArchived);
       try { await this.state.storage.put(arcKey, String(maxArchived)); } catch { /* 水位持久化失败不影响 */ }
     }

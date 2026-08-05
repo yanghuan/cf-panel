@@ -26,6 +26,7 @@
         <button class="dd-item" data-menu="service-setup">服务监控</button>
         <button class="dd-item" data-menu="tokens">访问令牌</button>
         <button class="dd-item" data-menu="audit-logs">审计日志</button>
+        <button class="dd-item" data-menu="usage">用量观测</button>
         <button class="dd-item dd-danger" data-menu="logout">退出</button>
       </div>
     </header>
@@ -281,6 +282,19 @@
     </div>
     <div class="settings-body">
       <ul id="audit-list" class="token-list"></ul>
+    </div>
+  </div>
+
+  <!-- 用量观测弹窗（仅管理员，/api/usage 估算） -->
+  <div id="usage-modal" class="modal hidden">
+    <div class="modal-head">
+      <span>用量观测（额度估算）</span>
+      <button id="btn-usage-close" class="ghost">关闭</button>
+    </div>
+    <div class="settings-body">
+      <div id="usage-est" class="usage-grid"></div>
+      <ul id="usage-list" class="token-list" style="margin-top:12px"></ul>
+      <p id="usage-note" class="muted" style="font-size:12px;margin-top:8px"></p>
     </div>
   </div>
 

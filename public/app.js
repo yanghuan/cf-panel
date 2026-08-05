@@ -1112,6 +1112,36 @@
     }
   }
 
+  // ---------- 用量观测（仅管理员，/api/usage 额度估算） ----------
+  async function openUsageModal() {
+    $('#usage-modal').classList.remove('hidden');
+    lockScroll();
+    await loadUsage();
+  }
+  async function loadUsage() {
+    try {
+      const u = await api('/api/usage');
+      $('#usage-note').textContent = u.note || '';
+      const est = u.estimates_per_day || {};
+      $('#usage-est').innerHTML = `
+        <div class="usage-item"><span class="usage-num">${est.report_frames ?? '-'}</span><span class="usage-label">上报帧/天</span></div>
+        <div class="usage-item"><span class="usage-num">${est.do_events ?? '-'}</span><span class="usage-label">DO 事件/天</span></div>
+        <div class="usage-item"><span class="usage-num">${est.d1_writes ?? '-'}</span><span class="usage-label">D1 写行/天</span></div>`;
+      // Worker 请求计数（实例级，evict/重启清零，仅趋势参考）
+      const apiRows = Object.entries(u.api || {}).sort((a, b) => b[1] - a[1]).slice(0, 10);
+      $('#usage-list').innerHTML = apiRows.length
+        ? apiRows.map(([k, v]) => `
+            <li><div class="audit-row">
+              <span class="audit-action">${escapeHtml(k)}</span>
+              <span class="audit-info">${v} 次</span>
+            </div></li>`).join('')
+        : '<li class="muted">暂无请求计数（Worker 实例级）</li>';
+    } catch (e) {
+      $('#usage-est').innerHTML = `<p class="muted">${escapeHtml(e.message)}</p>`;
+      $('#usage-list').innerHTML = '';
+    }
+  }
+
   // ---------- 事件绑定 ----------
   $('#btn-login').onclick = (e) => { e.preventDefault(); doLogin(); };
 
@@ -1179,6 +1209,7 @@
     else if (act === 'service-setup') openServiceSetupModal();
     else if (act === 'tokens') openTokensModal();
     else if (act === 'audit-logs') openAuditModal();
+    else if (act === 'usage') openUsageModal();
     else if (act === 'logout') { token = ''; localStorage.removeItem('cfpanel_token'); showAuth(); }
   });
 
@@ -1222,6 +1253,8 @@
 
   // 审计日志弹窗
   $('#btn-audit-close').onclick = () => { $('#audit-modal').classList.add('hidden'); unlockScroll(); };
+  // 用量观测弹窗
+  $('#btn-usage-close').onclick = () => { $('#usage-modal').classList.add('hidden'); unlockScroll(); };
   $('#token-list').addEventListener('click', (e) => {
     const btn = e.target.closest('button[data-tok-del]');
     if (btn) deleteToken(Number(btn.dataset.tokDel));

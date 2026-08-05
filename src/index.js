@@ -409,6 +409,23 @@ const lastSeenWrite = new Map(); // serverId -> 上次落盘秒（跨实例 evic
 // serverId -> { minTs, names: Set }：metrics_custom 分钟去重（同分钟同指标只写一次 D1；
 // 跨实例 evict 丢失后仅偶发多写一次，INSERT OR IGNORE 幂等无害）
 const customWritten = new Map();
+// B8：服务器行缓存（handleReport 每帧 SELECT 1 行 → 60s TTL，快采 −28,800 D1 读/天/机）。
+// 按隔离实例分布（Worker HTTP 上报 / TerminalDO 控制通道上报各自一份）；删除路径清 Worker 侧，
+// TerminalDO 侧 60s 自动过期，缓存窗口内的孤儿写无害（INSERT OR IGNORE / 条件写）
+const serverRowCache = new Map(); // serverId -> {info_json, probe_json, name, ts}
+const SERVER_ROW_TTL_MS = 60 * 1000;
+async function getServerRow(env, serverId) {
+  const c = serverRowCache.get(serverId);
+  if (c && Date.now() - c.ts < SERVER_ROW_TTL_MS) return c;
+  const row = await env.DB.prepare('SELECT info_json, probe_json, name FROM servers WHERE id = ?').bind(serverId).first();
+  if (row) serverRowCache.set(serverId, { ...row, ts: Date.now() });
+  return row;
+}
+// B9：MetricsDO /report 转发节流（仅分钟切换或 ≥10s 才转发；快采 28,800 → ~8,640 DO 事件/天/机）。
+// 告警/探活判定搭 /report 顺风车，随之降为 ~10s 一次（冷却 30min 不受影响，探活判定延迟 ≤10s 可接受）；
+// 卡片新鲜度 3s→≤10s，last_seen_s 最旧 ~13s 仍低于 15s 快宽限（留余量）
+const REPORT_FWD_THROTTLE_S = 10;
+const reportFwd = new Map(); // serverId -> {ts, minTs}（跨实例 evict 丢失后仅偶发多转发一次，无害）
 
 // agent 监控上报落库：更新 last_seen（在线判定唯一依据；系统信息变更才写 info_json，探活变更才写 probe_json），
 // 时序写入 MetricsDO 热区（供 /api/report 与控制通道复用）。
@@ -416,16 +433,16 @@ const customWritten = new Map();
 async function handleReport(env, payload) {
   const ts = Math.floor(Date.now() / 1000);
   const minTs = Math.floor(ts / 60);
-  // 单条 SELECT 同时完成数据读取与存在性复核（D1 读 2 → 1 行/上报，快采省 28,800 行/天/机）。
-  // 并发删除窗口（SELECT 后删除发生）：metrics_custom 孤儿行无害（INSERT OR IGNORE、无外键、删除时已清空）、
-  // last_seen/probe 为 WHERE id=? 条件写 0 影响行、热区由 MetricsDO /drop + alarm 清理兜底。
-  const server = await env.DB.prepare('SELECT info_json, probe_json, name FROM servers WHERE id = ?').bind(payload.serverId).first();
+  // 服务器行读缓存（B8）同时承担存在性复核（缓存未命中才查 D1；删除窗口孤儿写无害，
+  // 见 getServerRow 注释；热区由 MetricsDO /drop + alarm 清理兜底）。
+  const server = await getServerRow(env, payload.serverId);
   if (!server) return;
-  // 探活状态：变更才写 probe_json（告警去重状态在 MetricsDO 顺风车处理）
+  // 探活状态：变更才写 probe_json（告警去重状态在 MetricsDO 顺风车处理），写后更新行缓存
   if (Array.isArray(payload.probes)) {
     const probeJson = JSON.stringify(payload.probes);
     if (server.probe_json !== probeJson) {
       await env.DB.prepare('UPDATE servers SET probe_json = ? WHERE id = ?').bind(probeJson, payload.serverId).run();
+      serverRowCache.set(payload.serverId, { ...server, probe_json: probeJson, ts: Date.now() });
     }
   }
   // 自定义监控项：分钟粒度直写 D1；同分钟同指标只写一次（快采同分钟重复上报不再执行 INSERT，D1 写查询约 −95%）
@@ -451,9 +468,10 @@ async function handleReport(env, payload) {
   if (payload.info) {
     const infoJson = JSON.stringify(payload.info);
     if (server.info_json !== infoJson) {
-      // 系统信息变化：必须写（含 last_seen）
+      // 系统信息变化：必须写（含 last_seen），写后更新行缓存
       await env.DB.prepare('UPDATE servers SET last_seen = ?, info_json = ? WHERE id = ?')
         .bind(ts, infoJson, payload.serverId).run();
+      serverRowCache.set(payload.serverId, { ...server, info_json: infoJson, ts: Date.now() });
       lastSeenWrite.set(payload.serverId, ts);
     } else {
       // info 未变：last_seen 节流写（在线宽限 15s，10s 节流留余量）
@@ -470,8 +488,13 @@ async function handleReport(env, payload) {
       lastSeenWrite.set(payload.serverId, ts);
     }
   }
-  // 时序写入 MetricsDO 热区；告警/探活判定也在该调用内顺带完成（零额外请求）
+  // 时序写入 MetricsDO 热区；告警/探活判定也在该调用内顺带完成（零额外请求）。
+  // B9：转发节流——仅分钟切换或 ≥10s 才调用 MetricsDO（快采同分钟多帧不再 1:1 计费）
   const mdo = doMetrics(env);
+  const fwd = reportFwd.get(payload.serverId);
+  const shouldFwd = !fwd || fwd.minTs !== minTs || ts - fwd.ts >= REPORT_FWD_THROTTLE_S;
+  if (!shouldFwd) return;
+  reportFwd.set(payload.serverId, { ts, minTs });
   await mdo.fetch('https://do.internal/report', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
@@ -772,6 +795,7 @@ async function handleApi(request, env) {
       .run();
     await env.DB.prepare('INSERT INTO audit_logs (user_id, action) VALUES (?,?)').bind(user.id, 'server.create').run();
     serverListCache.clear(); // 服务器增删改后立即使列表缓存失效
+    serverRowCache.clear(); // 行缓存同步失效（B8）
     return json({
       agent_key: key,
       wss_base: `wss://${url.host}/ws/agent`,
@@ -793,6 +817,7 @@ async function handleApi(request, env) {
     // 2) 删除服务器本体（agent key 随之失效，重连返回 401）
     await env.DB.prepare('DELETE FROM servers WHERE id = ?').bind(id).run();
     serverListCache.clear(); // 服务器增删改后立即使列表缓存失效
+    serverRowCache.clear(); // 行缓存同步失效（B8）
     // 3) 审计日志
     await env.DB.prepare('INSERT INTO audit_logs (user_id, action, target_server_id, detail) VALUES (?,?,?,?)')
       .bind(user.id, 'server.delete', id, server.name).run();
@@ -2485,7 +2510,7 @@ export const __internals = {
   renderTemplate, parseHeaders, sendWebhook,
   shardForServerId, makeStreamId, shardFromStreamId,
   isAdmin, canAccessServer, canExec, handleReport,
-  lastSeenWrite, LAST_SEEN_THROTTLE_S, customWritten, serverListCache, apiCounts,
+  lastSeenWrite, LAST_SEEN_THROTTLE_S, customWritten, serverListCache, apiCounts, serverRowCache, reportFwd,
   // 重置模块级可变状态（设置缓存），保证测试间隔离
   // 注：告警冷却/探活去重状态在 MetricsDO 实例内存，由各测试实例自行隔离
   __reset() {
@@ -2495,5 +2520,7 @@ export const __internals = {
     customWritten.clear();
     serverListCache.clear();
     apiCounts.clear();
+    serverRowCache.clear();
+    reportFwd.clear();
   },
 };

@@ -322,6 +322,28 @@ test('agent 上报：key 指纹定位 + 哈希校验 + 落库', async () => {
   assert.equal(after[0].online, true);
 });
 
+test('B8/B9：服务器行缓存 + MetricsDO 转发节流（降额）', async () => {
+  const env = makeEnv();
+  const token = await login(env);
+  const { agent_key } = await addServer(env, token, { name: 'node-1' });
+  const reportCalls = () => env.METRICS.calls.filter((c) => c.path === '/report').length;
+  // 首帧上报：缓存 miss 查 D1，转发 MetricsDO 1 次
+  await call(env, { method: 'POST', path: '/api/report', body: { key: agent_key, cpu: 1 } });
+  assert.equal(reportCalls(), 1, '首帧转发 MetricsDO');
+  assert.ok(I.serverRowCache.has(1), '服务器行已缓存（B8）');
+  // 同分钟 + 10s 内重复上报：B9 节流不转发 MetricsDO（D1 写仍执行）
+  await call(env, { method: 'POST', path: '/api/report', body: { key: agent_key, cpu: 2 } });
+  await call(env, { method: 'POST', path: '/api/report', body: { key: agent_key, cpu: 3 } });
+  assert.equal(reportCalls(), 1, '同分钟 10s 内不重复转发（B9）');
+  // 超过 10s（时间戳拨回）→ 重新转发
+  I.reportFwd.set(1, { ts: Math.floor(Date.now() / 1000) - 11, minTs: Math.floor(Date.now() / 1000 / 60) });
+  await call(env, { method: 'POST', path: '/api/report', body: { key: agent_key, cpu: 4 } });
+  assert.equal(reportCalls(), 2, '超过 10s 重新转发');
+  // D1 数据仍正常落库（节流只影响 DO 转发）
+  const row = await env.DB.prepare('SELECT last_seen FROM servers WHERE id = 1').first();
+  assert.ok(row.last_seen > 0, 'last_seen 仍落库');
+});
+
 // ---------------- 安全响应头 ----------------
 test('安全响应头：API 响应带 nosniff/referrer/frame/CSP 头', async () => {
   const env = makeEnv();
@@ -339,8 +361,9 @@ test('删除后 in-flight 上报不写指标（H-11 存在性复核）', async (
   await I.handleReport(env, { serverId: 1, custom: [{ name: 'x', value: 1 }] });
   let rows = await env.DB.prepare('SELECT * FROM metrics_custom WHERE server_id = 1').all();
   assert.equal(rows.results.length, 1, '存在时写入');
-  // 并发删除（读取 server 后完成删除）
+  // 并发删除（读取 server 后完成删除；DELETE /api/servers 路径会同步清 serverRowCache，此处模拟）
   await env.DB.prepare('DELETE FROM servers WHERE id = 1').run();
+  I.serverRowCache.clear(); // 生产 DELETE 路径清行缓存（B8），后续上报缓存 miss → D1 复核拒绝
   // 在途上报：存在性复核被拒，不写入孤儿指标
   await I.handleReport(env, { serverId: 1, custom: [{ name: 'y', value: 2 }] });
   rows = await env.DB.prepare('SELECT * FROM metrics_custom WHERE server_id = 1').all();

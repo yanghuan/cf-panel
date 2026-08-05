@@ -208,6 +208,45 @@ test('MetricsDO: 增量归档按水位推进，跨线行直接归档、重复不
   assert.ok(st.storage.map.has('arc:1'), '水位已持久化');
 });
 
+test('MetricsDO: evict 后空 Map 上报水位不误推进，fullSweep 兜底归档（回归修复）', async () => {
+  const env = makeEnv();
+  const nowMin = Math.floor(Date.now() / 1000 / 60);
+  const oldTs = nowMin - 180; // 3h 前（<= 归档线，应归档）
+  // 模拟实例 A 已写入 storage：历史行 + 水位落后（实例 A 最后一次推进位置）
+  const state = mockState({
+    [`m:1:${oldTs}`]: JSON.stringify({ cpu: 30, mem_used: 100, net_in: 1, net_out: 2 }),
+    'arc:1': String(oldTs - 30),
+  });
+  // 实例 B（evict 后）：内存空 Map，慢采首帧上报当前分钟
+  const { inst, call } = mkMetrics(env, state);
+  await call('/report', { method: 'POST', body: JSON.stringify({ serverId: 1, minTs: nowMin, cpu: 50 }) });
+  // 修复后：空 Map 不推进水位（storage 历史行仍待归档，不会被 fullSweep 永久跳过）
+  assert.equal(await state.storage.get('arc:1'), String(oldTs - 30), '空 Map 时水位不误推进');
+  let rows = await env.DB.prepare('SELECT * FROM metrics_min WHERE server_id = 1').all();
+  assert.equal(rows.results.length, 0, '空 Map 未误归档历史行');
+  // fullSweep 兜底：归档水位之后的 storage 行并推进水位
+  await inst.fullSweep(true);
+  rows = await env.DB.prepare('SELECT * FROM metrics_min WHERE server_id = 1').all();
+  assert.equal(rows.results.length, 1, 'fullSweep 兜底归档历史行');
+  assert.equal(rows.results[0].cpu, 30);
+  assert.equal(Number(await state.storage.get('arc:1')), oldTs, 'fullSweep 推进水位到实际归档行');
+});
+
+test('MetricsDO: 新服务器 arcTs=0 水位不误推进，避免大区间空循环（回归修复）', async () => {
+  const env = makeEnv();
+  const state = mockState(); // 无 arc key → arcTs=0（新服务器）
+  const { call } = mkMetrics(env, state);
+  const nowMin = Math.floor(Date.now() / 1000 / 60);
+  // 新服务器首次上报（当前分钟，未跨归档线）：不得把水位推进到 cutoff（否则从分钟 1 空循环约 4000 万次）
+  await call('/report', { method: 'POST', body: JSON.stringify({ serverId: 1, minTs: nowMin, cpu: 1 }) });
+  assert.equal(await state.storage.get('arc:1'), undefined, '新服务器水位未推进到 cutoff');
+  const rows = await env.DB.prepare('SELECT * FROM metrics_min WHERE server_id = 1').all();
+  assert.equal(rows.results.length, 0, '当前分钟不归档');
+  // 跨线补报：直接归档并推进到实际行
+  await call('/report', { method: 'POST', body: JSON.stringify({ serverId: 1, minTs: nowMin - 61, cpu: 2 }) });
+  assert.equal(Number(await state.storage.get('arc:1')), nowMin - 61, '直接归档后水位推进到实际行');
+});
+
 test('MetricsDO: ARCHIVE_TO_D1=0 时 alarm 仍清理超 12h 的 storage 热区（防无限增长）', async () => {
   const env = makeEnv({ ARCHIVE_TO_D1: '0' });
   const st = mockState();

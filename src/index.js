@@ -1751,25 +1751,34 @@ export class MetricsDO {
       'INSERT OR IGNORE INTO metrics_min (server_id, ts, cpu, mem_used, mem_total, net_in, net_out, extra) VALUES (?,?,?,?,?,?,?,?)'
     ).bind(serverId, t, row.cpu, row.mem_used, row.mem_total, row.net_in, row.net_out, row.extra ? JSON.stringify(row.extra) : null);
     const stmts = [];
+    // 水位只推进到本次实际归档的最大 ts（maxArchived），不得无条件推进到 cutoff：
+    // 热写路径在实例 evict 后是空 Map，若水位仍推进，storage 中 arcTs+1~cutoff 的未归档行会被
+    // fullSweep（仅归档 ts>arcTs）永久跳过，12h 后删除 → 3d/7d/30d 历史出现永久空洞。
+    // 未归档/未扫到的行由 fullSweep（≈1h 一次）全扫 storage 兜底。
+    let maxArchived = -1;
     // 本次上报行已跨过归档线 → 直接归档（防回溯/补报漏归档）
     if (minTs <= archiveCutoff) {
       const row = m.get(minTs);
-      if (row) stmts.push(mk(minTs, row));
+      if (row) { stmts.push(mk(minTs, row)); maxArchived = minTs; }
     }
-    // 水位区间批量归档（水位之后、cutoff 之前；OR IGNORE 幂等，minTs 重复无害）
+    // 水位区间批量归档（水位之后、cutoff 之前；OR IGNORE 幂等，minTs 重复无害）。
+    // 防大区间空循环：只扫内存 Map 可覆盖的区间尾部（最近 METRICS_KEEP_MIN 分钟，至多 720 次/帧；
+    // 否则新服务器 arcTs=0 会从分钟 1 空循环到当前分钟约 4000 万次触发 CPU 尖峰），
+    // 更早/未覆盖的部分由 fullSweep 兜底归档。
     if (arcTs < archiveCutoff) {
-      for (let t = arcTs + 1; t <= archiveCutoff; t++) {
+      const start = Math.max(arcTs + 1, maxArchived + 1, archiveCutoff - METRICS_KEEP_MIN + 1);
+      for (let t = start; t <= archiveCutoff; t++) {
         const row = m.get(t);
-        if (row) stmts.push(mk(t, row));
+        if (row) { stmts.push(mk(t, row)); maxArchived = t; }
       }
     }
     // D1 写入成功后才推进水位（失败保持，下次重试）；首次水位=0 时区间可能很大，分批防超 batch 上限
     for (let i = 0; i < stmts.length; i += 100) {
       await this.env.DB.batch(stmts.slice(i, i + 100));
     }
-    if (arcTs < archiveCutoff) {
-      this.arcCache.set(serverId, archiveCutoff);
-      try { await this.state.storage.put(arcKey, String(archiveCutoff)); } catch { /* 水位持久化失败不影响 */ }
+    if (maxArchived > arcTs) {
+      this.arcCache.set(serverId, maxArchived);
+      try { await this.state.storage.put(arcKey, String(maxArchived)); } catch { /* 水位持久化失败不影响 */ }
     }
   }
 

@@ -458,6 +458,20 @@ test('PanelDO: 首帧 auth 鉴权通过后推送，非法 token 断开并触发�
   assert.deepEqual(list.map((s) => s.name), ['srv-a']);
 });
 
+test('PanelDO: 服务器列表与鉴权缓存（3s/5s TTL，降 D1 读）', async () => {
+  const env = makeEnv();
+  const token = await I.signJwt({ uid: 1, username: 'admin', role: 1, exp: Math.floor(Date.now() / 1000) + 3600 }, env);
+  await env.DB.prepare('INSERT INTO servers (agent_key_id, name, user_id, agent_key_hash) VALUES (?,?,?,?)').bind('k1', 'srv-a', 1, 'h').run();
+  const inst = new PanelDO({ getWebSockets: () => [] }, env);
+  await inst.webSocketMessage({ deserializeAttachment: () => token, send() {} }, 'sync'); // 首次查 D1
+  assert.ok(inst.listCache && inst.listCache.rows.length === 1, '列表已缓存');
+  assert.ok(inst.authCache.has(token), '鉴权已缓存');
+  // 二次 sync 走缓存（不重复查 D1）
+  const sent = [];
+  await inst.webSocketMessage({ deserializeAttachment: () => token, send: (m) => sent.push(m) }, 'sync');
+  assert.equal(JSON.parse(sent[0]).length, 1, '缓存列表返回');
+});
+
 test('PanelDO: webSocketMessage 按 token 推送过滤后的服务器列表', async () => {
   const env = makeEnv();
   const token = await I.signJwt({ uid: 1, username: 'admin', role: 1, exp: Math.floor(Date.now() / 1000) + 3600 }, env);

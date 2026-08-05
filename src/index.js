@@ -2053,6 +2053,41 @@ export class PanelDO {
   constructor(state, env) {
     this.state = state;
     this.env = env;
+    this.listCache = null; // {rows, ts} 服务器列表缓存（3s TTL，多观看者共享，降 D1 读）
+    this.authCache = new Map(); // token -> {user, ts} 鉴权缓存（5s TTL；PAT 删除后 ≤5s 失效）
+  }
+
+  // 鉴权缓存：JWT 本身是 HMAC（无 D1 读）；PAT 每次读 D1，缓存短 TTL 降频
+  async authUserCached(token) {
+    if (!token) return null;
+    const now = Date.now();
+    const c = this.authCache.get(token);
+    if (c && now - c.ts < 5000) return c.user;
+    const user = await authUserByToken(token, this.env);
+    if (this.authCache.size > 1000) this.authCache.clear(); // 防 Map 无限增长
+    this.authCache.set(token, { user, ts: now });
+    return user;
+  }
+
+  // 服务器列表缓存 + 权限过滤（过滤在缓存之上执行，不缓存可越权结论）
+  async filterServersCached(user) {
+    const now = Date.now();
+    let rows;
+    if (this.listCache && now - this.listCache.ts < 3000) {
+      rows = this.listCache.rows;
+    } else {
+      const r = await this.env.DB.prepare('SELECT * FROM servers ORDER BY "group", display_index, id').all();
+      rows = r.results;
+      this.listCache = { rows, ts: now };
+    }
+    if (isAdmin(user)) return rows;
+    if (user.pat) {
+      if (!user.pat.scopes.includes(SCOPE_READ)) return [];
+      if (user.pat.serverIDs == null) return rows;
+      const ids = new Set(user.pat.serverIDs.map(Number).filter((n) => n > 0));
+      return rows.filter((s) => ids.has(s.id));
+    }
+    return rows.filter((s) => s.user_id === user.id);
   }
 
   async fetch(request) {
@@ -2091,7 +2126,7 @@ export class PanelDO {
       let j = null;
       try { j = JSON.parse(typeof message === 'string' ? message : ''); } catch { /* 非 JSON 视为无效 */ }
       const token = j && j.type === 'auth' ? String(j.token || '') : '';
-      const user = await authUserByToken(token, this.env);
+      const user = await this.authUserCached(token);
       if (!user) {
         try { ws.close(1008, 'unauthorized'); } catch { /* ignore */ }
         return;
@@ -2103,11 +2138,11 @@ export class PanelDO {
       return;
     }
     const token = ws.deserializeAttachment() || '';
-    const user = await authUserByToken(token, this.env);
+    const user = await this.authUserCached(token);
     if (!user) return;
-    let rows;
+    let serverRows;
     try {
-      rows = await queryServersForUser(this.env, user);
+      serverRows = await this.filterServersCached(user);
     } catch {
       return; // D1 临时故障，下个周期再试
     }
@@ -2122,7 +2157,7 @@ export class PanelDO {
     const grace = (this.state.getWebSockets?.() || []).filter((w) => w.deserializeAttachment?.()).length > 0
       ? ONLINE_GRACE_FAST_S : ONLINE_GRACE_SLOW_S;
     const list = [];
-    for (const s of rows.results) {
+    for (const s of serverRows) {
       list.push({
         id: s.id,
         name: s.name,

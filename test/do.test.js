@@ -450,7 +450,7 @@ test('PanelDO: 首帧 auth 鉴权通过后推送，非法 token 断开并触发�
   await inst2.webSocketMessage(ws, JSON.stringify({ type: 'auth', token }));
   assert.equal(ws.closed, false);
   assert.equal(ws.attachment, token);
-  assert.ok(env.TERMINAL.calls.some((c) => c.path === '/rpc/wakeup')); // 快采唤醒
+  assert.ok(env.TERMINAL.calls.some((c) => c.path === '/rpc/set_viewers')); // 快采唤醒
 
   await inst2.webSocketMessage(ws, 'sync');
   assert.equal(ws.sent.length, 1);
@@ -492,18 +492,27 @@ test('PanelDO: PAT 只看白名单内的服务器', async () => {
 });
 
 // ---------------- TerminalDO ----------------
-test('TerminalDO: /rpc/wakeup 给本分片全部 agent 下发快采间隔', async () => {
+test('TerminalDO: /rpc/set_viewers 按观看者数切换快/慢采', async () => {
   const env = makeEnv();
   const sent = [];
   const inst = new TerminalDO(mockState(), env);
   inst.agents.set(1, { send: (m) => sent.push(m), readyState: 1 });
   inst.agents.set(2, { send: (m) => sent.push(m), readyState: 1 });
-  const res = await inst.fetch(new Request('https://do.internal/rpc/wakeup', { method: 'POST' }));
+  // 0→1 观看者 → 快采 3s
+  let res = await inst.fetch(new Request('https://do.internal/rpc/set_viewers', { method: 'POST', body: JSON.stringify({ count: 1 }) }));
   assert.equal(res.status, 200);
-  assert.equal(sent.length, 2);
   assert.deepEqual(sent, [
     JSON.stringify({ type: 'set_report_interval', interval: 3 }),
     JSON.stringify({ type: 'set_report_interval', interval: 3 }),
+  ]);
+  // 1→0 观看者 → 慢采 120s
+  res = await inst.fetch(new Request('https://do.internal/rpc/set_viewers', { method: 'POST', body: JSON.stringify({ count: 0 }) }));
+  assert.equal(res.status, 200);
+  assert.deepEqual(sent, [
+    JSON.stringify({ type: 'set_report_interval', interval: 3 }),
+    JSON.stringify({ type: 'set_report_interval', interval: 3 }),
+    JSON.stringify({ type: 'set_report_interval', interval: 120 }),
+    JSON.stringify({ type: 'set_report_interval', interval: 120 }),
   ]);
 });
 

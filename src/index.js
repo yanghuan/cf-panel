@@ -1086,11 +1086,15 @@ export class TerminalDO {
     const url = new URL(request.url);
     const path = url.pathname;
 
-    // 内部 RPC：首位观看者上线，本分片所有 agent 立即切快采（省配额策略）
-    if (path === '/rpc/wakeup' && request.method === 'POST') {
+    // 内部 RPC：观看者数变化事件（0→1 快采 / 1→0 慢采），更新本分片全部 agent 上报间隔
+    if (path === '/rpc/set_viewers' && request.method === 'POST') {
+      const body = await request.json();
+      const want = (Number(body.count) || 0) > 0 ? REPORT_FAST_INTERVAL_S : REPORT_SLOW_INTERVAL_S;
       for (const [serverId, w] of this.agents) {
-        this.agentInterval.set(serverId, REPORT_FAST_INTERVAL_S);
-        try { w.send(JSON.stringify({ type: 'set_report_interval', interval: REPORT_FAST_INTERVAL_S })); } catch { /* ignore */ }
+        if (this.agentInterval.get(serverId) !== want) {
+          this.agentInterval.set(serverId, want);
+          try { w.send(JSON.stringify({ type: 'set_report_interval', interval: want })); } catch { /* ignore */ }
+        }
       }
       return json({ ok: true });
     }
@@ -1528,17 +1532,18 @@ export class TerminalDO {
     }
   }
 
-  // 省配额策略：根据当前在线观看者数决定该 agent 的上报间隔，仅变化时下发指令
+  // 省配额策略：观看者数变化由 PanelDO 事件驱动（/rpc/set_viewers 更新 agentInterval 并广播），
+  // 上报时仅读内存（0 个 DO 调用）；仅当内存无记录（实例 evict / 新连接）时查 /viewers 兜底初始化。
   async syncAgentInterval(ws, serverId) {
+    if (this.agentInterval.has(serverId)) return; // 事件驱动已维护
+    let want = REPORT_SLOW_INTERVAL_S;
     try {
       const resp = await doPanel(this.env).fetch('https://do.internal/viewers');
       const v = await resp.json();
-      const want = (v.count || 0) > 0 ? REPORT_FAST_INTERVAL_S : REPORT_SLOW_INTERVAL_S;
-      if (this.agentInterval.get(serverId) !== want) {
-        this.agentInterval.set(serverId, want);
-        ws.send(JSON.stringify({ type: 'set_report_interval', interval: want }));
-      }
-    } catch { /* 查询失败维持现状 */ }
+      want = (v.count || 0) > 0 ? REPORT_FAST_INTERVAL_S : REPORT_SLOW_INTERVAL_S;
+    } catch { /* 兜底慢采 */ }
+    this.agentInterval.set(serverId, want);
+    ws.send(JSON.stringify({ type: 'set_report_interval', interval: want }));
   }
 
   async webSocketClose(ws) {
@@ -2065,12 +2070,17 @@ export class PanelDO {
     return new Response(null, { status: 101, webSocket: pair[0] });
   }
 
-  // 广播唤醒：让所有分片上的 agent 立即切到快采间隔
-  async wakeupAgents() {
+  // 观看者数变化事件 → 各分片 agent 切快/慢采（省配额：0→1 立即快采，1→0 恢复慢采）。
+  // 取代每次上报查询 /viewers（上报链 DO 事件 3→2/帧）。
+  async broadcastViewers(count) {
     for (let i = 0; i < SHARDS; i++) {
       try {
-        await doForShard(this.env, i).fetch('https://do.internal/rpc/wakeup', { method: 'POST' });
-      } catch { /* 分片暂不可达，后续 report 同步兜底 */ }
+        await doForShard(this.env, i).fetch('https://do.internal/rpc/set_viewers', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ count }),
+        });
+      } catch { /* 分片暂不可达，后续上报兜底 */ }
     }
   }
 
@@ -2087,9 +2097,9 @@ export class PanelDO {
         return;
       }
       ws.serializeAttachment(token);
-      // 首位已鉴权观看者上线 → 各分片 agent 立即切快采（省配额策略，免等下一次上报）
+      // 首位已鉴权观看者上线（0→1）→ 各分片 agent 立即切快采（事件驱动，免每次上报查 /viewers）
       const authed = (this.state.getWebSockets?.() || []).filter((w) => w.deserializeAttachment?.());
-      if (authed.length === 1) this.wakeupAgents();
+      if (authed.length === 1) this.broadcastViewers(1);
       return;
     }
     const token = ws.deserializeAttachment() || '';
@@ -2126,6 +2136,12 @@ export class PanelDO {
       });
     }
     try { ws.send(JSON.stringify(list)); } catch { /* ignore */ }
+  }
+
+  // 观看者断开：最后一个已鉴权观看者下线（1→0）→ 广播慢采（事件驱动省配额）
+  async webSocketClose(ws) {
+    const authed = (this.state.getWebSockets?.() || []).filter((w) => w !== ws && w.deserializeAttachment?.());
+    if (authed.length === 0) this.broadcastViewers(0);
   }
 }
 

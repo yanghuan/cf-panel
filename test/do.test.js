@@ -6,7 +6,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { MetricsDO, PanelDO, TerminalDO, __internals as I } from '../src/index.js';
-import { makeEnv, captureFetch } from './helpers.js';
+import { makeEnv, makePanelStub, captureFetch } from './helpers.js';
 
 function mockState(store = {}) {
   const map = new Map(Object.entries(store));
@@ -176,6 +176,52 @@ test('B10: MetricsDO 上报驱动聚合推送（set_push 开启 + 3s 节流）',
   inst.lastPushAt = Date.now() - 3100;
   await call('/report', { method: 'POST', body: JSON.stringify({ serverId: 1, minTs: nowMin, cpu: 4 }) });
   assert.equal(pushCount(), 2, '超过 3s 重新推送');
+});
+
+test('B10: latest_push 对已撤销观看者关闭连接（修复验证问题2）', async () => {
+  const env = makeEnv();
+  const ws = { closed: false, attachment: 'cfp_revoked_token', deserializeAttachment() { return this.attachment; }, send() {}, close() { this.closed = true; } };
+  const inst = new PanelDO({ getWebSockets: () => [ws] }, env);
+  const res = await inst.fetch(new Request('https://do.internal/rpc/latest_push', { method: 'POST', body: JSON.stringify({ latest: {} }) }));
+  assert.equal(res.status, 200);
+  assert.equal(ws.closed, true, '已撤销观看者连接被关闭（不再残留计数维持快采）');
+});
+
+test('B10: pushOn evict 丢失后反查 /viewers 自愈（修复验证问题3）', async () => {
+  const env = makeEnv({ PANEL: makePanelStub({ viewers: 1 }) }); // 实际有人观看
+  const st = mockState();
+  const { inst, call } = mkMetrics(env, st);
+  const nowMin = Math.floor(Date.now() / 1000 / 60);
+  assert.equal(inst.pushOn, false, '初始未开启（模拟 evict 后丢失）');
+  // pushOn=false + 有上报 → 低频反查 /viewers（count=1）→ 恢复推送
+  inst.lastPushProbeAt = 0;
+  await call('/report', { method: 'POST', body: JSON.stringify({ serverId: 1, minTs: nowMin, cpu: 1 }) });
+  assert.equal(inst.pushOn, true, '反查发现有人观看恢复推送');
+});
+
+test('MetricsDO: 首帧兜底失败置 pendingArcRetry，后续帧重试成功（修复验证问题4）', async () => {
+  const env = makeEnv();
+  const nowMin = Math.floor(Date.now() / 1000 / 60);
+  const xTs = nowMin - 200;
+  const minTs = nowMin - 61;
+  const state = mockState({
+    [`m:1:${xTs}`]: JSON.stringify({ cpu: 11 }),
+    'arc:1': String(nowMin - 300),
+  });
+  const { inst, call } = mkMetrics(env, state);
+  // 首帧兜底失败：不推进 + 置 pending 标记
+  const origList = state.storage.list.bind(state.storage);
+  state.storage.list = async () => { throw new Error('storage unavailable'); };
+  await call('/report', { method: 'POST', body: JSON.stringify({ serverId: 1, minTs, cpu: 22 }) });
+  assert.equal(Number(await state.storage.get('arc:1')), nowMin - 300, '首帧兜底失败不推进');
+  assert.ok(inst.pendingArcRetry.has(1), '失败置 pending 重试标记');
+  // 恢复后第 2 帧（fresh=false）仍重试兜底 → 滞后行归档 + 推进 + 清除标记
+  state.storage.list = origList;
+  await call('/report', { method: 'POST', body: JSON.stringify({ serverId: 1, minTs, cpu: 22 }) });
+  assert.equal(inst.pendingArcRetry.has(1), false, '兜底成功清除标记');
+  assert.equal(Number(await state.storage.get('arc:1')), minTs, '推进水位');
+  const rows = await env.DB.prepare('SELECT * FROM metrics_min WHERE server_id = 1').all();
+  assert.equal(rows.results.length, 2, '滞后行与跨线行均归档');
 });
 
 test('B10: PanelDO latest_push 按观看者权限广播（不查 /latest）', async () => {

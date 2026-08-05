@@ -17,6 +17,7 @@ const SYNC_MIN_INTERVAL_MS = 2000; // PanelDO sync 频率下限（<2s 忽略，�
 const ARCHIVE_IDLE_INTERVAL_MS = 60 * 60 * 1000; // 闲置（无数据且告警关闭）时 alarm 退避间隔（1h）
 const PAT_CHECK_INTERVAL_MS = 10 * 1000; // PAT 终端连接重校验间隔（B4：每条消息 → 10s 一次，−98%）
 const LATEST_PUSH_INTERVAL_MS = 3000; // B10：上报驱动聚合推送间隔（有观看者时 ≥3s 推一次全部 latest 给 PanelDO）
+const PUSH_PROBE_INTERVAL_MS = 30 * 1000; // pushOn 自愈反查 /viewers 的间隔（MetricsDO evict 丢失 pushOn 时）
 const PANEL_SWITCH_GRACE_MS = 30 * 1000; // 观看者 0→1 后在线判定用慢宽限的过渡期：Agent 切快采并完成首帧上报前，
 // 用 15s 快宽限会把慢采周期中（120s 内无上报）的节点误判离线；30s 后快宽限正常生效
 const PAT_PREFIX = 'cfp_'; // PAT token 前缀
@@ -1746,6 +1747,8 @@ export class MetricsDO {
     this.hotLoaded = new Set(); // serverId 已从 storage 完整加载热区的标记（见 ensureHot）
     this.pushOn = false; // B10：是否有观看者（PanelDO 0→1/1→0 通知），开启时才推送 latest
     this.lastPushAt = 0; // 上次推送 latest 给 PanelDO 的时刻（ms）；上报驱动节流，不引入定时器
+    this.lastPushProbeAt = 0; // 上次反查 /viewers 的时刻（pushOn 因 evict 丢失时的自愈兜底）
+    this.pendingArcRetry = new Set(); // serverId：首帧兜底 list 失败后待重试（A2 极窄回退加固）
   }
 
   // 家政状态（lastSweepAt/lastPruneAt）从 storage 惰性恢复（A3：持久化跨实例 evict，
@@ -1868,9 +1871,13 @@ export class MetricsDO {
     // 此后内存 Map 已覆盖本实例写入区间，滞后行由区间循环或 fullSweep（A3 修复后每 ~1h 可靠执行）
     // 兜底——避免「hotLoaded 仅 /query 置位」导致的每 60 秒一次全量 listStorage 读（~1.04M 行/天/机）。
     // 兜底读取失败（Storage 瞬时不可用）时不得推进水位：否则水位越过未归档行后，
-    // fullSweep（仅扫 ts>arcTs）也会永久跳过它们——正确性优先，失败时保持水位由下帧/fullSweep 重试。
+    // fullSweep（仅扫 ts>arcTs）也会永久跳过它们——正确性优先，失败时保持水位。
+    // 加固（问题 4）：失败置 pendingArcRetry 标记，后续帧（即使 fresh=false）继续重试兜底，
+    // 成功后才清除——避免「首帧兜底失败后第 2 帧起 fresh=false 永不重试」导致 storage-only
+    // 滞后行被后续正常推进的水位永久越过（仅时钟回拨 + evict + list 瞬时失败组合才触发）
     let fallbackOk = true;
-    if (maxArchived > arcTs && fresh) {
+    const needsFallback = maxArchived > arcTs && (fresh || this.pendingArcRetry.has(serverId));
+    if (needsFallback) {
       try {
         const items = await this.listStorage(this.hotPrefix(serverId));
         for (const k of items) {
@@ -1879,8 +1886,10 @@ export class MetricsDO {
             stmts.push(mk(t, JSON.parse(k.value)));
           }
         }
+        this.pendingArcRetry.delete(serverId); // 兜底成功：清除重试标记
       } catch {
         fallbackOk = false;
+        this.pendingArcRetry.add(serverId); // 兜底失败：置重试标记，后续帧继续
       }
     }
     // D1 写入成功后才推进水位（失败保持，下次重试）；首次水位=0 时区间可能很大，分批防超 batch 上限
@@ -1948,6 +1957,15 @@ export class MetricsDO {
             });
           } catch { /* 推送失败下个周期重试 */ }
         }
+      } else if (Date.now() - this.lastPushProbeAt >= PUSH_PROBE_INTERVAL_MS) {
+        // 自愈：pushOn 是实例内存，MetricsDO 无 WS 可能在 PanelDO set_push(1) 之后被 evict，
+        // 新实例不知道有人观看 → 面板数据冻结。低频（30s）反查 /viewers，有人看则恢复推送
+        this.lastPushProbeAt = Date.now();
+        try {
+          const vResp = await doPanel(this.env).fetch('https://do.internal/viewers');
+          const v = await vResp.json();
+          if ((v.count || 0) > 0) this.pushOn = true;
+        } catch { /* 反查失败下次再试 */ }
       }
       return json({ ok: true });
     }
@@ -2016,6 +2034,7 @@ export class MetricsDO {
       this.hotLoaded.delete(serverId);
       this.latestByServer.delete(serverId);
       this.lastSeenSec.delete(serverId);
+      this.pendingArcRetry.delete(serverId);
       // 清理该服务器的告警冷却与探活状态（内存 + storage）
       try {
         const ak = await this.listStorage(`alert:${serverId}:`);
@@ -2220,13 +2239,14 @@ export class MetricsDO {
     let alertOn = false; // 提升到函数级：finally 的闲置退避判定需要（try 内 const 不可见）
     try {
     // 用量观测：本周期计数累计到 storage（跨实例 evict 保留近似量级），随后清零内存。
-    // B5：业务计数（report/latest/query）全零时跳过 put（alarm 次数不持久化，避免每次 alarm 无条件写）
+    // B5：按「本期增量」判断全零才跳过 put（累计值 prev+本期 只要历史有过流量就永远非零，
+    // 用累计值判断会使跳过成为死代码）——闲置/无流量 alarm 不再无条件写 storage
     try {
       const prev = JSON.parse(await this.state.storage.get('usage:total') || '{}');
       const report = (prev.report || 0) + this.usage.report;
       const latest = (prev.latest || 0) + this.usage.latest;
       const query = (prev.query || 0) + this.usage.query;
-      if (report || latest || query) {
+      if (this.usage.report || this.usage.latest || this.usage.query) {
         await this.state.storage.put('usage:total', JSON.stringify({ report, latest, query }));
       }
     } catch { /* 用量汇总失败不影响主流程 */ }
@@ -2407,7 +2427,12 @@ export class PanelDO {
         if (!w.deserializeAttachment?.()) return; // 未鉴权连接跳过
         const token = String(w.deserializeAttachment() || '');
         const user = await this.authUserCached(token);
-        if (!user) return; // 已撤销：下个 sync 关闭（latest_push 只推数据，不做关闭决策）
+        if (!user) {
+          // 已撤销：直接关闭连接（B10 后前端仅 onopen 发一次 sync，webSocketMessage 的
+          // 关闭分支不会再触发——必须在此兜底，否则撤销连接残留计数导致 agent 持续快采）
+          try { w.close(1008, 'unauthorized'); } catch { /* ignore */ }
+          return;
+        }
         const list = await this.buildList(user, latest);
         if (list) { try { w.send(JSON.stringify(list)); } catch { /* ignore */ } }
       }));

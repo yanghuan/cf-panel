@@ -4,12 +4,17 @@
 // 本 DO 用 WebSocket Hibernation API：空闲时实例休眠（不计时长），
 // 只有收到客户端消息或推送才短暂唤醒 → 费用开销趋近普通 Worker。
 import {
-  LIST_CACHE_TTL_MS, LATEST_CACHE_TTL_MS, SYNC_MIN_INTERVAL_MS,
-  ONLINE_GRACE_FAST_S, ONLINE_GRACE_SLOW_S, PANEL_SWITCH_GRACE_MS,
-  SHARDS, SCOPE_READ,
+  ONLINE_GRACE_FAST_S, ONLINE_GRACE_SLOW_S, SHARDS, SCOPE_READ,
 } from './config.js';
 import { json, doForShard, doMetrics, safeJson } from './utils.js';
 import { authUserByToken, isAdmin } from './auth.js';
+
+// 本模块专用常量（缓存 TTL / 频率下限 / 切快采过渡期，就近定义便于对照使用代码）
+const LIST_CACHE_TTL_MS = 4500; // 服务器列表缓存 TTL：> 前端 3s sync 间隔（错开同频，消除单观看者 miss）
+const LATEST_CACHE_TTL_MS = 4000; // MetricsDO /latest 共享缓存 TTL（多观看者 sync 共享，DO 事件 −50%）
+const SYNC_MIN_INTERVAL_MS = 2000; // sync 频率下限（<2s 忽略，防任意消息/高频触发全链路）
+const PANEL_SWITCH_GRACE_MS = 30 * 1000; // 观看者 0→1 后在线判定用慢宽限的过渡期：Agent 切快采并完成首帧上报前，
+// 用 15s 快宽限会把慢采周期中（120s 内无上报）的节点误判离线；30s 后快宽限正常生效
 
 export class PanelDO {
   constructor(state, env) {

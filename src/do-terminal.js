@@ -1,11 +1,15 @@
 // cf-panel — Durable Object：WebSocket 中转核心（分片实例 TerminalDO）
-import {
-  SESSION_TTL_MS, MAX_SESSIONS_PER_SERVER, SESSION_ABS_MS,
-  REPORT_FAST_INTERVAL_S, REPORT_SLOW_INTERVAL_S, PAT_CHECK_INTERVAL_MS,
-} from './config.js';
 import { json, err, doPanel, sha256Hex, hashSecret } from './utils.js';
 import { authUserByToken, isAdmin, canExec } from './auth.js';
 import { handleReport } from './report.js';
+
+// 本模块专用常量（会话/上报间隔/PAT 校验，就近定义便于对照使用代码）
+const SESSION_TTL_MS = 10 * 60 * 1000; // 会话两端都断开超过 10 分钟 → 回收
+const MAX_SESSIONS_PER_SERVER = 8; // 每服务器并发会话上限（超限 429，防 PTY/bash/FD 耗尽）
+const SESSION_ABS_MS = 4 * 60 * 60 * 1000; // 会话绝对最长时长（含活跃连接，到期强制回收）
+const PAT_CHECK_INTERVAL_MS = 10 * 1000; // PAT 终端连接重校验间隔（每条消息 → 10s 一次，−98%）
+const REPORT_FAST_INTERVAL_S = 5;  // 有观看者：5 秒上报（快采 28,800 → 17,280 帧/天/机）
+const REPORT_SLOW_INTERVAL_S = 120; // 无人查看：120 秒上报
 
 export class TerminalDO {
   constructor(state, env) {

@@ -1,7 +1,31 @@
 // cf-panel — 路由层：REST API（handleApi）+ MCP（handleMcp）+ WebSocket 路由（handleWs）
 import {
-  ALLOWED_SCOPES, SCOPE_READ, PAT_PREFIX, MCP_VERSION, SHARDS, MCP_TOOLS, parsePanelUsers,
+  SCOPE_READ, SCOPE_EXEC, PAT_PREFIX, SHARDS, parsePanelUsers,
 } from './config.js';
+
+// 本模块专用常量（PAT scope 白名单 / MCP 协议与工具，就近定义便于对照使用代码）
+const ALLOWED_SCOPES = [SCOPE_READ, SCOPE_EXEC]; // PAT 合法 scope 白名单
+const MCP_VERSION = '2025-11-25'; // 服务器声明支持的协议版本（缺失头时客户端按 2025-03-26 兼容）
+const MCP_TOOLS = [
+  {
+    name: 'list_servers',
+    description: '列出面板中所有可访问的服务器，返回每台的状态：在线与否、实时 CPU%/内存/负载，以及系统信息（OS/内核/IP）。',
+    inputSchema: { type: 'object', properties: {}, required: [] },
+  },
+  {
+    name: 'get_monitor',
+    description: '查询某台服务器的监控历史（分钟序列）：CPU、内存、网络速率及扩展项（Swap/负载/温度/进程数/TCP-UDP 连接数）。提供 server_id 或 server_name 之一；range 可选 1h/12h/3d/7d/30d，默认 12h。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        server_id: { type: 'integer', description: '服务器 ID（见 list_servers 返回值中的 id）' },
+        server_name: { type: 'string', description: '服务器名称（与 server_id 二选一）' },
+        range: { type: 'string', enum: ['1h', '12h', '3d', '7d', '30d'], description: '查询时间范围，默认 12h' },
+      },
+      required: [],
+    },
+  },
+];
 import {
   json, err, requireJwtSecret, signJwt, randomHex, sha256Hex, hashSecret,
   kvGet, kvPut, sanitizeAlerts, parseRangeHours,

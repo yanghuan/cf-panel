@@ -1,11 +1,18 @@
 // cf-panel — Durable Object：监控时序内存热区（MetricsDO）
-import {
-  METRICS_KEEP_MIN, ARCHIVE_INTERVAL_MS, ARCHIVE_AFTER_MIN,
-  METRICS_RETENTION_DAYS, AUDIT_RETENTION_DAYS, PRUNE_INTERVAL_MS,
-  ARCHIVE_IDLE_INTERVAL_MS, LATEST_PUSH_INTERVAL_MS, PUSH_PROBE_INTERVAL_MS,
-} from './config.js';
+import { ARCHIVE_AFTER_MIN } from './config.js';
 import { json, err, doPanel, sendWebhook } from './utils.js';
 import { getAlertCfg, SETTINGS_CACHE } from './db.js';
+
+// 本模块专用常量（热区/归档/家政/推送，就近定义便于对照使用代码）
+const METRICS_KEEP_MIN = 720; // 内存保留最近 12 小时（分钟粒度）
+const ARCHIVE_INTERVAL_MS = 10 * 60 * 1000; // 归档周期
+const METRICS_RETENTION_DAYS = 30; // D1 历史保留期（天），过期行每日清理
+const AUDIT_RETENTION_DAYS = 90; // 审计日志保留期（天），过期行随每日清理删除
+const PRUNE_INTERVAL_MS = 24 * 60 * 60 * 1000; // 保留期清理周期
+const ARCHIVE_IDLE_INTERVAL_MS = 60 * 60 * 1000; // 闲置（无数据且告警关闭）时 alarm 退避间隔（1h）
+const LATEST_PUSH_INTERVAL_MS = 5000; // 上报驱动聚合推送间隔（有观看者时 ≥5s 推一次全部 latest 给 PanelDO；
+// 单机时被 REPORT_FWD_THROTTLE_S=5s 钳制（MetricsDO 每 5s 收帧），多机时聚合多台上报防推送风暴）
+const PUSH_PROBE_INTERVAL_MS = 30 * 1000; // pushOn 自愈反查 /viewers 的间隔（MetricsDO evict 丢失 pushOn 时）
 
 // 内存热区（12h 秒回）+ alarm 归档 D1（默认开启，ARCHIVE_TO_D1=0 可关闭）；
 // 归档时按 METRICS_RETENTION_DAYS 保留期每日清理过期历史

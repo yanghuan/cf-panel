@@ -1606,6 +1606,8 @@ export class MetricsDO {
     this.probeState = new Map(); // `${serverId}:probeName` -> {ok, lastFail}
     this.alertLoaded = false;
     this.probeLoaded = false;
+    this.arcCache = new Map(); // serverId -> 已归档水位（分钟），实例内缓存，evict 后从 storage 恢复
+    this.sweepCount = 0; // 全量 sweep 计数（每 6 次 alarm ≈ 1 小时做一次）
   }
 
   // 从 DO Storage 惰性恢复告警冷却 / 探活去重状态（实例 evict 后首次使用时加载一次）
@@ -1662,6 +1664,45 @@ export class MetricsDO {
     return this.data.get(serverId);
   }
 
+  // 增量归档：把该服务器热区中「归档水位之后、归档线之前」的行落 D1。
+  // 由 /report 热写路径顺带调用（水位 < 归档线时才执行，正常每 ~10 分钟一次），
+  // 取代 alarm 每 10 分钟全量 list + 重复 INSERT（消除 DO Storage 读与 D1 重复写）。
+  // 本次上报行本身若已跨过归档线则直接归档（不依赖水位，防回溯/补报漏归档）。
+  async archiveIncrement(serverId, m, minTs) {
+    if (this.env.ARCHIVE_TO_D1 === '0') return;
+    const arcKey = `arc:${serverId}`;
+    let arcTs = this.arcCache.get(serverId);
+    if (arcTs == null) {
+      try { arcTs = Number(await this.state.storage.get(arcKey)) || 0; } catch { arcTs = 0; }
+      this.arcCache.set(serverId, arcTs);
+    }
+    const archiveCutoff = Math.floor(Date.now() / 1000 / 60) - ARCHIVE_AFTER_MIN;
+    const mk = (t, row) => this.env.DB.prepare(
+      'INSERT OR IGNORE INTO metrics_min (server_id, ts, cpu, mem_used, mem_total, net_in, net_out, extra) VALUES (?,?,?,?,?,?,?,?)'
+    ).bind(serverId, t, row.cpu, row.mem_used, row.mem_total, row.net_in, row.net_out, row.extra ? JSON.stringify(row.extra) : null);
+    const stmts = [];
+    // 本次上报行已跨过归档线 → 直接归档（防回溯/补报漏归档）
+    if (minTs <= archiveCutoff) {
+      const row = m.get(minTs);
+      if (row) stmts.push(mk(minTs, row));
+    }
+    // 水位区间批量归档（水位之后、cutoff 之前；OR IGNORE 幂等，minTs 重复无害）
+    if (arcTs < archiveCutoff) {
+      for (let t = arcTs + 1; t <= archiveCutoff; t++) {
+        const row = m.get(t);
+        if (row) stmts.push(mk(t, row));
+      }
+    }
+    // D1 写入成功后才推进水位（失败保持，下次重试）；首次水位=0 时区间可能很大，分批防超 batch 上限
+    for (let i = 0; i < stmts.length; i += 100) {
+      await this.env.DB.batch(stmts.slice(i, i + 100));
+    }
+    if (arcTs < archiveCutoff) {
+      this.arcCache.set(serverId, archiveCutoff);
+      try { await this.state.storage.put(arcKey, String(archiveCutoff)); } catch { /* 水位持久化失败不影响 */ }
+    }
+  }
+
   async fetch(request) {
     const url = new URL(request.url);
 
@@ -1675,6 +1716,8 @@ export class MetricsDO {
         m.set(minTs, v);
         this.trim(m);
         await this.state.storage.put(this.hotKey(b.serverId, minTs), JSON.stringify(v));
+        // 增量归档：水位之后、归档线之前的行落 D1（消除 alarm 全量重复 INSERT）
+        await this.archiveIncrement(b.serverId, m, minTs);
       } catch { /* storage 不可用时降级为纯内存（仅当前实例生命周期） */ }
       this.scheduleArchive();
       // 告警/探活去重判定搭本次 /report 调用顺风车（零额外请求）；失败不影响监控存储
@@ -1913,43 +1956,11 @@ export class MetricsDO {
     const archiveOn = this.env.ARCHIVE_TO_D1 !== '0';
     const alertOn = (await getAlertCfg(this.env)).enabled;
     if (alertOn) await this.checkOfflineAlerts();
-    // 归档线（60min）：此前的数据落 D1；热区上限（METRICS_KEEP_MIN=720min）：此前的热区行删除
-    const archiveCutoff = Math.floor(Date.now() / 1000 / 60) - ARCHIVE_AFTER_MIN;
-    const keepCutoff = Math.floor(Date.now() / 1000 / 60) - METRICS_KEEP_MIN;
-    const stmts = [];
-    const keysToDelete = [];
-    try {
-      const keys = await this.listStorage('m:');
-      for (const k of keys) {
-        const rest = k.name.slice(2); // 去掉 'm:'
-        const sep = rest.indexOf(':');
-        if (sep <= 0) continue;
-        const serverId = Number(rest.slice(0, sep));
-        const ts = Number(rest.slice(sep + 1));
-        // 归档线以上：写 D1（OR IGNORE 幂等）；热区行保留（不再删 60min 内的行，≤12h 查询完整）
-        if (ts <= archiveCutoff && archiveOn) {
-          const v = JSON.parse(k.value);
-          stmts.push(
-            this.env.DB.prepare(
-              'INSERT OR IGNORE INTO metrics_min (server_id, ts, cpu, mem_used, mem_total, net_in, net_out, extra) VALUES (?,?,?,?,?,?,?,?)'
-            ).bind(serverId, ts, v.cpu, v.mem_used, v.mem_total, v.net_in, v.net_out, v.extra ? JSON.stringify(v.extra) : null)
-          );
-        }
-        // 超过热区上限（12h）：删除 storage 行（防无限增长；D1 已含归档数据）
-        if (ts <= keepCutoff) keysToDelete.push(k.name);
-      }
-    } catch { /* storage 不可用则跳过本次清理（行保留，下次重试） */ }
-    // D1 写入成功后才删除 storage 行（防 D1 失败时两端数据丢失）；
-    // D1 batch 单次最多 100 条，分批提交（防归档积压/服务器增多后单次超大 batch 超限）
-    for (let i = 0; i < stmts.length; i += 100) {
-      await this.env.DB.batch(stmts.slice(i, i + 100));
-    }
-    await Promise.all(keysToDelete.map((name) => this.state.storage.delete(name)));
-    // 同步清理内存缓存中超过热区上限的数据
-    for (const [, m] of this.data) {
-      for (const ts of [...m.keys()]) {
-        if (ts <= keepCutoff) m.delete(ts);
-      }
+    // 全量 sweep 降频：每 6 次 alarm（≈1 小时）做一次「>12h 行清理 + 兜底归档」；
+    // 常态归档已由 /report 增量完成，其余周期不再扫描 storage（消除全量 list 读与重复 INSERT 写）
+    this.sweepCount += 1;
+    if (this.sweepCount % 6 === 0) {
+      await this.fullSweep(archiveOn);
     }
     // 保留期清理（每天一次）：删除超过 METRICS_RETENTION_DAYS 的旧数据，以及超过
     // AUDIT_RETENTION_DAYS 的审计日志（created_at 为 datetime('now') 文本，可直接比较）
@@ -1967,6 +1978,62 @@ export class MetricsDO {
     } finally {
       // 无论是否异常都续排下一次 alarm：防归档/清理/告警因单次失败永久停摆
       this.state.storage.setAlarm(Date.now() + ARCHIVE_INTERVAL_MS);
+    }
+  }
+
+  // 全量 sweep（降频，≈1 小时一次）：>12h 热区行清理 + 兜底归档（水位之后的行 INSERT OR IGNORE）。
+  // 常态归档由 /report 增量完成；此处仅兜底异常（水位滞后/实例 evict 后恢复）与执行 12h 上限清理。
+  async fullSweep(archiveOn) {
+    const archiveCutoff = Math.floor(Date.now() / 1000 / 60) - ARCHIVE_AFTER_MIN;
+    const keepCutoff = Math.floor(Date.now() / 1000 / 60) - METRICS_KEEP_MIN;
+    const stmts = [];
+    const keysToDelete = [];
+    const arcMax = new Map(); // serverId -> 兜底归档到的最大 ts
+    try {
+      const keys = await this.listStorage('m:');
+      for (const k of keys) {
+        const rest = k.name.slice(2); // 去掉 'm:'
+        const sep = rest.indexOf(':');
+        if (sep <= 0) continue;
+        const serverId = Number(rest.slice(0, sep));
+        const ts = Number(rest.slice(sep + 1));
+        // 兜底归档：水位之后、归档线之前的行（正常水位=归档线，此处仅兜底异常）
+        if (ts <= archiveCutoff && archiveOn) {
+          const arcKey = `arc:${serverId}`;
+          let arcTs = this.arcCache.get(serverId);
+          if (arcTs == null) {
+            try { arcTs = Number(await this.state.storage.get(arcKey)) || 0; } catch { arcTs = 0; }
+            this.arcCache.set(serverId, arcTs);
+          }
+          if (ts > arcTs) {
+            const v = JSON.parse(k.value);
+            stmts.push(
+              this.env.DB.prepare(
+                'INSERT OR IGNORE INTO metrics_min (server_id, ts, cpu, mem_used, mem_total, net_in, net_out, extra) VALUES (?,?,?,?,?,?,?,?)'
+              ).bind(serverId, ts, v.cpu, v.mem_used, v.mem_total, v.net_in, v.net_out, v.extra ? JSON.stringify(v.extra) : null)
+            );
+            arcMax.set(serverId, Math.max(arcMax.get(serverId) || 0, ts));
+          }
+        }
+        // 超过热区上限（12h）：删除 storage 行（防无限增长；D1 已含归档数据）
+        if (ts <= keepCutoff) keysToDelete.push(k.name);
+      }
+    } catch { /* storage 不可用则跳过本次清理（行保留，下次重试） */ }
+    // D1 写入成功后才删除 storage 行（防 D1 失败时两端数据丢失）；分批提交
+    for (let i = 0; i < stmts.length; i += 100) {
+      await this.env.DB.batch(stmts.slice(i, i + 100));
+    }
+    await Promise.all(keysToDelete.map((name) => this.state.storage.delete(name)));
+    // 同步清理内存缓存中超过热区上限的数据
+    for (const [, m] of this.data) {
+      for (const ts of [...m.keys()]) {
+        if (ts <= keepCutoff) m.delete(ts);
+      }
+    }
+    // 兜底后推进水位（到实际归档的最大 ts）
+    for (const [serverId, ts] of arcMax) {
+      this.arcCache.set(serverId, ts);
+      try { await this.state.storage.put(`arc:${serverId}`, String(ts)); } catch { /* ignore */ }
     }
   }
 }

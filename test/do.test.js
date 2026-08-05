@@ -141,6 +141,27 @@ test('MetricsDO: alarm 归档超 1 小时数据到 D1；热区保留 12h，不�
   assert.equal(rows2.results.length, 1, '二次归档不重复写 D1（OR IGNORE）');
 });
 
+test('MetricsDO: 增量归档按水位推进，跨线行直接归档、重复不重复写（降额优化）', async () => {
+  const env = makeEnv();
+  const st = mockState();
+  const { call } = mkMetrics(env, st);
+  const nowMin = Math.floor(Date.now() / 1000 / 60);
+  // 跨过归档线的行（now-61）→ /report 时直接归档
+  await call('/report', { method: 'POST', body: JSON.stringify({ serverId: 1, minTs: nowMin - 61, cpu: 1 }) });
+  let rows = await env.DB.prepare('SELECT * FROM metrics_min WHERE server_id = 1').all();
+  assert.equal(rows.results.length, 1, '跨线行直接归档');
+  // 当前分钟行 → 未跨线不立即归档
+  await call('/report', { method: 'POST', body: JSON.stringify({ serverId: 1, minTs: nowMin, cpu: 2 }) });
+  rows = await env.DB.prepare('SELECT * FROM metrics_min WHERE server_id = 1').all();
+  assert.equal(rows.results.length, 1, '未跨线行不归档');
+  // 重复上报跨线行 → OR IGNORE 不重复写
+  await call('/report', { method: 'POST', body: JSON.stringify({ serverId: 1, minTs: nowMin - 61, cpu: 3 }) });
+  rows = await env.DB.prepare('SELECT * FROM metrics_min WHERE server_id = 1').all();
+  assert.equal(rows.results.length, 1, '重复跨线行不重复写');
+  // 水位已持久化
+  assert.ok(st.storage.map.has('arc:1'), '水位已持久化');
+});
+
 test('MetricsDO: ARCHIVE_TO_D1=0 时 alarm 仍清理超 12h 的 storage 热区（防无限增长）', async () => {
   const env = makeEnv({ ARCHIVE_TO_D1: '0' });
   const st = mockState();
@@ -151,7 +172,8 @@ test('MetricsDO: ARCHIVE_TO_D1=0 时 alarm 仍清理超 12h 的 storage 热区�
   assert.ok(st.storage.map.has(`m:1:${nowMin - 730}`), '超 12h 行已写入 storage');
   assert.ok(st.storage.map.has(`m:1:${nowMin - 5}`), '新行已写入 storage');
 
-  await inst.alarm();
+  // >12h 行清理在降频 fullSweep（每 6 次 alarm ≈1h）中执行
+  await inst.fullSweep(false);
 
   // 归档关闭：超 12h 行仍从 storage 删除（不落 D1），12h 内行保留（供 ≤12h 查询）
   assert.equal(st.storage.map.has(`m:1:${nowMin - 730}`), false, '超 12h 行被清理');
@@ -826,12 +848,11 @@ test('MetricsDO: 归档超过 100 行分批 batch 落 D1', async () => {
   const { inst, call } = mkMetrics(env, st);
   const nowMin = Math.floor(Date.now() / 1000 / 60);
   for (let i = 0; i < 150; i++) {
-    // 全部 >60min 归档线（且 <12h 热区上限），确保 150 行都归档
+    // 全部 >60min 归档线（且 <12h 热区上限）：增量归档在 /report 时完成（本次上报行直接归档）
     await call('/report', { method: 'POST', body: JSON.stringify({ serverId: 1, minTs: nowMin - 220 + i, cpu: i }) });
   }
-  await inst.alarm();
   const rows = await env.DB.prepare('SELECT COUNT(*) AS c FROM metrics_min WHERE server_id = 1').all();
-  assert.equal(rows.results[0].c, 150, '分批归档全部落 D1');
+  assert.equal(rows.results[0].c, 150, '增量归档全部落 D1');
 });
 
 test('TerminalDO: 控制通道重连时关闭该服务器旧会话流（dropAgentSessions）', async () => {

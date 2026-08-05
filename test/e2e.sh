@@ -236,7 +236,7 @@ if command -v node >/dev/null 2>&1; then
       # 等待 agent 数据流挂接（open_file 指令经控制通道下发 + agent 连 /ws/agent/file）
       sleep 2
       # node 客户端：鉴权 → 20 × 512KB write（按 write_result 推进）→ 20 × read → 内容校验
-      NODE_RES=$(timeout 120 node "$ROOT/test/e2e-file.mjs" "$BASE" "$TOKEN" "$FSID" "$TMP/upload.bin" /tmp/e2e-upload.bin 2>&1 || true)
+      NODE_RES=$(timeout 120 node "$ROOT/scripts/e2e-file.mjs" "$BASE" "$TOKEN" "$FSID" "$TMP/upload.bin" /tmp/e2e-upload.bin 2>&1 || true)
       if [ -s /tmp/e2e-upload.bin ] && cmp -s "$TMP/upload.bin" /tmp/e2e-upload.bin \
         && [ -s "$TMP/upload.bin.down" ] && cmp -s "$TMP/upload.bin" "$TMP/upload.bin.down"; then
         ok "文件上传/下载 10MB 成功（上传与下载内容均与源一致）"

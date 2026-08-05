@@ -528,7 +528,7 @@
   // ---------- 文件管理（目录浏览 / 上传 / 下载） ----------
   let fileWs = null;
   let fileCwd = '/';
-  const FILE_CHUNK = 1024 * 1024;      // 分段传输块大小 1MB
+  const FILE_CHUNK = 512 * 1024;       // 分段传输块大小 512KB（base64 后 ~683KB < workerd 入站 1MB 限制）
   const FILE_MAX = 500 * 1024 * 1024;  // 单文件大小上限 500MB
   let fileUpload = null;               // { size, sent } 上传进度
   let fileDownload = null;             // { path, size, parts, received } 下载进度

@@ -365,7 +365,10 @@ async fn file_list(path: String, pattern: Option<String>) -> String {
         // 目录列表最大条目数，防超大目录物化全部条目/生成巨型 JSON。
         // 通配符过滤先于截断：确保大目录下匹配的文件都在结果中（前端只过滤会遗漏截断区间）
         const FILE_LIST_MAX: usize = 1000;
-        let matcher = pattern.as_deref().filter(|p| !p.is_empty()).map(|p| p.to_ascii_lowercase());
+        let matcher = pattern
+            .as_deref()
+            .filter(|p| !p.is_empty())
+            .map(|p| p.to_ascii_lowercase());
         let mut entries = Vec::new();
         let mut truncated = false;
         if let Ok(rd) = std::fs::read_dir(&path) {

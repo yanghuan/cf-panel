@@ -391,7 +391,7 @@ test('删除后 in-flight 上报不写指标（H-11 存在性复核）', async (
   assert.equal(rows.results[0].name, 'x', '仅保留删除前数据');
 });
 
-test('last_seen 节流：10s 内重复上报只写一次（降额优化）', async () => {
+test('last_seen 节流：60s 内重复上报只写一次（降额优化）', async () => {
   const env = makeEnv();
   await env.DB.prepare('INSERT INTO servers (agent_key_id, name, user_id, agent_key_hash) VALUES (?,?,?,?)').bind('k1', 's1', 1, 'h1').run();
   I.__reset();
@@ -403,9 +403,9 @@ test('last_seen 节流：10s 内重复上报只写一次（降额优化）', asy
   // 连续同秒上报（info 不变）→ 节流不重写
   await I.handleReport(env, { serverId: 1 });
   await I.handleReport(env, { serverId: 1 });
-  assert.equal(I.lastSeenWrite.get(1), ts1, '10s 节流窗口内不重复写');
-  // 模拟 20s 前落盘 → 再次上报应重写
-  I.lastSeenWrite.set(1, now - 20);
+  assert.equal(I.lastSeenWrite.get(1), ts1, '60s 节流窗口内不重复写');
+  // 模拟 70s 前落盘 → 再次上报应重写
+  I.lastSeenWrite.set(1, now - 70);
   await I.handleReport(env, { serverId: 1 });
   assert.ok(I.lastSeenWrite.get(1) >= now, '超过节流窗口后重写');
   // DB last_seen 与节流记录一致

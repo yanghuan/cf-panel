@@ -405,9 +405,10 @@ async function sendWebhook(cfg, payload) {
   }
 }
 
-// last_seen D1 落盘节流（秒）：有观看者快采 3s 上报时，D1 写从 28,800 → ~5,760 行/天/机（−80%）。
-// 在线宽限 ONLINE_GRACE_FAST_S=15，10s 节流最旧 ~12s 仍低于宽限（留余量）；慢采间隔本就 >10s，不受影响。
-const LAST_SEEN_THROTTLE_S = 10;
+// last_seen D1 落盘节流（秒）：快采 5s 上报时，D1 写从 17,280 → ~1,440 行/天/机（−92%）。
+// 在线判定主用 MetricsDO 秒级 last_seen_s（零 D1 成本），不受本节流影响；D1 last_seen 仅
+// 冷启动兜底 + 离线告警（offline_after_s=180 远大于 60s，不受影响）。
+const LAST_SEEN_THROTTLE_S = 60;
 const lastSeenWrite = new Map(); // serverId -> 上次落盘秒（跨实例 evict 丢失后仅偶发多写一次，无害）
 // serverId -> { minTs, names: Set }：metrics_custom 分钟去重（同分钟同指标只写一次 D1；
 // 跨实例 evict 丢失后仅偶发多写一次，INSERT OR IGNORE 幂等无害）

@@ -81,8 +81,8 @@ fn validate_wss(wss: &str) -> Result<(), String> {
         // 去掉 userinfo（'@' 前的部分）——防 userinfo 里伪装 loopback
         let host_port = authority.rsplit('@').next().unwrap_or(authority);
         // 处理 host:port、IPv6 [::1]:port 与裸 IPv6（::1，无端口时冒号多于 1 个）
-        let host = if host_port.starts_with('[') {
-            host_port[1..].split(']').next().unwrap_or("")
+        let host = if let Some(rest) = host_port.strip_prefix('[') {
+            rest.split(']').next().unwrap_or("")
         } else if host_port.matches(':').count() > 1 {
             host_port
         } else {
@@ -143,7 +143,7 @@ async fn run_control(
             }
             Err(e) => {
                 log(format!("control channel error: {e}"));
-                if is_auth_error(&e) {
+                if is_auth_error(e.as_ref()) {
                     log("auth failed (401): retrying slowly");
                     backoff = AUTH_FAIL_SECS;
                 } else {
@@ -162,11 +162,11 @@ async fn run_control(
 }
 
 // 判断是否 401 鉴权失败（tungstenite 对非 101 升级响应返回 Error::Http）
-fn is_auth_error(e: &Box<dyn Error + Send + Sync>) -> bool {
-    if let Some(we) = e.downcast_ref::<tokio_tungstenite::tungstenite::Error>() {
-        if let tokio_tungstenite::tungstenite::Error::Http(resp) = we {
-            return resp.status().as_u16() == 401;
-        }
+fn is_auth_error(e: &(dyn Error + Send + Sync + 'static)) -> bool {
+    if let Some(tokio_tungstenite::tungstenite::Error::Http(resp)) =
+        e.downcast_ref::<tokio_tungstenite::tungstenite::Error>()
+    {
+        return resp.status().as_u16() == 401;
     }
     false
 }
@@ -433,23 +433,29 @@ mod tests {
     fn is_auth_error_detects_401_http() {
         use tokio_tungstenite::tungstenite::http::{Response, StatusCode};
         // HTTP 401（key 失效/服务器删除）→ 判为鉴权失败，走长退避
-        let err: Box<dyn Error + Send + Sync> = Box::new(
-            tokio_tungstenite::tungstenite::Error::Http(
-                Response::builder().status(StatusCode::UNAUTHORIZED).body(None).unwrap(),
-            ),
-        );
-        assert!(is_auth_error(&err));
+        let err: Box<dyn Error + Send + Sync> =
+            Box::new(tokio_tungstenite::tungstenite::Error::Http(
+                Response::builder()
+                    .status(StatusCode::UNAUTHORIZED)
+                    .body(None)
+                    .unwrap(),
+            ));
+        assert!(is_auth_error(err.as_ref()));
         // 其他状态码（如 404 反代不存在）→ 非鉴权失败，走指数退避
-        let err404: Box<dyn Error + Send + Sync> = Box::new(
-            tokio_tungstenite::tungstenite::Error::Http(
-                Response::builder().status(StatusCode::NOT_FOUND).body(None).unwrap(),
-            ),
-        );
-        assert!(!is_auth_error(&err404));
+        let err404: Box<dyn Error + Send + Sync> =
+            Box::new(tokio_tungstenite::tungstenite::Error::Http(
+                Response::builder()
+                    .status(StatusCode::NOT_FOUND)
+                    .body(None)
+                    .unwrap(),
+            ));
+        assert!(!is_auth_error(err404.as_ref()));
         // 非 Http 错误 → 非鉴权失败
-        let io_err: Box<dyn Error + Send + Sync> =
-            Box::new(std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "refused"));
-        assert!(!is_auth_error(&io_err));
+        let io_err: Box<dyn Error + Send + Sync> = Box::new(std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            "refused",
+        ));
+        assert!(!is_auth_error(io_err.as_ref()));
     }
 
     // env 操作集中在单个测试内顺序执行（Rust 测试并行，避免 ALLOW_INSECURE_WS 竞争）

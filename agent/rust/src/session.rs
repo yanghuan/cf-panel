@@ -10,10 +10,10 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message;
 
 const FILE_LIMIT: u64 = 500 * 1024 * 1024; // 单文件总上限 500MB
-// 服务端固定内部缓冲（与客户端分块解耦）：
-// - READ_BLOCK：单次 read 最多读取并返回的字节（前端按返回的 got 累加续传，自动适配任意值）。
-//   1MB 与前端下载分块对齐：一次 read 返回 1MB，下载 1MB 只需 1 个 read 请求/帧（原 512KB 需 2 帧，帧数 −50%）
-// - WRITE_BUF：写路径流式 base64 解码的缓冲（边解边写，内存不随块大小增长）
+                                           // 服务端固定内部缓冲（与客户端分块解耦）：
+                                           // - READ_BLOCK：单次 read 最多读取并返回的字节（前端按返回的 got 累加续传，自动适配任意值）。
+                                           //   1MB 与前端下载分块对齐：一次 read 返回 1MB，下载 1MB 只需 1 个 read 请求/帧（原 512KB 需 2 帧，帧数 −50%）
+                                           // - WRITE_BUF：写路径流式 base64 解码的缓冲（边解边写，内存不随块大小增长）
 const READ_BLOCK: usize = 1024 * 1024;
 const WRITE_BUF: usize = 64 * 1024;
 // 文件 WS 入站消息大小上限（防恶意超大 data 整包占内存；正常前端 1MB 分块远小于此）
@@ -162,7 +162,11 @@ async fn run_terminal_inner(cfg: &Config, term: &Arc<TermSession>) {
             batch.extend_from_slice(&bytes);
             loop {
                 if batch.len() >= TERM_BATCH_BYTES {
-                    if write.send(Message::Binary(std::mem::take(&mut batch))).await.is_err() {
+                    if write
+                        .send(Message::Binary(std::mem::take(&mut batch)))
+                        .await
+                        .is_err()
+                    {
                         return;
                     }
                     break;
@@ -171,10 +175,13 @@ async fn run_terminal_inner(cfg: &Config, term: &Arc<TermSession>) {
                     Ok(Some(more)) => batch.extend_from_slice(&more),
                     _ => {
                         // 窗口到期或通道关闭：flush 剩余
-                        if !batch.is_empty() {
-                            if write.send(Message::Binary(std::mem::take(&mut batch))).await.is_err() {
-                                return;
-                            }
+                        if !batch.is_empty()
+                            && write
+                                .send(Message::Binary(std::mem::take(&mut batch)))
+                                .await
+                                .is_err()
+                        {
+                            return;
                         }
                         break;
                     }
@@ -545,11 +552,20 @@ mod tests {
     #[test]
     fn buffer_constants() {
         // 固定缓冲重构的常量约束（与前端分块解耦的服务端固定缓冲）
-        assert_eq!(READ_BLOCK, 1024 * 1024, "READ_BLOCK 与前端 1MB 下载分块对齐");
+        assert_eq!(
+            READ_BLOCK,
+            1024 * 1024,
+            "READ_BLOCK 与前端 1MB 下载分块对齐"
+        );
         assert_eq!(WRITE_BUF, 64 * 1024);
         assert_eq!(WS_MSG_LIMIT, 8 * 1024 * 1024);
         assert_eq!(FILE_LIMIT, 500 * 1024 * 1024);
-        assert!(TERM_BATCH_MS >= 8 && TERM_BATCH_MS <= 32, "合帧窗口过大则交互卡顿");
-        assert!(TERM_BATCH_BYTES >= 16 * 1024 && TERM_BATCH_BYTES <= 64 * 1024, "合帧字节阈值合理");
+        // 常量断言（编译期校验，避免运行时断言被 clippy 标记）
+        const {
+            assert!(TERM_BATCH_MS >= 8 && TERM_BATCH_MS <= 32);
+        };
+        const {
+            assert!(TERM_BATCH_BYTES >= 16 * 1024 && TERM_BATCH_BYTES <= 64 * 1024);
+        };
     }
 }

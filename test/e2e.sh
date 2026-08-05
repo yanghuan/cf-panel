@@ -158,17 +158,20 @@ if ! wait_for "监控数据上报（/api/monitor 有数据）" 60 bash -c \
 fi
 ok "监控数据已写入（系统指标 ≥1 条）"
 
-# 上报包含系统信息与探活/自定义等（由 agent 内置采集）
-SYSINFO=$(curl -s "$BASE/api/servers" -H "authorization: Bearer $TOKEN" | jq -c '.[] | select(.name=="e2e-node") | {info, metric}' || true)
-if jq -e '.info.os and .info.kern' <<<"$SYSINFO" >/dev/null 2>&1; then
+# 上报包含系统信息与实时指标。注意 /api/servers 有 2s 短 TTL 列表缓存（降 D1 读，#12），
+# 上报后立即查询可能命中「仅控制通道建连、首帧未上报」的旧快照（info/metric 为 null）；
+# 因此用轮询等待最终一致（≤2s 缓存滞后），而不是一次性断言。
+if wait_for "系统信息入库（os/kern）" 15 bash -c \
+  "curl -s '$BASE/api/servers' -H 'authorization: Bearer $TOKEN' | jq -e '.[] | select(.name==\"e2e-node\") | .info.os and .info.kern' >/dev/null"; then
   ok "系统信息已入库（os/kern）"
 else
-  bad "系统信息缺失：$SYSINFO"
+  bad "系统信息缺失：$(curl -s "$BASE/api/servers" -H "authorization: Bearer $TOKEN" | jq -c '.[] | select(.name=="e2e-node") | {info, metric}' || true)"
 fi
-if jq -e '.metric.cpu != null and .metric.mem_used != null' <<<"$SYSINFO" >/dev/null 2>&1; then
+if wait_for "实时指标可见（cpu/mem_used）" 15 bash -c \
+  "curl -s '$BASE/api/servers' -H 'authorization: Bearer $TOKEN' | jq -e '.[] | select(.name==\"e2e-node\") | .metric.cpu != null and .metric.mem_used != null' >/dev/null"; then
   ok "实时指标可见（cpu/mem_used）"
 else
-  bad "实时指标缺失：$SYSINFO"
+  bad "实时指标缺失：$(curl -s "$BASE/api/servers" -H "authorization: Bearer $TOKEN" | jq -c '.[] | select(.name=="e2e-node") | {info, metric}' || true)"
 fi
 
 # 6) 终端双向透传（需 socat；本地无 socat 时跳过）

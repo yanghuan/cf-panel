@@ -11,6 +11,11 @@ const SHARDS = 4; // 终端 DO 分片数（改大后旧会话不可达，一般�
 const SESSION_TTL_MS = 10 * 60 * 1000; // 会话两端都断开超过 10 分钟 → 回收
 const MAX_SESSIONS_PER_SERVER = 8; // 每服务器并发会话上限（超限 429，防 PTY/bash/FD 耗尽）
 const SESSION_ABS_MS = 4 * 60 * 60 * 1000; // 会话绝对最长时长（含活跃连接，到期强制回收）
+const LIST_CACHE_TTL_MS = 4500; // PanelDO 服务器列表缓存 TTL：> 前端 3s sync 间隔（错开同频，消除单观看者 miss）
+const LATEST_CACHE_TTL_MS = 4000; // MetricsDO /latest 共享缓存 TTL（多观看者 sync 共享，DO 事件 −50%）
+const SYNC_MIN_INTERVAL_MS = 2000; // PanelDO sync 频率下限（<2s 忽略，防任意消息/高频触发全链路）
+const ARCHIVE_IDLE_INTERVAL_MS = 60 * 60 * 1000; // 闲置（无数据且告警关闭）时 alarm 退避间隔（1h）
+const PAT_CHECK_INTERVAL_MS = 10 * 1000; // PAT 终端连接重校验间隔（B4：每条消息 → 10s 一次，−98%）
 const PANEL_SWITCH_GRACE_MS = 30 * 1000; // 观看者 0→1 后在线判定用慢宽限的过渡期：Agent 切快采并完成首帧上报前，
 // 用 15s 快宽限会把慢采周期中（120s 内无上报）的节点误判离线；30s 后快宽限正常生效
 const PAT_PREFIX = 'cfp_'; // PAT token 前缀
@@ -306,11 +311,12 @@ async function queryCustomMetrics(env, serverId, hours) {
   return custom;
 }
 
-// 设置缓存（避免告警检查每次上报读 D1），TTL 60s，保存设置时清除
+// 设置缓存（避免告警检查每次上报读 D1），TTL 300s（B3：> 慢采间隔 120s，慢采每帧不再必 miss），
+// 保存设置时清除（Worker 侧）+ MetricsDO RPC 清除（DO 隔离实例侧）
 // 注意：告警冷却（ALERT_LAST）与探活去重（PROBE_STATE）状态已移至 MetricsDO 实例内存
 // （单实例全局一致，且复用每次上报已有的 /report 调用，零额外请求），见 MetricsDO.checkAlerts/checkProbeAlerts
 const SETTINGS_CACHE = new Map();
-const SETTINGS_TTL_MS = 60 * 1000;
+const SETTINGS_TTL_MS = 300 * 1000;
 async function kvGetCached(env, key, fallback) {
   const c = SETTINGS_CACHE.get(key);
   if (c && Date.now() - c.ts < SETTINGS_TTL_MS) return c.value;
@@ -954,7 +960,11 @@ async function handleApi(request, env) {
       geo_lookup: body.geo_lookup !== undefined ? !!body.geo_lookup : !!current.geo_lookup,
     };
     await kvPut(env, 'settings', next);
-    kvClearCache('settings'); // 告警配置立即生效
+    kvClearCache('settings'); // 告警配置立即生效（Worker 侧）
+    // B3：MetricsDO 是独立隔离实例，其 SETTINGS_CACHE 需 RPC 清除（否则告警/探活判定最长滞后 300s）
+    try {
+      await doMetrics(env).fetch('https://do.internal/rpc/clear_settings_cache', { method: 'POST' });
+    } catch { /* 清缓存失败：MetricsDO 侧按 300s TTL 自然过期 */ }
     return json(next);
   }
 
@@ -1513,6 +1523,7 @@ export class TerminalDO {
       // 鉴权通过 → 挂接为会话用户端；附件升级为 user 角色（供休眠唤醒重建索引）。
       // patToken 随附件持久化：PAT 撤销后每次浏览器消息重校验，撤销即关闭（JWT 不存，保持零 D1 读）
       sess.userWs = ws;
+      sess.lastPatCheck = Date.now(); // 首帧已校验，PAT 重校验节流起点（B4）
       ws.serializeAttachment({
         role: 'user', sid: att.sid, serverId: sess.serverId,
         creatorUserId: sess.creatorUserId, type: sess.type, createdAt: sess.createdAt,
@@ -1572,14 +1583,18 @@ export class TerminalDO {
     }
 
     if (ws === sess.userWs) {
-      // PAT 撤销即时校验：每次浏览器消息重查 D1（PAT 输入频率低，成本可忽略）；
-      // 撤销后下一次输入即关闭连接；挂机连接由会话 TTL/绝对 TTL 兜底回收
+      // PAT 撤销校验（B4 节流）：每 10s 重查一次 D1（打字 2~5 消息/s → 10s 一次，−98%；
+      // 撤销后最迟 10s 内的一次输入即关闭连接；挂机连接由会话 TTL/绝对 TTL 兜底回收）
       const uatt = ws.deserializeAttachment?.();
       if (uatt && uatt.patToken) {
-        const u = await authUserByToken(uatt.patToken, this.env);
-        if (!u) {
-          try { ws.close(1008, 'unauthorized'); } catch { /* ignore */ }
-          return;
+        const nowP = Date.now();
+        if (!sess.lastPatCheck || nowP - sess.lastPatCheck >= PAT_CHECK_INTERVAL_MS) {
+          sess.lastPatCheck = nowP;
+          const u = await authUserByToken(uatt.patToken, this.env);
+          if (!u) {
+            try { ws.close(1008, 'unauthorized'); } catch { /* ignore */ }
+            return;
+          }
         }
       }
       // 浏览器 → DO
@@ -1975,6 +1990,12 @@ export class MetricsDO {
       return json({ counters: this.usage, persisted });
     }
 
+    // 内部 RPC：面板保存设置后清本隔离实例的 SETTINGS_CACHE（B3：告警/探活配置立即生效）
+    if (url.pathname === '/rpc/clear_settings_cache' && request.method === 'POST') {
+      SETTINGS_CACHE.clear();
+      return json({ ok: true });
+    }
+
     return err('not found', 404);
   }
 
@@ -2145,21 +2166,23 @@ export class MetricsDO {
   // + 每天 D1 保留期清理 + 离线/恢复告警。归档与删除无条件执行，防 ARCHIVE_TO_D1=0 时
   // storage 热区 / audit_logs 无限增长。
   async alarm() {
+    let alertOn = false; // 提升到函数级：finally 的闲置退避判定需要（try 内 const 不可见）
     try {
-    // 用量观测：本周期计数累计到 storage（跨实例 evict 保留近似量级），随后清零内存
+    // 用量观测：本周期计数累计到 storage（跨实例 evict 保留近似量级），随后清零内存。
+    // B5：业务计数（report/latest/query）全零时跳过 put（alarm 次数不持久化，避免每次 alarm 无条件写）
     try {
       const prev = JSON.parse(await this.state.storage.get('usage:total') || '{}');
-      await this.state.storage.put('usage:total', JSON.stringify({
-        report: (prev.report || 0) + this.usage.report,
-        latest: (prev.latest || 0) + this.usage.latest,
-        query: (prev.query || 0) + this.usage.query,
-        alarm: (prev.alarm || 0) + this.usage.alarm + 1,
-      }));
+      const report = (prev.report || 0) + this.usage.report;
+      const latest = (prev.latest || 0) + this.usage.latest;
+      const query = (prev.query || 0) + this.usage.query;
+      if (report || latest || query) {
+        await this.state.storage.put('usage:total', JSON.stringify({ report, latest, query }));
+      }
     } catch { /* 用量汇总失败不影响主流程 */ }
     this.usage = { report: 0, latest: 0, query: 0, alarm: 0 };
     await this.ensureHousekeepLoaded();
     const archiveOn = this.env.ARCHIVE_TO_D1 !== '0';
-    const alertOn = (await getAlertCfg(this.env)).enabled;
+    alertOn = (await getAlertCfg(this.env)).enabled;
     if (alertOn) await this.checkOfflineAlerts();
     const now = Date.now();
     let housekeepChanged = false;
@@ -2196,8 +2219,11 @@ export class MetricsDO {
       } catch { /* 持久化失败：下次 alarm 按当前值重新判定（可能提前执行，无害） */ }
     }
     } finally {
-      // 无论是否异常都续排下一次 alarm：防归档/清理/告警因单次失败永久停摆
-      this.alarmCached = Date.now() + ARCHIVE_INTERVAL_MS;
+      // 无论是否异常都续排下一次 alarm：防归档/清理/告警因单次失败永久停摆。
+      // B7：闲置（无热区数据且告警关闭）时退避 +1h（零服务器/无上报面板不再 10min 空转 144 次/天）；
+      // 新上报经 scheduleArchive 提前拉回（alarmCached 失效后 getAlarm 发现更早需求重新设置）
+      const idle = this.data.size === 0 && !alertOn;
+      this.alarmCached = Date.now() + (idle ? ARCHIVE_IDLE_INTERVAL_MS : ARCHIVE_INTERVAL_MS);
       this.state.storage.setAlarm(this.alarmCached);
     }
   }
@@ -2269,7 +2295,9 @@ export class PanelDO {
   constructor(state, env) {
     this.state = state;
     this.env = env;
-    this.listCache = null; // {rows, ts} 服务器列表缓存（3s TTL，多观看者共享，降 D1 读）
+    this.listCache = null; // {rows, ts} 服务器列表缓存（B1：TTL 4500ms，多观看者共享，降 D1 读）
+    this.latestCache = null; // {data, ts} MetricsDO /latest 共享缓存（B2：TTL 4s，sync 链 DO 事件 −50%）
+    this.syncAt = new Map(); // ws -> 上次 sync 时间（B6：频率下限 <2s 忽略，防刷）
     this.authCache = new Map(); // token -> {user, ts} 鉴权缓存（5s TTL；PAT 删除后 ≤5s 失效）
     this.fastSince = 0; // 最近一次 0→1 切快采时刻（毫秒）；过渡期内在线判定用慢宽限，避免首次显示离线
   }
@@ -2290,7 +2318,7 @@ export class PanelDO {
   async filterServersCached(user) {
     const now = Date.now();
     let rows;
-    if (this.listCache && now - this.listCache.ts < 3000) {
+    if (this.listCache && now - this.listCache.ts < LIST_CACHE_TTL_MS) {
       rows = this.listCache.rows;
     } else {
       const r = await this.env.DB.prepare('SELECT * FROM servers ORDER BY "group", display_index, id').all();
@@ -2363,6 +2391,13 @@ export class PanelDO {
       return;
     }
     const token = ws.deserializeAttachment() || '';
+    // B6：仅响应 'sync'（任意其他消息不再触发全链路）；频率下限 <2s 忽略（防刷/异常放大）
+    if (message !== 'sync') return;
+    const syncNow = Date.now();
+    const lastSync = this.syncAt.get(ws) || 0;
+    if (syncNow - lastSync < SYNC_MIN_INTERVAL_MS) return;
+    this.syncAt.set(ws, syncNow);
+    if (this.syncAt.size > 500) this.syncAt.clear(); // 防 Map 无限增长
     const user = await this.authUserCached(token);
     if (!user) {
       // PAT/JWT 已失效（撤销/删除）：关闭连接而非静默忽略——撤销后观看者立即下线，
@@ -2376,12 +2411,18 @@ export class PanelDO {
     } catch {
       return; // D1 临时故障，下个周期再试
     }
-    // 附带每台机器的最新指标（卡片实时展示）
+    // 附带每台机器的最新指标（卡片实时展示；B2：共享缓存 4s，多观看者 sync 不再各自打 DO /latest）
     let latest = {};
-    try {
-      const lResp = await doMetrics(this.env).fetch('https://do.internal/latest');
-      latest = await lResp.json();
-    } catch { /* 无最新指标 */ }
+    const lcNow = Date.now();
+    if (this.latestCache && lcNow - this.latestCache.ts < LATEST_CACHE_TTL_MS) {
+      latest = this.latestCache.data;
+    } else {
+      try {
+        const lResp = await doMetrics(this.env).fetch('https://do.internal/latest');
+        latest = await lResp.json();
+        this.latestCache = { data: latest, ts: lcNow };
+      } catch { /* 无最新指标 */ }
+    }
     const now = Math.floor(Date.now() / 1000);
     // 本 DO 内直接统计已鉴权观看者（无需额外 RPC）；切快采过渡期（0→1 后 30s 内）用慢宽限
     const hasViewers = (this.state.getWebSockets?.() || []).filter((w) => w.deserializeAttachment?.()).length > 0;

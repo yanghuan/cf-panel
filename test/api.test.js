@@ -629,6 +629,9 @@ test('设置：告警配置被清洗；非管理员 403', async () => {
   assert.equal(got.site_name, 'ops');
   assert.equal(got.alerts.cpu_pct, 88);
 
+  // B3：保存后通知 MetricsDO 清设置缓存（DO 隔离实例的告警/探活配置立即生效）
+  assert.ok(env.METRICS.calls.some((c) => c.path === '/rpc/clear_settings_cache'), '设置保存触发 MetricsDO 清缓存 RPC');
+
   // PAT 不能读写设置
   const pat = await (await call(env, {
     method: 'POST', path: '/api/tokens', token: adminToken, body: { name: 'r', scopes: ['server:read'] },

@@ -165,7 +165,7 @@ test('MetricsDO: /usage 用量计数，alarm 汇总到 storage 跨 evict 保留'
   assert.equal(after.persisted.report, 2, '累计到 storage');
   assert.equal(after.persisted.latest, 1);
   assert.equal(after.persisted.query, 1);
-  assert.equal(after.persisted.alarm, 1);
+  assert.equal(after.persisted.alarm, undefined, 'alarm 次数不持久化（B5 全零跳过 put）');
   // 新实例（共享 storage）能读到累计总量
   const { inst: instB } = mkMetrics(env, state);
   await instB.alarm();
@@ -734,6 +734,29 @@ test('TerminalDO: PAT 撤销后浏览器消息关闭连接（重校验）', asyn
   assert.equal(ws.closed, true, 'PAT 撤销后输入即关闭连接');
 });
 
+test('PanelDO: /latest 共享缓存 + sync 频率下限（B2/B6 降额）', async () => {
+  const env = makeEnv();
+  const token = await I.signJwt({ uid: 1, username: 'admin', role: 1, exp: Math.floor(Date.now() / 1000) + 3600 }, env);
+  await insertServer(env, 'k1', 'srv-a');
+  const ws = { attachment: token, deserializeAttachment: () => token, send() {}, close() {} };
+  const inst = new PanelDO({ getWebSockets: () => [ws] }, env);
+  const latestCalls = () => env.METRICS.calls.filter((c) => c.path === '/latest').length;
+  // 首次 sync → 查 MetricsDO /latest（1 次 DO 事件）
+  await inst.webSocketMessage(ws, 'sync');
+  assert.equal(latestCalls(), 1, '首次 sync 查 /latest');
+  // 2s 内再次 sync → 频率下限拦截（不触发全链路）
+  await inst.webSocketMessage(ws, 'sync');
+  assert.equal(latestCalls(), 1, '<2s sync 被拦截');
+  // 非 sync 消息 → 忽略
+  inst.syncAt.delete(ws);
+  await inst.webSocketMessage(ws, 'hello');
+  assert.equal(latestCalls(), 1, '非 sync 消息忽略');
+  // 绕过频率下限后再 sync → 命中 /latest 共享缓存（仍不调 DO）
+  inst.syncAt.delete(ws);
+  await inst.webSocketMessage(ws, 'sync');
+  assert.equal(latestCalls(), 1, '/latest 共享缓存命中（B2）');
+});
+
 test('PanelDO: webSocketError 兜底执行下线检查（最后观看者残留防护）', async () => {
   const env = makeEnv();
   const inst = new PanelDO({ getWebSockets: () => [] }, env); // 错误后该 ws 已不在连接表
@@ -762,6 +785,7 @@ test('PanelDO: 切快采过渡期（30s 内）在线判定用慢宽限（防首�
   assert.equal(JSON.parse(ws.sent[0])[0].online, true, '过渡期慢宽限不误判离线');
   // 过渡期结束（fastSince 拨回 31s 前）→ 快宽限 15s → 60s 前上报判离线
   inst.fastSince = Date.now() - 31000;
+  inst.syncAt.delete(ws); // 绕过 <2s 频率下限（B6），模拟下一个 sync 周期
   await inst.webSocketMessage(ws, 'sync');
   assert.equal(JSON.parse(ws.sent[1])[0].online, false, '过渡期后快宽限生效');
 });
@@ -774,13 +798,13 @@ test('PanelDO: webSocketMessage 按 token 推送过滤后的服务器列表', as
 
   const sent = [];
   const inst = new PanelDO({ getWebSockets: () => [] }, env);
-  await inst.webSocketMessage({ deserializeAttachment: () => token, send: (m) => sent.push(m) });
+  await inst.webSocketMessage({ deserializeAttachment: () => token, send: (m) => sent.push(m) }, 'sync');
   assert.equal(sent.length, 1);
   const list = JSON.parse(sent[0]);
   assert.deepEqual(list.map((s) => s.name), ['srv-a', 'srv-b']);
 
   // 非法 token → 不发送
-  await inst.webSocketMessage({ deserializeAttachment: () => 'bogus', send: (m) => sent.push(m) });
+  await inst.webSocketMessage({ deserializeAttachment: () => 'bogus', send: (m) => sent.push(m) }, 'sync');
   assert.equal(sent.length, 1);
 });
 
@@ -795,7 +819,7 @@ test('PanelDO: PAT 只看白名单内的服务器', async () => {
 
   const sent = [];
   const inst = new PanelDO({ getWebSockets: () => [] }, env);
-  await inst.webSocketMessage({ deserializeAttachment: () => pat, send: (m) => sent.push(m) });
+  await inst.webSocketMessage({ deserializeAttachment: () => pat, send: (m) => sent.push(m) }, 'sync');
   assert.deepEqual(JSON.parse(sent[0]).map((s) => s.name), ['srv-a']);
 });
 

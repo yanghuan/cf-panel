@@ -922,6 +922,10 @@ async function handleApi(request, env) {
     if (!isAdmin(user)) return err('forbidden', 403);
     const id = Number(path.split('/')[3]) || 0;
     await env.DB.prepare('DELETE FROM api_tokens WHERE id = ?').bind(id).run();
+    // PAT 撤销即时生效：清 PanelDO 鉴权缓存，已建观看者连接下个 sync（≤3s）内关闭
+    try {
+      await doPanel(env).fetch('https://do.internal/rpc/clear_auth_cache', { method: 'POST' });
+    } catch { /* 清缓存失败由 authCache 5s TTL 兜底 */ }
     return json({ ok: true });
   }
 
@@ -1506,11 +1510,13 @@ export class TerminalDO {
         try { ws.close(1008, 'unauthorized'); } catch { /* ignore */ }
         return;
       }
-      // 鉴权通过 → 挂接为会话用户端；附件升级为 user 角色（供休眠唤醒重建索引）
+      // 鉴权通过 → 挂接为会话用户端；附件升级为 user 角色（供休眠唤醒重建索引）。
+      // patToken 随附件持久化：PAT 撤销后每次浏览器消息重校验，撤销即关闭（JWT 不存，保持零 D1 读）
       sess.userWs = ws;
       ws.serializeAttachment({
         role: 'user', sid: att.sid, serverId: sess.serverId,
         creatorUserId: sess.creatorUserId, type: sess.type, createdAt: sess.createdAt,
+        patToken: user.pat ? token : null,
       });
       // 补发鉴权前缓冲的 agent 输出（如初始 bash 提示符），保证打开即见首屏
       if (sess.userBuf && sess.userBuf.length) {
@@ -1566,6 +1572,16 @@ export class TerminalDO {
     }
 
     if (ws === sess.userWs) {
+      // PAT 撤销即时校验：每次浏览器消息重查 D1（PAT 输入频率低，成本可忽略）；
+      // 撤销后下一次输入即关闭连接；挂机连接由会话 TTL/绝对 TTL 兜底回收
+      const uatt = ws.deserializeAttachment?.();
+      if (uatt && uatt.patToken) {
+        const u = await authUserByToken(uatt.patToken, this.env);
+        if (!u) {
+          try { ws.close(1008, 'unauthorized'); } catch { /* ignore */ }
+          return;
+        }
+      }
       // 浏览器 → DO
       if (typeof message === 'string') {
         try {
@@ -2252,6 +2268,11 @@ export class PanelDO {
       const count = (this.state.getWebSockets?.() || []).filter((w) => w.deserializeAttachment?.()).length;
       return json({ count });
     }
+    // 内部 RPC：PAT 撤销后清鉴权缓存（已建观看者连接下个 sync 即失效关闭；清失败由 5s TTL 兜底）
+    if (url.pathname === '/rpc/clear_auth_cache' && request.method === 'POST') {
+      this.authCache.clear();
+      return json({ ok: true });
+    }
     if (url.pathname !== '/ws/push') return new Response('not found', { status: 404 });
     const pair = new WebSocketPair();
     this.state.acceptWebSocket(pair[1]);
@@ -2297,7 +2318,12 @@ export class PanelDO {
     }
     const token = ws.deserializeAttachment() || '';
     const user = await this.authUserCached(token);
-    if (!user) return;
+    if (!user) {
+      // PAT/JWT 已失效（撤销/删除）：关闭连接而非静默忽略——撤销后观看者立即下线，
+      // 其 3s 快采随之恢复慢采（与 webSocketClose 的广播逻辑衔接）
+      try { ws.close(1008, 'unauthorized'); } catch { /* ignore */ }
+      return;
+    }
     let serverRows;
     try {
       serverRows = await this.filterServersCached(user);

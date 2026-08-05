@@ -328,10 +328,17 @@
         }
       } catch { /* 忽略非 JSON 帧 */ }
     };
-    ws.onclose = () => {
+    ws.onclose = (ev) => {
       stopPushTimer();
       if (pushWs !== ws) return; // 已被 stopPush 主动关闭
       if (!token) return;
+      if (ev && ev.code === 1008) {
+        // 鉴权已失效（PAT 撤销/连接被服务端拒绝）：清除登录态回登录页，避免 3s 重连死循环
+        token = '';
+        localStorage.removeItem('cfpanel_token');
+        showAuth();
+        return;
+      }
       if (pushRetries < 5) {
         pushRetries += 1;
         setTimeout(startPush, 3000);
@@ -462,10 +469,19 @@
             if (typeof ev.data === 'string') term.write(ev.data);
             else term.write(new Uint8Array(ev.data));
           };
-          w.onclose = () => {
+          w.onclose = (ev) => {
             if (closed) return;
             if (rebuilding) return; // 重建已由无响应分支的 connect() 接管
             if (noDataTimer) { clearTimeout(noDataTimer); noDataTimer = null; }
+            if (ev && ev.code === 1008) {
+              // 鉴权已失效（PAT 撤销/服务端拒绝）：关闭会话并回登录页，不再重连
+              closed = true;
+              term.write('\r\n\x1b[90m[权限已失效，连接已关闭]\x1b[0m\r\n');
+              token = '';
+              localStorage.removeItem('cfpanel_token');
+              showAuth();
+              return;
+            }
             if (retries < TERM_RETRY_MAX) {
               retries += 1;
               term.write(`\r\n\x1b[90m[连接断开，${retries}s 后自动重连...]\x1b[0m\r\n`);

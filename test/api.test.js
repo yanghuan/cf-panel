@@ -514,6 +514,8 @@ test('PAT：创建/使用/删除，scopes + 白名单生效', async () => {
   const del = await call(env, { method: 'DELETE', path: `/api/tokens/${list[0].id}`, token: adminToken });
   assert.equal(del.status, 200);
   assert.equal((await call(env, { path: '/api/me', token })).status, 401);
+  // 删除后通知 PanelDO 清鉴权缓存（已建观看者连接下个 sync 即失效关闭）
+  assert.ok(env.PANEL.calls.some((u) => String(u).includes('/rpc/clear_auth_cache')), 'PAT 删除触发 PanelDO 缓存清除');
 });
 
 test('PAT：scopes 白名单校验（非法值 400，混合值只留合法项）', async () => {

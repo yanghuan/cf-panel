@@ -593,6 +593,34 @@ test('PanelDO: 服务器列表与鉴权缓存（3s/5s TTL，降 D1 读）', asyn
   assert.equal(JSON.parse(sent[0]).length, 1, '缓存列表返回');
 });
 
+test('PanelDO: PAT 撤销后 sync 关闭连接（不再静默忽略）', async () => {
+  const env = makeEnv();
+  const inst = new PanelDO({ getWebSockets: () => [] }, env);
+  // 已撤销 token（D1 中不存在）→ sync 时鉴权失败应关闭连接
+  const ws = {
+    closed: false, attachment: 'cfp_revoked_token',
+    deserializeAttachment() { return this.attachment; },
+    send() {}, close() { this.closed = true; },
+  };
+  await inst.webSocketMessage(ws, 'sync');
+  assert.equal(ws.closed, true, '撤销后观看者连接被关闭');
+});
+
+test('TerminalDO: PAT 撤销后浏览器消息关闭连接（重校验）', async () => {
+  const env = makeEnv();
+  const inst = new TerminalDO(mockState(), env);
+  const sess = { streamId: '0-sid', serverId: 1, creatorUserId: 1, createdAt: Date.now(), userWs: null, agentWs: null, userBuf: [] };
+  inst.sessions.set('0-sid', sess);
+  const ws = {
+    closed: false,
+    deserializeAttachment: () => ({ role: 'user', sid: '0-sid', serverId: 1, creatorUserId: 1, type: 'terminal', createdAt: Date.now(), patToken: 'cfp_revoked_token' }),
+    send() {}, close() { this.closed = true; },
+  };
+  sess.userWs = ws;
+  await inst.webSocketMessage(ws, 'echo hi');
+  assert.equal(ws.closed, true, 'PAT 撤销后输入即关闭连接');
+});
+
 test('PanelDO: webSocketError 兜底执行下线检查（最后观看者残留防护）', async () => {
   const env = makeEnv();
   const inst = new PanelDO({ getWebSockets: () => [] }, env); // 错误后该 ws 已不在连接表

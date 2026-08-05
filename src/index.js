@@ -692,7 +692,8 @@ async function handleApi(request, env) {
       name: s.name,
       group: s.group || '',
       display_index: s.display_index || 0,
-      online: now - (s.last_seen || 0) < grace, // 观看者在线时快宽限（30s），否则慢宽限（180s）
+      // 在线判定优先用 MetricsDO 秒级 last_seen_s（内存热区实时）；D1 last_seen 节流写，仅冷启动兜底
+      online: now - (latest[s.id]?.last_seen_s || s.last_seen || 0) < grace,
       wan_ip: s.wan_ip || '',
       info: safeJson(s.info_json),
       probes: safeJson(s.probe_json),
@@ -915,7 +916,8 @@ async function mcpListServers(user, env) {
       id: s.id,
       name: s.name,
       group: s.group || '',
-      online: now - (s.last_seen || 0) < grace, // 观看者在线时快宽限（30s），否则慢宽限（180s）
+      // 在线判定优先用 MetricsDO 秒级 last_seen_s；D1 last_seen 节流写，仅冷启动兜底
+      online: now - (m?.last_seen_s || s.last_seen || 0) < grace,
       wan_ip: s.wan_ip || '',
       info: safeJson(s.info_json),
       metrics: m ? {
@@ -1613,6 +1615,7 @@ export class MetricsDO {
     this.probeLoaded = false;
     this.arcCache = new Map(); // serverId -> 已归档水位（分钟），实例内缓存，evict 后从 storage 恢复
     this.sweepCount = 0; // 全量 sweep 计数（每 6 次 alarm ≈ 1 小时做一次）
+    this.lastSeenSec = new Map(); // serverId -> 最后上报秒（内存，/latest 在线判定用；evict 后由 D1 last_seen 兜底）
   }
 
   // 从 DO Storage 惰性恢复告警冷却 / 探活去重状态（实例 evict 后首次使用时加载一次）
@@ -1721,6 +1724,8 @@ export class MetricsDO {
         m.set(minTs, v);
         this.trim(m);
         await this.state.storage.put(this.hotKey(b.serverId, minTs), JSON.stringify(v));
+        // 秒级最后上报时间（内存，/latest 在线判定用，比 D1 last_seen 节流更实时）
+        this.lastSeenSec.set(b.serverId, Math.floor(Date.now() / 1000));
         // 增量归档：水位之后、归档线之前的行落 D1（消除 alarm 全量重复 INSERT）
         await this.archiveIncrement(b.serverId, m, minTs);
       } catch { /* storage 不可用时降级为纯内存（仅当前实例生命周期） */ }
@@ -1758,7 +1763,7 @@ export class MetricsDO {
           if (ts > lastTs) { lastTs = ts; lastV = v; }
         }
         if (lastV) {
-          out[serverId] = { ts: lastTs, cpu: lastV.cpu, mem_used: lastV.mem_used, mem_total: lastV.mem_total, net_in: lastV.net_in, net_out: lastV.net_out, extra: lastV.extra };
+          out[serverId] = { ts: lastTs, cpu: lastV.cpu, mem_used: lastV.mem_used, mem_total: lastV.mem_total, net_in: lastV.net_in, net_out: lastV.net_out, extra: lastV.extra, last_seen_s: this.lastSeenSec.get(serverId) };
         }
       }
       // 仅实例 evict 后（内存缓存为空）才全量扫 storage 恢复；活跃期直接读内存，
@@ -1775,7 +1780,7 @@ export class MetricsDO {
           const cur = out[serverId];
           if (!cur || ts > cur.ts) {
             const v = JSON.parse(k.value);
-            out[serverId] = { ts, cpu: v.cpu, mem_used: v.mem_used, mem_total: v.mem_total, net_in: v.net_in, net_out: v.net_out, extra: v.extra };
+            out[serverId] = { ts, cpu: v.cpu, mem_used: v.mem_used, mem_total: v.mem_total, net_in: v.net_in, net_out: v.net_out, extra: v.extra, last_seen_s: this.lastSeenSec.get(serverId) };
           }
         }
       }
@@ -2163,7 +2168,8 @@ export class PanelDO {
         name: s.name,
         group: s.group || '',
         display_index: s.display_index || 0,
-        online: now - (s.last_seen || 0) < grace, // 观看者在线时快宽限（30s），否则慢宽限（180s）
+        // 在线判定优先用 MetricsDO 秒级 last_seen_s；D1 last_seen 节流写，仅冷启动兜底
+        online: now - (latest[s.id]?.last_seen_s || s.last_seen || 0) < grace,
         wan_ip: s.wan_ip || '',
         info: safeJson(s.info_json),
         probes: safeJson(s.probe_json),

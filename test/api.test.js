@@ -342,6 +342,28 @@ test('删除后 in-flight 上报不写指标（H-11 存在性复核）', async (
   assert.equal(rows.results[0].name, 'x', '仅保留删除前数据');
 });
 
+test('last_seen 节流：10s 内重复上报只写一次（降额优化）', async () => {
+  const env = makeEnv();
+  await env.DB.prepare('INSERT INTO servers (agent_key_id, name, user_id, agent_key_hash) VALUES (?,?,?,?)').bind('k1', 's1', 1, 'h1').run();
+  I.__reset();
+  const now = Math.floor(Date.now() / 1000);
+  // 首次上报 → 落盘
+  await I.handleReport(env, { serverId: 1 });
+  const ts1 = I.lastSeenWrite.get(1);
+  assert.ok(ts1 >= now, '首次上报写入 last_seen');
+  // 连续同秒上报（info 不变）→ 节流不重写
+  await I.handleReport(env, { serverId: 1 });
+  await I.handleReport(env, { serverId: 1 });
+  assert.equal(I.lastSeenWrite.get(1), ts1, '10s 节流窗口内不重复写');
+  // 模拟 20s 前落盘 → 再次上报应重写
+  I.lastSeenWrite.set(1, now - 20);
+  await I.handleReport(env, { serverId: 1 });
+  assert.ok(I.lastSeenWrite.get(1) >= now, '超过节流窗口后重写');
+  // DB last_seen 与节流记录一致
+  const row = await env.DB.prepare('SELECT last_seen FROM servers WHERE id = 1').first();
+  assert.equal(row.last_seen, I.lastSeenWrite.get(1));
+});
+
 // ---------------- 监控 ----------------
 test('监控：短区间走内存热区（METRICS /query），非法 range 回退 12h', async () => {
   const env = makeEnv();

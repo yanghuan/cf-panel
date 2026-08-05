@@ -394,6 +394,11 @@ async function sendWebhook(cfg, payload) {
   }
 }
 
+// last_seen D1 落盘节流（秒）：有观看者快采 3s 上报时，D1 写从 28,800 → ~5,760 行/天/机（−80%）。
+// 在线宽限 ONLINE_GRACE_FAST_S=15，10s 节流最旧 ~12s 仍低于宽限（留余量）；慢采间隔本就 >10s，不受影响。
+const LAST_SEEN_THROTTLE_S = 10;
+const lastSeenWrite = new Map(); // serverId -> 上次落盘秒（跨实例 evict 丢失后仅偶发多写一次，无害）
+
 // agent 监控上报落库：更新 last_seen（在线判定唯一依据；系统信息变更才写 info_json，探活变更才写 probe_json），
 // 时序写入 MetricsDO 热区（供 /api/report 与控制通道复用）。
 // 告警冷却/探活去重判定在 MetricsDO 内部完成（见 MetricsDO.checkAlerts / checkProbeAlerts）。
@@ -424,13 +429,24 @@ async function handleReport(env, payload) {
   if (payload.info) {
     const infoJson = JSON.stringify(payload.info);
     if (server.info_json !== infoJson) {
+      // 系统信息变化：必须写（含 last_seen）
       await env.DB.prepare('UPDATE servers SET last_seen = ?, info_json = ? WHERE id = ?')
         .bind(ts, infoJson, payload.serverId).run();
+      lastSeenWrite.set(payload.serverId, ts);
     } else {
-      await env.DB.prepare('UPDATE servers SET last_seen = ? WHERE id = ?').bind(ts, payload.serverId).run();
+      // info 未变：last_seen 节流写（在线宽限 15s，10s 节流留余量）
+      const last = lastSeenWrite.get(payload.serverId) || 0;
+      if (ts - last >= LAST_SEEN_THROTTLE_S) {
+        await env.DB.prepare('UPDATE servers SET last_seen = ? WHERE id = ?').bind(ts, payload.serverId).run();
+        lastSeenWrite.set(payload.serverId, ts);
+      }
     }
   } else {
-    await env.DB.prepare('UPDATE servers SET last_seen = ? WHERE id = ?').bind(ts, payload.serverId).run();
+    const last = lastSeenWrite.get(payload.serverId) || 0;
+    if (ts - last >= LAST_SEEN_THROTTLE_S) {
+      await env.DB.prepare('UPDATE servers SET last_seen = ? WHERE id = ?').bind(ts, payload.serverId).run();
+      lastSeenWrite.set(payload.serverId, ts);
+    }
   }
   // 时序写入 MetricsDO 热区；告警/探活判定也在该调用内顺带完成（零额外请求）
   const mdo = doMetrics(env);
@@ -2068,10 +2084,12 @@ export const __internals = {
   renderTemplate, parseHeaders, sendWebhook,
   shardForServerId, makeStreamId, shardFromStreamId,
   isAdmin, canAccessServer, canExec, handleReport,
+  lastSeenWrite, LAST_SEEN_THROTTLE_S,
   // 重置模块级可变状态（设置缓存），保证测试间隔离
   // 注：告警冷却/探活去重状态在 MetricsDO 实例内存，由各测试实例自行隔离
   __reset() {
     SETTINGS_CACHE.clear();
     loginFails.clear();
+    lastSeenWrite.clear();
   },
 };

@@ -567,6 +567,48 @@ async function hasPanelViewers(env) {
   }
 }
 
+// 服务器列表 + 实时状态公共构建（GET /api/servers 与 MCP list_servers 共用）：
+// 短 TTL（2s）按用户维度缓存，多入口/多观看者重复读时命中，避免每次都读 D1 全表 +
+// MetricsDO /latest + PanelDO /viewers（Worker 侧读放大）。
+// 正确性：权限过滤在 SQL 层（queryServersForUser）完成，不缓存越权结论；
+// 服务器增删改（POST/DELETE）时显式 clear，最长滞后 2s。
+const SERVER_LIST_CACHE_TTL_MS = 2000;
+const serverListCache = new Map(); // userKey -> { ts, list }
+function serverListCacheKey(user) {
+  return `${user.id}:${user.role}:${user.username}:${user.pat
+    ? `${user.pat.scopes.join(',')}|${user.pat.serverIDs == null ? '*' : user.pat.serverIDs.join(',')}`
+    : ''}`;
+}
+async function listServersWithState(env, user) {
+  const key = serverListCacheKey(user);
+  const now = Date.now();
+  const cached = serverListCache.get(key);
+  if (cached && now - cached.ts < SERVER_LIST_CACHE_TTL_MS) return cached.list;
+  const rows = await queryServersForUser(env, user);
+  let latest = {};
+  try {
+    const lResp = await doMetrics(env).fetch('https://do.internal/latest');
+    latest = await lResp.json();
+  } catch { /* 无最新指标 */ }
+  const nowSec = Math.floor(now / 1000);
+  const grace = (await hasPanelViewers(env)) ? ONLINE_GRACE_FAST_S : ONLINE_GRACE_SLOW_S;
+  const list = rows.results.map((s) => ({
+    id: s.id,
+    name: s.name,
+    group: s.group || '',
+    display_index: s.display_index || 0,
+    // 在线判定优先用 MetricsDO 秒级 last_seen_s（内存热区实时）；D1 last_seen 节流写，仅冷启动兜底
+    online: nowSec - (latest[s.id]?.last_seen_s || s.last_seen || 0) < grace,
+    wan_ip: s.wan_ip || '',
+    info: safeJson(s.info_json),
+    probes: safeJson(s.probe_json),
+    metric: latest[s.id] || null,
+  }));
+  if (serverListCache.size > 500) serverListCache.clear(); // 防 Map 无限增长
+  serverListCache.set(key, { ts: now, list });
+  return list;
+}
+
 // ---------------- REST API ----------------
 
 // 登录失败限流（应用层纵深防御）。内存窗口按 IP 计数，缓解单 IP 爆破；
@@ -617,10 +659,20 @@ function recordLoginFail(ip) {
   }
 }
 
+// 用量观测：Worker 侧请求计数（实例级，evict/重启清零，仅趋势参考；
+// MetricsDO 侧计数每 10 分钟 alarm 汇总到 storage，跨 evict 保留近似量级）
+const apiCounts = new Map(); // `${method} ${path}` -> 次数
+function countApi(method, path) {
+  const key = `${method} ${path}`;
+  apiCounts.set(key, (apiCounts.get(key) || 0) + 1);
+  if (apiCounts.size > 200) apiCounts.clear(); // 防 Map 无限增长
+}
+
 async function handleApi(request, env) {
   const url = new URL(request.url);
   const path = url.pathname;
   const method = request.method;
+  countApi(method, path);
 
   // POST /api/login —— 面板登录（PANEL_USERS 多用户 或 PANEL_PASSWORD 单管理员）
   // 暴力破解防护：应用层按 IP 失败限流（纵深防御，默认生效）；
@@ -691,29 +743,9 @@ async function handleApi(request, env) {
     return json({ id: user.id, username: user.username, role: user.role, is_pat: !!user.pat });
   }
 
-  // GET /api/servers —— 服务器列表（权限过滤由 queryServersForUser 在 SQL 层完成）
+  // GET /api/servers —— 服务器列表（权限过滤由 queryServersForUser 在 SQL 层完成；列表短 TTL 缓存降读放大）
   if (method === 'GET' && path === '/api/servers') {
-    const rows = await queryServersForUser(env, user);
-    let latest = {};
-    try {
-      const lResp = await doMetrics(env).fetch('https://do.internal/latest');
-      latest = await lResp.json();
-    } catch { /* 无最新指标 */ }
-    const now = Math.floor(Date.now() / 1000);
-    const grace = (await hasPanelViewers(env)) ? ONLINE_GRACE_FAST_S : ONLINE_GRACE_SLOW_S;
-    const list = rows.results.map((s) => ({
-      id: s.id,
-      name: s.name,
-      group: s.group || '',
-      display_index: s.display_index || 0,
-      // 在线判定优先用 MetricsDO 秒级 last_seen_s（内存热区实时）；D1 last_seen 节流写，仅冷启动兜底
-      online: now - (latest[s.id]?.last_seen_s || s.last_seen || 0) < grace,
-      wan_ip: s.wan_ip || '',
-      info: safeJson(s.info_json),
-      probes: safeJson(s.probe_json),
-      metric: latest[s.id] || null,
-    }));
-    return json(list);
+    return json(await listServersWithState(env, user));
   }
 
   // POST /api/servers —— 注册一台服务器（name + 可选 group + 可选序号；仅管理员）
@@ -731,6 +763,7 @@ async function handleApi(request, env) {
       .bind(keyId, name, group, displayIndex, user.id, hash)
       .run();
     await env.DB.prepare('INSERT INTO audit_logs (user_id, action) VALUES (?,?)').bind(user.id, 'server.create').run();
+    serverListCache.clear(); // 服务器增删改后立即使列表缓存失效
     return json({
       agent_key: key,
       wss_base: `wss://${url.host}/ws/agent`,
@@ -751,6 +784,7 @@ async function handleApi(request, env) {
     ]);
     // 2) 删除服务器本体（agent key 随之失效，重连返回 401）
     await env.DB.prepare('DELETE FROM servers WHERE id = ?').bind(id).run();
+    serverListCache.clear(); // 服务器增删改后立即使列表缓存失效
     // 3) 审计日志
     await env.DB.prepare('INSERT INTO audit_logs (user_id, action, target_server_id, detail) VALUES (?,?,?,?)')
       .bind(user.id, 'server.delete', id, server.name).run();
@@ -773,6 +807,28 @@ async function handleApi(request, env) {
       } catch { /* 分片暂不可达；agent 重连会因 key 失效被拒 */ }
     }
     return json({ ok: true });
+  }
+
+  // GET /api/usage —— 用量观测（仅管理员）：Worker 请求计数 + MetricsDO 上报/查询计数（近 24h 估算参考）
+  if (method === 'GET' && path === '/api/usage') {
+    if (!isAdmin(user)) return err('forbidden', 403);
+    let doUsage = {};
+    try {
+      doUsage = await (await doMetrics(env).fetch('https://do.internal/usage')).json();
+    } catch { /* 用量读取失败不影响 */ }
+    const reportFrames = Number(doUsage.persisted?.report || 0);
+    const api = {};
+    for (const [k, v] of apiCounts) api[k] = v;
+    return json({
+      note: 'Worker 计数为实例级（evict/重启清零，趋势参考）；MetricsDO 计数每 10 分钟 alarm 汇总到 storage（跨 evict 保留）。',
+      api,
+      metrics_do: doUsage,
+      estimates_per_day: {
+        report_frames: reportFrames, // 上报帧：快采 28,800/天/机、慢采 720/天/机
+        do_events: reportFrames * 2, // 每帧上报链约 2 个 DO 事件（report + latest/告警顺风车）
+        d1_writes: Math.round(reportFrames * 1.5), // last_seen 节流(~0.2/帧) + custom 去重 + info/probe 变更
+      },
+    });
   }
 
   // POST /api/terminal —— 创建终端会话（exec 权限 + 服务器归属）
@@ -913,42 +969,29 @@ function mcpResult(id, result, error) {
   });
 }
 
-// 工具：服务器列表 + 实时状态 + 系统信息
+// 工具：服务器列表 + 实时状态 + 系统信息（复用 listServersWithState 短 TTL 缓存，映射 MCP 字段格式）
 async function mcpListServers(user, env) {
-  const rows = await queryServersForUser(env, user);
-  let latest = {};
-  try {
-    const lResp = await doMetrics(env).fetch('https://do.internal/latest');
-    latest = await lResp.json();
-  } catch { /* 无最新指标 */ }
-  const now = Math.floor(Date.now() / 1000);
-  const grace = (await hasPanelViewers(env)) ? ONLINE_GRACE_FAST_S : ONLINE_GRACE_SLOW_S;
-  const list = [];
-  for (const s of rows.results) {
-    const m = latest[s.id] || null;
-    list.push({
-      id: s.id,
-      name: s.name,
-      group: s.group || '',
-      // 在线判定优先用 MetricsDO 秒级 last_seen_s；D1 last_seen 节流写，仅冷启动兜底
-      online: now - (m?.last_seen_s || s.last_seen || 0) < grace,
-      wan_ip: s.wan_ip || '',
-      info: safeJson(s.info_json),
-      metrics: m ? {
-        cpu_pct: m.cpu,
-        mem_used_bytes: m.mem_used,
-        net_in_rate_bps: m.net_in,
-        net_out_rate_bps: m.net_out,
-        load1: m.extra && m.extra.load1,
-        swap_bytes: m.extra && m.extra.swap,
-        temp_c: m.extra && m.extra.temp,
-        procs: m.extra && m.extra.procs,
-        tcp_conns: m.extra && m.extra.tcp,
-        udp_conns: m.extra && m.extra.udp,
-      } : null,
-    });
-  }
-  return list;
+  const list = await listServersWithState(env, user);
+  return list.map((s) => ({
+    id: s.id,
+    name: s.name,
+    group: s.group || '',
+    online: s.online,
+    wan_ip: s.wan_ip || '',
+    info: s.info,
+    metrics: s.metric ? {
+      cpu_pct: s.metric.cpu,
+      mem_used_bytes: s.metric.mem_used,
+      net_in_rate_bps: s.metric.net_in,
+      net_out_rate_bps: s.metric.net_out,
+      load1: s.metric.extra && s.metric.extra.load1,
+      swap_bytes: s.metric.extra && s.metric.extra.swap,
+      temp_c: s.metric.extra && s.metric.extra.temp,
+      procs: s.metric.extra && s.metric.extra.procs,
+      tcp_conns: s.metric.extra && s.metric.extra.tcp,
+      udp_conns: s.metric.extra && s.metric.extra.udp,
+    } : null,
+  }));
 }
 
 // 工具：监控历史（内存热区 ≤12h，D1 归档更长；长区间 SQL 抽样）
@@ -1632,6 +1675,9 @@ export class MetricsDO {
     this.lastSeenSec = new Map(); // serverId -> 最后上报秒（内存，/latest 在线判定用；evict 后由 D1 last_seen 兜底）
     this.alarmCached = null; // 实例内已知的下一次 alarm 时间戳；避免每帧上报都 getAlarm（DO Storage 读）
     this.latestByServer = new Map(); // serverId -> 最新指标 {ts, ..., last_seen_s}（/report 热写 O(1) 维护，/latest 直接 O(S) 返回）
+    this.offlineLoaded = false; // 离线告警状态是否已从 storage 一次性加载（惰性）
+    this.offlineState = new Map(); // serverId -> 'on'|'off'（内存副本，避免每机逐个 getAlarm）
+    this.usage = { report: 0, latest: 0, query: 0, alarm: 0 }; // 用量观测：本周期（10min）计数，alarm 时累计到 storage
   }
 
   // 从 DO Storage 惰性恢复告警冷却 / 探活去重状态（实例 evict 后首次使用时加载一次）
@@ -1731,6 +1777,7 @@ export class MetricsDO {
     const url = new URL(request.url);
 
     if (url.pathname === '/report' && request.method === 'POST') {
+      this.usage.report += 1; // 用量观测
       const b = await request.json();
       const minTs = Number(b.minTs);
       const v = { cpu: b.cpu, mem_used: b.mem_used, mem_total: b.mem_total, net_in: b.net_in, net_out: b.net_out, extra: b.extra };
@@ -1764,6 +1811,7 @@ export class MetricsDO {
     }
 
     if (url.pathname === '/query' && request.method === 'GET') {
+      this.usage.query += 1; // 用量观测
       const serverId = Number(url.searchParams.get('server_id')) || 0;
       const limit = Number(url.searchParams.get('limit')) || METRICS_KEEP_MIN;
       // 从 storage 恢复（实例 evict 后 data 缓存为空），保证热区查询不丢数据
@@ -1777,6 +1825,7 @@ export class MetricsDO {
 
     // 返回所有服务器的最新一条指标（面板卡片实时指标用）
     if (url.pathname === '/latest' && request.method === 'GET') {
+      this.usage.latest += 1; // 用量观测
       const out = {};
       // 增量 latest Map：/report 热写 O(1) 维护，此处 O(S) 直接返回（避免对分钟 Map 扫描）
       if (this.latestByServer.size > 0) {
@@ -1832,6 +1881,13 @@ export class MetricsDO {
         if (k.startsWith(`${serverId}:`)) this.probeState.delete(k);
       }
       return json({ ok: true });
+    }
+
+    // 用量观测：本周期内存计数 + 累计到 storage 的总量（跨实例 evict 保留近似量级）
+    if (url.pathname === '/usage' && request.method === 'GET') {
+      let persisted = {};
+      try { persisted = JSON.parse(await this.state.storage.get('usage:total') || '{}'); } catch { /* ignore */ }
+      return json({ counters: this.usage, persisted });
     }
 
     return err('not found', 404);
@@ -1950,18 +2006,34 @@ export class MetricsDO {
     }
   }
 
-  // 离线/恢复告警：状态存 DO Storage（重启不丢，避免重复告警）
+  // 离线/恢复告警：状态存 DO Storage（重启不丢，避免重复告警）。
+  // 降额：未配置 webhook 时无法送达，跳过扫描（零成本）；在线判定复用增量 latest 的秒级 last_seen_s；
+  // 状态一次性 list 加载到内存（避免每机逐个 get）。
+  async ensureOfflineLoaded() {
+    if (this.offlineLoaded) return;
+    this.offlineLoaded = true;
+    try {
+      const keys = await this.listStorage('alert:offline:');
+      for (const k of keys) {
+        this.offlineState.set(k.name.slice('alert:offline:'.length), k.value);
+      }
+    } catch { /* 加载失败按全在线处理 */ }
+  }
   async checkOfflineAlerts() {
     const cfg = await getAlertCfg(this.env);
-    if (!cfg.enabled) return;
+    if (!cfg.enabled || !cfg.webhook_url) return; // 未配置 webhook 时离线告警无法送达，跳过扫描
+    await this.ensureOfflineLoaded();
     const now = Math.floor(Date.now() / 1000);
     const offlineAfter = cfg.offline_after_s;
     const rows = await this.env.DB.prepare('SELECT id, name, last_seen FROM servers').all();
     for (const s of rows.results) {
-      const isOnline = (s.last_seen || 0) > now - offlineAfter;
+      // 在线判定优先用 MetricsDO 秒级 last_seen_s（与列表判定一致）；D1 last_seen 仅冷启动兜底
+      const lastSeen = this.latestByServer.get(s.id)?.last_seen_s || s.last_seen || 0;
+      const isOnline = lastSeen > now - offlineAfter;
       const key = `alert:offline:${s.id}`;
-      const last = (await this.state.storage.get(key)) || 'on';
+      const last = this.offlineState.get(s.id) || 'on';
       if (!isOnline && last !== 'off') {
+        this.offlineState.set(s.id, 'off');
         await this.state.storage.put(key, 'off');
         await sendWebhook(cfg, {
           event: 'offline',
@@ -1971,6 +2043,7 @@ export class MetricsDO {
           time: new Date().toISOString(),
         });
       } else if (isOnline && last === 'off') {
+        this.offlineState.set(s.id, 'on');
         await this.state.storage.put(key, 'on');
         await sendWebhook(cfg, {
           event: 'recovered',
@@ -1988,6 +2061,17 @@ export class MetricsDO {
   // storage 热区 / audit_logs 无限增长。
   async alarm() {
     try {
+    // 用量观测：本周期计数累计到 storage（跨实例 evict 保留近似量级），随后清零内存
+    try {
+      const prev = JSON.parse(await this.state.storage.get('usage:total') || '{}');
+      await this.state.storage.put('usage:total', JSON.stringify({
+        report: (prev.report || 0) + this.usage.report,
+        latest: (prev.latest || 0) + this.usage.latest,
+        query: (prev.query || 0) + this.usage.query,
+        alarm: (prev.alarm || 0) + this.usage.alarm + 1,
+      }));
+    } catch { /* 用量汇总失败不影响主流程 */ }
+    this.usage = { report: 0, latest: 0, query: 0, alarm: 0 };
     const archiveOn = this.env.ARCHIVE_TO_D1 !== '0';
     const alertOn = (await getAlertCfg(this.env)).enabled;
     if (alertOn) await this.checkOfflineAlerts();
@@ -1998,11 +2082,14 @@ export class MetricsDO {
       await this.fullSweep(archiveOn);
     }
     // 保留期清理（每天一次）：删除超过 METRICS_RETENTION_DAYS 的旧数据，以及超过
-    // AUDIT_RETENTION_DAYS 的审计日志（created_at 为 datetime('now') 文本，可直接比较）
+    // AUDIT_RETENTION_DAYS 的审计日志（created_at 为 datetime('now') 文本，可直接比较）。
+    // METRICS_RETENTION_DAYS 可用环境变量覆盖（默认 30）：缩小保留期可降低 D1 容量占用。
     const now = Date.now();
     if (now - this.lastPrune > PRUNE_INTERVAL_MS) {
       this.lastPrune = now;
-      const minTs = Math.floor(now / 1000 / 60) - METRICS_RETENTION_DAYS * 1440;
+      const retention = Number(this.env.METRICS_RETENTION_DAYS) > 0
+        ? Number(this.env.METRICS_RETENTION_DAYS) : METRICS_RETENTION_DAYS;
+      const minTs = Math.floor(now / 1000 / 60) - retention * 1440;
       await this.env.DB.batch([
         this.env.DB.prepare('DELETE FROM metrics_min WHERE ts < ?').bind(minTs),
         this.env.DB.prepare('DELETE FROM metrics_custom WHERE ts < ?').bind(minTs),
@@ -2234,7 +2321,7 @@ export const __internals = {
   renderTemplate, parseHeaders, sendWebhook,
   shardForServerId, makeStreamId, shardFromStreamId,
   isAdmin, canAccessServer, canExec, handleReport,
-  lastSeenWrite, LAST_SEEN_THROTTLE_S, customWritten,
+  lastSeenWrite, LAST_SEEN_THROTTLE_S, customWritten, serverListCache, apiCounts,
   // 重置模块级可变状态（设置缓存），保证测试间隔离
   // 注：告警冷却/探活去重状态在 MetricsDO 实例内存，由各测试实例自行隔离
   __reset() {
@@ -2242,5 +2329,7 @@ export const __internals = {
     loginFails.clear();
     lastSeenWrite.clear();
     customWritten.clear();
+    serverListCache.clear();
+    apiCounts.clear();
   },
 };

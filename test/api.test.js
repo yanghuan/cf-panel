@@ -218,21 +218,24 @@ test('服务器：在线状态按 last_seen 宽限期（180s）判定', async ()
   const list0 = await (await call(env, { path: '/api/servers', token })).json();
   const id = list0[0].id;
 
-  // 模拟刚刚上报 → 在线
+  // 模拟刚刚上报 → 在线（列表短 TTL 缓存：改 DB 后显式失效以便断言实时状态）
   await env.DB.prepare('UPDATE servers SET last_seen = ? WHERE id = ?')
     .bind(Math.floor(Date.now() / 1000), id).run();
+  I.serverListCache.clear();
   const list1 = await (await call(env, { path: '/api/servers', token })).json();
   assert.equal(list1[0].online, true);
 
   // 慢采间隔内（120s < 180s 宽限期）→ 仍在线（存活服务器不应误显示离线）
   await env.DB.prepare('UPDATE servers SET last_seen = ? WHERE id = ?')
     .bind(Math.floor(Date.now() / 1000) - 120, id).run();
+  I.serverListCache.clear();
   const list2 = await (await call(env, { path: '/api/servers', token })).json();
   assert.equal(list2[0].online, true);
 
   // 超过宽限期 → 离线（即使 online=1）
   await env.DB.prepare('UPDATE servers SET last_seen = ? WHERE id = ?')
     .bind(Math.floor(Date.now() / 1000) - 300, id).run();
+  I.serverListCache.clear();
   const list3 = await (await call(env, { path: '/api/servers', token })).json();
   assert.equal(list3[0].online, false);
 });
@@ -247,12 +250,14 @@ test('服务器：有观看者时用快宽限期（15s）判定在线', async ()
   // 60s 前上报：观看者在线 → 快宽限 15s → 判离线（死亡检测更快）
   await env.DB.prepare('UPDATE servers SET last_seen = ? WHERE id = ?')
     .bind(Math.floor(Date.now() / 1000) - 60, id).run();
+  I.serverListCache.clear();
   const list1 = await (await call(env, { path: '/api/servers', token })).json();
   assert.equal(list1[0].online, false);
 
   // 刚上报 → 在线
   await env.DB.prepare('UPDATE servers SET last_seen = ? WHERE id = ?')
     .bind(Math.floor(Date.now() / 1000), id).run();
+  I.serverListCache.clear();
   const list2 = await (await call(env, { path: '/api/servers', token })).json();
   assert.equal(list2[0].online, true);
 });
@@ -311,7 +316,8 @@ test('agent 上报：key 指纹定位 + 哈希校验 + 落库', async () => {
     probes: [{ name: 'web', ok: true, ms: 5 }],
   }));
 
-  // 上报后列表显示在线 + 指标
+  // 上报后列表显示在线 + 指标（列表短 TTL 缓存：上报后显式失效再断言）
+  I.serverListCache.clear();
   const after = await (await call(env, { path: '/api/servers', token })).json();
   assert.equal(after[0].online, true);
 });
@@ -582,6 +588,21 @@ test('审计日志：管理员可查（倒序 + limit），非管理员 403', as
   // PAT 不能查看
   const pat = await (await call(env, { method: 'POST', path: '/api/tokens', token: adminToken, body: { name: 'r', scopes: ['server:read'] } })).json();
   assert.equal((await call(env, { path: '/api/audit-logs', token: pat.token })).status, 403);
+});
+
+test('用量观测：/api/usage 仅管理员可访问，返回用量估算（P2 #15）', async () => {
+  const env = makeEnv();
+  const adminToken = await login(env);
+  const res = await call(env, { path: '/api/usage', token: adminToken });
+  assert.equal(res.status, 200);
+  const body = await res.json();
+  assert.ok('api' in body, '含 Worker 请求计数');
+  assert.ok('metrics_do' in body, '含 MetricsDO 用量');
+  assert.ok('estimates_per_day' in body, '含每日估算');
+  assert.ok(body.estimates_per_day.report_frames >= 0);
+  // PAT（非管理员）403
+  const pat = await (await call(env, { method: 'POST', path: '/api/tokens', token: adminToken, body: { name: 'r', scopes: ['server:read'] } })).json();
+  assert.equal((await call(env, { path: '/api/usage', token: pat.token })).status, 403);
 });
 
 // ---------------- 设置（仅管理员） ----------------

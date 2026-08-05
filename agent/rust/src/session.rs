@@ -4,18 +4,25 @@ use futures_util::{SinkExt, StreamExt};
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use std::io::{Read, Write};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message;
 
 const FILE_LIMIT: u64 = 500 * 1024 * 1024; // 单文件总上限 500MB
-                                           // 服务端固定内部缓冲（与客户端分块解耦）：
-                                           // - READ_BLOCK：单次 read 最多读取并返回的字节（前端按返回的 got 累加续传，自动适配任意值）
-                                           // - WRITE_BUF：写路径流式 base64 解码的缓冲（边解边写，内存不随块大小增长）
-const READ_BLOCK: usize = 512 * 1024;
+// 服务端固定内部缓冲（与客户端分块解耦）：
+// - READ_BLOCK：单次 read 最多读取并返回的字节（前端按返回的 got 累加续传，自动适配任意值）。
+//   1MB 与前端下载分块对齐：一次 read 返回 1MB，下载 1MB 只需 1 个 read 请求/帧（原 512KB 需 2 帧，帧数 −50%）
+// - WRITE_BUF：写路径流式 base64 解码的缓冲（边解边写，内存不随块大小增长）
+const READ_BLOCK: usize = 1024 * 1024;
 const WRITE_BUF: usize = 64 * 1024;
 // 文件 WS 入站消息大小上限（防恶意超大 data 整包占内存；正常前端 1MB 分块远小于此）
 const WS_MSG_LIMIT: usize = 8 * 1024 * 1024;
+// 终端输出合帧：聚合 TERM_BATCH_MS 或 TERM_BATCH_BYTES 后合并为一条 WS 帧。
+// 刷屏场景（pty 每 8KB 一帧）DO 计费消息数从 N 帧降到约 1 帧/16ms（约 −60%~75%）；
+// 交互延迟 ≤16ms 人眼无感；顺序保持（同批内按到达序拼接）。
+const TERM_BATCH_MS: u64 = 16;
+const TERM_BATCH_BYTES: usize = 32 * 1024;
 
 fn b64e(data: &[u8]) -> String {
     base64::Engine::encode(&base64::engine::general_purpose::STANDARD, data)
@@ -149,10 +156,33 @@ async fn run_terminal_inner(cfg: &Config, term: &Arc<TermSession>) {
         }
     });
     let send_task = tokio::spawn(async move {
+        // 合帧发送：聚合约 16ms 或 32KB 合并一条 WS 帧（降 DO 计费消息数，见 TERM_BATCH_* 注释）
+        let mut batch: Vec<u8> = Vec::with_capacity(TERM_BATCH_BYTES);
         while let Some(bytes) = rx.recv().await {
-            if write.send(Message::Binary(bytes)).await.is_err() {
-                break;
+            batch.extend_from_slice(&bytes);
+            loop {
+                if batch.len() >= TERM_BATCH_BYTES {
+                    if write.send(Message::Binary(std::mem::take(&mut batch))).await.is_err() {
+                        return;
+                    }
+                    break;
+                }
+                match tokio::time::timeout(Duration::from_millis(TERM_BATCH_MS), rx.recv()).await {
+                    Ok(Some(more)) => batch.extend_from_slice(&more),
+                    _ => {
+                        // 窗口到期或通道关闭：flush 剩余
+                        if !batch.is_empty() {
+                            if write.send(Message::Binary(std::mem::take(&mut batch))).await.is_err() {
+                                return;
+                            }
+                        }
+                        break;
+                    }
+                }
             }
+        }
+        if !batch.is_empty() {
+            let _ = write.send(Message::Binary(batch)).await;
         }
     });
 
@@ -515,9 +545,11 @@ mod tests {
     #[test]
     fn buffer_constants() {
         // 固定缓冲重构的常量约束（与前端分块解耦的服务端固定缓冲）
-        assert_eq!(READ_BLOCK, 512 * 1024);
+        assert_eq!(READ_BLOCK, 1024 * 1024, "READ_BLOCK 与前端 1MB 下载分块对齐");
         assert_eq!(WRITE_BUF, 64 * 1024);
         assert_eq!(WS_MSG_LIMIT, 8 * 1024 * 1024);
         assert_eq!(FILE_LIMIT, 500 * 1024 * 1024);
+        assert!(TERM_BATCH_MS >= 8 && TERM_BATCH_MS <= 32, "合帧窗口过大则交互卡顿");
+        assert!(TERM_BATCH_BYTES >= 16 * 1024 && TERM_BATCH_BYTES <= 64 * 1024, "合帧字节阈值合理");
     }
 }

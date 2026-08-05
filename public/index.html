@@ -242,7 +242,7 @@
       <button id="btn-custom-setup-close" class="ghost">关闭</button>
     </div>
     <div class="settings-body">
-      <p class="muted" style="font-size:13px">在目标机器的 <code>/etc/cf-panel-agent.env</code> 中配置 <code>CUSTOM_METRICS</code>（JSON 数组：<code>name</code> 指标名、<code>cmd</code> 采集命令），agent 会按上报周期执行命令采集数值指标；配置完成后可在该服务器卡片的「⋯ → 自定义指标」中查看曲线。</p>
+      <p class="muted" style="font-size:13px">在目标机器的 <code>/etc/cf-panel-agent.env</code> 中配置 <code>CUSTOM_METRICS</code>（JSON 数组：<code>name</code> 指标名、<code>cmd</code> 采集命令），agent 会按上报周期执行命令采集数值指标；配置完成后可在该服务器卡片的「⋯ → 自定义指标」中查看曲线。<br><strong>容量提示</strong>：每机每 1 个自定义指标约新增 1,440 行/天（30 天保留约 43,200 行）；建议每机 ≤20 个，避免 D1 免费 5GB 触顶（总占用 ≈ 43,200 × 服务器数 × 指标数 行）。</p>
       <div class="settings-row">
         <textarea id="custom-setup-editor" rows="5" class="custom-editor" spellcheck="false">[{"name":"cpu_temp","cmd":"cat /sys/class/thermal/thermal_zone0/temp"},{"name":"estab_conns","cmd":"ss -t state established | wc -l"}]</textarea>
       </div>

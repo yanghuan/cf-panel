@@ -76,6 +76,34 @@ test('MetricsDO: report / query / latest 基本读写', async () => {
   assert.equal((await call('/nope')).status, 404);
 });
 
+test('MetricsDO: /usage 用量计数，alarm 汇总到 storage 跨 evict 保留', async () => {
+  const env = makeEnv({ ARCHIVE_TO_D1: '0' });
+  const state = mockState();
+  const { inst, call } = mkMetrics(env, state);
+  const nowMin = Math.floor(Date.now() / 1000 / 60);
+  await call('/report', { method: 'POST', body: JSON.stringify({ serverId: 1, minTs: nowMin, cpu: 1 }) });
+  await call('/report', { method: 'POST', body: JSON.stringify({ serverId: 1, minTs: nowMin, cpu: 2 }) });
+  await call('/latest');
+  await call('/query?server_id=1');
+  const usage = await (await call('/usage')).json();
+  assert.equal(usage.counters.report, 2);
+  assert.equal(usage.counters.latest, 1);
+  assert.equal(usage.counters.query, 1);
+  // alarm 将本周期计数累计到 storage 并清零内存
+  await inst.alarm();
+  const after = await (await call('/usage')).json();
+  assert.equal(after.counters.report, 0, 'alarm 后内存清零');
+  assert.equal(after.persisted.report, 2, '累计到 storage');
+  assert.equal(after.persisted.latest, 1);
+  assert.equal(after.persisted.query, 1);
+  assert.equal(after.persisted.alarm, 1);
+  // 新实例（共享 storage）能读到累计总量
+  const { inst: instB } = mkMetrics(env, state);
+  await instB.alarm();
+  const usageB = await (await instB.fetch(new Request('https://do.internal/usage'))).json();
+  assert.equal(usageB.persisted.report, 2, '跨实例累计保留');
+});
+
 test('MetricsDO: /latest 增量 Map evict 后从 storage 恢复并回填（降额优化）', async () => {
   const env = makeEnv({ ARCHIVE_TO_D1: '0' });
   const state = mockState();

@@ -156,6 +156,13 @@ wrangler secret put PANEL_USERS      # 回车后粘贴值，如 alice:pass1,bob:
 
 > ⚠️ 配置过 dashboard secret 的 Worker 只能通过 Builds/CI 部署（`wrangler deploy` 会被拒绝），参见方式一第 4 步说明。
 
+### 免费额度与容量估算（部署前评估）
+
+- **D1 存储**：`metrics_min` 每机每日约 `1,440` 行（保留 `METRICS_RETENTION_DAYS` 天，默认 30 → 约 `43,200×S` 行，S=服务器数）；`metrics_custom` 再乘每机自定义指标数 `C`（约 `43,200×S×C` 行）。**5GB 免费档**建议：`S×C` ≤ 约 100（默认 30 天保留）。
+- **`METRICS_RETENTION_DAYS`**（可选变量，默认 30）：历史保留天数，缩短可线性降低 D1 容量占用（如 7 天则 `metrics_min` 约 `10,080×S` 行）。Worker → Settings → Variables（非 Secret）配置。
+- **自定义指标建议每机 ≤20 个**：面板「自定义指标设置」弹窗已给出容量提示。
+- **用量观测**：管理员访问 `GET /api/usage` 可查看近 24h 上报帧 / DO 事件 / D1 写行估算（Worker 请求计数 + MetricsDO 用量，仅管理员）。
+
 **Webhook 告警配置**（可选，**模板化**）：登录面板 → **设置**弹窗 → 「告警」区填写即启用（存 D1 `settings.alerts`，**无需环境变量**）。支持 **GET/POST**、**JSON/纯文本**、**token 放 URL/Header/Body 任意位置**，任意渠道由用户侧对接。
 
 | 配置项 | 默认 | 说明 |

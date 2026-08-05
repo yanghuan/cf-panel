@@ -145,7 +145,7 @@ test('MetricsDO: 家政状态持久化跨 evict（A3：fullSweep/prune 不因重
   assert.equal(hAfter.lastPruneAt, hBefore.lastPruneAt, '未到期不重复 prune');
 });
 
-test('B10: MetricsDO 上报驱动聚合推送（set_push 开启 + 3s 节流）', async () => {
+test('B10: MetricsDO 上报驱动聚合推送（set_push 开启 + 5s 节流）', async () => {
   // 自定义 Panel stub：记录 init（makePanelStub 不记录请求体）
   const pushCalls = [];
   const env = makeEnv({
@@ -169,13 +169,13 @@ test('B10: MetricsDO 上报驱动聚合推送（set_push 开启 + 3s 节流）',
   assert.equal(pushCount(), 1, '开启后 /report 触发 latest_push');
   const body = JSON.parse(pushCalls.find((c) => c.url.includes('/rpc/latest_push')).init.body);
   assert.equal(body.latest[1].cpu, 2, '推送包含最新指标');
-  // 3s 内再上报 → 节流不推送
+  // 5s 内再上报 → 节流不推送
   await call('/report', { method: 'POST', body: JSON.stringify({ serverId: 1, minTs: nowMin, cpu: 3 }) });
-  assert.equal(pushCount(), 1, '3s 内不重复推送');
-  // 超过 3s → 重新推送
-  inst.lastPushAt = Date.now() - 3100;
+  assert.equal(pushCount(), 1, '5s 内不重复推送');
+  // 超过 5s → 重新推送
+  inst.lastPushAt = Date.now() - 5100;
   await call('/report', { method: 'POST', body: JSON.stringify({ serverId: 1, minTs: nowMin, cpu: 4 }) });
-  assert.equal(pushCount(), 2, '超过 3s 重新推送');
+  assert.equal(pushCount(), 2, '超过 5s 重新推送');
 });
 
 test('B10: latest_push 对已撤销观看者关闭连接（修复验证问题2）', async () => {
@@ -930,15 +930,15 @@ test('TerminalDO: /rpc/set_viewers 按观看者数切换快/慢采', async () =>
   let res = await inst.fetch(new Request('https://do.internal/rpc/set_viewers', { method: 'POST', body: JSON.stringify({ count: 1 }) }));
   assert.equal(res.status, 200);
   assert.deepEqual(sent, [
-    JSON.stringify({ type: 'set_report_interval', interval: 3 }),
-    JSON.stringify({ type: 'set_report_interval', interval: 3 }),
+    JSON.stringify({ type: 'set_report_interval', interval: 5 }),
+    JSON.stringify({ type: 'set_report_interval', interval: 5 }),
   ]);
   // 1→0 观看者 → 慢采 120s
   res = await inst.fetch(new Request('https://do.internal/rpc/set_viewers', { method: 'POST', body: JSON.stringify({ count: 0 }) }));
   assert.equal(res.status, 200);
   assert.deepEqual(sent, [
-    JSON.stringify({ type: 'set_report_interval', interval: 3 }),
-    JSON.stringify({ type: 'set_report_interval', interval: 3 }),
+    JSON.stringify({ type: 'set_report_interval', interval: 5 }),
+    JSON.stringify({ type: 'set_report_interval', interval: 5 }),
     JSON.stringify({ type: 'set_report_interval', interval: 120 }),
     JSON.stringify({ type: 'set_report_interval', interval: 120 }),
   ]);

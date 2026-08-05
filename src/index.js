@@ -16,7 +16,8 @@ const LATEST_CACHE_TTL_MS = 4000; // MetricsDO /latest 共享缓存 TTL（多观
 const SYNC_MIN_INTERVAL_MS = 2000; // PanelDO sync 频率下限（<2s 忽略，防任意消息/高频触发全链路）
 const ARCHIVE_IDLE_INTERVAL_MS = 60 * 60 * 1000; // 闲置（无数据且告警关闭）时 alarm 退避间隔（1h）
 const PAT_CHECK_INTERVAL_MS = 10 * 1000; // PAT 终端连接重校验间隔（B4：每条消息 → 10s 一次，−98%）
-const LATEST_PUSH_INTERVAL_MS = 3000; // B10：上报驱动聚合推送间隔（有观看者时 ≥3s 推一次全部 latest 给 PanelDO）
+const LATEST_PUSH_INTERVAL_MS = 5000; // B10：上报驱动聚合推送间隔（有观看者时 ≥5s 推一次全部 latest 给 PanelDO；
+// 单机时被 REPORT_FWD_THROTTLE_S=5s 钳制（MetricsDO 每 5s 收帧），多机时聚合多台上报防推送风暴）
 const PUSH_PROBE_INTERVAL_MS = 30 * 1000; // pushOn 自愈反查 /viewers 的间隔（MetricsDO evict 丢失 pushOn 时）
 const PANEL_SWITCH_GRACE_MS = 30 * 1000; // 观看者 0→1 后在线判定用慢宽限的过渡期：Agent 切快采并完成首帧上报前，
 // 用 15s 快宽限会把慢采周期中（120s 内无上报）的节点误判离线；30s 后快宽限正常生效
@@ -34,13 +35,13 @@ const AUDIT_RETENTION_DAYS = 90; // 审计日志保留期（天），过期行�
 const PRUNE_INTERVAL_MS = 24 * 60 * 60 * 1000; // 保留期清理周期
 // 在线判定宽限期（秒）：按观看者状态动态选择——
 // 无观看者：agent 慢采 120s，需约 1.5 倍间隔宽限（与离线告警阈值 offline_after_s=180 对齐）；
-// 有观看者：agent 快采 3s，5 次未上报（15s）即判定离线。15s = 5 个快采周期，
+// 有观看者：agent 快采 5s，3 次未上报（15s）即判定离线。15s = 3 个快采周期，
 // 留足"切快采 ≤5s + 控制通道重连间隙 3~6s + 网络抖动"的余量，又远快于 180s。
 const ONLINE_GRACE_SLOW_S = 180;
 const ONLINE_GRACE_FAST_S = 15;
 
 // 省配额上报策略：有前端观看者时 agent 快采，否则低频采样
-const REPORT_FAST_INTERVAL_S = 3;  // 有观看者：3 秒上报
+const REPORT_FAST_INTERVAL_S = 5;  // 有观看者：5 秒上报（快采 28,800 → 17,280 帧/天/机）
 const REPORT_SLOW_INTERVAL_S = 120; // 无人查看：120 秒上报
 
 // MCP（Model Context Protocol）标准 AI 接入：无状态 Streamable HTTP（2026-07-28 修订版）
@@ -423,10 +424,11 @@ async function getServerRow(env, serverId) {
   if (row) serverRowCache.set(serverId, { ...row, ts: Date.now() });
   return row;
 }
-// B9：MetricsDO /report 转发节流（仅分钟切换或 ≥10s 才转发；快采 28,800 → ~8,640 DO 事件/天/机）。
-// 告警/探活判定搭 /report 顺风车，随之降为 ~10s 一次（冷却 30min 不受影响，探活判定延迟 ≤10s 可接受）；
-// 卡片新鲜度 3s→≤10s，last_seen_s 最旧 ~13s 仍低于 15s 快宽限（留余量）
-const REPORT_FWD_THROTTLE_S = 10;
+// B9：MetricsDO /report 转发节流（仅分钟切换或 ≥5s 才转发；与快采 5s 对齐后每帧转发，
+// 该限速主要兜底 agent 未按服务端间隔上报的异常情况；快采 MetricsDO 事件 ≤17,280/天/机）。
+// 告警/探活判定搭 /report 顺风车，随之 ~5s 一次（冷却 30min 不受影响，探活判定延迟 ≤5s）；
+// 卡片新鲜度 ≤5s，last_seen_s 最旧 ~6s 远低于 15s 快宽限（余量充足）
+const REPORT_FWD_THROTTLE_S = 5;
 const reportFwd = new Map(); // serverId -> {ts, minTs}（跨实例 evict 丢失后仅偶发多转发一次，无害）
 
 // agent 监控上报落库：更新 last_seen（在线判定唯一依据；系统信息变更才写 info_json，探活变更才写 probe_json），
@@ -491,7 +493,7 @@ async function handleReport(env, payload) {
     }
   }
   // 时序写入 MetricsDO 热区；告警/探活判定也在该调用内顺带完成（零额外请求）。
-  // B9：转发节流——仅分钟切换或 ≥10s 才调用 MetricsDO（快采同分钟多帧不再 1:1 计费）
+  // B9：转发节流——仅分钟切换或 ≥5s 才调用 MetricsDO（限速兜底，防异常高频上报 1:1 打穿 MetricsDO）
   const mdo = doMetrics(env);
   const fwd = reportFwd.get(payload.serverId);
   const shouldFwd = !fwd || fwd.minTs !== minTs || ts - fwd.ts >= REPORT_FWD_THROTTLE_S;

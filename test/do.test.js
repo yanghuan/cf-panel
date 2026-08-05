@@ -232,6 +232,23 @@ test('MetricsDO: evict 后空 Map 上报水位不误推进，fullSweep 兜底归
   assert.equal(Number(await state.storage.get('arc:1')), oldTs, 'fullSweep 推进水位到实际归档行');
 });
 
+test('MetricsDO: evict 后热写空 Map 不误判已加载，/query 完整恢复（回归修复）', async () => {
+  const env = makeEnv({ ARCHIVE_TO_D1: '0' });
+  const nowMin = Math.floor(Date.now() / 1000 / 60);
+  // storage 预置历史行（实例 A evict 前写入的最近数据）
+  const state = mockState({
+    [`m:1:${nowMin - 5}`]: JSON.stringify({ cpu: 10 }),
+    [`m:1:${nowMin - 30}`]: JSON.stringify({ cpu: 20 }),
+  });
+  const { call } = mkMetrics(env, state);
+  // 实例 B 热写当前分钟（创建空 Map，不应视为「已完整加载」）
+  await call('/report', { method: 'POST', body: JSON.stringify({ serverId: 1, minTs: nowMin, cpu: 30 }) });
+  // /query 应完整恢复：storage 历史行 + 本次行（修复前 data.has 误判导致缺最近 ~1h）
+  const q = await (await call('/query?server_id=1&limit=100')).json();
+  const tsList = q.map((x) => x.ts).sort((a, b) => a - b);
+  assert.deepEqual(tsList, [nowMin - 30, nowMin - 5, nowMin], '热写空 Map 后 /query 仍完整恢复 storage 数据');
+});
+
 test('MetricsDO: 新服务器 arcTs=0 水位不误推进，避免大区间空循环（回归修复）', async () => {
   const env = makeEnv();
   const state = mockState(); // 无 arc key → arcTs=0（新服务器）
@@ -557,6 +574,38 @@ test('PanelDO: 服务器列表与鉴权缓存（3s/5s TTL，降 D1 读）', asyn
   assert.equal(JSON.parse(sent[0]).length, 1, '缓存列表返回');
 });
 
+test('PanelDO: webSocketError 兜底执行下线检查（最后观看者残留防护）', async () => {
+  const env = makeEnv();
+  const inst = new PanelDO({ getWebSockets: () => [] }, env); // 错误后该 ws 已不在连接表
+  await inst.webSocketError({ deserializeAttachment: () => 'tok' }, 'boom');
+  assert.ok(
+    env.TERMINAL.calls.some((c) => c.path === '/rpc/set_viewers' && JSON.parse(c.init.body).count === 0),
+    'error 后广播慢采（防观看者残留导致持续快采）'
+  );
+});
+
+test('PanelDO: 切快采过渡期（30s 内）在线判定用慢宽限（防首次误判离线）', async () => {
+  const env = makeEnv();
+  const token = await I.signJwt({ uid: 1, username: 'admin', role: 1, exp: Math.floor(Date.now() / 1000) + 3600 }, env);
+  await insertServer(env, 'k1', 'srv-a', { last_seen: Math.floor(Date.now() / 1000) - 60 }); // 60s 前上报
+  const ws = {
+    attachment: null, sent: [],
+    deserializeAttachment() { return this.attachment; },
+    serializeAttachment(t) { this.attachment = t; },
+    send(m) { this.sent.push(m); },
+  };
+  const inst = new PanelDO({ getWebSockets: () => [ws] }, env);
+  await inst.webSocketMessage(ws, JSON.stringify({ type: 'auth', token })); // 0→1 切快采
+  assert.ok(inst.fastSince > 0, '切快采时刻已记录');
+  // 过渡期内：慢宽限 180s → 60s 前上报仍在线（不误判离线）
+  await inst.webSocketMessage(ws, 'sync');
+  assert.equal(JSON.parse(ws.sent[0])[0].online, true, '过渡期慢宽限不误判离线');
+  // 过渡期结束（fastSince 拨回 31s 前）→ 快宽限 15s → 60s 前上报判离线
+  inst.fastSince = Date.now() - 31000;
+  await inst.webSocketMessage(ws, 'sync');
+  assert.equal(JSON.parse(ws.sent[1])[0].online, false, '过渡期后快宽限生效');
+});
+
 test('PanelDO: webSocketMessage 按 token 推送过滤后的服务器列表', async () => {
   const env = makeEnv();
   const token = await I.signJwt({ uid: 1, username: 'admin', role: 1, exp: Math.floor(Date.now() / 1000) + 3600 }, env);
@@ -763,6 +812,30 @@ test('TerminalDO: 活跃会话超绝对 TTL 强制回收（H-04）', async () =>
   assert.equal(inst.sessions.has('0-old'), false, '超绝对 TTL 被回收（即使有连接）');
   assert.equal(userWs.closed, true, '连接被关闭');
   assert.equal(inst.sessions.has('0-live'), true, '未超 TTL 保留');
+  // 活跃会话也排绝对 TTL alarm（4h 准时回收，不依赖后续 fetch）
+  assert.ok(st.storage.alarmTs != null, '活跃会话也排 alarm');
+  assert.ok(
+    Math.abs(st.storage.alarmTs - (now - 1000 + 4 * 3600 * 1000 + 1000)) < 10000,
+    'alarm 设为活跃会话的绝对 TTL（±10s 容忍）'
+  );
+});
+
+test('TerminalDO: maybeSweep 活跃会话按绝对 TTL 排 alarm，到期准时回收', async () => {
+  const env = makeEnv();
+  const st = mockState();
+  const inst = new TerminalDO(st, env);
+  const createdAt = Date.now() - 1000;
+  inst.sessions.set('1-a', { streamId: '1-a', serverId: 1, creatorUserId: 1, createdAt, type: 'terminal', userWs: { readyState: 1 }, agentWs: null, userBuf: [] });
+  inst.maybeSweep();
+  assert.ok(st.storage.alarmTs != null, '活跃会话也排 alarm');
+  assert.equal(st.storage.alarmTs, createdAt + 4 * 3600 * 1000 + 1000, 'alarm 对齐绝对 TTL');
+  // 模拟 4h 后：maybeSweep 强制回收（即使连接仍活跃）
+  const live = { closed: false, close() { this.closed = true; } };
+  inst.sessions.get('1-a').createdAt = Date.now() - (4 * 3600 * 1000 + 1000);
+  inst.sessions.get('1-a').userWs = live;
+  inst.maybeSweep();
+  assert.equal(live.closed, true, '超绝对 TTL 强制关闭连接');
+  assert.equal(inst.sessions.has('1-a'), false, '会话已回收');
 });
 
 test('TerminalDO: user-pending 首帧鉴权后挂接 userWs，非法 token 断开', async () => {

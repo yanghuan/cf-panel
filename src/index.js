@@ -11,6 +11,8 @@ const SHARDS = 4; // 终端 DO 分片数（改大后旧会话不可达，一般�
 const SESSION_TTL_MS = 10 * 60 * 1000; // 会话两端都断开超过 10 分钟 → 回收
 const MAX_SESSIONS_PER_SERVER = 8; // 每服务器并发会话上限（超限 429，防 PTY/bash/FD 耗尽）
 const SESSION_ABS_MS = 4 * 60 * 60 * 1000; // 会话绝对最长时长（含活跃连接，到期强制回收）
+const PANEL_SWITCH_GRACE_MS = 30 * 1000; // 观看者 0→1 后在线判定用慢宽限的过渡期：Agent 切快采并完成首帧上报前，
+// 用 15s 快宽限会把慢采周期中（120s 内无上报）的节点误判离线；30s 后快宽限正常生效
 const PAT_PREFIX = 'cfp_'; // PAT token 前缀
 const SCOPE_READ = 'server:read';
 const SCOPE_EXEC = 'server:exec';
@@ -1361,7 +1363,11 @@ export class TerminalDO {
         this.state.storage.delete('sess:' + sid).catch(() => {}); // 清理持久化会话
         continue;
       }
-      if (sess.userWs || sess.agentWs) continue; // 任一端有连接即不回收（未超绝对 TTL）
+      if (sess.userWs || sess.agentWs) {
+        // 活跃会话也按绝对 TTL 排 alarm：确保 4h 到期时准时回收，不依赖后续 fetch/alarm 偶发触发
+        next = Math.min(next, sess.createdAt + SESSION_ABS_MS);
+        continue;
+      }
       if (now - sess.createdAt > SESSION_TTL_MS) {
         this.sessions.delete(sid);
         this.state.storage.delete('sess:' + sid).catch(() => {}); // 清理持久化会话
@@ -1678,6 +1684,7 @@ export class MetricsDO {
     this.offlineLoaded = false; // 离线告警状态是否已从 storage 一次性加载（惰性）
     this.offlineState = new Map(); // serverId -> 'on'|'off'（内存副本，避免每机逐个 getAlarm）
     this.usage = { report: 0, latest: 0, query: 0, alarm: 0 }; // 用量观测：本周期（10min）计数，alarm 时累计到 storage
+    this.hotLoaded = new Set(); // serverId 已从 storage 完整加载热区的标记（见 ensureHot）
   }
 
   // 从 DO Storage 惰性恢复告警冷却 / 探活去重状态（实例 evict 后首次使用时加载一次）
@@ -1727,10 +1734,13 @@ export class MetricsDO {
       m.set(ts, JSON.parse(k.value));
     }
     this.data.set(serverId, m);
+    this.hotLoaded.add(serverId);
     return m;
   }
+  // 仅当该服务器热区已「完整加载」才直接返回内存；热写路径在 evict 后创建的空 Map 不算已加载
+  // （否则 /query 会因 data.has() 误判而跳过 storage 恢复，出现最近 ~1h 数据缺口）
   async ensureHot(serverId) {
-    if (!this.data.has(serverId)) await this.loadHot(serverId);
+    if (!this.hotLoaded.has(serverId)) await this.loadHot(serverId);
     return this.data.get(serverId);
   }
 
@@ -1872,6 +1882,7 @@ export class MetricsDO {
         await Promise.all(keys.map((k) => this.state.storage.delete(k.name)));
       } catch { /* storage 不可用则仅清内存 */ }
       this.data.delete(serverId);
+      this.hotLoaded.delete(serverId);
       this.latestByServer.delete(serverId);
       this.lastSeenSec.delete(serverId);
       // 清理该服务器的告警冷却与探活状态（内存 + storage）
@@ -2182,6 +2193,7 @@ export class PanelDO {
     this.env = env;
     this.listCache = null; // {rows, ts} 服务器列表缓存（3s TTL，多观看者共享，降 D1 读）
     this.authCache = new Map(); // token -> {user, ts} 鉴权缓存（5s TTL；PAT 删除后 ≤5s 失效）
+    this.fastSince = 0; // 最近一次 0→1 切快采时刻（毫秒）；过渡期内在线判定用慢宽限，避免首次显示离线
   }
 
   // 鉴权缓存：JWT 本身是 HMAC（无 D1 读）；PAT 每次读 D1，缓存短 TTL 降频
@@ -2261,7 +2273,10 @@ export class PanelDO {
       ws.serializeAttachment(token);
       // 首位已鉴权观看者上线（0→1）→ 各分片 agent 立即切快采（事件驱动，免每次上报查 /viewers）
       const authed = (this.state.getWebSockets?.() || []).filter((w) => w.deserializeAttachment?.());
-      if (authed.length === 1) this.broadcastViewers(1);
+      if (authed.length === 1) {
+        this.fastSince = Date.now(); // 过渡期内（30s）在线判定用慢宽限，防切快采前短暂误判离线
+        this.broadcastViewers(1);
+      }
       return;
     }
     const token = ws.deserializeAttachment() || '';
@@ -2280,8 +2295,9 @@ export class PanelDO {
       latest = await lResp.json();
     } catch { /* 无最新指标 */ }
     const now = Math.floor(Date.now() / 1000);
-    // 本 DO 内直接统计已鉴权观看者（无需额外 RPC）
-    const grace = (this.state.getWebSockets?.() || []).filter((w) => w.deserializeAttachment?.()).length > 0
+    // 本 DO 内直接统计已鉴权观看者（无需额外 RPC）；切快采过渡期（0→1 后 30s 内）用慢宽限
+    const hasViewers = (this.state.getWebSockets?.() || []).filter((w) => w.deserializeAttachment?.()).length > 0;
+    const grace = (hasViewers && Date.now() - this.fastSince >= PANEL_SWITCH_GRACE_MS)
       ? ONLINE_GRACE_FAST_S : ONLINE_GRACE_SLOW_S;
     const list = [];
     for (const s of serverRows) {
@@ -2304,7 +2320,17 @@ export class PanelDO {
   // 观看者断开：最后一个已鉴权观看者下线（1→0）→ 广播慢采（事件驱动省配额）
   async webSocketClose(ws) {
     const authed = (this.state.getWebSockets?.() || []).filter((w) => w !== ws && w.deserializeAttachment?.());
-    if (authed.length === 0) this.broadcastViewers(0);
+    if (authed.length === 0) {
+      this.fastSince = 0;
+      this.broadcastViewers(0);
+    }
+  }
+
+  // 观看者异常断开：错误回调同样执行下线检查（error 后连接即将关闭，close 回调若延迟/缺失则在此兜底，
+  // 避免最后一个观看者残留导致 agent 持续快采）；同时记录错误便于诊断
+  async webSocketError(ws, error) {
+    try { console.error('panel ws error:', error); } catch { /* ignore */ }
+    await this.webSocketClose(ws);
   }
 }
 

@@ -350,13 +350,13 @@
     try { w.close(); } catch { /* ignore */ }
   }
 
-  // 后台标签页隐藏时暂停 sync（恢复可见时立即拉取一次 + 恢复 3s 定时）
+  // 后台标签页隐藏时关闭整个 WS（观看者计数减 1 → agent 恢复慢采，后台接近零成本）；
+  // 恢复可见时重建连接：onopen 发 auth + startPushTimer 立即拉取一次并恢复 3s 定时
   document.addEventListener('visibilitychange', () => {
     if (document.hidden) {
-      stopPushTimer();
+      stopPush();
     } else if (token) {
-      startPush();      // 连接已断开则重建；仍连接则 no-op
-      startPushTimer(); // 立即拉取一次 + 恢复定时
+      startPush();
     }
   });
 

@@ -54,10 +54,17 @@ jobs:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS: -C linker=musl-gcc -C strip=symbols
         run: cargo build --release --target x86_64-unknown-linux-musl
 
+      - name: 生成 UPX --lzma 压缩版（省磁盘 ~58%，启动约 +60ms / RSS +0.5MB）
+        run: |
+          sudo apt-get install -y upx-ucl
+          cd agent/rust/target/x86_64-unknown-linux-musl/release
+          upx --lzma --force cf-panel-agent -o cf-panel-agent.upx
+
       - name: 生成 Release 校验和（sha256）
         run: |
           cd agent/rust/target/x86_64-unknown-linux-musl/release
           sha256sum cf-panel-agent > cf-panel-agent.sha256
+          sha256sum cf-panel-agent.upx > cf-panel-agent.upx.sha256
 
       - name: 生成 Release 标题（cf-panel-agent + 时间）
         id: release
@@ -71,6 +78,10 @@ jobs:
           # 固定用法文本
           cat > /tmp/release-body.md <<'EOF'
           Rust 版 cf-panel agent 全静态二进制（musl，仅依赖系统调用，任意 Linux 发行版直跑）。
+
+          两个版本（校验和见同名 `.sha256` 文件）：
+          - `cf-panel-agent`：完整版（约 2MB），无启动额外开销
+          - `cf-panel-agent.upx`：UPX `--lzma` 压缩版（约 0.9MB，省磁盘 ~58%），启动约 +60ms、常驻内存 +0.5MB
 
           用法：
           ```
@@ -101,6 +112,8 @@ jobs:
           files: |
             agent/rust/target/x86_64-unknown-linux-musl/release/cf-panel-agent
             agent/rust/target/x86_64-unknown-linux-musl/release/cf-panel-agent.sha256
+            agent/rust/target/x86_64-unknown-linux-musl/release/cf-panel-agent.upx
+            agent/rust/target/x86_64-unknown-linux-musl/release/cf-panel-agent.upx.sha256
           name: ${{ steps.release.outputs.title }}
           tag_name: ${{ steps.release.outputs.tag }}
           body_path: /tmp/release-body.md

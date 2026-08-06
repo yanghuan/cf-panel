@@ -16,6 +16,8 @@ const FILE_LIMIT: u64 = 500 * 1024 * 1024; // 单文件总上限 500MB
 const READ_BLOCK: usize = 1024 * 1024;
 // 文件 WS 入站消息大小上限（防恶意超大 data 整包占内存；正常前端 512KB 分块远小于此）
 const WS_MSG_LIMIT: usize = 8 * 1024 * 1024;
+// L3：终端入站消息上限 1MB（正常输入单帧极小，异常/恶意超大帧直接断开，与文件通道对齐）
+const TERM_MSG_LIMIT: usize = 1024 * 1024;
 // 终端输出合帧：聚合 TERM_BATCH_MS 或 TERM_BATCH_BYTES 后合并为一条 WS 帧。
 // 刷屏场景（pty 每 8KB 一帧）DO 计费消息数从 N 帧降到约 1 帧/16ms（约 −60%~75%）；
 // 交互延迟 ≤16ms 人眼无感；顺序保持（同批内按到达序拼接）。
@@ -142,7 +144,13 @@ async fn run_terminal_inner(cfg: &Config, term: &Arc<TermSession>) {
         return;
     };
     req.headers_mut().insert("X-Agent-Key", key);
-    let (ws, _) = match tokio_tungstenite::connect_async(req).await {
+    // L3：终端入站限制 1MB（与文件通道对齐，防恶意超大帧占内存）
+    let cfg_ws = tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
+        max_message_size: Some(TERM_MSG_LIMIT),
+        ..Default::default()
+    };
+    let (ws, _) = match tokio_tungstenite::connect_async_with_config(req, Some(cfg_ws), false).await
+    {
         Ok(x) => x,
         Err(e) => {
             log(format!("terminal {} connect failed: {e}", term.sid));

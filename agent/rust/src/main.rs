@@ -98,28 +98,39 @@ fn validate_wss(wss: &str) -> Result<(), String> {
     Err("AGENT_WSS_URL 必须以 wss:// 或 ws:// 开头".to_string())
 }
 
-// ---------------- 日志（追加 + 轮转） ----------------
-fn log_file() -> &'static std::sync::Mutex<std::fs::File> {
-    static F: OnceLock<std::sync::Mutex<std::fs::File>> = OnceLock::new();
-    F.get_or_init(|| {
-        let cfg = CONFIG.get().unwrap();
-        let f = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&cfg.log_file)
-            .unwrap_or_else(|_| std::fs::File::create(&cfg.log_file).unwrap());
-        std::sync::Mutex::new(f)
+// ---------------- 日志（mpsc + 专用写线程，M6：async 侧零阻塞） ----------------
+// M6：stdout 接管道且对端不消费时 write_all 会永久阻塞 worker 线程；改有界 mpsc 队列 +
+// 专用 OS 写线程，async 侧 try_send 失败（队列满）即丢弃降级，采集/会话路径永不因日志挂起。
+fn log_sender() -> &'static std::sync::mpsc::SyncSender<String> {
+    static TX: OnceLock<std::sync::mpsc::SyncSender<String>> = OnceLock::new();
+    TX.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<String>(1024);
+        std::thread::Builder::new()
+            .name("log-writer".to_string())
+            .spawn(move || {
+                let cfg = CONFIG.get().unwrap();
+                let mut f = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&cfg.log_file)
+                    .unwrap_or_else(|_| std::fs::File::create(&cfg.log_file).unwrap());
+                while let Ok(line) = rx.recv() {
+                    // 轮转：文件超上限直接截断（原写入前检查逻辑移入写线程）
+                    if f.metadata().map(|m| m.len()).unwrap_or(0) > cfg.log_max {
+                        let _ = f.set_len(0);
+                    }
+                    let _ = f.write_all(line.as_bytes());
+                    let _ = std::io::stdout().write_all(line.as_bytes());
+                }
+            })
+            .expect("spawn log writer thread");
+        tx
     })
 }
 pub fn log(msg: impl AsRef<str>) {
     let line = format!("[cf-panel] {}\n", msg.as_ref());
-    if let Ok(mut f) = log_file().lock() {
-        if f.metadata().map(|m| m.len()).unwrap_or(0) > CONFIG.get().unwrap().log_max {
-            let _ = f.set_len(0);
-        }
-        let _ = f.write_all(line.as_bytes());
-    }
-    let _ = std::io::stdout().write_all(line.as_bytes());
+    // M6：队列满（写线程积压、对端不消费）时丢弃而非阻塞
+    let _ = log_sender().try_send(line);
 }
 
 // ---------------- 控制通道（断线重连 + 指令分发 + 上报） ----------------
@@ -131,6 +142,7 @@ const RETRY_MAX_SECS: u64 = 300;
 const AUTH_FAIL_SECS: u64 = 300;
 const MIN_UPTIME_RESET_SECS: u64 = 10; // 存活 ≥10s 才算"健康连接"，才重置退避（H4 防秒断风暴）
 const CONTROL_READ_TIMEOUT_S: u64 = 180; // 读循环超时：180s 无任何消息判定半开（健康连接有 30s 心跳）
+const CTRL_MSG_LIMIT: usize = 64 * 1024; // L3：控制通道入站消息上限 64KB（指令/心跳远小于此）
 
 async fn run_control(
     cfg: &Config,
@@ -187,7 +199,12 @@ async fn control_conn(
     let url = format!("{}/control", cfg.wss);
     let mut req = url.into_client_request()?;
     req.headers_mut().insert("X-Agent-Key", cfg.key.parse()?);
-    let (ws, _) = tokio_tungstenite::connect_async(req).await?;
+    // L3：控制通道入站限制 64KB，防恶意超大消息整包占内存（异常帧读循环报错即重连）
+    let cfg_ws = tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
+        max_message_size: Some(CTRL_MSG_LIMIT),
+        ..Default::default()
+    };
+    let (ws, _) = tokio_tungstenite::connect_async_with_config(req, Some(cfg_ws), false).await?;
     log("control channel connected");
     let (write, mut read) = ws.split();
     let write = Arc::new(Mutex::new(write));

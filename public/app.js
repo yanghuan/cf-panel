@@ -858,12 +858,11 @@
   }
 
   function renderMonitorChart(rows, custom) {
-    const wrap = $('#monitor-chart').parentElement;
+    const wrap = $('#monitor-modal .chart-wrap');
     if (monitorChart) { monitorChart.destroy(); monitorChart = null; }
-    // 重建 canvas（可能被上次的提示文本覆盖）
-    if (!$('#monitor-chart') || $('#monitor-chart').tagName !== 'CANVAS') {
-      wrap.innerHTML = '<canvas id="monitor-chart"></canvas>';
-    }
+    // 重建 canvas（用固定容器定位，canvas 可能被上次提示文本覆盖导致元素为空）
+    const canvas = wrap.querySelector('#monitor-chart');
+    if (!canvas || canvas.tagName !== 'CANVAS') wrap.innerHTML = '<canvas id="monitor-chart"></canvas>';
     if (!window.Chart) {
       wrap.innerHTML = '<p class="muted" style="padding:24px">图表库（Chart.js）加载失败，请检查网络。</p>';
       return;
@@ -948,8 +947,11 @@
   }
 
   function renderCustomChart(custom) {
-    const wrap = $('#custom-chart').parentElement;
+    const wrap = $('#custom-modal .chart-wrap');
     if (customChart) { customChart.destroy(); customChart = null; }
+    // 若 canvas 被上次提示文本覆盖则重建（用固定容器定位，防重复打开时 #custom-chart 为空）
+    const canvas = wrap.querySelector('#custom-chart');
+    if (!canvas || canvas.tagName !== 'CANVAS') wrap.innerHTML = '<canvas id="custom-chart"></canvas>';
     if (!window.Chart) {
       wrap.innerHTML = '<p class="muted" style="padding:24px">图表库（Chart.js）加载失败，请检查网络。</p>';
       return;

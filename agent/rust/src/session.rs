@@ -12,11 +12,9 @@ use tokio_tungstenite::tungstenite::Message;
 const FILE_LIMIT: u64 = 500 * 1024 * 1024; // 单文件总上限 500MB
                                            // 服务端固定内部缓冲（与客户端分块解耦）：
                                            // - READ_BLOCK：单次 read 最多读取并返回的字节（前端按返回的 got 累加续传，自动适配任意值）。
-                                           //   1MB 与前端下载分块对齐：一次 read 返回 1MB，下载 1MB 只需 1 个 read 请求/帧（原 512KB 需 2 帧，帧数 −50%）
-                                           // - WRITE_BUF：写路径流式 base64 解码的缓冲（边解边写，内存不随块大小增长）
+                                           //   512KB 块 + 1MB 上限：混合帧下原始字节直传，帧大小 = JSON 头 + 数据（块 ≤512KB 时帧 < 1MB）
 const READ_BLOCK: usize = 1024 * 1024;
-const WRITE_BUF: usize = 64 * 1024;
-// 文件 WS 入站消息大小上限（防恶意超大 data 整包占内存；正常前端 1MB 分块远小于此）
+// 文件 WS 入站消息大小上限（防恶意超大 data 整包占内存；正常前端 512KB 分块远小于此）
 const WS_MSG_LIMIT: usize = 8 * 1024 * 1024;
 // 终端输出合帧：聚合 TERM_BATCH_MS 或 TERM_BATCH_BYTES 后合并为一条 WS 帧。
 // 刷屏场景（pty 每 8KB 一帧）DO 计费消息数从 N 帧降到约 1 帧/16ms（约 −60%~75%）；
@@ -24,9 +22,6 @@ const WS_MSG_LIMIT: usize = 8 * 1024 * 1024;
 const TERM_BATCH_MS: u64 = 16;
 const TERM_BATCH_BYTES: usize = 32 * 1024;
 
-fn b64e(data: &[u8]) -> String {
-    base64::Engine::encode(&base64::engine::general_purpose::STANDARD, data)
-}
 fn err_json(msg: &str) -> String {
     serde_json::json!({ "type": "error", "ok": false, "message": msg }).to_string()
 }
@@ -249,12 +244,18 @@ pub async fn run_file_session(cfg: Config, sid: String) {
             Ok(m) => m,
             Err(_) => break,
         };
-        let line = match msg {
-            Message::Text(t) => t,
+        // 混合帧协议：Text 为无数据命令（list/read/abort，及旧协议 base64 write）；
+        // Binary 为 write 混合帧（JSON 头 + '\n' + 原始字节）。响应按内容区分 Text/Binary
+        let reply = match msg {
+            Message::Text(t) => handle_file_cmd(&t, &created).await,
+            Message::Binary(b) => handle_file_cmd_binary(&b, &created).await,
             _ => continue,
         };
-        let reply = handle_file_cmd(&line, &created).await;
-        if write.send(Message::Text(reply)).await.is_err() {
+        let sent = match reply {
+            FileReply::Text(s) => write.send(Message::Text(s)).await,
+            FileReply::Binary(b) => write.send(Message::Binary(b)).await,
+        };
+        if sent.is_err() {
             break;
         }
     }
@@ -268,10 +269,16 @@ pub async fn run_file_session(cfg: Config, sid: String) {
     log(format!("file session {sid} ended"));
 }
 
-async fn handle_file_cmd(line: &str, created: &Arc<std::sync::Mutex<Vec<String>>>) -> String {
+// 文件命令响应：Text（list_result/write_result/error 等无数据）或 Binary（read_result 混合帧）
+enum FileReply {
+    Text(String),
+    Binary(Vec<u8>),
+}
+
+async fn handle_file_cmd(line: &str, created: &Arc<std::sync::Mutex<Vec<String>>>) -> FileReply {
     let v: serde_json::Value = match serde_json::from_str(line) {
         Ok(v) => v,
-        Err(_) => return err_json("bad json"),
+        Err(_) => return FileReply::Text(err_json("bad json")),
     };
     let ty = v.get("type").and_then(|x| x.as_str()).unwrap_or("");
     let path = v
@@ -284,27 +291,38 @@ async fn handle_file_cmd(line: &str, created: &Arc<std::sync::Mutex<Vec<String>>
             // 可选通配符过滤规则（由前端输入框传递；过滤在 agent 端完成，避免大目录
             // 截断（FILE_LIST_MAX=1000）后前端只拿到截断区间子集而遗漏匹配文件）
             let pattern = v.get("pattern").and_then(|x| x.as_str()).map(String::from);
-            file_list(path, pattern).await
+            FileReply::Text(file_list(path, pattern).await)
         }
         "read" => {
             let offset = v.get("offset").and_then(|x| x.as_u64()).unwrap_or(0);
             let limit = v.get("limit").and_then(|x| x.as_u64()).unwrap_or(0);
-            file_read(path, offset, limit).await
+            match file_read(path, offset, limit).await {
+                Ok(frame) => FileReply::Binary(frame),
+                Err(e) => FileReply::Text(err_json(&e)),
+            }
         }
         "write" => {
+            // 旧协议兼容：Text + base64 data（新协议走 Binary 混合帧，见 handle_file_cmd_binary）
             let offset = v.get("offset").and_then(|x| x.as_u64()).unwrap_or(0);
             let data = v
                 .get("data")
                 .and_then(|x| x.as_str())
                 .unwrap_or("")
                 .to_string();
+            let bytes =
+                match base64::Engine::decode(&base64::engine::general_purpose::STANDARD, data) {
+                    Ok(b) => b,
+                    Err(_) => return FileReply::Text(err_json("bad base64")),
+                };
             let commit = v.get("commit").and_then(|x| x.as_bool()).unwrap_or(false);
             let upload_id = v
                 .get("upload_id")
                 .and_then(|x| x.as_str())
                 .unwrap_or("default")
                 .to_string();
-            file_write(path, offset, data, commit, upload_id, created.clone()).await
+            FileReply::Text(
+                file_write(path, offset, bytes, commit, upload_id, created.clone()).await,
+            )
         }
         "abort" => {
             let upload_id = v
@@ -312,10 +330,42 @@ async fn handle_file_cmd(line: &str, created: &Arc<std::sync::Mutex<Vec<String>>
                 .and_then(|x| x.as_str())
                 .unwrap_or("default")
                 .to_string();
-            file_abort(path, upload_id).await
+            FileReply::Text(file_abort(path, upload_id).await)
         }
-        _ => err_json("unknown cmd"),
+        _ => FileReply::Text(err_json("unknown cmd")),
     }
+}
+
+// Binary 混合帧：'\n' 前为 JSON 元数据（write 命令），'\n' 后为原始文件字节
+async fn handle_file_cmd_binary(
+    frame: &[u8],
+    created: &Arc<std::sync::Mutex<Vec<String>>>,
+) -> FileReply {
+    let Some(nl) = frame.iter().position(|&b| b == b'\n') else {
+        return FileReply::Text(err_json("bad frame (no json header)"));
+    };
+    let v: serde_json::Value = match serde_json::from_slice(&frame[..nl]) {
+        Ok(v) => v,
+        Err(_) => return FileReply::Text(err_json("bad json")),
+    };
+    let ty = v.get("type").and_then(|x| x.as_str()).unwrap_or("");
+    let path = v
+        .get("path")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
+    if ty != "write" {
+        return FileReply::Text(err_json("unknown cmd"));
+    }
+    let offset = v.get("offset").and_then(|x| x.as_u64()).unwrap_or(0);
+    let commit = v.get("commit").and_then(|x| x.as_bool()).unwrap_or(false);
+    let upload_id = v
+        .get("upload_id")
+        .and_then(|x| x.as_str())
+        .unwrap_or("default")
+        .to_string();
+    let data = frame[nl + 1..].to_vec();
+    FileReply::Text(file_write(path, offset, data, commit, upload_id, created.clone()).await)
 }
 
 // spawn_blocking + 超时：防止挂死的挂载点（NFS 等）永久占用 blocking 线程
@@ -417,19 +467,21 @@ async fn file_list(path: String, pattern: Option<String>) -> String {
     }
 }
 
-async fn file_read(path: String, offset: u64, limit: u64) -> String {
+// 读取返回混合帧（JSON 头 + '\n' + 原始字节，无 base64 膨胀）。
+// 块上限仍由 READ_BLOCK 约束（与前端 512KB 分块一致），错误返回 Err(描述)
+async fn file_read(path: String, offset: u64, limit: u64) -> Result<Vec<u8>, String> {
     match blocking_with_timeout(30, move || {
         use std::io::{Read, Seek, SeekFrom};
         let meta = match std::fs::metadata(&path) {
             Ok(m) => m,
-            Err(_) => return err_json("not a file or unreadable"),
+            Err(_) => return Err("not a file or unreadable".to_string()),
         };
         let size = meta.len();
         if size > FILE_LIMIT {
-            return err_json("file exceeds 500MB limit");
+            return Err("file exceeds 500MB limit".to_string());
         }
         if !meta.is_file() {
-            return err_json("not a file or unreadable");
+            return Err("not a file or unreadable".to_string());
         }
         // 单次读取上限 READ_BLOCK：服务端固定 512KB 内部缓冲，与前端分块解耦。
         // 即使 limit=0（读全文件），也最多返回 READ_BLOCK，前端按返回的 got 累加 offset 续传，自动适配任意块大小。
@@ -441,10 +493,10 @@ async fn file_read(path: String, offset: u64, limit: u64) -> String {
         let read_len = (want as usize).min(READ_BLOCK) as u64;
         let mut f = match std::fs::File::open(&path) {
             Ok(f) => f,
-            Err(_) => return err_json("not a file or unreadable"),
+            Err(_) => return Err("not a file or unreadable".to_string()),
         };
         if f.seek(SeekFrom::Start(offset)).is_err() {
-            return err_json("read failed");
+            return Err("read failed".to_string());
         }
         let mut buf = vec![0u8; read_len as usize];
         let mut got = 0usize;
@@ -455,23 +507,28 @@ async fn file_read(path: String, offset: u64, limit: u64) -> String {
                 Err(_) => break,
             }
         }
-        serde_json::json!({
+        // 混合帧：JSON 头 + '\n' + 原始字节
+        let head = serde_json::json!({
             "type": "read_result", "ok": true, "path": path,
-            "offset": offset, "data": b64e(&buf[..got]), "got": got, "size": size,
+            "offset": offset, "got": got, "size": size,
         })
-        .to_string()
+        .to_string();
+        let mut frame = head.into_bytes();
+        frame.push(b'\n');
+        frame.extend_from_slice(&buf[..got]);
+        Ok(frame)
     })
     .await
     {
         Some(v) => v,
-        None => err_json("read timeout"),
+        None => Err("read timeout".to_string()),
     }
 }
 
 async fn file_write(
     path: String,
     offset: u64,
-    data: String,
+    data: Vec<u8>,
     commit: bool,
     upload_id: String,
     created: Arc<std::sync::Mutex<Vec<String>>>,
@@ -514,23 +571,11 @@ async fn file_write(
             cleanup(&tmp);
             return err_json("write failed");
         }
-        // 流式 base64 解码：边解边写，内部缓冲固定 WRITE_BUF，内存不随入站块大小增长。
-        let mut dec = base64::read::DecoderReader::new(
-            std::io::Cursor::new(data.into_bytes()),
-            &base64::engine::general_purpose::STANDARD,
-        );
-        let mut buf = vec![0u8; WRITE_BUF];
-        let mut written: u64 = 0;
-        loop {
-            match dec.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    if f.write_all(&buf[..n]).is_err() {
-                        cleanup(&tmp);
-                        return err_json("write failed");
-                    }
-                    written += n as u64;
-                }
+        // 原始字节直写（混合帧数据不再 base64）；块 ≤512KB，内存随入站块大小即块大小
+        let mut written = 0usize;
+        while written < data.len() {
+            match f.write(&data[written..]) {
+                Ok(n) => written += n,
                 Err(_) => {
                     cleanup(&tmp);
                     return err_json("write failed");
@@ -580,12 +625,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn b64e_roundtrip() {
-        assert_eq!(b64e(b"hello cf-panel"), "aGVsbG8gY2YtcGFuZWw=");
-        assert_eq!(b64e(b""), "");
-    }
-
-    #[test]
     fn err_json_shape() {
         let v: serde_json::Value = serde_json::from_str(&err_json("boom")).unwrap();
         assert_eq!(v["type"], "error");
@@ -613,12 +652,7 @@ mod tests {
     #[test]
     fn buffer_constants() {
         // 固定缓冲重构的常量约束（与前端分块解耦的服务端固定缓冲）
-        assert_eq!(
-            READ_BLOCK,
-            1024 * 1024,
-            "READ_BLOCK 与前端 1MB 下载分块对齐"
-        );
-        assert_eq!(WRITE_BUF, 64 * 1024);
+        assert_eq!(READ_BLOCK, 1024 * 1024, "READ_BLOCK 单次读取上限");
         assert_eq!(WS_MSG_LIMIT, 8 * 1024 * 1024);
         assert_eq!(FILE_LIMIT, 500 * 1024 * 1024);
         // 常量断言（编译期校验，避免运行时断言被 clippy 标记）

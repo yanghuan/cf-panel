@@ -570,12 +570,25 @@
       fileWs = ws;
       ws.onopen = () => { fileSend({ type: 'auth', token }); reloadFileList(); };
       ws.onmessage = (ev) => {
+        if (typeof ev.data !== 'string') {
+          // Binary 混合帧：read_result（JSON 头\n + 原始字节，无 base64 膨胀）
+          const p = ev.data instanceof ArrayBuffer
+            ? Promise.resolve(new Uint8Array(ev.data))
+            : ev.data.arrayBuffer().then((b) => new Uint8Array(b));
+          p.then((buf) => {
+            const nl = buf.indexOf(10);
+            if (nl < 0) return;
+            let j; try { j = JSON.parse(new TextDecoder().decode(buf.subarray(0, nl))); } catch { return; }
+            if (j.type === 'read_result' && j.ok) onReadResult(j, buf.subarray(nl + 1));
+          }).catch(() => { /* ignore */ });
+          return;
+        }
         let j; try { j = JSON.parse(ev.data); } catch { return; }
         if (j.type === 'list_result' && j.ok) {
           renderFileList(j.entries); // agent 端已按过滤规则返回
           if (j.truncated) $('#file-msg').textContent = '目录条目过多，仅显示前 1000 项';
         }
-        else if (j.type === 'read_result' && j.ok) onReadResult(j);
+        else if (j.type === 'read_result' && j.ok) onReadResult(j); // 兼容旧 base64 Text
         else if (j.type === 'write_result' && j.ok) onWriteResult(j);
         else if (j.type === 'error') $('#file-msg').textContent = `错误：${j.message}`;
       };
@@ -622,7 +635,7 @@
     fileSend({ type: 'read', path, offset: 0, limit: FILE_CHUNK });
   }
 
-  function onReadResult(j) {
+  function onReadResult(j, data) {
     if (!fileDownload || j.path !== fileDownload.path) {
       $('#file-msg').textContent = '下载状态异常，请重试';
       fileDownload = null;
@@ -634,10 +647,14 @@
       fileDownload = null;
       return;
     }
-    // 每块立即解码为 Uint8Array（避免字符串积累 + 完成时 join/二次复制），内存峰值显著下降
-    const bin = atob(j.data);
-    const bytes = new Uint8Array(bin.length);
-    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    // 混合帧：data 为原始字节（Uint8Array）；兼容旧 base64 Text（j.data）
+    let bytes = data;
+    if (!bytes && j.data) {
+      const bin = atob(j.data);
+      bytes = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    }
+    if (!bytes) return;
     fileDownload.parts.push(bytes);
     fileDownload.received += j.got;
     const pct = fileDownload.size ? Math.min(100, Math.round((fileDownload.received / fileDownload.size) * 100)) : 0;
@@ -675,12 +692,17 @@
       if (!fileUpload || fileUpload.sent >= fileUpload.size) return;
       const chunk = file.slice(fileUpload.sent, Math.min(fileUpload.sent + FILE_CHUNK, file.size));
       reader.onload = () => {
-        const b64 = String(reader.result).split(',')[1] || '';
         const commit = fileUpload.sent + chunk.size >= file.size;
-        fileSend({ type: 'write', path: fileUpload.path, offset: fileUpload.sent, data: b64, commit, upload_id: fileUpload.uploadId });
+        // 混合帧：JSON 头 + '\n' + 原始字节（Binary 帧，无 base64 膨胀）
+        const head = new TextEncoder().encode(JSON.stringify({ type: 'write', path: fileUpload.path, offset: fileUpload.sent, commit, upload_id: fileUpload.uploadId }) + '\n');
+        const data = new Uint8Array(reader.result);
+        const frame = new Uint8Array(head.length + data.length);
+        frame.set(head, 0);
+        frame.set(data, head.length);
+        if (fileWs && fileWs.readyState === 1) fileWs.send(frame.buffer);
         fileUpload.sent += chunk.size; // 下一块在 onWriteResult 确认后发送
       };
-      reader.readAsDataURL(chunk);
+      reader.readAsArrayBuffer(chunk);
     };
     fileUpload.sendNext = sendNext;
     $('#btn-file-cancel').classList.remove('hidden');

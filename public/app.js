@@ -137,6 +137,32 @@
     return `<div class="mt-title">实时指标</div>${items}${sysHtml}${diskHtml}`;
   }
 
+  // 指标行 HTML（数值随推送变化；tooltip 数据内嵌 data-metric，事件委托绑定不受重建影响）
+  function metricBlockHtml(s) {
+    const m = s.metric;
+    if (!m) return '';
+    // 磁盘使用率：取所有挂载点中最大
+    function diskPct() {
+      const arr = m.extra && m.extra.disk;
+      if (!Array.isArray(arr) || !arr.length) return '-';
+      return Math.max(...arr.map((d) => Number(d.u) || 0)) + '%';
+    }
+    return `
+        <div class="metric" data-metric="${escapeHtml(JSON.stringify({ metric: m, info: s.info || null }))}">
+          <span class="m-cell"><b>${m.cpu == null ? '-' : m.cpu.toFixed(1) + '%'}</b><i>CPU</i></span>
+          <span class="m-cell"><b>${fmtBytes(m.mem_used)}</b><i>内存</i></span>
+          <span class="m-cell"><b>${m.extra && m.extra.load1 != null ? Number(m.extra.load1).toFixed(2) : '-'}</b><i>负载</i></span>
+          <span class="m-cell"><b>${m.net_in != null ? fmtBytes(m.net_in) + '/s' : '-'}</b><i>网络↓</i></span>
+          <span class="m-cell"><b>${m.extra && m.extra.swap != null ? fmtBytes(m.extra.swap) : '-'}</b><i>Swap</i></span>
+          <span class="m-cell"><b>${diskPct()}</b><i>磁盘</i></span>
+        </div>`;
+  }
+  // 探活行 HTML
+  function probesBlockHtml(s) {
+    if (!Array.isArray(s.probes) || !s.probes.length) return '';
+    return `
+        <div class="probes">${s.probes.map((p) => `<span class="probe ${p.ok ? 'ok' : 'down'}" title="${escapeHtml(p.name)}${p.code ? ` · HTTP ${p.code}` : ''}"><i class="dot"></i>${escapeHtml(p.name)}</span>`).join('')}</div>`;
+  }
   function cardHtml(s) {
     const m = s.metric;
     // 开机时间（秒 → 天）
@@ -145,25 +171,8 @@
     const wan = (s.wan_ip && !GEO_PRIVATE.test(s.wan_ip)) ? s.wan_ip : '';
     const ip = (wan || (s.info && s.info.ip4) || '').trim();
     const info = s.info ? [s.info.os, up, ip].filter(Boolean).join(' · ') : up;
-    // 磁盘使用率：取所有挂载点中最大
-    function diskPct() {
-      const arr = m && m.extra && m.extra.disk;
-      if (!Array.isArray(arr) || !arr.length) return '-';
-      return Math.max(...arr.map((d) => Number(d.u) || 0)) + '%';
-    }
-    const metricHtml = m ? `
-        <div class="metric" data-metric="${escapeHtml(JSON.stringify({ metric: m, info: s.info || null }))}">
-          <span class="m-cell"><b>${m.cpu == null ? '-' : m.cpu.toFixed(1) + '%'}</b><i>CPU</i></span>
-          <span class="m-cell"><b>${fmtBytes(m.mem_used)}</b><i>内存</i></span>
-          <span class="m-cell"><b>${m.extra && m.extra.load1 != null ? Number(m.extra.load1).toFixed(2) : '-'}</b><i>负载</i></span>
-          <span class="m-cell"><b>${m.net_in != null ? fmtBytes(m.net_in) + '/s' : '-'}</b><i>网络↓</i></span>
-          <span class="m-cell"><b>${m.extra && m.extra.swap != null ? fmtBytes(m.extra.swap) : '-'}</b><i>Swap</i></span>
-          <span class="m-cell"><b>${diskPct()}</b><i>磁盘</i></span>
-        </div>` : '';
-    const probes = Array.isArray(s.probes) && s.probes.length ? `
-        <div class="probes">${s.probes.map((p) => `<span class="probe ${p.ok ? 'ok' : 'down'}" title="${escapeHtml(p.name)}${p.code ? ` · HTTP ${p.code}` : ''}"><i class="dot"></i>${escapeHtml(p.name)}</span>`).join('')}</div>` : '';
     return `
-      <div class="card">
+      <div class="card" data-id="${s.id}">
         <div class="card-head">
           <div class="card-title">
             <span class="name">${escapeHtml(s.name)}</span>
@@ -178,8 +187,8 @@
           </div>
           <span class="badge ${s.online ? 'on' : 'off'}"><i class="dot"></i>${s.online ? '在线' : '离线'}</span>
         </div>
-        ${metricHtml}
-        ${probes}
+        ${metricBlockHtml(s)}
+        ${probesBlockHtml(s)}
         <div class="meta" data-ip="${escapeHtml(ip)}"><span class="cid">#${s.id}</span>${info ? ' · ' + escapeHtml(info) : ''}</div>
       </div>`;
   }
@@ -252,37 +261,113 @@
     }
   }
 
-  function renderServers() {
-    const box = $('#servers');
-    // 本地在线老化：服务端只在推送时算 online，两次推送之间由前端按 last_seen_s 倒计时判离线。
-    // 20s = 快宽限 15s + 5s 余量（有推送即有观看者快采；容忍时钟偏差与 ~3s 推送间隔）；
-    // 无最新指标（冷启动/D1 兜底）的服务器保留服务端判定不覆盖
+  // 在线老化：服务端只在推送时算 online，两次推送之间由前端按 last_seen_s 倒计时判离线。
+  // 20s = 快宽限 15s + 5s 余量；无最新指标（冷启动/D1 兜底）的服务器保留服务端判定不覆盖
+  function agingServers() {
     const agingNow = Date.now() / 1000;
     for (const s of serversCache) {
       if (s.metric && s.metric.last_seen_s) {
         s.online = agingNow - s.metric.last_seen_s < 20;
       }
     }
-    renderOverview();
-    if (!serversCache.length) {
-      box.innerHTML = '<div class="empty"><p>还没有服务器</p><p class="muted">点「添加服务器」生成 agent 配置后开始监控</p></div>';
-      return;
-    }
-    // 组内按 display_index（序号）排序
+  }
+  // 分组标题序列（用于判断分组结构是否变化）
+  function groupList() {
     const sorted = [...serversCache].sort((a, b) => (a.display_index || 0) - (b.display_index || 0));
     const groups = {};
     for (const s of sorted) {
       const g = s.group || '未分组';
       (groups[g] = groups[g] || []).push(s);
     }
-    // 分组展示顺序：按名称排序，「未分组」始终排最后
-    const groupOrder = Object.keys(groups).sort(
+    // 组内按 display_index（序号）排序，分组按名称排序，「未分组」始终排最后
+    return Object.keys(groups).sort(
       (a, b) => (a === '未分组') - (b === '未分组') || a.localeCompare(b, 'zh')
     );
-    box.innerHTML = groupOrder.map((g) => `
-      <h3 class="group-title">${escapeHtml(g)}（${groups[g].length}）</h3>
-      <div class="grid">${groups[g].map(cardHtml).join('')}</div>`).join('');
+  }
+  function renderServers() {
+    const box = $('#servers');
+    agingServers();
+    renderOverview();
+    if (!serversCache.length) {
+      box.innerHTML = '<div class="empty"><p>还没有服务器</p><p class="muted">点「添加服务器」生成 agent 配置后开始监控</p></div>';
+      return;
+    }
+    const groups = groupList();
+    const byGroup = (g) => serversCache
+      .filter((s) => (s.group || '未分组') === g)
+      .sort((a, b) => (a.display_index || 0) - (b.display_index || 0));
+    box.innerHTML = groups.map((g) => `
+      <h3 class="group-title">${escapeHtml(g)}（${byGroup(g).length}）</h3>
+      <div class="grid">${byGroup(g).map(cardHtml).join('')}</div>`).join('');
     lookupGeo(); // 异步补充各卡片 IP 归属地
+  }
+  // 推送到达：增量更新已有卡片（指标/探活/徽章），不重建卡片 DOM——
+  // 防每秒/每推送全量重建导致 hover 高亮抖动、打开的节点菜单被销毁
+  function updateServerCards() {
+    const box = $('#servers');
+    agingServers();
+    // 服务器增删或分组结构变化 → 低频全量重建
+    const domIds = new Set([...box.querySelectorAll('.card')].map((c) => Number(c.dataset.id)));
+    const wantIds = new Set(serversCache.map((s) => s.id));
+    if (domIds.size !== wantIds.size || [...domIds].some((id) => !wantIds.has(id))) {
+      renderServers();
+      return;
+    }
+    const domGroups = [...box.querySelectorAll('.group-title')].map((h) => h.textContent.replace(/[（(]\d+[）)]\s*$/, ''));
+    const wantGroups = groupList();
+    if (domGroups.join('|') !== wantGroups.join('|')) {
+      renderServers();
+      return;
+    }
+    // 增量更新各卡片内容
+    for (const s of serversCache) {
+      const card = box.querySelector(`.card[data-id="${s.id}"]`);
+      if (!card) continue;
+      const metaEl = card.querySelector('.meta');
+      // 在线徽章（状态切换才动 DOM）
+      const badge = card.querySelector('.badge');
+      if (badge) {
+        const on = s.online;
+        if ((on && !badge.classList.contains('on')) || (!on && !badge.classList.contains('off'))) {
+          badge.className = `badge ${on ? 'on' : 'off'}`;
+          badge.innerHTML = `<i class="dot"></i>${on ? '在线' : '离线'}`;
+        }
+      }
+      // 指标行（重建该块；不含菜单/事件绑定，全局 click 委托不受影响）
+      const mh = metricBlockHtml(s);
+      const metricEl = card.querySelector('.metric');
+      if (mh) {
+        if (metricEl) metricEl.outerHTML = mh;
+        else if (metaEl) metaEl.insertAdjacentHTML('beforebegin', mh);
+      } else if (metricEl) {
+        metricEl.remove();
+      }
+      // 探活行
+      const ph = probesBlockHtml(s);
+      const probesEl = card.querySelector('.probes');
+      if (ph) {
+        if (probesEl) probesEl.outerHTML = ph;
+        else if (metaEl) metaEl.insertAdjacentHTML('beforebegin', ph);
+      } else if (probesEl) {
+        probesEl.remove();
+      }
+    }
+    renderOverview();
+  }
+  // 每秒在线老化：只更新徽章/概览条，不重建 DOM
+  function updateAging() {
+    agingServers();
+    renderOverview();
+    document.querySelectorAll('#servers .card').forEach((card) => {
+      const s = serversCache.find((x) => x.id === Number(card.dataset.id));
+      if (!s) return;
+      const badge = card.querySelector('.badge');
+      if (!badge) return;
+      const on = s.online;
+      if ((on && badge.classList.contains('on')) || (!on && badge.classList.contains('off'))) return;
+      badge.className = `badge ${on ? 'on' : 'off'}`;
+      badge.innerHTML = `<i class="dot"></i>${on ? '在线' : '离线'}`;
+    });
   }
 
   async function addServer() {
@@ -303,14 +388,14 @@
   }
 
   // 连接建立发一次 sync 拉初始列表，此后数据由服务端上报驱动推送（WS 被动接收，不再 3s 轮询）。
-  // pushTimer 改为「本地在线老化」：每秒重渲染（last_seen_s 随时间流逝自动判离线——
-  // 否则服务端不再轮询后，死机服务器会永远显示在线）
+  // pushTimer 改为「本地在线老化」：每秒只更新在线徽章/概览条（last_seen_s 随时间流逝
+  // 自动判离线，死机服务器不再永远显示在线）；不重建 DOM，防 hover 高亮抖动/菜单被打断
   function startPushTimer() {
     if (pushTimer) clearInterval(pushTimer);
     try { if (pushWs && pushWs.readyState === WebSocket.OPEN) pushWs.send('sync'); } catch { /* ignore */ }
     pushTimer = setInterval(() => {
       if (document.hidden) return; // 后台由 visibilitychange 关 WS，无需老化
-      renderServers();
+      updateAging();
     }, 1000);
   }
   function stopPushTimer() {
@@ -336,7 +421,7 @@
         const list = JSON.parse(ev.data);
         if (Array.isArray(list)) {
           serversCache = list;
-          renderServers();
+          updateServerCards();
         }
       } catch { /* 忽略非 JSON 帧 */ }
     };

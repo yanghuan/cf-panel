@@ -248,7 +248,7 @@ pub async fn run_file_session(cfg: Config, sid: String) {
         // Binary 为 write 混合帧（JSON 头 + '\n' + 原始字节）。响应按内容区分 Text/Binary
         let reply = match msg {
             Message::Text(t) => handle_file_cmd(&t, &created).await,
-            Message::Binary(b) => handle_file_cmd_binary(&b, &created).await,
+            Message::Binary(b) => handle_file_cmd_binary(b, created.clone()).await,
             _ => continue,
         };
         let sent = match reply {
@@ -337,35 +337,51 @@ async fn handle_file_cmd(line: &str, created: &Arc<std::sync::Mutex<Vec<String>>
 }
 
 // Binary 混合帧：'\n' 前为 JSON 元数据（write 命令），'\n' 后为原始文件字节
+// Binary 混合帧（owned Vec，直接来自 tungstenite 分配）：'\n' 前 JSON 头，后为原始文件字节。
+// 拆分与写入都在 spawn_blocking 闭包内完成，数据切片直接写、无二次拷贝——
+// 内存 = 入站帧本身（512KB 块 + JSON 头），不随块大小额外放大
 async fn handle_file_cmd_binary(
-    frame: &[u8],
-    created: &Arc<std::sync::Mutex<Vec<String>>>,
+    frame: Vec<u8>,
+    created: Arc<std::sync::Mutex<Vec<String>>>,
 ) -> FileReply {
-    let Some(nl) = frame.iter().position(|&b| b == b'\n') else {
-        return FileReply::Text(err_json("bad frame (no json header)"));
-    };
-    let v: serde_json::Value = match serde_json::from_slice(&frame[..nl]) {
-        Ok(v) => v,
-        Err(_) => return FileReply::Text(err_json("bad json")),
-    };
-    let ty = v.get("type").and_then(|x| x.as_str()).unwrap_or("");
-    let path = v
-        .get("path")
-        .and_then(|x| x.as_str())
-        .unwrap_or("")
-        .to_string();
-    if ty != "write" {
-        return FileReply::Text(err_json("unknown cmd"));
+    match blocking_with_timeout(30, move || {
+        let Some(nl) = frame.iter().position(|&b| b == b'\n') else {
+            return err_json("bad frame (no json header)");
+        };
+        let v: serde_json::Value = match serde_json::from_slice(&frame[..nl]) {
+            Ok(v) => v,
+            Err(_) => return err_json("bad json"),
+        };
+        let ty = v.get("type").and_then(|x| x.as_str()).unwrap_or("");
+        if ty != "write" {
+            return err_json("unknown cmd");
+        }
+        let path = v
+            .get("path")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string();
+        let offset = v.get("offset").and_then(|x| x.as_u64()).unwrap_or(0);
+        let commit = v.get("commit").and_then(|x| x.as_bool()).unwrap_or(false);
+        let upload_id = v
+            .get("upload_id")
+            .and_then(|x| x.as_str())
+            .unwrap_or("default")
+            .to_string();
+        write_bytes(
+            &path,
+            offset,
+            &frame[nl + 1..],
+            commit,
+            &upload_id,
+            &created,
+        )
+    })
+    .await
+    {
+        Some(v) => FileReply::Text(v),
+        None => FileReply::Text(err_json("write timeout")),
     }
-    let offset = v.get("offset").and_then(|x| x.as_u64()).unwrap_or(0);
-    let commit = v.get("commit").and_then(|x| x.as_bool()).unwrap_or(false);
-    let upload_id = v
-        .get("upload_id")
-        .and_then(|x| x.as_str())
-        .unwrap_or("default")
-        .to_string();
-    let data = frame[nl + 1..].to_vec();
-    FileReply::Text(file_write(path, offset, data, commit, upload_id, created.clone()).await)
 }
 
 // spawn_blocking + 超时：防止挂死的挂载点（NFS 等）永久占用 blocking 线程
@@ -525,6 +541,81 @@ async fn file_read(path: String, offset: u64, limit: u64) -> Result<Vec<u8>, Str
     }
 }
 
+// 同步原子写（供 spawn_blocking 闭包调用，避免 async 借用问题）：
+// 临时文件 {path}.upload.{upload_id}（上传 ID 唯一，同路径并发上传互不冲突），
+// commit（最后一块）时 fsync + rename 原子替换目标。失败/中断只留临时残留、不破坏目标。
+// 严格 offset 校验：必须与临时文件当前长度一致（防丢块/乱序/并发块错写）。
+fn write_bytes(
+    path: &str,
+    offset: u64,
+    data: &[u8],
+    commit: bool,
+    upload_id: &str,
+    created: &Arc<std::sync::Mutex<Vec<String>>>,
+) -> String {
+    use std::io::{Seek, SeekFrom, Write};
+    let tmp = format!("{}.upload.{}", path, upload_id);
+    if let Some(parent) = std::path::Path::new(path).parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    // 记录本会话创建的临时文件（会话结束/断线时清理）
+    if let Ok(mut c) = created.lock() {
+        c.push(tmp.clone());
+    }
+    let cleanup = |tmp: &str| {
+        let _ = std::fs::remove_file(tmp);
+    };
+    // offset 校验：期望 = 临时文件当前长度（首块为 0）
+    let cur_len = std::fs::metadata(&tmp).map(|m| m.len()).unwrap_or(0);
+    if offset != cur_len {
+        cleanup(&tmp);
+        return err_json(&format!(
+            "offset mismatch: got {offset}, expect {cur_len} (丢块或并发块错写)"
+        ));
+    }
+    // 注意：create 时不 truncate（upload_id 唯一，首块 offset=0 天然从空文件开始）
+    #[allow(clippy::suspicious_open_options)]
+    let mut f = match std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .open(&tmp)
+    {
+        Ok(f) => f,
+        Err(_) => return err_json("write failed"),
+    };
+    if f.seek(SeekFrom::Start(offset)).is_err() {
+        cleanup(&tmp);
+        return err_json("write failed");
+    }
+    // 原始字节直写（混合帧数据不再 base64）；数据切片直接来自入站帧，无额外拷贝
+    let mut written = 0usize;
+    while written < data.len() {
+        match f.write(&data[written..]) {
+            Ok(n) => written += n,
+            Err(_) => {
+                cleanup(&tmp);
+                return err_json("write failed");
+            }
+        }
+    }
+    // 大小校验（针对临时文件）
+    let cur = std::fs::metadata(&tmp).map(|m| m.len()).unwrap_or(0);
+    if cur > FILE_LIMIT {
+        cleanup(&tmp);
+        return err_json("file exceeds 500MB limit, aborted");
+    }
+    // commit：fsync + 原子 rename 覆盖目标文件
+    if commit && (f.sync_all().is_err() || std::fs::rename(&tmp, path).is_err()) {
+        cleanup(&tmp);
+        return err_json("write failed");
+    }
+    serde_json::json!({
+        "type": "write_result", "ok": true, "path": path,
+        "offset": offset, "written": written, "commit": commit,
+    })
+    .to_string()
+}
+
 async fn file_write(
     path: String,
     offset: u64,
@@ -534,70 +625,7 @@ async fn file_write(
     created: Arc<std::sync::Mutex<Vec<String>>>,
 ) -> String {
     match blocking_with_timeout(30, move || {
-        use std::io::{Seek, SeekFrom};
-        // 原子写：临时文件 {path}.upload.{upload_id}（上传 ID 唯一，同路径并发上传互不冲突），
-        // commit（最后一块）时 fsync + rename 原子替换目标。失败/中断只留临时残留、不破坏目标。
-        // 严格 offset 校验：必须与临时文件当前长度一致（防丢块/乱序/并发块错写）。
-        let tmp = format!("{}.upload.{}", path, upload_id);
-        if let Some(parent) = std::path::Path::new(&path).parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        // 记录本会话创建的临时文件（会话结束/断线时清理）
-        if let Ok(mut c) = created.lock() {
-            c.push(tmp.clone());
-        }
-        let cleanup = |tmp: &str| {
-            let _ = std::fs::remove_file(tmp);
-        };
-        // offset 校验：期望 = 临时文件当前长度（首块为 0）
-        let cur_len = std::fs::metadata(&tmp).map(|m| m.len()).unwrap_or(0);
-        if offset != cur_len {
-            cleanup(&tmp);
-            return err_json(&format!(
-                "offset mismatch: got {offset}, expect {cur_len} (丢块或并发块错写)"
-            ));
-        }
-        // 注意：create 时不 truncate（upload_id 唯一，首块 offset=0 天然从空文件开始）
-        #[allow(clippy::suspicious_open_options)]
-        let mut f = match std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .open(&tmp)
-        {
-            Ok(f) => f,
-            Err(_) => return err_json("write failed"),
-        };
-        if f.seek(SeekFrom::Start(offset)).is_err() {
-            cleanup(&tmp);
-            return err_json("write failed");
-        }
-        // 原始字节直写（混合帧数据不再 base64）；块 ≤512KB，内存随入站块大小即块大小
-        let mut written = 0usize;
-        while written < data.len() {
-            match f.write(&data[written..]) {
-                Ok(n) => written += n,
-                Err(_) => {
-                    cleanup(&tmp);
-                    return err_json("write failed");
-                }
-            }
-        }
-        // 大小校验（针对临时文件）
-        let cur = std::fs::metadata(&tmp).map(|m| m.len()).unwrap_or(0);
-        if cur > FILE_LIMIT {
-            cleanup(&tmp);
-            return err_json("file exceeds 500MB limit, aborted");
-        }
-        // commit：fsync + 原子 rename 覆盖目标文件
-        if commit && (f.sync_all().is_err() || std::fs::rename(&tmp, &path).is_err()) {
-            cleanup(&tmp);
-            return err_json("write failed");
-        }
-        serde_json::json!({
-            "type": "write_result", "ok": true, "path": path,
-            "offset": offset, "written": written, "commit": commit,
-        })
-        .to_string()
+        write_bytes(&path, offset, &data, commit, &upload_id, &created)
     })
     .await
     {

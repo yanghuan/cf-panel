@@ -34,6 +34,7 @@ CREATE TABLE IF NOT EXISTS api_tokens (
 CREATE TABLE IF NOT EXISTS audit_logs (
   id               INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id          INTEGER NOT NULL,
+  username         TEXT,                      -- 操作者用户名（显示用，uid 仅为配置序号）
   action           TEXT    NOT NULL,         -- terminal.open / server.create ...
   target_server_id INTEGER,
   detail           TEXT,

@@ -1219,7 +1219,7 @@
         ? rows.map((r) => `
             <li><div class="audit-row">
               <span class="audit-action">${escapeHtml(AUDIT_ACTION_LABEL[r.action] || r.action)}</span>
-              <span class="audit-info">uid=${escapeHtml(r.user_id)}${r.target_server_id ? ` · server#${escapeHtml(r.target_server_id)}` : ''}${r.detail ? ` · ${escapeHtml(r.detail)}` : ''}</span>
+              <span class="audit-info">${escapeHtml(r.username || `uid=${r.user_id}`)}${r.target_server_id ? ` · server#${escapeHtml(r.target_server_id)}` : ''}${r.detail ? ` · ${escapeHtml(r.detail)}` : ''}</span>
               <span class="audit-time">${escapeHtml(r.created_at || '')}</span>
             </div></li>`).join('')
         : '<li class="muted">暂无审计记录</li>';

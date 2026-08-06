@@ -244,10 +244,10 @@ pub async fn run_file_session(cfg: Config, sid: String) {
             Ok(m) => m,
             Err(_) => break,
         };
-        // 混合帧协议：Text 为无数据命令（list/read/abort，及旧协议 base64 write）；
-        // Binary 为 write 混合帧（JSON 头 + '\n' + 原始字节）。响应按内容区分 Text/Binary
+        // 混合帧协议：Text 为无数据命令（list/read/abort）；Binary 为 write 混合帧
+        //（JSON 头 + '\n' + 原始字节）。响应按内容区分 Text/Binary
         let reply = match msg {
-            Message::Text(t) => handle_file_cmd(&t, &created).await,
+            Message::Text(t) => handle_file_cmd(&t).await,
             Message::Binary(b) => handle_file_cmd_binary(b, created.clone()).await,
             _ => continue,
         };
@@ -275,7 +275,7 @@ enum FileReply {
     Binary(Vec<u8>),
 }
 
-async fn handle_file_cmd(line: &str, created: &Arc<std::sync::Mutex<Vec<String>>>) -> FileReply {
+async fn handle_file_cmd(line: &str) -> FileReply {
     let v: serde_json::Value = match serde_json::from_str(line) {
         Ok(v) => v,
         Err(_) => return FileReply::Text(err_json("bad json")),
@@ -301,29 +301,7 @@ async fn handle_file_cmd(line: &str, created: &Arc<std::sync::Mutex<Vec<String>>
                 Err(e) => FileReply::Text(err_json(&e)),
             }
         }
-        "write" => {
-            // 旧协议兼容：Text + base64 data（新协议走 Binary 混合帧，见 handle_file_cmd_binary）
-            let offset = v.get("offset").and_then(|x| x.as_u64()).unwrap_or(0);
-            let data = v
-                .get("data")
-                .and_then(|x| x.as_str())
-                .unwrap_or("")
-                .to_string();
-            let bytes =
-                match base64::Engine::decode(&base64::engine::general_purpose::STANDARD, data) {
-                    Ok(b) => b,
-                    Err(_) => return FileReply::Text(err_json("bad base64")),
-                };
-            let commit = v.get("commit").and_then(|x| x.as_bool()).unwrap_or(false);
-            let upload_id = v
-                .get("upload_id")
-                .and_then(|x| x.as_str())
-                .unwrap_or("default")
-                .to_string();
-            FileReply::Text(
-                file_write(path, offset, bytes, commit, upload_id, created.clone()).await,
-            )
-        }
+
         "abort" => {
             let upload_id = v
                 .get("upload_id")
@@ -614,24 +592,6 @@ fn write_bytes(
         "offset": offset, "written": written, "commit": commit,
     })
     .to_string()
-}
-
-async fn file_write(
-    path: String,
-    offset: u64,
-    data: Vec<u8>,
-    commit: bool,
-    upload_id: String,
-    created: Arc<std::sync::Mutex<Vec<String>>>,
-) -> String {
-    match blocking_with_timeout(30, move || {
-        write_bytes(&path, offset, &data, commit, &upload_id, &created)
-    })
-    .await
-    {
-        Some(v) => v,
-        None => err_json("write timeout"),
-    }
 }
 
 // abort：取消上传，删除对应临时文件（{path}.upload.{upload_id}）

@@ -588,7 +588,6 @@
           renderFileList(j.entries); // agent 端已按过滤规则返回
           if (j.truncated) $('#file-msg').textContent = '目录条目过多，仅显示前 1000 项';
         }
-        else if (j.type === 'read_result' && j.ok) onReadResult(j); // 兼容旧 base64 Text
         else if (j.type === 'write_result' && j.ok) onWriteResult(j);
         else if (j.type === 'error') $('#file-msg').textContent = `错误：${j.message}`;
       };
@@ -647,15 +646,9 @@
       fileDownload = null;
       return;
     }
-    // 混合帧：data 为原始字节（Uint8Array）；兼容旧 base64 Text（j.data）
-    let bytes = data;
-    if (!bytes && j.data) {
-      const bin = atob(j.data);
-      bytes = new Uint8Array(bin.length);
-      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-    }
-    if (!bytes) return;
-    fileDownload.parts.push(bytes);
+    // 混合帧：data 为原始字节（Uint8Array），由 onmessage Binary 分支传入
+    if (!data) return;
+    fileDownload.parts.push(data);
     fileDownload.received += j.got;
     const pct = fileDownload.size ? Math.min(100, Math.round((fileDownload.received / fileDownload.size) * 100)) : 0;
     $('#file-msg').textContent = `下载中：${pct}%`;

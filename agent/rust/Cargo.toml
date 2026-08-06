@@ -17,7 +17,6 @@ tokio-tungstenite = { version = "0.21", default-features = false, features = ["c
 futures-util = "0.3"
 serde_json = "1"
 portable-pty = "0.9"
-base64 = "0.22"
 libc = "0.2"
 
 # 构建优化说明（2026-08 实测）：

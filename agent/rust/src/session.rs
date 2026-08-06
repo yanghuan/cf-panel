@@ -33,6 +33,7 @@ pub struct TermSession {
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     child: Arc<Mutex<Option<Box<dyn portable_pty::Child + Send + Sync>>>>,
     child_pid: u32,
+    cleaned: std::sync::atomic::AtomicBool, // cleanup 幂等（M5：防双调用 kill 后 PID 复用误杀）
 }
 
 impl TermSession {
@@ -56,6 +57,7 @@ impl TermSession {
             writer: Arc::new(Mutex::new(writer)),
             child: Arc::new(Mutex::new(Some(child))),
             child_pid,
+            cleaned: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -70,8 +72,13 @@ impl TermSession {
         }
     }
 
-    // 会话结束清理：kill 进程组（bash 由 portable-pty setsid 启动，负 PID 即整组）
+    // 会话结束清理：kill 进程组（bash 由 portable-pty setsid 启动，负 PID 即整组）。
+    // 幂等（M5）：首调 kill 后 PID 即释放，双调用再 kill(-pid) 可能命中被复用的进程组——
+    // 用 AtomicBool 保证 cleanup 只执行一次
     pub async fn cleanup(&self) {
+        if self.cleaned.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
         #[cfg(unix)]
         if self.child_pid > 0 {
             unsafe {
@@ -150,7 +157,7 @@ async fn run_terminal_inner(cfg: &Config, term: &Arc<TermSession>) {
             }
         }
     });
-    let send_task = tokio::spawn(async move {
+    let mut send_task = tokio::spawn(async move {
         // 合帧发送：聚合约 16ms 或 32KB 合并一条 WS 帧（降 DO 计费消息数，见 TERM_BATCH_* 注释）
         let mut batch: Vec<u8> = Vec::with_capacity(TERM_BATCH_BYTES);
         while let Some(bytes) = rx.recv().await {
@@ -188,24 +195,30 @@ async fn run_terminal_inner(cfg: &Config, term: &Arc<TermSession>) {
         }
     });
 
-    // WS → pty 输入
-    while let Some(msg) = read.next().await {
-        let msg = match msg {
-            Ok(m) => m,
-            Err(_) => break,
-        };
-        match msg {
-            Message::Text(t) => {
-                let mut w = term.writer.lock().await;
-                let _ = w.write_all(t.as_bytes());
-                let _ = w.flush();
+    // WS → pty 输入；pty 消亡（bash 退出 → reader EOF → send_task 结束）时主动结束会话，
+    // 不再等会话 TTL 回收（M9：bash 自然退出后终端立即关闭而非挂死）
+    loop {
+        tokio::select! {
+            _ = &mut send_task => break,
+            msg = read.next() => {
+                let msg = match msg {
+                    Some(Ok(m)) => m,
+                    _ => break,
+                };
+                match msg {
+                    Message::Text(t) => {
+                        let mut w = term.writer.lock().await;
+                        let _ = w.write_all(t.as_bytes());
+                        let _ = w.flush();
+                    }
+                    Message::Binary(b) => {
+                        let mut w = term.writer.lock().await;
+                        let _ = w.write_all(&b);
+                        let _ = w.flush();
+                    }
+                    _ => {}
+                }
             }
-            Message::Binary(b) => {
-                let mut w = term.writer.lock().await;
-                let _ = w.write_all(&b);
-                let _ = w.flush();
-            }
-            _ => {}
         }
     }
     send_task.abort();
@@ -362,12 +375,19 @@ async fn handle_file_cmd_binary(
     }
 }
 
-// spawn_blocking + 超时：防止挂死的挂载点（NFS 等）永久占用 blocking 线程
+// spawn_blocking + 超时：防止挂死的挂载点（NFS 等）永久占用 blocking 线程。
+// 信号量限并发（H1）：挂死任务最多占满有限槽位，前端重试放大不会打穿线程池
+static BLOCKING_PERMITS: usize = 4;
+static BLOCKING_SEM: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
 async fn blocking_with_timeout<F, T>(secs: u64, f: F) -> Option<T>
 where
     F: FnOnce() -> T + Send + 'static,
     T: Send + 'static,
 {
+    let sem = BLOCKING_SEM
+        .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(BLOCKING_PERMITS)))
+        .clone();
+    let _permit = sem.acquire_owned().await.ok()?;
     let join = tokio::task::spawn_blocking(f);
     match tokio::time::timeout(std::time::Duration::from_secs(secs), join).await {
         Ok(Ok(v)) => Some(v),

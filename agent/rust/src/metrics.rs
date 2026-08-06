@@ -25,12 +25,23 @@ fn read_file(path: &str) -> Option<String> {
     std::fs::read_to_string(path).ok()
 }
 
-// spawn_blocking + 超时：命令在阻塞线程池执行，防止挂死的挂载点/命令阻塞 async runtime
+// 阻塞并发上限（H1）：限制 spawn_blocking 任务数，防挂死挂载点/命令累积耗尽线程池
+static BLOCKING_PERMITS: usize = 4;
+static BLOCKING_SEM: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
+fn blocking_sem() -> Arc<tokio::sync::Semaphore> {
+    BLOCKING_SEM
+        .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(BLOCKING_PERMITS)))
+        .clone()
+}
+
+// spawn_blocking + 超时：命令在阻塞线程池执行，防止挂死的挂载点/命令阻塞 async runtime。
+// 信号量限并发：挂死任务（tokio 无法取消 spawn_blocking）最多占满 4 个槽，其余采集立即失败不堆积
 async fn run_blocking<F, T>(secs: u64, f: F) -> Option<T>
 where
     F: FnOnce() -> T + Send + 'static,
     T: Send + 'static,
 {
+    let _permit = blocking_sem().acquire_owned().await.ok()?;
     let join = tokio::task::spawn_blocking(f);
     match tokio::time::timeout(Duration::from_secs(secs), join).await {
         Ok(Ok(v)) => Some(v),
@@ -129,37 +140,63 @@ fn collect_temp() -> Option<f64> {
     None
 }
 
-// TCP/UDP 连接数
+// TCP/UDP 连接数（M1：BufReader 流式计数，不物化全文件——50 万连接不再一次性分配 ~75MB String）
+fn count_lines(path: &str) -> u64 {
+    use std::io::BufRead;
+    std::fs::File::open(path)
+        .map(|f| std::io::BufReader::new(f).lines().count().saturating_sub(1) as u64)
+        .unwrap_or(0)
+}
 fn collect_conns() -> (u64, u64) {
-    let tcp = read_file("/proc/net/tcp")
-        .map(|s| s.lines().count().saturating_sub(1) as u64)
-        .unwrap_or(0);
-    let udp = read_file("/proc/net/udp")
-        .map(|s| s.lines().count().saturating_sub(1) as u64)
-        .unwrap_or(0);
-    (tcp, udp)
+    (count_lines("/proc/net/tcp"), count_lines("/proc/net/udp"))
+}
+
+// 磁盘结果缓存（H1/M7）：df 结果 60s 内复用；超时/失败返回上次成功值（熔断降级，不空转重试）
+type DiskCache = tokio::sync::Mutex<Option<(std::time::Instant, Vec<serde_json::Value>)>>;
+static DISK_CACHE: std::sync::OnceLock<DiskCache> = std::sync::OnceLock::new();
+async fn disk_cache(
+) -> tokio::sync::MutexGuard<'static, Option<(std::time::Instant, Vec<serde_json::Value>)>> {
+    DISK_CACHE
+        .get_or_init(|| tokio::sync::Mutex::new(None))
+        .lock()
+        .await
 }
 
 // 磁盘：df -Pk（挂载点以 / 开头）；阻塞命令放线程池 + 超时（df 撞挂死挂载点不阻塞 runtime）
 async fn collect_disk() -> Vec<serde_json::Value> {
+    let now = std::time::Instant::now();
+    if let Some((ts, disk)) = disk_cache().await.as_ref() {
+        if now.duration_since(*ts).as_secs() < 60 {
+            return disk.clone(); // 60s 缓存命中（快采 5s → 12 帧只跑一次 df）
+        }
+    }
     let out = run_blocking(5, || {
         std::process::Command::new("df").args(["-Pk"]).output()
     })
     .await;
     let mut disk = Vec::new();
-    if let Some(Ok(out)) = out {
-        let text = String::from_utf8_lossy(&out.stdout);
-        for line in text.lines().skip(1) {
-            let mut it = line.split_whitespace();
-            let _fs = it.next();
-            let _blocks = it.next();
-            let _used = it.next();
-            let _avail = it.next();
-            let cap = it.next().unwrap_or("");
-            let mount = it.next().unwrap_or("");
-            if mount.starts_with('/') {
-                let pct = cap.trim_end_matches('%').parse::<u64>().unwrap_or(0);
-                disk.push(json!({ "m": mount, "u": pct }));
+    match out {
+        Some(Ok(out)) if out.status.success() => {
+            let text = String::from_utf8_lossy(&out.stdout);
+            for line in text.lines().skip(1) {
+                let mut it = line.split_whitespace();
+                let _fs = it.next();
+                let _blocks = it.next();
+                let _used = it.next();
+                let _avail = it.next();
+                let cap = it.next().unwrap_or("");
+                let mount = it.next().unwrap_or("");
+                if mount.starts_with('/') {
+                    let pct = cap.trim_end_matches('%').parse::<u64>().unwrap_or(0);
+                    disk.push(json!({ "m": mount, "u": pct }));
+                }
+            }
+            *disk_cache().await = Some((now, disk.clone())); // 成功才更新缓存
+        }
+        _ => {
+            // 超时/失败（df 撞挂死挂载点）：熔断，返回上次成功值（避免每帧空转重试放大）
+            if let Some((_, disk)) = disk_cache().await.as_ref() {
+                return disk.clone();
             }
         }
     }

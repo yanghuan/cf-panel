@@ -205,11 +205,12 @@ async fn collect_disk() -> Vec<serde_json::Value> {
             *disk_cache().await = Some((now, disk.clone())); // 成功：更新缓存
         }
         _ => {
-            // 失败/超时：真熔断——刷新时间戳，后续 60s 内直接返回旧值不重试
+            // 失败/超时：真熔断——刷新时间戳，后续 60s 内直接返回旧值/空值不重试；
+            // 无旧值也写空缓存（开机即挂死 NFS 场景下避免每帧重跑 df 挂 5s）
             let mut c = disk_cache().await;
             let old = c.as_ref().map(|(_, v)| v.clone());
+            *c = Some((now, old.clone().unwrap_or_default()));
             if let Some(old) = old {
-                *c = Some((now, old.clone()));
                 return old;
             }
         }

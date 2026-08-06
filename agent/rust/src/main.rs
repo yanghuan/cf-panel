@@ -209,36 +209,43 @@ async fn control_conn(
     let (write, mut read) = ws.split();
     let write = Arc::new(Mutex::new(write));
 
-    // 上报任务（动态间隔，分段等待，间隔变更 ≤5s 生效）
+    // 上报任务（动态间隔，分段等待，间隔变更 ≤5s 生效）。
+    // 持有句柄：读循环退出（正常关闭/错误/半开超时）时 abort，防僵尸任务累积
     let interval = Arc::new(AtomicU64::new(cfg.report_interval));
     let note = Arc::new(Notify::new());
-    {
+    let report_task = {
         let write = write.clone();
         let cfg2 = cfg.clone();
         let interval = interval.clone();
         let note = note.clone();
         tokio::spawn(async move {
             report_loop(&cfg2, &write, &interval, &note).await;
-        });
-    }
+        })
+    };
 
     // 读循环：指令分发（180s 无任何消息判定半开连接，断开触发重连——
     // NAT/防火墙静默断链不再依赖 TCP keepalive 2h 才发现；健康连接有服务端 30s 心跳必有下行）
-    loop {
+    let result: Result<(), Box<dyn Error + Send + Sync>> = loop {
         let msg =
             match tokio::time::timeout(Duration::from_secs(CONTROL_READ_TIMEOUT_S), read.next())
                 .await
             {
                 Ok(Some(Ok(m))) => m,
-                Ok(Some(Err(e))) => return Err(Box::new(e)),
-                Ok(None) => break, // 服务端正常关闭
-                Err(_) => return Err("control read timeout (half-open connection)".into()),
+                Ok(Some(Err(e))) => break Err(Box::new(e)),
+                Ok(None) => break Ok(()), // 服务端正常关闭
+                Err(_) => break Err("control read timeout (half-open connection)".into()),
             };
         if let Message::Text(t) = msg {
-            dispatch(cfg, sessions, file_sessions, &write, &interval, &note, &t).await?;
+            if let Err(e) =
+                dispatch(cfg, sessions, file_sessions, &write, &interval, &note, &t).await
+            {
+                break Err(e);
+            }
         }
-    }
-    Ok(())
+    };
+    // 读循环退出（任何路径）：终止上报任务，防僵尸累积
+    report_task.abort();
+    result
 }
 
 // 上报间隔下限/上限校验（防异常/恶意 interval=0 导致采集紧循环打满 CPU）
@@ -432,7 +439,7 @@ fn print_help() {
     println!("可配置环境变量：");
     println!("  AGENT_WSS_URL     必填  面板 agent WebSocket 地址（wss://<域名>/ws/agent）");
     println!("  AGENT_KEY         必填  agent 身份 + 凭证（面板「添加服务器」时生成）");
-    println!("  REPORT_INTERVAL   默认 120   默认上报间隔（秒）；有观看者时服务端动态下发 3s");
+    println!("  REPORT_INTERVAL   默认 120   默认上报间隔（秒）；有观看者时服务端动态下发 5s");
     println!("  DISABLE_EXEC      默认 0     设为 1 禁用终端/文件管理（仅保留监控）");
     println!("  PROBES            默认 空    服务探活：\"name:http:URL,name:tcp:host:port,...\"");
     println!(

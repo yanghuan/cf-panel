@@ -41,10 +41,8 @@ fn read_config() -> Config {
     Config {
         wss: std::env::var("AGENT_WSS_URL").unwrap_or_default(),
         key,
-        report_interval: std::env::var("REPORT_INTERVAL")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(120),
+        // 与 set_report_interval 指令同路径校验下限/上限（防操作员误设 0 触发采集紧循环）
+        report_interval: parse_report_interval(std::env::var("REPORT_INTERVAL").ok()),
         disable_exec: std::env::var("DISABLE_EXEC").unwrap_or_default() == "1",
         probes: std::env::var("PROBES").unwrap_or_default(),
         custom_metrics: std::env::var("CUSTOM_METRICS").unwrap_or_default(),
@@ -246,6 +244,11 @@ async fn control_conn(
 // 上报间隔下限/上限校验（防异常/恶意 interval=0 导致采集紧循环打满 CPU）
 fn clamp_report_interval(iv: u64) -> u64 {
     iv.clamp(1, 3600)
+}
+
+// 环境变量 REPORT_INTERVAL 解析，与指令路径同走 clamp（防操作员误设 0/超上限）
+fn parse_report_interval(raw: Option<String>) -> u64 {
+    clamp_report_interval(raw.and_then(|v| v.parse().ok()).unwrap_or(120))
 }
 
 async fn dispatch(
@@ -521,6 +524,27 @@ mod tests {
         assert_eq!(clamp_report_interval(3), 3, "正常值不变");
         assert_eq!(clamp_report_interval(120), 120);
         assert_eq!(clamp_report_interval(5000), 3600, "超上限钳到 3600");
+    }
+
+    #[test]
+    fn parse_report_interval_env_clamps() {
+        assert_eq!(parse_report_interval(None), 120, "缺省 120");
+        assert_eq!(
+            parse_report_interval(Some("0".into())),
+            1,
+            "env 误设 0 钳到下限"
+        );
+        assert_eq!(parse_report_interval(Some("5".into())), 5, "正常值不变");
+        assert_eq!(
+            parse_report_interval(Some("99999".into())),
+            3600,
+            "env 超上限钳到 3600"
+        );
+        assert_eq!(
+            parse_report_interval(Some("abc".into())),
+            120,
+            "非法值回退默认"
+        );
     }
 
     #[test]

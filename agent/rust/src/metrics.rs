@@ -170,7 +170,9 @@ async fn disk_cache(
         .await
 }
 
-// 磁盘：df -Pk（挂载点以 / 开头）；阻塞命令放线程池 + 超时（df 撞挂死挂载点不阻塞 runtime）
+// 磁盘：df -Pkl（-l 仅本地文件系统，不碰 NFS/CIFS 挂死挂载点）；tokio 子进程 +
+// kill_on_drop + 进程组（超时即杀，不留孤儿）；60s 缓存；失败走真熔断——
+// 刷新缓存时间戳使熔断窗口内直接返回旧值不重试（60s 后重试一次）
 async fn collect_disk() -> Vec<serde_json::Value> {
     let now = std::time::Instant::now();
     if let Some((ts, disk)) = disk_cache().await.as_ref() {
@@ -178,13 +180,14 @@ async fn collect_disk() -> Vec<serde_json::Value> {
             return disk.clone(); // 60s 缓存命中（快采 5s → 12 帧只跑一次 df）
         }
     }
-    let out = run_blocking(5, || {
-        std::process::Command::new("df").args(["-Pk"]).output()
-    })
-    .await;
+    let mut cmd = tokio::process::Command::new("df");
+    cmd.args(["-Pkl"]).kill_on_drop(true);
+    #[cfg(unix)]
+    cmd.process_group(0); // 超时取消时杀掉整个进程组，防 df 孤儿残留
+    let out = tokio::time::timeout(Duration::from_secs(5), cmd.output()).await;
     let mut disk = Vec::new();
     match out {
-        Some(Ok(out)) if out.status.success() => {
+        Ok(Ok(out)) if out.status.success() => {
             let text = String::from_utf8_lossy(&out.stdout);
             for line in text.lines().skip(1) {
                 let mut it = line.split_whitespace();
@@ -199,12 +202,15 @@ async fn collect_disk() -> Vec<serde_json::Value> {
                     disk.push(json!({ "m": mount, "u": pct }));
                 }
             }
-            *disk_cache().await = Some((now, disk.clone())); // 成功才更新缓存
+            *disk_cache().await = Some((now, disk.clone())); // 成功：更新缓存
         }
         _ => {
-            // 超时/失败（df 撞挂死挂载点）：熔断，返回上次成功值（避免每帧空转重试放大）
-            if let Some((_, disk)) = disk_cache().await.as_ref() {
-                return disk.clone();
+            // 失败/超时：真熔断——刷新时间戳，后续 60s 内直接返回旧值不重试
+            let mut c = disk_cache().await;
+            let old = c.as_ref().map(|(_, v)| v.clone());
+            if let Some(old) = old {
+                *c = Some((now, old.clone()));
+                return old;
             }
         }
     }
@@ -312,7 +318,10 @@ async fn collect_info() -> serde_json::Value {
         }
     }
     let val = json!({ "os": os, "kern": kern, "ip4": ip4, "ip6": ip6 });
-    *info_cache().await = Some((now, val.clone())); // 成功才更新缓存
+    // uname/hostname 全空（采集超时/失败）不缓存：避免空结果（IP 字段空显）被缓存 10 分钟
+    if !kern.is_empty() || !host.is_empty() {
+        *info_cache().await = Some((now, val.clone()));
+    }
     val
 }
 

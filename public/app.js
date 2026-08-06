@@ -71,6 +71,7 @@
     $('#whoami').textContent = user.is_pat ? `令牌（${escapeHtml(user.username)}）` : escapeHtml(user.username || 'admin');
     loadServers(); // 先拉一次，WS 建立后每 3 秒由服务端推送覆盖
     startPush();
+    resetIdle(); // 空闲观看保护：登录后开始计时
   }
 
   async function doLogin() {
@@ -454,6 +455,51 @@
     try { w.close(); } catch { /* ignore */ }
   }
 
+  // ---------- 空闲观看保护（类似视频网站"继续观看？"） ----------
+  // 长时间无浏览器操作 → 提示并暂停实时刷新：断开 /ws/push → 观看者数减 1 →
+  // 服务端下发慢采 → agent 恢复 120s 上报，节省 Cloudflare 额度（快采 5s ≈ 17,280 帧/天/机）
+  const IDLE_TIMEOUT_MS = 10 * 60 * 1000; // 无操作 10 分钟判定空闲
+  const IDLE_PROMPT_MS = 60 * 1000;       // 提示后 60s 无响应自动暂停
+  let idleTimer = null;
+  let idlePromptTimer = null;
+  let idlePaused = false;
+
+  function resetIdle() {
+    if (idlePaused || !token) return;
+    clearTimeout(idleTimer);
+    clearTimeout(idlePromptTimer);
+    idleTimer = setTimeout(onIdleTimeout, IDLE_TIMEOUT_MS);
+  }
+  function onIdleTimeout() {
+    if (!token || idlePaused) return;
+    const pause = () => pauseViewing();
+    // 确认=继续观看（重置计时）；取消=立即暂停；关闭弹窗=忽略提示（60s 倒计时自动暂停兜底）
+    confirmDialog('长时间未操作。为节省 Cloudflare 额度，将暂停实时刷新（agent 将恢复慢采）。\n\n点击「确认」继续观看，或「取消」暂停；60 秒无响应将自动暂停。', resetIdle, pause);
+    idlePromptTimer = setTimeout(pause, IDLE_PROMPT_MS);
+  }
+  function pauseViewing() {
+    if (idlePaused) return;
+    idlePaused = true;
+    clearTimeout(idleTimer);
+    clearTimeout(idlePromptTimer);
+    stopPush(); // 断开 /ws/push → 观看者减 1 → agent 恢复慢采
+    toast('已暂停实时刷新（agent 恢复慢采，节省额度）。移动鼠标或按键即可恢复。');
+  }
+  function resumeViewing() {
+    if (!idlePaused) return;
+    idlePaused = false;
+    startPush(); // 重连 /ws/push → 观看者加 1 → agent 恢复快采
+    resetIdle();
+    toast('已恢复实时刷新。');
+  }
+  // 用户活动：暂停中 → 恢复观看；观看中 → 重置空闲计时
+  ['mousemove', 'mousedown', 'keydown', 'scroll', 'touchstart'].forEach((ev) => {
+    document.addEventListener(ev, () => {
+      if (idlePaused) resumeViewing();
+      else resetIdle();
+    }, { passive: true });
+  });
+
   // 后台标签页隐藏时关闭整个 WS（观看者计数减 1 → agent 恢复慢采，后台接近零成本）；
   // 恢复可见时重建连接：onopen 发 auth + startPushTimer 立即拉取一次并恢复 3s 定时
   document.addEventListener('visibilitychange', () => {
@@ -485,7 +531,7 @@
     $('#btn-dialog-close').onclick = closeDialog;
     $('#btn-dialog-cancel').onclick = closeDialog;
   }
-  function confirmDialog(message, onOk) {
+  function confirmDialog(message, onOk, onCancel) {
     $('#dialog-title').textContent = '确认';
     $('#dialog-text').textContent = message;
     $('#dialog-text').classList.remove('mono');
@@ -495,7 +541,7 @@
     $('#dialog').classList.remove('hidden');
     lockScroll();
     $('#btn-dialog-close').onclick = closeDialog;
-    $('#btn-dialog-cancel').onclick = closeDialog;
+    $('#btn-dialog-cancel').onclick = () => { closeDialog(); onCancel && onCancel(); };
     $('#btn-dialog-ok').onclick = () => { closeDialog(); onOk && onOk(); };
   }
 

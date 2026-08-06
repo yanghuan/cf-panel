@@ -251,8 +251,25 @@ async fn collect_net() -> (u64, u64) {
     (in_rate, out_rate)
 }
 
+// 系统信息缓存（M7）：OS/内核/IP 基本不变，10min 内复用（快采不再每帧 fork uname/hostname）
+type InfoCache = tokio::sync::Mutex<Option<(std::time::Instant, serde_json::Value)>>;
+static INFO_CACHE: std::sync::OnceLock<InfoCache> = std::sync::OnceLock::new();
+async fn info_cache(
+) -> tokio::sync::MutexGuard<'static, Option<(std::time::Instant, serde_json::Value)>> {
+    INFO_CACHE
+        .get_or_init(|| tokio::sync::Mutex::new(None))
+        .lock()
+        .await
+}
+
 // 系统信息：OS / 内核 / IP（uname/hostname 放线程池+超时）
 async fn collect_info() -> serde_json::Value {
+    let now = std::time::Instant::now();
+    if let Some((ts, v)) = info_cache().await.as_ref() {
+        if now.duration_since(*ts).as_secs() < 600 {
+            return v.clone(); // 10min 缓存命中
+        }
+    }
     let os = read_file("/etc/os-release")
         .and_then(|s| {
             s.lines()
@@ -286,7 +303,9 @@ async fn collect_info() -> serde_json::Value {
             ip4 = p.to_string();
         }
     }
-    json!({ "os": os, "kern": kern, "ip4": ip4, "ip6": ip6 })
+    let val = json!({ "os": os, "kern": kern, "ip4": ip4, "ip6": ip6 });
+    *info_cache().await = Some((now, val.clone())); // 成功才更新缓存
+    val
 }
 
 // ---- 探活 PROBES：名称:类型:目标,...（http 检查 2xx/3xx，tcp 测连通）----
@@ -458,15 +477,23 @@ async fn collect_custom(cfg: &Config) -> Vec<serde_json::Value> {
 
 // ---- 汇总上报 ----
 pub async fn collect_report(cfg: &Config) -> Option<String> {
-    let cpu = collect_cpu().await;
-    let (mem_used, mem_total, swap) = collect_mem();
-    let (l1, l5, l15, procs, uptime) = collect_load();
-    let (tcp, udp) = collect_conns();
-    let (net_in, net_out) = collect_net().await;
-    let info = collect_info().await;
-    let probes = collect_probes(cfg).await;
-    let custom = collect_custom(cfg).await;
-    let disk = collect_disk().await;
+    // M4：无依赖采集项并行（join!），消除串行累积（cpu 200ms + df/uname/hostname 5s 上限 +
+    // probes/custom 5s/个）对快采帧率的稀释；blocking 峰值 = info(1) + disk(1) = 2 < Semaphore 4
+    let (cpu, mem, load, conns, net, info, probes, custom, disk) = tokio::join!(
+        collect_cpu(),
+        async { collect_mem() },
+        async { collect_load() },
+        async { collect_conns() },
+        collect_net(),
+        collect_info(),
+        collect_probes(cfg),
+        collect_custom(cfg),
+        collect_disk(),
+    );
+    let (mem_used, mem_total, swap) = mem;
+    let (l1, l5, l15, procs, uptime) = load;
+    let (tcp, udp) = conns;
+    let (net_in, net_out) = net;
     let report = json!({
         "type": "report",
         "cpu": cpu,

@@ -262,15 +262,22 @@ async fn dispatch(
             if sid.is_empty() {
                 return Ok(());
             }
-            // 幂等：同 SID 会话已存在（DO 确认重发场景）则不重复 spawn，仅回执 ready
-            if sessions.lock().await.contains_key(&sid) {
-                let mut w = write.lock().await;
-                let _ = w
-                    .send(Message::Text(format!(
-                        r#"{{"type":"terminal_ready","stream_id":"{sid}"}}"#
-                    )))
-                    .await;
-                return Ok(());
+            // 幂等：同 SID 会话已存在且仍活跃（DO 确认重发场景）则不重复 spawn，仅回执 ready。
+            // M8：旧会话已死（数据面结束但未移出 map 的僵尸）则先移除再重建，回执才有意义
+            {
+                let mut map = sessions.lock().await;
+                if let Some(existing) = map.get(&sid) {
+                    if existing.is_alive() {
+                        let mut w = write.lock().await;
+                        let _ = w
+                            .send(Message::Text(format!(
+                                r#"{{"type":"terminal_ready","stream_id":"{sid}"}}"#
+                            )))
+                            .await;
+                        return Ok(());
+                    }
+                    map.remove(&sid); // 僵尸会话：移除，走重建
+                }
             }
             log(format!("open_terminal sid={sid}"));
             let term = match session::TermSession::spawn(&sid).await {
@@ -321,8 +328,17 @@ async fn dispatch(
                 .and_then(|x| x.as_str())
                 .unwrap_or("")
                 .to_string();
-            let rows = v.get("rows").and_then(|x| x.as_u64()).unwrap_or(24);
-            let cols = v.get("cols").and_then(|x| x.as_u64()).unwrap_or(80);
+            // L1：clamp 1..=500，防异常超大值截断为 0（rows=65536 as u16 → 0）
+            let rows = v
+                .get("rows")
+                .and_then(|x| x.as_u64())
+                .unwrap_or(24)
+                .clamp(1, 500);
+            let cols = v
+                .get("cols")
+                .and_then(|x| x.as_u64())
+                .unwrap_or(80)
+                .clamp(1, 500);
             if let Some(term) = sessions.lock().await.get(&sid).cloned() {
                 term.resize(rows as u16, cols as u16);
             }

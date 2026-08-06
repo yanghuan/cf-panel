@@ -34,6 +34,7 @@ pub struct TermSession {
     child: Arc<Mutex<Option<Box<dyn portable_pty::Child + Send + Sync>>>>,
     child_pid: u32,
     cleaned: std::sync::atomic::AtomicBool, // cleanup 幂等（M5：防双调用 kill 后 PID 复用误杀）
+    alive: std::sync::atomic::AtomicBool, // 会话是否仍活跃（M8：僵尸会话不再回执 ready，而是重建）
 }
 
 impl TermSession {
@@ -58,6 +59,7 @@ impl TermSession {
             child: Arc::new(Mutex::new(Some(child))),
             child_pid,
             cleaned: std::sync::atomic::AtomicBool::new(false),
+            alive: std::sync::atomic::AtomicBool::new(true),
         })
     }
 
@@ -79,6 +81,7 @@ impl TermSession {
         if self.cleaned.swap(true, std::sync::atomic::Ordering::SeqCst) {
             return;
         }
+        self.alive.store(false, std::sync::atomic::Ordering::SeqCst); // M8：会话结束标记
         #[cfg(unix)]
         if self.child_pid > 0 {
             unsafe {
@@ -88,9 +91,15 @@ impl TermSession {
         let mut child = self.child.lock().await;
         if let Some(c) = child.as_mut() {
             let _ = c.kill();
+            let _ = c.wait(); // L6：kill 后 wait 收集僵尸，避免 PID 复用
         }
         *child = None;
         log(format!("terminal {} cleaned up", self.sid));
+    }
+
+    // M8：会话是否仍活跃（false = 数据面已结束/僵尸，ready 分支据此决定重建）
+    pub fn is_alive(&self) -> bool {
+        self.alive.load(std::sync::atomic::Ordering::SeqCst)
     }
 }
 
@@ -124,8 +133,15 @@ async fn run_terminal_inner(cfg: &Config, term: &Arc<TermSession>) {
             return;
         }
     };
-    req.headers_mut()
-        .insert("X-Agent-Key", cfg.key.parse().unwrap());
+    // M2：key 含非法 header 字符时友好退出而非 panic
+    let Ok(key) = cfg
+        .key
+        .parse::<tokio_tungstenite::tungstenite::http::HeaderValue>()
+    else {
+        log(format!("terminal {} bad agent key", term.sid));
+        return;
+    };
+    req.headers_mut().insert("X-Agent-Key", key);
     let (ws, _) = match tokio_tungstenite::connect_async(req).await {
         Ok(x) => x,
         Err(e) => {
@@ -234,8 +250,15 @@ pub async fn run_file_session(cfg: Config, sid: String) {
             return;
         }
     };
-    req.headers_mut()
-        .insert("X-Agent-Key", cfg.key.parse().unwrap());
+    // M2：key 含非法 header 字符时友好退出而非 panic
+    let Ok(key) = cfg
+        .key
+        .parse::<tokio_tungstenite::tungstenite::http::HeaderValue>()
+    else {
+        log(format!("file {sid} bad agent key"));
+        return;
+    };
+    req.headers_mut().insert("X-Agent-Key", key);
     // 限制入站消息大小，防恶意超大 data 整包占内存
     let cfg_ws = tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
         max_message_size: Some(WS_MSG_LIMIT),
@@ -273,8 +296,8 @@ pub async fn run_file_session(cfg: Config, sid: String) {
         }
     }
     // 断线/会话结束：清理本会话创建的临时文件（防止 .upload.{id} 残留累积）
-    {
-        let tmp = created.lock().unwrap();
+    // M2：Mutex poison 容忍
+    if let Ok(tmp) = created.lock() {
         for p in tmp.iter() {
             let _ = std::fs::remove_file(p);
         }
@@ -447,19 +470,27 @@ async fn file_list(path: String, pattern: Option<String>) -> String {
                     truncated = true;
                     break;
                 }
-                let meta = e.metadata();
-                let is_dir = meta.as_ref().map(|m| m.is_dir()).unwrap_or(false);
+                // L4：先用 file_type（readdir 已带类型，无需完整 stat），仅文件再取 len/mtime
+                let ft = match e.file_type() {
+                    Ok(t) => t,
+                    Err(_) => continue,
+                };
+                let is_dir = ft.is_dir();
                 let size = if is_dir {
                     0
                 } else {
-                    meta.as_ref().map(|m| m.len()).unwrap_or(0)
+                    e.metadata().map(|m| m.len()).unwrap_or(0)
                 };
-                let mtime = meta
-                    .and_then(|m| m.modified())
-                    .ok()
-                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0);
+                let mtime = if is_dir {
+                    0
+                } else {
+                    e.metadata()
+                        .ok()
+                        .and_then(|m| m.modified().ok())
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0)
+                };
                 entries.push(serde_json::json!({
                     "name": name,
                     "type": if is_dir { "dir" } else { "file" },
@@ -552,13 +583,22 @@ fn write_bytes(
     created: &Arc<std::sync::Mutex<Vec<String>>>,
 ) -> String {
     use std::io::{Seek, SeekFrom, Write};
+    // L11：upload_id 字符白名单（深度防御，path 已任意，防异常 upload_id 注入临时文件名）
+    if !upload_id
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return err_json("bad upload_id");
+    }
     let tmp = format!("{}.upload.{}", path, upload_id);
     if let Some(parent) = std::path::Path::new(path).parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    // 记录本会话创建的临时文件（会话结束/断线时清理）
+    // 记录本会话创建的临时文件（会话结束/断线时清理）；L2：contains 去重防重复 push
     if let Ok(mut c) = created.lock() {
-        c.push(tmp.clone());
+        if !c.contains(&tmp) {
+            c.push(tmp.clone());
+        }
     }
     let cleanup = |tmp: &str| {
         let _ = std::fs::remove_file(tmp);

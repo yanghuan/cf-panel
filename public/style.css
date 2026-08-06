@@ -435,6 +435,15 @@ button.danger:hover { background: rgba(248, 113, 113, .12); }
 .settings-body h4:first-child { margin-top: 0; }
 .settings-row { display: flex; gap: 8px; align-items: center; margin-bottom: 8px; flex-wrap: wrap; }
 .settings-row input { flex: 1; min-width: 160px; }
+/* checkbox 例外：不被 flex:1 拉伸成长条，固定尺寸 + 主题色 */
+.settings-row input[type="checkbox"] {
+  flex: 0 0 auto;
+  width: 16px;
+  height: 16px;
+  min-width: 0;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
 .settings-row .chk { font-size: 13px; color: var(--muted); display: flex; align-items: center; gap: 4px; white-space: nowrap; }
 .token-list { list-style: none; margin: 8px 0 0; padding: 0; font-size: 13px; }
 .token-list li { display: flex; justify-content: space-between; align-items: center; padding: 6px 8px; border-bottom: 1px solid var(--border); word-break: break-all; }

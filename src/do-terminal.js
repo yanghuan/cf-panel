@@ -18,7 +18,7 @@ export class TerminalDO {
     this.sessions = new Map(); // streamId -> {streamId, serverId, creatorUserId, createdAt, userWs, agentWs}
     this.agents = new Map(); // serverId -> 控制 WS
     this.agentInterval = new Map(); // serverId -> 当前下发的上报间隔（秒），避免重复下发
-    this.pendingTerm = new Map(); // streamId -> {tries, timer} open_terminal 确认重发
+    this.pendingOpen = new Map(); // streamId -> {tries, timer, type} open_terminal/open_file 确认重发
     this.lastPingAt = new Map(); // serverId -> 上次心跳时间（控制通道保活，防健康连接被 read -t 180 误判半开）
   }
 
@@ -59,11 +59,11 @@ export class TerminalDO {
         this.sessions.delete(sid);
         this.state.storage.delete('sess:' + sid).catch(() => {}); // 清理持久化会话
       }
-      // 清理该服务器的 open_terminal 待确认（定时器停止）
+      // 清理该服务器的 open_terminal/open_file 待确认（定时器停止）
       for (const sid of sids) {
-        const r = this.pendingTerm.get(sid);
+        const r = this.pendingOpen.get(sid);
         if (r && r.timer) clearTimeout(r.timer);
-        this.pendingTerm.delete(sid);
+        this.pendingOpen.delete(sid);
       }
       return json({ ok: true });
     }
@@ -113,10 +113,11 @@ export class TerminalDO {
           const next = createdAt + SESSION_TTL_MS + 1000;
           if (existing == null || next < existing) this.state.storage.setAlarm(next);
         } catch { /* 无法安排 alarm 时依赖 fetch 时 maybeSweep */ }
-        agentWs.send(JSON.stringify({ type: isFile ? 'open_file' : 'open_terminal', stream_id: body.streamId }));
-        // 终端会话：确认重发机制——agent 收到并 spawn 后回 terminal_ready，
-        // 未确认则定时重发（最多 3 次），避免控制通道重连窗口丢指令
-        if (!isFile) this.scheduleTermAck(agentWs, body.streamId, body.serverId);
+        // 会话指令：确认重发机制（L10 补齐 open_file）——agent 收到并启动后回
+        // terminal_ready/file_ready，未确认则定时重发（最多 3 次），避免控制通道重连窗口丢指令
+        const openType = isFile ? 'open_file' : 'open_terminal';
+        agentWs.send(JSON.stringify({ type: openType, stream_id: body.streamId }));
+        this.scheduleOpenAck(agentWs, body.streamId, body.serverId, openType);
         return json({ ok: true });
       }
       return err('bad op');
@@ -229,7 +230,7 @@ export class TerminalDO {
     return sess;
   }
 
-  // 惰性清理：两端都断开且超过 TTL 的僵尸会话 → 删除；并清理对应 pendingTerm。
+  // 惰性清理：两端都断开且超过 TTL 的僵尸会话 → 删除；并清理对应 pendingOpen。
   // 若有未到期的僵尸会话，则安排 DO alarm 到最早到期时间——Hibernation 下零流量也会
   // 被 alarm 短暂唤醒执行清理，避免"必须等下一次 fetch 才回收"的滞留（alarm 每次 = 1 次请求，僵尸会话罕见，成本可忽略）。
   maybeSweep() {
@@ -256,12 +257,12 @@ export class TerminalDO {
         next = Math.min(next, sess.createdAt + SESSION_TTL_MS);
       }
     }
-    // 清理已无会话的 open_terminal 待确认（流已回收，停止定时器，防泄漏）
-    for (const sid of [...this.pendingTerm.keys()]) {
+    // 清理已无会话的 open_terminal/open_file 待确认（流已回收，停止定时器，防泄漏）
+    for (const sid of [...this.pendingOpen.keys()]) {
       if (!this.sessions.has(sid)) {
-        const r = this.pendingTerm.get(sid);
+        const r = this.pendingOpen.get(sid);
         if (r && r.timer) clearTimeout(r.timer);
-        this.pendingTerm.delete(sid);
+        this.pendingOpen.delete(sid);
       }
     }
     if (next !== Infinity) {
@@ -275,22 +276,22 @@ export class TerminalDO {
     this.maybeSweep();
   }
 
-  // open_terminal 确认重发：下发后 5s 未收到 agent 的 terminal_ready 则重发，最多 3 次
-  // 解决 agent 控制通道重连窗口内指令丢失导致的终端"打不开"
+  // open_terminal/open_file 确认重发：下发后 5s 未收到 agent 的 *_ready 则重发，最多 3 次
+  // 解决 agent 控制通道重连窗口内指令丢失导致的终端/文件"打不开"（L10：open_file 补齐）
   // 记录 serverId + agentWs 归属：cleanup 断开时只清理关联项，不影响其他服务器/会话
-  scheduleTermAck(agentWs, streamId, serverId) {
-    if (this.pendingTerm.has(streamId)) return;
-    const rec = { tries: 0, timer: null, serverId, agentWs };
-    this.pendingTerm.set(streamId, rec);
+  scheduleOpenAck(agentWs, streamId, serverId, openType) {
+    if (this.pendingOpen.has(streamId)) return;
+    const rec = { tries: 0, timer: null, serverId, agentWs, type: openType };
+    this.pendingOpen.set(streamId, rec);
     const retry = () => {
-      const r = this.pendingTerm.get(streamId);
-      if (!r) return; // 已确认（terminal_ready）或已清理
+      const r = this.pendingOpen.get(streamId);
+      if (!r) return; // 已确认（*_ready）或已清理
       if (agentWs.readyState === 1) {
-        try { agentWs.send(JSON.stringify({ type: 'open_terminal', stream_id: streamId })); } catch { /* ignore */ }
+        try { agentWs.send(JSON.stringify({ type: r.type, stream_id: streamId })); } catch { /* ignore */ }
       }
       r.tries += 1;
       if (r.tries < 3) r.timer = setTimeout(retry, 5000);
-      else this.pendingTerm.delete(streamId); // 3 次后放弃（前端有自愈兜底）
+      else this.pendingOpen.delete(streamId); // 3 次后放弃（前端有自愈兜底）
     };
     rec.timer = setTimeout(retry, 5000);
   }
@@ -411,11 +412,11 @@ export class TerminalDO {
       if (typeof message === 'string') {
         try {
           const j = JSON.parse(message);
-          if (j && j.type === 'terminal_ready') {
-            // agent 已收到 open_terminal 并开始 spawn → 停止确认重发
-            const r = this.pendingTerm.get(j.stream_id);
+          if (j && (j.type === 'terminal_ready' || j.type === 'file_ready')) {
+            // agent 已收到 open_terminal/open_file 并开始启动 → 停止确认重发（L10：file_ready 补齐）
+            const r = this.pendingOpen.get(j.stream_id);
             if (r && r.timer) clearTimeout(r.timer);
-            this.pendingTerm.delete(j.stream_id);
+            this.pendingOpen.delete(j.stream_id);
             return;
           }
           if (j && j.type === 'report') {
@@ -531,10 +532,10 @@ export class TerminalDO {
         if (sess.userWs) {
           try { sess.userWs.close(); } catch { /* ignore */ }
         }
-        // 会话数据流断开 → 仅清理该会话的 open_terminal 待确认（数据流已不可用）
-        const r = this.pendingTerm.get(sid);
+        // 会话数据流断开 → 仅清理该会话的 open_terminal/open_file 待确认（数据流已不可用）
+        const r = this.pendingOpen.get(sid);
         if (r && r.timer) clearTimeout(r.timer);
-        this.pendingTerm.delete(sid);
+        this.pendingOpen.delete(sid);
       }
       if (!sess.userWs && !sess.agentWs) {
         this.sessions.delete(sid);
@@ -545,10 +546,10 @@ export class TerminalDO {
       if (w === ws) {
         this.agents.delete(serverId);
         // 控制通道断开 → 仅清理该 agent（serverId）的待确认，不影响其他服务器/会话
-        for (const [sid, r] of [...this.pendingTerm]) {
+        for (const [sid, r] of [...this.pendingOpen]) {
           if (r.serverId === serverId) {
             if (r.timer) clearTimeout(r.timer);
-            this.pendingTerm.delete(sid);
+            this.pendingOpen.delete(sid);
           }
         }
       }

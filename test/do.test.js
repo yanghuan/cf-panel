@@ -1054,15 +1054,67 @@ test('TerminalDO: terminal_ready 确认后停止重发', async (t) => {
   }
 });
 
+test('TerminalDO: /rpc open_file 下发确认重发，未确认时 5s 重发最多 3 次（L10）', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  try {
+    const env = makeEnv();
+    const sent = [];
+    const agentWs = { send: (m) => sent.push(m), readyState: 1 };
+    const inst = new TerminalDO(mockState(), env);
+    inst.agents.set(1, agentWs);
+    const res = await inst.fetch(new Request('https://do.internal/rpc', {
+      method: 'POST',
+      body: JSON.stringify({ op: 'open_file', streamId: '0-fid', serverId: 1, creatorUserId: 1 }),
+    }));
+    assert.equal(res.status, 200);
+    assert.deepEqual(sent, [JSON.stringify({ type: 'open_file', stream_id: '0-fid' })]);
+
+    t.mock.timers.tick(5000); // 第 1 次重发（重发的仍是 open_file 类型）
+    assert.equal(sent.length, 2);
+    assert.deepEqual(sent[1], JSON.stringify({ type: 'open_file', stream_id: '0-fid' }));
+    t.mock.timers.tick(5000); // 第 2 次重发
+    assert.equal(sent.length, 3);
+    t.mock.timers.tick(5000); // 第 3 次重发后达上限放弃
+    assert.equal(sent.length, 4);
+    t.mock.timers.tick(5000); // 不再重发
+    assert.equal(sent.length, 4);
+  } finally {
+    t.mock.timers.reset();
+  }
+});
+
+test('TerminalDO: file_ready 确认后停止 open_file 重发（L10）', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  try {
+    const env = makeEnv();
+    const sent = [];
+    const agentWs = { send: (m) => sent.push(m), readyState: 1 };
+    const inst = new TerminalDO(mockState(), env);
+    inst.agents.set(1, agentWs);
+    await inst.fetch(new Request('https://do.internal/rpc', {
+      method: 'POST',
+      body: JSON.stringify({ op: 'open_file', streamId: '0-fid', serverId: 1, creatorUserId: 1 }),
+    }));
+    assert.equal(sent.length, 1);
+
+    // agent 回 file_ready → 停止重发
+    await inst.webSocketMessage(agentWs, JSON.stringify({ type: 'file_ready', stream_id: '0-fid' }));
+    t.mock.timers.tick(5000);
+    assert.equal(sent.length, 1);
+  } finally {
+    t.mock.timers.reset();
+  }
+});
+
 test('TerminalDO: 僵尸会话超 TTL 由 alarm 清理，未到期安排下次 alarm', async () => {
   const env = makeEnv();
   const st = mockState();
   const inst = new TerminalDO(st, env);
   const now = Date.now();
   const TTL = 10 * 60 * 1000; // SESSION_TTL_MS
-  // 过期僵尸 → 直接清掉，其 pendingTerm 也清理
+  // 过期僵尸 → 直接清掉，其 pendingOpen 也清理
   inst.sessions.set('0-old', { streamId: '0-old', serverId: 1, creatorUserId: 1, createdAt: now - TTL - 1000, userWs: null, agentWs: null });
-  inst.pendingTerm.set('0-old', { tries: 0, timer: null });
+  inst.pendingOpen.set('0-old', { tries: 0, timer: null });
   // 未过期僵尸 → 保留并安排 alarm 到其到期时间
   inst.sessions.set('0-young', { streamId: '0-young', serverId: 1, creatorUserId: 1, createdAt: now - 1000, userWs: null, agentWs: null });
   // 任一端有连接 → 不回收（即使创建很久）
@@ -1071,7 +1123,7 @@ test('TerminalDO: 僵尸会话超 TTL 由 alarm 清理，未到期安排下次 a
   await inst.alarm();
 
   assert.equal(inst.sessions.has('0-old'), false);
-  assert.equal(inst.pendingTerm.has('0-old'), false);
+  assert.equal(inst.pendingOpen.has('0-old'), false);
   assert.equal(inst.sessions.has('0-young'), true);
   assert.equal(inst.sessions.has('0-live'), true);
   // 安排了 alarm：最早僵尸到期时间 +1s
@@ -1255,7 +1307,7 @@ test('TerminalDO: 浏览器鉴权前 agent 输出缓冲，鉴权后补发（初�
 });
 
 test('TerminalDO: 会话持久化到 DO Storage，休眠后可水合（浏览器 auth 不因会话丢失被拒）', async (t) => {
-  t.mock.timers.enable({ apis: ['setTimeout'] }); // 屏蔽 scheduleTermAck 的 5s 定时器
+  t.mock.timers.enable({ apis: ['setTimeout'] }); // 屏蔽 scheduleOpenAck 的 5s 定时器
   try {
     const env = makeEnv();
     const st = mockState(); // 共享 storage，模拟 DO 持久化跨实例存活
@@ -1354,7 +1406,7 @@ test('TerminalDO: 控制通道重连时关闭该服务器旧会话流（dropAgen
   assert.equal(inst.sessions.get('2-c').agentWs.closed, false, '其他服务器会话不受影响');
 });
 
-test('TerminalDO: cleanup 按归属清理 pendingTerm，跨服务器/会话隔离', async () => {
+test('TerminalDO: cleanup 按归属清理 pendingOpen，跨服务器/会话隔离', async () => {
   const env = makeEnv();
   const ctl1 = { send() {}, readyState: 1 }; // server 1 控制通道
   const ctl2 = { send() {}, readyState: 1 }; // server 2 控制通道
@@ -1364,22 +1416,22 @@ test('TerminalDO: cleanup 按归属清理 pendingTerm，跨服务器/会话隔�
   inst.agents.set(2, ctl2);
   inst.sessions.set('1-a', { streamId: '1-a', serverId: 1, creatorUserId: 1, createdAt: Date.now(), userWs: null, agentWs: agentFlow, userBuf: [] });
   inst.sessions.set('2-b', { streamId: '2-b', serverId: 2, creatorUserId: 1, createdAt: Date.now(), userWs: null, agentWs: null, userBuf: [] });
-  inst.pendingTerm.set('1-a', { tries: 0, timer: null, serverId: 1, agentWs: ctl1 });
-  inst.pendingTerm.set('2-b', { tries: 0, timer: null, serverId: 2, agentWs: ctl2 });
+  inst.pendingOpen.set('1-a', { tries: 0, timer: null, serverId: 1, agentWs: ctl1, type: 'open_terminal' });
+  inst.pendingOpen.set('2-b', { tries: 0, timer: null, serverId: 2, agentWs: ctl2, type: 'open_file' });
 
   // server1 控制通道断开 → 只清 server1 的待确认
   inst.cleanup(ctl1);
   assert.equal(inst.agents.has(1), false);
-  assert.equal(inst.pendingTerm.has('1-a'), false, 'server1 待确认被清理');
-  assert.equal(inst.pendingTerm.has('2-b'), true, 'server2 待确认不受影响');
+  assert.equal(inst.pendingOpen.has('1-a'), false, 'server1 待确认被清理');
+  assert.equal(inst.pendingOpen.has('2-b'), true, 'server2 待确认不受影响');
 
   // 会话 1-a 的 agent 数据流断开 → 清该会话待确认并回收会话，不影响 server2
   inst.cleanup(agentFlow);
   assert.equal(inst.sessions.has('1-a'), false, '1-a 两端断开被回收');
-  assert.equal(inst.pendingTerm.has('2-b'), true, 'server2 待确认仍保留');
+  assert.equal(inst.pendingOpen.has('2-b'), true, 'server2 待确认仍保留');
 
   // server2 控制通道断开 → 全部清空
   inst.cleanup(ctl2);
   assert.equal(inst.agents.size, 0);
-  assert.equal(inst.pendingTerm.size, 0, 'server2 断开后 pendingTerm 清空');
+  assert.equal(inst.pendingOpen.size, 0, 'server2 断开后 pendingOpen 清空');
 });

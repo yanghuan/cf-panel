@@ -147,11 +147,12 @@ const CTRL_MSG_LIMIT: usize = 64 * 1024; // L3：控制通道入站消息上限 
 async fn run_control(
     cfg: &Config,
     sessions: &Arc<Mutex<std::collections::HashMap<String, Arc<session::TermSession>>>>,
+    file_sessions: &Arc<Mutex<std::collections::HashSet<String>>>,
 ) {
     let mut backoff = RETRY_INITIAL_SECS;
     loop {
         let started = std::time::Instant::now();
-        match control_conn(cfg, sessions).await {
+        match control_conn(cfg, sessions, file_sessions).await {
             Ok(_) => {
                 log("control channel closed");
                 // H4：存活 <10s 的"成功连接"（服务端立即关闭/反代错误/服务端 bug）
@@ -195,6 +196,7 @@ fn is_auth_error(e: &(dyn Error + Send + Sync + 'static)) -> bool {
 async fn control_conn(
     cfg: &Config,
     sessions: &Arc<Mutex<std::collections::HashMap<String, Arc<session::TermSession>>>>,
+    file_sessions: &Arc<Mutex<std::collections::HashSet<String>>>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let url = format!("{}/control", cfg.wss);
     let mut req = url.into_client_request()?;
@@ -235,7 +237,7 @@ async fn control_conn(
                 Err(_) => return Err("control read timeout (half-open connection)".into()),
             };
         if let Message::Text(t) = msg {
-            dispatch(cfg, sessions, &write, &interval, &note, &t).await?;
+            dispatch(cfg, sessions, file_sessions, &write, &interval, &note, &t).await?;
         }
     }
     Ok(())
@@ -249,6 +251,7 @@ fn clamp_report_interval(iv: u64) -> u64 {
 async fn dispatch(
     cfg: &Config,
     sessions: &Arc<Mutex<std::collections::HashMap<String, Arc<session::TermSession>>>>,
+    file_sessions: &Arc<Mutex<std::collections::HashSet<String>>>,
     write: &Arc<Mutex<Sink>>,
     interval: &Arc<AtomicU64>,
     note: &Arc<Notify>,
@@ -333,10 +336,30 @@ async fn dispatch(
             if sid.is_empty() {
                 return Ok(());
             }
+            // L10：幂等——确认重发场景（回执在重连窗口丢失导致 DO 重发）已存在则不重复启动
+            if !file_sessions.lock().await.insert(sid.clone()) {
+                let mut w = write.lock().await;
+                let _ = w
+                    .send(Message::Text(format!(
+                        r#"{{"type":"file_ready","stream_id":"{sid}"}}"#
+                    )))
+                    .await;
+                return Ok(());
+            }
             log(format!("open_file sid={sid}"));
+            // L10：回执 file_ready，停止 DO 的 open_file 确认重发
+            let mut w = write.lock().await;
+            let _ = w
+                .send(Message::Text(format!(
+                    r#"{{"type":"file_ready","stream_id":"{sid}"}}"#
+                )))
+                .await;
+            drop(w);
             let cfg2 = cfg.clone();
+            let fs2 = file_sessions.clone();
             tokio::spawn(async move {
-                session::run_file_session(cfg2, sid).await;
+                session::run_file_session(cfg2, sid.clone()).await;
+                fs2.lock().await.remove(&sid); // 会话结束释放槽位
             });
         }
         "resize" => {
@@ -442,6 +465,9 @@ async fn main() {
 
     let sessions: Arc<Mutex<std::collections::HashMap<String, Arc<session::TermSession>>>> =
         Arc::new(Mutex::new(Default::default()));
+    // L10：文件会话注册表（open_file 确认重发场景幂等：重发时已存在仅回执，不重复启动）
+    let file_sessions: Arc<Mutex<std::collections::HashSet<String>>> =
+        Arc::new(Mutex::new(Default::default()));
 
     // 信号：SIGTERM/SIGINT → 清理退出
     let shutdown = Arc::new(Notify::new());
@@ -464,7 +490,7 @@ async fn main() {
     }
 
     tokio::select! {
-        _ = run_control(&cfg, &sessions) => {}
+        _ = run_control(&cfg, &sessions, &file_sessions) => {}
         _ = shutdown.notified() => {}
     }
 

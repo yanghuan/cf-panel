@@ -129,6 +129,8 @@ pub fn log(msg: impl AsRef<str>) {
 const RETRY_INITIAL_SECS: u64 = 3;
 const RETRY_MAX_SECS: u64 = 300;
 const AUTH_FAIL_SECS: u64 = 300;
+const MIN_UPTIME_RESET_SECS: u64 = 10; // 存活 ≥10s 才算"健康连接"，才重置退避（H4 防秒断风暴）
+const CONTROL_READ_TIMEOUT_S: u64 = 180; // 读循环超时：180s 无任何消息判定半开（健康连接有 30s 心跳）
 
 async fn run_control(
     cfg: &Config,
@@ -136,10 +138,17 @@ async fn run_control(
 ) {
     let mut backoff = RETRY_INITIAL_SECS;
     loop {
+        let started = std::time::Instant::now();
         match control_conn(cfg, sessions).await {
             Ok(_) => {
                 log("control channel closed");
-                backoff = RETRY_INITIAL_SECS;
+                // H4：存活 <10s 的"成功连接"（服务端立即关闭/反代错误/服务端 bug）
+                // 同样指数退避，防秒断时每 ~3s 重连风暴（28,800 次/天放大 Worker/D1）
+                if started.elapsed().as_secs() < MIN_UPTIME_RESET_SECS {
+                    backoff = (backoff * 2).min(RETRY_MAX_SECS);
+                } else {
+                    backoff = RETRY_INITIAL_SECS;
+                }
             }
             Err(e) => {
                 log(format!("control channel error: {e}"));
@@ -196,14 +205,28 @@ async fn control_conn(
         });
     }
 
-    // 读循环：指令分发
-    while let Some(msg) = read.next().await {
-        let msg = msg?;
+    // 读循环：指令分发（H3：180s 无任何消息判定半开连接，断开触发重连——
+    // NAT/防火墙静默断链不再依赖 TCP keepalive 2h 才发现；健康连接有服务端 30s 心跳必有下行）
+    loop {
+        let msg =
+            match tokio::time::timeout(Duration::from_secs(CONTROL_READ_TIMEOUT_S), read.next())
+                .await
+            {
+                Ok(Some(Ok(m))) => m,
+                Ok(Some(Err(e))) => return Err(Box::new(e)),
+                Ok(None) => break, // 服务端正常关闭
+                Err(_) => return Err("control read timeout (half-open connection)".into()),
+            };
         if let Message::Text(t) = msg {
             dispatch(cfg, sessions, &write, &interval, &note, &t).await?;
         }
     }
     Ok(())
+}
+
+// M3：上报间隔下限/上限校验（防异常/恶意 interval=0 导致采集紧循环打满 CPU）
+fn clamp_report_interval(iv: u64) -> u64 {
+    iv.clamp(1, 3600)
 }
 
 async fn dispatch(
@@ -223,7 +246,7 @@ async fn dispatch(
         "ping" => {} // 心跳保活，忽略
         "set_report_interval" => {
             if let Some(iv) = v.get("interval").and_then(|x| x.as_u64()) {
-                interval.store(iv, Ordering::Relaxed);
+                interval.store(clamp_report_interval(iv), Ordering::Relaxed);
                 note.notify_waiters();
             }
         }
@@ -427,6 +450,18 @@ mod tests {
     #[test]
     fn validate_wss_accepts_wss() {
         assert!(validate_wss("wss://panel.example.com/ws/agent").is_ok());
+    }
+
+    #[test]
+    fn clamp_report_interval_bounds() {
+        assert_eq!(
+            clamp_report_interval(0),
+            1,
+            "interval=0 钳到下限，防采集紧循环"
+        );
+        assert_eq!(clamp_report_interval(3), 3, "正常值不变");
+        assert_eq!(clamp_report_interval(120), 120);
+        assert_eq!(clamp_report_interval(5000), 3600, "超上限钳到 3600");
     }
 
     #[test]

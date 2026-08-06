@@ -268,7 +268,18 @@ async fn http_probe(url: &str, timeout_secs: u64) -> Option<(u16, u128)> {
         _ => (hostport.to_string(), 80u16),
     };
     let path = if path.is_empty() { "/" } else { path };
-    let addr: SocketAddr = format!("{host}:{port}").parse().ok()?;
+    // 域名兜底：IP 字面量直接解析；否则 lookup_host DNS（与 tcp_probe 对齐），
+    // 修复 http://域名/ 探活永远 DOWN（此前仅 IP 字面量，域名场景持续误告警）
+    let addr: SocketAddr = match format!("{host}:{port}").parse() {
+        Ok(a) => a,
+        Err(_) => match tokio::net::lookup_host((host.as_str(), port)).await {
+            Ok(mut it) => match it.next() {
+                Some(a) => a,
+                None => return None,
+            },
+            Err(_) => return None,
+        },
+    };
     let t0 = Instant::now();
     let fut = async {
         let mut conn = TcpStream::connect(addr).await.ok()?;

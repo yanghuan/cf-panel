@@ -622,7 +622,10 @@
   // 重新拉取列表（带当前通配符过滤规则）。过滤在 agent 端完成（先过滤再截断 1000 条），
   // 避免大目录下前端只拿到截断区间子集而遗漏匹配文件
   function reloadFileList() {
-    const pattern = $('#file-filter').value.trim();
+    let pattern = $('#file-filter').value.trim();
+    // Everything 风格：无通配符的纯文本按「子串包含」匹配（*文本*）——输入 dotnet 能匹配
+    // dotnet-sdk-*.exe 等任意位置包含的文件；含 * 或 ? 时保留通配符语义（*.log、dotnet*）
+    if (pattern && !/[*?]/.test(pattern)) pattern = `*${pattern}*`;
     const body = { type: 'list', path: fileCwd };
     if (pattern) body.pattern = pattern;
     fileSend(body);

@@ -49,23 +49,31 @@ where
     }
 }
 
-// CPU：两次采样（间隔 200ms）求差值，对齐 shell awk 算法
+// CPU：两次采样（间隔 200ms）求差值。
+// L7：扩展 8 字段口径（shell 版已弃用，不再对齐其 4 字段简化算法）——
+// total = user+nice+system+idle+iowait+irq+softirq+steal（guest/guest_nice 内核已计入 user/nice，
+// 不重复累加）；usage = (total - idle) / total，iowait/irq/softirq/steal 计入忙碌，
+// 高 iowait（磁盘/网络慢）与云主机 steal 被抢占时读数不再偏低
 async fn collect_cpu() -> f64 {
     let s1 = read_file("/proc/stat").and_then(|s| s.lines().next().map(|l| l.to_string()));
     tokio::time::sleep(Duration::from_millis(200)).await;
     let s2 = read_file("/proc/stat").and_then(|s| s.lines().next().map(|l| l.to_string()));
-    let parse = |l: &str| -> Option<(u64, u64, u64, u64)> {
+    let parse = |l: &str| -> Option<(u64, u64)> {
         let mut it = l.split_whitespace().skip(1);
-        let u = it.next()?.parse().ok()?;
-        let n = it.next()?.parse().ok()?;
-        let s = it.next()?.parse().ok()?;
-        let i = it.next()?.parse().ok()?;
-        Some((u, n, s, i))
+        let u: u64 = it.next()?.parse().ok()?;
+        let n: u64 = it.next()?.parse().ok()?;
+        let s: u64 = it.next()?.parse().ok()?;
+        let i: u64 = it.next()?.parse().ok()?;
+        let io: u64 = it.next()?.parse().ok()?;
+        let irq: u64 = it.next()?.parse().ok()?;
+        let soft: u64 = it.next()?.parse().ok()?;
+        let steal: u64 = it.next()?.parse().ok()?;
+        Some((u + n + s + i + io + irq + soft + steal, i))
     };
     match (s1.as_deref().and_then(parse), s2.as_deref().and_then(parse)) {
-        (Some((u0, n0, s0, i0)), Some((u1, n1, s1, i1))) => {
-            let total = (u1 + n1 + s1 + i1) as i64 - (u0 + n0 + s0 + i0) as i64;
-            let idle = i1 as i64 - i0 as i64;
+        (Some((t0, idle0)), Some((t1, idle1))) => {
+            let total = t1 as i64 - t0 as i64;
+            let idle = idle1 as i64 - idle0 as i64;
             if total <= 0 {
                 0.0
             } else {

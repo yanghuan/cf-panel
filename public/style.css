@@ -364,7 +364,15 @@ button.danger:hover { background: rgba(248, 113, 113, .12); }
   align-items: center;
   justify-content: space-between;
   padding: 8px 0;
+  /* 标题栏与内容容器对齐（居中），避免贴满全屏两端 */
+  width: 100%;
+  margin-left: auto;
+  margin-right: auto;
 }
+/* 标题栏宽度跟随各弹窗内容容器（settings-body 640 / dialog-body 560 / file-body 760） */
+.modal:has(.settings-body) .modal-head { max-width: 640px; }
+.modal:has(.dialog-body) .modal-head { max-width: 560px; }
+.modal:has(.file-body) .modal-head { max-width: 760px; }
 .modal-head span { font-weight: 600; }
 .term { flex: 1; background: #05070c; border: 1px solid var(--border); border-radius: 12px; padding: 8px; overflow: hidden; box-shadow: 0 0 40px rgba(99, 102, 241, .08); }
 .term .xterm { height: 100%; }
@@ -413,6 +421,7 @@ button.danger:hover { background: rgba(248, 113, 113, .12); }
 
 /* ---------- 设置 ---------- */
 .settings-body {
+  width: 100%; /* 固定为容器宽（受 max-width 限制），避免内容驱动宽度导致与标题栏不对齐 */
   max-width: 640px;
   margin: 0 auto;
   background: var(--panel);

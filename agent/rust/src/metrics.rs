@@ -25,7 +25,7 @@ fn read_file(path: &str) -> Option<String> {
     std::fs::read_to_string(path).ok()
 }
 
-// 阻塞并发上限（H1）：限制 spawn_blocking 任务数，防挂死挂载点/命令累积耗尽线程池
+// 阻塞并发上限：限制 spawn_blocking 任务数，防挂死挂载点/命令累积耗尽线程池
 static BLOCKING_PERMITS: usize = 4;
 static BLOCKING_SEM: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
 fn blocking_sem() -> Arc<tokio::sync::Semaphore> {
@@ -50,7 +50,7 @@ where
 }
 
 // CPU：两次采样（间隔 200ms）求差值。
-// L7：扩展 8 字段口径（shell 版已弃用，不再对齐其 4 字段简化算法）——
+// 扩展 8 字段口径（shell 版已弃用，不再对齐其 4 字段简化算法）——
 // total = user+nice+system+idle+iowait+irq+softirq+steal（guest/guest_nice 内核已计入 user/nice，
 // 不重复累加）；usage = (total - idle) / total，iowait/irq/softirq/steal 计入忙碌，
 // 高 iowait（磁盘/网络慢）与云主机 steal 被抢占时读数不再偏低
@@ -148,7 +148,7 @@ fn collect_temp() -> Option<f64> {
     None
 }
 
-// TCP/UDP 连接数（M1：BufReader 流式计数，不物化全文件——50 万连接不再一次性分配 ~75MB String）
+// TCP/UDP 连接数（BufReader 流式计数，不物化全文件——50 万连接不再一次性分配 ~75MB String）
 fn count_lines(path: &str) -> u64 {
     use std::io::BufRead;
     std::fs::File::open(path)
@@ -159,7 +159,7 @@ fn collect_conns() -> (u64, u64) {
     (count_lines("/proc/net/tcp"), count_lines("/proc/net/udp"))
 }
 
-// 磁盘结果缓存（H1/M7）：df 结果 60s 内复用；超时/失败返回上次成功值（熔断降级，不空转重试）
+// 磁盘结果缓存：df 结果 60s 内复用；超时/失败返回上次成功值（熔断降级，不空转重试）
 type DiskCache = tokio::sync::Mutex<Option<(std::time::Instant, Vec<serde_json::Value>)>>;
 static DISK_CACHE: std::sync::OnceLock<DiskCache> = std::sync::OnceLock::new();
 async fn disk_cache(
@@ -259,7 +259,7 @@ async fn collect_net() -> (u64, u64) {
     (in_rate, out_rate)
 }
 
-// 系统信息缓存（M7）：OS/内核/IP 基本不变，10min 内复用（快采不再每帧 fork uname/hostname）
+// 系统信息缓存：OS/内核/IP 基本不变，10min 内复用（快采不再每帧 fork uname/hostname）
 type InfoCache = tokio::sync::Mutex<Option<(std::time::Instant, serde_json::Value)>>;
 static INFO_CACHE: std::sync::OnceLock<InfoCache> = std::sync::OnceLock::new();
 async fn info_cache(
@@ -485,7 +485,7 @@ async fn collect_custom(cfg: &Config) -> Vec<serde_json::Value> {
 
 // ---- 汇总上报 ----
 pub async fn collect_report(cfg: &Config) -> Option<String> {
-    // M4：无依赖采集项并行（join!），消除串行累积（cpu 200ms + df/uname/hostname 5s 上限 +
+    // 无依赖采集项并行（join!），消除串行累积（cpu 200ms + df/uname/hostname 5s 上限 +
     // probes/custom 5s/个）对快采帧率的稀释；blocking 峰值 = info(1) + disk(1) = 2 < Semaphore 4
     let (cpu, mem, load, conns, net, info, probes, custom, disk) = tokio::join!(
         collect_cpu(),

@@ -16,7 +16,7 @@ const FILE_LIMIT: u64 = 500 * 1024 * 1024; // 单文件总上限 500MB
 const READ_BLOCK: usize = 1024 * 1024;
 // 文件 WS 入站消息大小上限（防恶意超大 data 整包占内存；正常前端 512KB 分块远小于此）
 const WS_MSG_LIMIT: usize = 8 * 1024 * 1024;
-// L3：终端入站消息上限 1MB（正常输入单帧极小，异常/恶意超大帧直接断开，与文件通道对齐）
+// 终端入站消息上限 1MB（正常输入单帧极小，异常/恶意超大帧直接断开，与文件通道对齐）
 const TERM_MSG_LIMIT: usize = 1024 * 1024;
 // 终端输出合帧：聚合 TERM_BATCH_MS 或 TERM_BATCH_BYTES 后合并为一条 WS 帧。
 // 刷屏场景（pty 每 8KB 一帧）DO 计费消息数从 N 帧降到约 1 帧/16ms（约 −60%~75%）；
@@ -35,8 +35,8 @@ pub struct TermSession {
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     child: Arc<Mutex<Option<Box<dyn portable_pty::Child + Send + Sync>>>>,
     child_pid: u32,
-    cleaned: std::sync::atomic::AtomicBool, // cleanup 幂等（M5：防双调用 kill 后 PID 复用误杀）
-    alive: std::sync::atomic::AtomicBool, // 会话是否仍活跃（M8：僵尸会话不再回执 ready，而是重建）
+    cleaned: std::sync::atomic::AtomicBool, // cleanup 幂等（防双调用 kill 后 PID 复用误杀）
+    alive: std::sync::atomic::AtomicBool,   // 会话是否仍活跃（僵尸会话不再回执 ready，而是重建）
 }
 
 impl TermSession {
@@ -77,13 +77,13 @@ impl TermSession {
     }
 
     // 会话结束清理：kill 进程组（bash 由 portable-pty setsid 启动，负 PID 即整组）。
-    // 幂等（M5）：首调 kill 后 PID 即释放，双调用再 kill(-pid) 可能命中被复用的进程组——
+    // 幂等：首调 kill 后 PID 即释放，双调用再 kill(-pid) 可能命中被复用的进程组——
     // 用 AtomicBool 保证 cleanup 只执行一次
     pub async fn cleanup(&self) {
         if self.cleaned.swap(true, std::sync::atomic::Ordering::SeqCst) {
             return;
         }
-        self.alive.store(false, std::sync::atomic::Ordering::SeqCst); // M8：会话结束标记
+        self.alive.store(false, std::sync::atomic::Ordering::SeqCst); // 会话结束标记
         #[cfg(unix)]
         if self.child_pid > 0 {
             unsafe {
@@ -93,13 +93,13 @@ impl TermSession {
         let mut child = self.child.lock().await;
         if let Some(c) = child.as_mut() {
             let _ = c.kill();
-            let _ = c.wait(); // L6：kill 后 wait 收集僵尸，避免 PID 复用
+            let _ = c.wait(); // kill 后 wait 收集僵尸，避免 PID 复用
         }
         *child = None;
         log(format!("terminal {} cleaned up", self.sid));
     }
 
-    // M8：会话是否仍活跃（false = 数据面已结束/僵尸，ready 分支据此决定重建）
+    // 会话是否仍活跃（false = 数据面已结束/僵尸，ready 分支据此决定重建）
     pub fn is_alive(&self) -> bool {
         self.alive.load(std::sync::atomic::Ordering::SeqCst)
     }
@@ -135,7 +135,7 @@ async fn run_terminal_inner(cfg: &Config, term: &Arc<TermSession>) {
             return;
         }
     };
-    // M2：key 含非法 header 字符时友好退出而非 panic
+    // key 含非法 header 字符时友好退出而非 panic
     let Ok(key) = cfg
         .key
         .parse::<tokio_tungstenite::tungstenite::http::HeaderValue>()
@@ -144,7 +144,7 @@ async fn run_terminal_inner(cfg: &Config, term: &Arc<TermSession>) {
         return;
     };
     req.headers_mut().insert("X-Agent-Key", key);
-    // L3：终端入站限制 1MB（与文件通道对齐，防恶意超大帧占内存）
+    // 终端入站限制 1MB（与文件通道对齐，防恶意超大帧占内存）
     let cfg_ws = tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
         max_message_size: Some(TERM_MSG_LIMIT),
         ..Default::default()
@@ -220,7 +220,7 @@ async fn run_terminal_inner(cfg: &Config, term: &Arc<TermSession>) {
     });
 
     // WS → pty 输入；pty 消亡（bash 退出 → reader EOF → send_task 结束）时主动结束会话，
-    // 不再等会话 TTL 回收（M9：bash 自然退出后终端立即关闭而非挂死）
+    // 不再等会话 TTL 回收（bash 自然退出后终端立即关闭而非挂死）
     loop {
         tokio::select! {
             _ = &mut send_task => break,
@@ -258,7 +258,7 @@ pub async fn run_file_session(cfg: Config, sid: String) {
             return;
         }
     };
-    // M2：key 含非法 header 字符时友好退出而非 panic
+    // key 含非法 header 字符时友好退出而非 panic
     let Ok(key) = cfg
         .key
         .parse::<tokio_tungstenite::tungstenite::http::HeaderValue>()
@@ -304,7 +304,7 @@ pub async fn run_file_session(cfg: Config, sid: String) {
         }
     }
     // 断线/会话结束：清理本会话创建的临时文件（防止 .upload.{id} 残留累积）
-    // M2：Mutex poison 容忍
+    // Mutex poison 容忍
     if let Ok(tmp) = created.lock() {
         for p in tmp.iter() {
             let _ = std::fs::remove_file(p);
@@ -407,7 +407,7 @@ async fn handle_file_cmd_binary(
 }
 
 // spawn_blocking + 超时：防止挂死的挂载点（NFS 等）永久占用 blocking 线程。
-// 信号量限并发（H1）：挂死任务最多占满有限槽位，前端重试放大不会打穿线程池
+// 信号量限并发：挂死任务最多占满有限槽位，前端重试放大不会打穿线程池
 static BLOCKING_PERMITS: usize = 4;
 static BLOCKING_SEM: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
 async fn blocking_with_timeout<F, T>(secs: u64, f: F) -> Option<T>
@@ -478,7 +478,7 @@ async fn file_list(path: String, pattern: Option<String>) -> String {
                     truncated = true;
                     break;
                 }
-                // L4：先用 file_type（readdir 已带类型，无需完整 stat），仅文件再取 len/mtime
+                // 先用 file_type（readdir 已带类型，无需完整 stat），仅文件再取 len/mtime
                 let ft = match e.file_type() {
                     Ok(t) => t,
                     Err(_) => continue,
@@ -591,7 +591,7 @@ fn write_bytes(
     created: &Arc<std::sync::Mutex<Vec<String>>>,
 ) -> String {
     use std::io::{Seek, SeekFrom, Write};
-    // L11：upload_id 字符白名单（深度防御，path 已任意，防异常 upload_id 注入临时文件名）
+    // upload_id 字符白名单（深度防御，path 已任意，防异常 upload_id 注入临时文件名）
     if !upload_id
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
@@ -602,7 +602,7 @@ fn write_bytes(
     if let Some(parent) = std::path::Path::new(path).parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    // 记录本会话创建的临时文件（会话结束/断线时清理）；L2：contains 去重防重复 push
+    // 记录本会话创建的临时文件（会话结束/断线时清理）；contains 去重防重复 push
     if let Ok(mut c) = created.lock() {
         if !c.contains(&tmp) {
             c.push(tmp.clone());

@@ -98,8 +98,8 @@ fn validate_wss(wss: &str) -> Result<(), String> {
     Err("AGENT_WSS_URL 必须以 wss:// 或 ws:// 开头".to_string())
 }
 
-// ---------------- 日志（mpsc + 专用写线程，M6：async 侧零阻塞） ----------------
-// M6：stdout 接管道且对端不消费时 write_all 会永久阻塞 worker 线程；改有界 mpsc 队列 +
+// ---------------- 日志（mpsc + 专用写线程，async 侧零阻塞） ----------------
+// stdout 接管道且对端不消费时 write_all 会永久阻塞 worker 线程；改有界 mpsc 队列 +
 // 专用 OS 写线程，async 侧 try_send 失败（队列满）即丢弃降级，采集/会话路径永不因日志挂起。
 fn log_sender() -> &'static std::sync::mpsc::SyncSender<String> {
     static TX: OnceLock<std::sync::mpsc::SyncSender<String>> = OnceLock::new();
@@ -129,7 +129,7 @@ fn log_sender() -> &'static std::sync::mpsc::SyncSender<String> {
 }
 pub fn log(msg: impl AsRef<str>) {
     let line = format!("[cf-panel] {}\n", msg.as_ref());
-    // M6：队列满（写线程积压、对端不消费）时丢弃而非阻塞
+    // 队列满（写线程积压、对端不消费）时丢弃而非阻塞
     let _ = log_sender().try_send(line);
 }
 
@@ -140,9 +140,9 @@ pub fn log(msg: impl AsRef<str>) {
 const RETRY_INITIAL_SECS: u64 = 3;
 const RETRY_MAX_SECS: u64 = 300;
 const AUTH_FAIL_SECS: u64 = 300;
-const MIN_UPTIME_RESET_SECS: u64 = 10; // 存活 ≥10s 才算"健康连接"，才重置退避（H4 防秒断风暴）
+const MIN_UPTIME_RESET_SECS: u64 = 10; // 存活 ≥10s 才算"健康连接"，才重置退避（防秒断风暴）
 const CONTROL_READ_TIMEOUT_S: u64 = 180; // 读循环超时：180s 无任何消息判定半开（健康连接有 30s 心跳）
-const CTRL_MSG_LIMIT: usize = 64 * 1024; // L3：控制通道入站消息上限 64KB（指令/心跳远小于此）
+const CTRL_MSG_LIMIT: usize = 64 * 1024; // 控制通道入站消息上限 64KB（指令/心跳远小于此）
 
 async fn run_control(
     cfg: &Config,
@@ -155,7 +155,7 @@ async fn run_control(
         match control_conn(cfg, sessions, file_sessions).await {
             Ok(_) => {
                 log("control channel closed");
-                // H4：存活 <10s 的"成功连接"（服务端立即关闭/反代错误/服务端 bug）
+                // 存活 <10s 的"成功连接"（服务端立即关闭/反代错误/服务端 bug）
                 // 同样指数退避，防秒断时每 ~3s 重连风暴（28,800 次/天放大 Worker/D1）
                 if started.elapsed().as_secs() < MIN_UPTIME_RESET_SECS {
                     backoff = (backoff * 2).min(RETRY_MAX_SECS);
@@ -201,7 +201,7 @@ async fn control_conn(
     let url = format!("{}/control", cfg.wss);
     let mut req = url.into_client_request()?;
     req.headers_mut().insert("X-Agent-Key", cfg.key.parse()?);
-    // L3：控制通道入站限制 64KB，防恶意超大消息整包占内存（异常帧读循环报错即重连）
+    // 控制通道入站限制 64KB，防恶意超大消息整包占内存（异常帧读循环报错即重连）
     let cfg_ws = tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
         max_message_size: Some(CTRL_MSG_LIMIT),
         ..Default::default()
@@ -224,7 +224,7 @@ async fn control_conn(
         });
     }
 
-    // 读循环：指令分发（H3：180s 无任何消息判定半开连接，断开触发重连——
+    // 读循环：指令分发（180s 无任何消息判定半开连接，断开触发重连——
     // NAT/防火墙静默断链不再依赖 TCP keepalive 2h 才发现；健康连接有服务端 30s 心跳必有下行）
     loop {
         let msg =
@@ -243,7 +243,7 @@ async fn control_conn(
     Ok(())
 }
 
-// M3：上报间隔下限/上限校验（防异常/恶意 interval=0 导致采集紧循环打满 CPU）
+// 上报间隔下限/上限校验（防异常/恶意 interval=0 导致采集紧循环打满 CPU）
 fn clamp_report_interval(iv: u64) -> u64 {
     iv.clamp(1, 3600)
 }
@@ -283,7 +283,7 @@ async fn dispatch(
                 return Ok(());
             }
             // 幂等：同 SID 会话已存在且仍活跃（DO 确认重发场景）则不重复 spawn，仅回执 ready。
-            // M8：旧会话已死（数据面结束但未移出 map 的僵尸）则先移除再重建，回执才有意义
+            // 旧会话已死（数据面结束但未移出 map 的僵尸）则先移除再重建，回执才有意义
             {
                 let mut map = sessions.lock().await;
                 if let Some(existing) = map.get(&sid) {
@@ -336,7 +336,7 @@ async fn dispatch(
             if sid.is_empty() {
                 return Ok(());
             }
-            // L10：幂等——确认重发场景（回执在重连窗口丢失导致 DO 重发）已存在则不重复启动
+            // 幂等——确认重发场景（回执在重连窗口丢失导致 DO 重发）已存在则不重复启动
             if !file_sessions.lock().await.insert(sid.clone()) {
                 let mut w = write.lock().await;
                 let _ = w
@@ -347,7 +347,7 @@ async fn dispatch(
                 return Ok(());
             }
             log(format!("open_file sid={sid}"));
-            // L10：回执 file_ready，停止 DO 的 open_file 确认重发
+            // 回执 file_ready，停止 DO 的 open_file 确认重发
             let mut w = write.lock().await;
             let _ = w
                 .send(Message::Text(format!(
@@ -368,7 +368,7 @@ async fn dispatch(
                 .and_then(|x| x.as_str())
                 .unwrap_or("")
                 .to_string();
-            // L1：clamp 1..=500，防异常超大值截断为 0（rows=65536 as u16 → 0）
+            // clamp 1..=500，防异常超大值截断为 0（rows=65536 as u16 → 0）
             let rows = v
                 .get("rows")
                 .and_then(|x| x.as_u64())
@@ -465,7 +465,7 @@ async fn main() {
 
     let sessions: Arc<Mutex<std::collections::HashMap<String, Arc<session::TermSession>>>> =
         Arc::new(Mutex::new(Default::default()));
-    // L10：文件会话注册表（open_file 确认重发场景幂等：重发时已存在仅回执，不重复启动）
+    // 文件会话注册表（open_file 确认重发场景幂等：重发时已存在仅回执，不重复启动）
     let file_sessions: Arc<Mutex<std::collections::HashSet<String>>> =
         Arc::new(Mutex::new(Default::default()));
 

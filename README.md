@@ -1,8 +1,8 @@
 # cf-panel
 
-在 Cloudflare 上实现带终端功能的监控面板。
+在 Cloudflare 上实现带终端与文件管理功能的监控面板。
 
-- 前端：Cloudflare Pages（纯静态 + xterm.js，零构建）
+- 前端：静态资源由 Worker 的 `[assets]` 提供（纯静态 + xterm.js，零构建）
 - 后端：Cloudflare Workers + Durable Objects（WebSocket 双向中转）+ D1（面板核心数据 + kv_json 键值表）
 - Agent：Rust 版（单进程、全静态 musl、任意 Linux 发行版直跑，无 websocat/socat/jq 依赖），部署在每台目标机器上，与面板通过 WebSocket 通信
 
@@ -13,9 +13,20 @@
 ```
 cf-panel/
 ├── wrangler.toml        # Worker/DO/D1/静态资源配置
-├── schema.sql           # D1 数据库表（含 kv_json 键值表）
-├── src/index.js         # Worker：REST API + 鉴权 + TerminalDO 双端对拷 + PanelDO 实时推送
-├── public/              # 前端（index.html / app.js / style.css）
+├── schema.sql           # D1 数据库表（含 kv_json 键值表；migrations/ 为版本化增量）
+├── migrations/          # D1 迁移（版本化管理，部署时自动按序 apply）
+├── src/                 # Worker 后端（多模块）
+│   ├── index.js         #   入口：路由分发 + WebSocket 接入
+│   ├── routes.js        #   REST API 路由
+│   ├── auth.js          #   鉴权（JWT / PAT / agent key / 登录限流）
+│   ├── config.js        #   环境变量与常量
+│   ├── db.js            #   D1 查询
+│   ├── do-terminal.js   #   TerminalDO：WS 双端对拷 + 会话注册表
+│   ├── do-metrics.js    #   MetricsDO：监控热区 + D1 归档 + 告警
+│   ├── do-panel.js      #   PanelDO：实时推送（Hibernation 休眠态）
+│   ├── report.js        #   agent 监控上报处理
+│   └── utils.js         #   公共工具
+├── public/              # 前端（零构建：index.html / app.js / api.js / utils.js / style.css / vendor/）
 ├── agent/               # 被控机 agent（README / systemd 模板）
 │   ├── rust/            # ✅ Rust 版 agent（推荐：内存低、单进程、全静态任意发行版直跑）
 │   └── shell/           # ⚠️ Shell 版 agent（已废弃，保留参考/过渡）
@@ -256,7 +267,7 @@ wrangler secret put PANEL_USERS      # 回车后粘贴值，如 alice:pass1,bob:
 - **自定义监控项**：agent 配置 `CUSTOM_METRICS`（JSON：`name`+`cmd`）后，执行任意命令采集数值指标；监控图中以独立曲线展示（按 ts 对齐系统时间轴，共用右轴看趋势），数据直写 D1 `metrics_custom` 表（30 天保留）。
 - **实时列表**：登录后前端与 `/ws/push` 保持 WebSocket，连接建立发一次 sync 拉初始列表，此后由 MetricsDO 上报驱动推送（PanelDO，Hibernation 休眠态，费用趋近普通 Worker）按权限广播服务器列表（在线状态前端本地老化自动更新），无需手动刷新。
 - **终端**：面板服务器卡片点「终端」→ xterm.js 弹出 → 按键实时到达被控机 shell；窗口拉伸自动 resize（经控制通道 `stty` 下发）；断线自动重连（最多 3 次）。
-- **文件管理**：面板服务器卡片点「文件」→ 弹出文件管理器，可浏览目录（点击进入/上级/路径跳转）、**上传**（本地文件写入 agent）、**下载**（agent 文件回传浏览器）；文件经独立 WS 会话**分段传输**（512KB/段，Binary 混合帧 = JSON 头 + 原始字节，无 base64 膨胀），支持文件名通配符过滤（`*`/`?`，agent 端先过滤再截断），**单文件上限 500MB**（Rust 版无额外依赖；Shell 版需 GNU coreutils）。
+- **文件管理**：面板服务器卡片点「文件」→ 弹出文件管理器，可浏览目录（点击进入/上级/路径跳转）、**上传**（本地文件写入 agent）、**下载**（agent 文件回传浏览器）；文件经独立 WS 会话**分段传输**（512KB/段，Binary 混合帧 = JSON 头 + 原始字节，无 base64 膨胀），支持文件名通配符过滤（`*`/`?`，agent 端先过滤再截断），**单文件上限 500MB**。每行最右侧 **⋯** 下拉菜单提供：下载（目录自动打包 ZIP 下载，文件名为 `目录名.zip`）、重命名（仅改名，不支持跨目录）、删除（目录递归删除）；**重命名/删除/打包对系统目录（`/proc`、`/sys`、`/etc`、`/usr`、`/var`、`/root` 等）自动拒绝**，防止误操作破坏系统。
 - **监控**：点「监控」默认看近 12 小时分钟数据（内存 DO 热区，秒回）；可切 1小时/3天/7天/30天查看 D1 归档历史（分钟粒度，超长区间自动降采样）。指标：CPU / 内存 / Swap / 磁盘（根分区）/ 负载 / 温度 / 进程数；服务器卡片显示 OS / 内核 / IP 系统信息。
 - **分组与排序**：添加服务器可填「分组」和「序号」，列表按分组展示、组内按序号排序（未填归入「未分组」）。
 - **登录**：`PANEL_USERS` 多用户（`user:pass,user:pass`）或单管理员（`PANEL_PASSWORD`），登录即管理员。**应用内置失败限流**（同一 IP 在 15 分钟窗口内失败 ≥5 次 → 锁定 15 分钟并返回 `429` + `Retry-After`，登录成功自动清零）；生产部署**必须**再前置 **Cloudflare Access**（登录密码作为第二层），以覆盖跨边缘实例的限流一致性。
@@ -277,8 +288,9 @@ wrangler secret put PANEL_USERS      # 回车后粘贴值，如 alice:pass1,bob:
 | DELETE | `/api/servers/:id` | 删除服务器（仅管理员） |
 | POST | `/api/terminal` | 创建终端会话（exec 权限 + 归属校验），返回 session_id |
 | POST | `/api/file/open` | 创建文件管理会话（exec 权限 + 归属校验），返回 session_id |
+| GET | `/api/usage` | 用量观测（近 24h 上报帧 / DO 事件 / D1 写行估算，仅管理员） |
 | GET | `/ws/terminal/{id}` | 浏览器终端 WebSocket（校验创建者/admin） |
-| GET | `/ws/file/{id}` | 浏览器文件管理 WebSocket（JSON 行协议：list/read/write，校验创建者/admin） |
+| GET | `/ws/file/{id}` | 浏览器文件管理 WebSocket（JSON 行协议：list/read/write/zip/rename/delete，校验创建者/admin） |
 | GET | `/ws/agent/file` | agent 文件数据流（key 校验 + stream 归属校验） |
 | GET | `/ws/push` | 面板实时刷新：客户端每 3 秒发 sync，服务端按权限返回服务器列表 |
 | GET | `/ws/agent/control` | agent 控制通道（key 指纹定位 + 校验，按分片路由；监控上报也走这里） |

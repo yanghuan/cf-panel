@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Cloudflare 上的带终端功能的监控面板（Worker + Durable Objects + D1）",
+  "description": "Cloudflare 上的带终端与文件管理功能的监控面板（Worker + Durable Objects + D1）",
   "scripts": {
     "test": "node --test",
     "test:unit": "node --test test/unit.test.js",

@@ -1,7 +1,7 @@
-# 在 Cloudflare 上实现带终端功能的监控面板 — 架构设计文档
+# 在 Cloudflare 上实现带终端与文件管理功能的监控面板 — 架构设计文档
 
 > 版本：v0.1 ｜ 日期：2026-08-02
-> 范围：用 Cloudflare Workers / Pages + Durable Objects 实现一个监控面板，并附带 Web 终端功能。
+> 范围：用 Cloudflare Workers / Durable Objects 实现一个监控面板，并附带 Web 终端与文件管理功能。
 > 参考实现：哪吒探针（nezha / nezhahq）的终端模块，其"中转 + 外部 agent + PTY"思路被平移到 Cloudflare 模型。
 
 ---
@@ -12,7 +12,7 @@
 
 | 能力 | 能否在 Cloudflare 上运行 | 承载组件 |
 | --- | --- | --- |
-| 面板前端（静态） | ✅ 可行 | Cloudflare Pages |
+| 面板前端（静态） | ✅ 可行 | Worker 静态资源（`[assets]`，等价 Pages 能力） |
 | 鉴权 / 路由 | ✅ 可行 | Cloudflare Worker |
 | WebSocket 长连接中转、双向字节对拷 | ✅ 可行 | Durable Object（WebSocket Hibernation） |
 | **终端执行端（fork 进程 / 开 PTY / exec）** | ❌ **不可行** | 必须在外部有 OS 的机器上（VPS / 本地） |
@@ -36,7 +36,8 @@
 │              Cloudflare 边缘（无 OS）            │
 │                                                │
 │  ┌──────────────┐     ┌─────────────────────┐  │
-│  │ Pages (静态)  │     │  Worker (鉴权/路由)   │  │
+│  │ Worker assets│     │  Worker (鉴权/路由)   │  │
+│  │  (静态前端)    │     │                     │  │
 │  └──────────────┘     └──────────┬──────────┘  │
 │                                   ▼             │
 │                         ┌─────────────────────┐ │
@@ -55,21 +56,21 @@
 └──────────────────────────────────────────────┘
 ```
 
-把哪吒架构里的 **gRPC IOStream 换成出站 WebSocket** 即可；帧协议（magic + streamID 防串流、首字节 0/1 区分输入/resize）可直接复用。
+把哪吒架构里的 **gRPC IOStream 换成出站 WebSocket** 即可；帧协议（magic + streamID 防串流、首字节 0/1 区分输入/resize）可直接复用（实际实现采用简化协议：header 鉴权 + 纯字节透传，见 §4）。
 
 ---
 
 ## 3. 组件设计
 
-### 3.1 前端（Cloudflare Pages）
-- 托管静态资源（Vue/React/Svelte 均可），全球 CDN、零成本。
+### 3.1 前端（静态资源）
+- 静态资源由 Worker 的 `[assets]` 提供（等价 Pages 能力：全球 CDN、零成本、零构建；本项目为原生 JS + 本地化 vendor 依赖，无构建步骤）。
 - 终端 UI 用成熟组件：`xterm.js` + `xterm-addon-fit`（自适应窗口大小）。
 - 流程：点击"打开终端" → `POST /api/terminal {server_id}` 拿到 `session_id` → 用 `session_id` 建立 `WebSocket('/ws/terminal/{id}')` → `xterm` 把按键写入 WS、把收到的字节渲染出来。
 
 ### 3.2 鉴权 Worker
 - 校验 JWT / PAT，校验当前用户对目标 `server_id` 是否有权限（参考哪吒 `server.HasPermission`）。
 - 终端功能需要独立的权限 scope（哪吒用 `nezha:server:exec`），与"只读监控"分离。
-- 审计入口；暴力破解防护由前置的 Cloudflare Access 承担（应用内不再内置登录限流）。
+- 审计入口；**应用内置登录失败限流**（同一 IP 在 15 分钟窗口内失败 ≥5 次 → 锁定 15 分钟并返回 `429` + `Retry-After`，登录成功自动清零）；生产部署仍建议前置 **Cloudflare Access**（登录密码作为第二层），以覆盖跨边缘实例的限流一致性。
 
 #### 3.2.1 MCP（AI 接入端点）
 
@@ -85,7 +86,7 @@ DO 是整个设计的心脏，对应哪吒 Dashboard 里那两个 `io.Copy` 的�
 
 - **会话注册表**：`streamId -> { creatorUserId, targetServerId, userSocket, agentSocket }`。
 - **浏览器端 WS**：`/ws/terminal/{id}` —— 仅允许 `creatorUser` 或 `admin` 连接（**防劫持，见 §6**）。
-- **agent 端 WS**：`/ws/agent/terminal?streamId=...` —— agent 作为 WebSocket client 主动连回，首帧发 magic 鉴权（见 §4）。
+- **agent 端 WS**：`/ws/agent/terminal?streamId=...` —— agent 作为 WebSocket client 主动连回，用 `X-Agent-Key` 请求头鉴权（见 §4）。
 - **双向对拷**：当两端 socket 都就绪，互相转发字节：
   - 浏览器字节 → agent socket（用户输入）
   - agent 字节 → 浏览器 socket（终端输出）
@@ -106,10 +107,9 @@ DO 是整个设计的心脏，对应哪吒 Dashboard 里那两个 `io.Copy` 的�
 
 - 与 DO 之间维护一条**常驻出站 WebSocket**（用于接收"开终端"等控制指令）。
 - 收到"开终端 {streamId}"指令后：
-  1. 新建一个 WebSocket 连回 DO 的 `/ws/agent/terminal?streamId=...`；
-  2. 首帧发送 **magic + streamId**（`0xff 0x05 0xff 0x05` + streamId）自报家门；
-  3. `pty.Start(shell)` 起一个真实 PTY；
-  4. 起两个协程：`producePTYOutput`（PTY 输出 → WS 发回 DO）、`receiveInput`（WS 收字节 → 写 PTY stdin）。
+  1. 新建一个 WebSocket 连回 DO 的 `/ws/agent/terminal?streamId=...`（`X-Agent-Key` 请求头鉴权）；
+  2. 起一个真实 PTY（Rust 版 `portable-pty`，Shell 版 `socat`）；
+  3. 起两个协程/线程：`producePTYOutput`（PTY 输出 → WS 发回 DO）、`receiveInput`（WS 收字节 → 写 PTY stdin）。
 
 ### 3.5 外部 Agent 实现选型
 
@@ -196,7 +196,7 @@ done
 - 监控上报：后台循环每 `REPORT_INTERVAL`（默认 120s）采集一次，JSON 写入 FIFO；控制通道 websocat 以 FIFO 为 stdin，数据自动经 WS 上行，服务端识别 `{type:"report"}` 落监控热区——**免 crontab、免独立脚本**。
 - 上报内容：固定列（CPU/内存/网络速率）+ `extra` JSON（Swap/磁盘/负载/温度/进程数/TCP-UDP 连接数，紧凑短 key 不压缩）+ `info`（OS/内核/IP，服务端比对变化才更新 `servers.info_json`）。网络速率由 agent 对 `/proc/net/dev` 累计值做差分，避免累计值当速率。
 - **省配额策略**：PanelDO 暴露 `/viewers` RPC（`state.getWebSockets().length` 统计在线前端）；TerminalDO 在 agent 控制通道建立与每次上报后查询它，通过 `{type:"set_report_interval", interval}` 下发间隔（仅变化时）：有观看者 3s 快采、无人 120s 低频采样——配额从"时刻满采"降到"只在有人看时满采"。首位观看者上线时 PanelDO 还会向各分片广播 `/rpc/wakeup`，agent 立即切快采（免等下一次上报）。agent 端把下发的间隔写入 `$TMP_DIR/report-interval`，上报循环每次唤醒后读取。
-- **文件管理**：与终端同构的独立会话——面板 `POST /api/file/open` 创建会话并下发 `open_file` 指令，agent 用 `websocat` 连回 `/ws/agent/file` 跑 `file-server.sh`（JSON 行协议：`list`/`read`/`write`，文件内容 base64）；浏览器经 `/ws/file/{sid}` 透传。服务端复用 TerminalDO 会话注册表/权限/清理，DO 只做双向透传。
+- **文件管理**：与终端同构的独立会话——面板 `POST /api/file/open` 创建会话并下发 `open_file` 指令，agent 连回 `/ws/agent/file` 处理（**Rust 版内置实现，无独立脚本**）。JSON 行协议：`list`（目录列表，支持通配符过滤）/`read`/`write`（**Binary 混合帧 = JSON 头 + `\n` + 原始字节，无 base64 膨胀**；分块 512KB、`write` 按确认推进、临时文件 + 原子 rename）+ `zip`（**目录打包**：agent 手写 STORED ZIP 到临时文件，返回路径/大小，前端分段拉取完成后发 `delete` 清理）/`rename`/`delete`（**系统路径保护**：`/proc` `/sys` `/etc` `/usr` `/var` `/root` 等目录的重命名/删除/打包一律拒绝，防误操作破坏系统）；浏览器经 `/ws/file/{sid}` 透传。服务端复用 TerminalDO 会话注册表/权限/清理，DO 只做双向透传。
 - 权衡：Shell 版零解释器依赖、部署极简；但并发弱、进程多、每终端 +9MB。已实现 **Rust 版（`agent/rust/`）替代**：实测内存 1.9MB（全静态 musl）、单进程、无外部二进制依赖，协议一致可无缝替换；Shell 版废弃保留参考。
 
 #### 3.5.1 内存占用对比（低内存设备选型）
@@ -254,7 +254,13 @@ agent 可能运行在低内存设备（OpenWrt 路由器 / 树莓派 Zero 等）
 
 ## 4. 通信协议（数据帧格式）
 
-DO 与 agent 之间的 WebSocket 用二进制帧，结构对齐哪吒实现：
+> **实际实现（2026-08，Rust 版）**：采用下述简化协议，以下"magic 帧/多路复用"为初版设计参考（对齐哪吒），当前未使用。
+> - **鉴权**：agent 数据流（`/ws/agent/terminal|file`）用 `X-Agent-Key` 请求头（key 指纹 + 哈希校验）；浏览器流（`/ws/terminal|file`）用**首帧** `{type:"auth", token}`（token 不进 URL，防日志/历史泄露）。
+> - **控制通道**（agent 常驻 WS，JSON 文本帧）：`open_terminal` / `open_file` / `resize {stream_id,rows,cols}` / `set_report_interval {interval}` / `ping`（心跳）；agent 回执 `terminal_ready` / `file_ready` 停止 DO 的确认重发。
+> - **终端数据流**：纯字节透传（输入/输出无帧头，单向直转）；resize 走控制通道（非数据流帧）。
+> - **心跳保活**：控制通道 `ping` + DO 侧 30s 限频心跳下行，防健康连接被误判半开。
+
+DO 与 agent 之间的 WebSocket 用二进制帧，结构对齐哪吒实现（初版设计）：
 
 | 帧类型 | 首字节 | 含义 | 处理 |
 | --- | --- | --- | --- |
@@ -280,9 +286,10 @@ DO 与 agent 之间的 WebSocket 用二进制帧，结构对齐哪吒实现：
  │<── CreateTerminalResponse {session_id} ──────│
  │                                                │
  │  WS /ws/terminal/{id}  ──>│                    │
- │  (校验 creator/admin)    │                    │
+ │  (首帧 {type:"auth"} 鉴权 │                    │
+ │   校验 creator/admin)     │                    │
  │                   等待 agent 连回...            │  WS /ws/agent/terminal?streamId=...
- │                         <────────────────────│  首帧: magic + streamId
+ │                         <────────────────────│  请求头 X-Agent-Key 鉴权
  │                   校验归属, 登记 agent socket   │
  │                   两端就绪 → 双向对拷 ──────────│<──>│<──> PTY
  │<═══════ 按键/输出 实时双向流转 ════════════════>│<──>│<──> PTY
@@ -299,7 +306,7 @@ DO 与 agent 之间的 WebSocket 用二进制帧，结构对齐哪吒实现：
    - 鉴权 token **不放 URL**（避免进访问日志/浏览器历史），改为连接后**首帧发送** `{type:"auth", token}`，未通过前不挂接数据流。
    - 背景：哪吒曾有一个 GHSA 漏洞——任何人只要拿到 stream UUID（经 Referer 泄露、日志、浏览器历史），就能接管一个活跃终端、直接拿到目标机器的 shell。UUID 不可作为保密凭据。
 2. **agent 侧 stream 归属校验**
-   - DO 收到 agent 的 magic 帧后，校验该 `streamId` 确实属于这个 agent 对应的 `server`，防止 A 机器的 agent 往 B 机器的 stream 注入 IO。
+   - DO 收到 agent 数据流（`X-Agent-Key` 请求头）后，先按 key 指纹/哈希校验 agent 身份，再校验该 `streamId` 确实属于这个 agent 对应的 `server`，防止 A 机器的 agent 往 B 机器的 stream 注入 IO。
 3. **鉴权与最小权限**
    - 终端需要独立 scope（`exec`），与只读监控分离；PAT 按 `server_ids` 白名单收窄。
 4. **全局命令执行开关**
@@ -335,6 +342,8 @@ DO 与 agent 之间的 WebSocket 用二进制帧，结构对齐哪吒实现：
 | 监控时序（CPU / 内存 历史） | **内存 DO 热区 + D1 归档（默认开启）** | 内存滚动窗口（720 分钟/机，秒回）+ alarm 批量归档 D1（默认开启，`ARCHIVE_TO_D1=0` 关闭），保留 30 天、每日清理 |
 
 ### 8.2 D1 初版 Schema（草稿）
+
+> ⚠️ 以下为初版设计草稿，**实际建表以 `schema.sql` / `migrations/` 为准**（版本化管理，部署自动 apply）。与草稿的关键差异：`users` 表已移除（多用户改由环境变量 `PANEL_USERS`/`PANEL_PASSWORD` 配置，登录即管理员）；`servers` 新增 `group`（分组）、`agent_key_hash`（HMAC 密钥哈希）、`wan_ip`（出口 IP）、`probe_json`（服务探活结果）；`audit_logs` 新增 `username`/`client_ip`；`metrics_min` 新增 `mem_total`；另有自定义指标表 `metrics_custom`。
 
 ```sql
 -- 服务器（agent 上报身份的归属）
@@ -425,7 +434,7 @@ CREATE TABLE kv_json (
 
 **阶段 2 — 安全加固**
 - [ ] `/ws/terminal/{id}` 校验 creator/admin（防 UUID 劫持）。
-- [ ] agent magic 帧 + stream 归属校验。
+- [x] agent 身份（`X-Agent-Key` header）+ stream 归属校验。
 - [ ] 全局命令执行开关。
 - [ ] resize 帧（窗口自适应）。
 - [ ] 审计日志。

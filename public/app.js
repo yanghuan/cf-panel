@@ -3,7 +3,7 @@
   'use strict';
   // 工具函数与 <cf-ip> 组件从 utils.js 解构；api 层从 api.js 解构（index.html 中均须先加载）
   const { $, escapeHtml, fmtBytes, fileJoin, fileParent, downsample, lockScroll, unlockScroll,
-          MONITOR_STEP_MAX, MONITOR_RANGE_LABEL, MONITOR_COLORS, FILE_CHUNK, FILE_MAX,
+          MONITOR_STEP_MAX, MONITOR_RANGE_LABEL, MONITOR_COLORS,
           GEO_PRIVATE, setGeoEnabled } = CfUtils;
   const { api, setTokenGetter, FileSession } = CfApi;
   let token = localStorage.getItem('cfpanel_token') || '';

@@ -37,10 +37,6 @@
   const MONITOR_RANGE_LABEL = { '1h': '近1小时', '12h': '近12小时', '3d': '近3天', '7d': '近7天', '30d': '近30天' };
   const MONITOR_COLORS = ['#8b5cf6', '#22d3ee', '#f472b6', '#34d399', '#fbbf24', '#a78bfa'];
 
-  // 文件管理常量
-  const FILE_CHUNK = 512 * 1024;       // 分段传输块大小 512KB（base64 后 ~683KB < workerd 入站 1MB 限制）
-  const FILE_MAX = 500 * 1024 * 1024;  // 单文件大小上限 500MB
-
   // 长区间数据太多时按区间平均降采样，保证可读性
   function downsample(rows, max = MONITOR_STEP_MAX) {
     if (rows.length <= max) return rows;
@@ -145,7 +141,6 @@
     $, escapeHtml, fmtBytes, fileJoin, fileParent, downsample,
     lockScroll, unlockScroll,
     MONITOR_STEP_MAX, MONITOR_RANGE_LABEL, MONITOR_COLORS,
-    FILE_CHUNK, FILE_MAX,
     GEO_PRIVATE, geoLookup, setGeoEnabled,
   };
 })();

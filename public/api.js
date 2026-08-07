@@ -1,8 +1,12 @@
 // cf-panel API 层：请求封装 + token 管理 + 文件会话（连接/协议/上传下载状态机）
 // 普通 script（IIFE），挂 window.CfApi；app.js 开头解构所需
-// 依赖：utils.js 须先加载（FileSession 用到 fileJoin/FILE_CHUNK/FILE_MAX）
+// 依赖：utils.js 须先加载（FileSession 用到 fileJoin）
 (() => {
   'use strict';
+
+  // 文件协议常量（文件会话专用）
+  const FILE_CHUNK = 512 * 1024;       // 分段传输块大小 512KB（base64 后 ~683KB < workerd 入站 1MB 限制）
+  const FILE_MAX = 500 * 1024 * 1024;  // 单文件大小上限 500MB
 
   // ---------- token 管理（app.js 注册 getter，token 本体仍由 app.js 持有） ----------
   let tokenGetter = () => '';
@@ -97,7 +101,7 @@
     // ---------- 上传状态机（stop-and-wait：等 write_result 确认才发下一块） ----------
     upload(file) {
       if (this.uploadState) { if (this.h.onError) this.h.onError('已有上传进行中，请等待完成'); return; }
-      if (file.size > CfUtils.FILE_MAX) { if (this.h.onError) this.h.onError('文件超过 500MB 限制'); return; }
+      if (file.size > FILE_MAX) { if (this.h.onError) this.h.onError('文件超过 500MB 限制'); return; }
       const uploadId = (window.crypto && crypto.randomUUID) ? crypto.randomUUID() : String(Date.now()) + '-' + Math.random().toString(36).slice(2);
       this.uploadState = { file, size: file.size, sent: 0, acked: 0, uploadId, path: CfUtils.fileJoin(this.cwd, file.name), reader: new FileReader() };
       this._sendNextUpload();
@@ -105,7 +109,7 @@
     _sendNextUpload() {
       const u = this.uploadState;
       if (!u || u.sent >= u.size) return;
-      const chunk = u.file.slice(u.sent, Math.min(u.sent + CfUtils.FILE_CHUNK, u.size));
+      const chunk = u.file.slice(u.sent, Math.min(u.sent + FILE_CHUNK, u.size));
       u.reader.onload = () => {
         if (!this.uploadState) return; // 已取消（reader 异步完成）
         const commit = u.sent + chunk.size >= u.size;
@@ -143,11 +147,11 @@
     // ---------- 下载状态机（分段拉取，Blob 直引 parts） ----------
     download(path, size) {
       if (this.downloadState) { if (this.h.onError) this.h.onError('已有下载进行中，请等待完成'); return; } // 并发防护
-      if (size > CfUtils.FILE_MAX) { if (this.h.onError) this.h.onError('文件超过 500MB 限制'); return; }
+      if (size > FILE_MAX) { if (this.h.onError) this.h.onError('文件超过 500MB 限制'); return; }
       if (size <= 0) { if (this.h.onError) this.h.onError('空文件，无需下载'); return; }
       this.downloadState = { path, size, parts: [], received: 0 };
       if (this.h.onDownloadProgress) this.h.onDownloadProgress(0);
-      this.send({ type: 'read', path, offset: 0, limit: CfUtils.FILE_CHUNK });
+      this.send({ type: 'read', path, offset: 0, limit: FILE_CHUNK });
     }
     cancelDownload() {
       if (!this.downloadState) return;
@@ -174,7 +178,7 @@
         if (this.h.onDownloadDone) this.h.onDownloadDone(path, parts);
       } else {
         if (this.h.onDownloadProgress) this.h.onDownloadProgress(Math.min(100, Math.round((d.received / d.size) * 100)));
-        this.send({ type: 'read', path: j.path, offset: d.received, limit: CfUtils.FILE_CHUNK });
+        this.send({ type: 'read', path: j.path, offset: d.received, limit: FILE_CHUNK });
       }
     }
   }

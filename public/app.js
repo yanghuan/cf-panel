@@ -208,7 +208,33 @@
   }
 
   // ---------- IP 归属地（HTTPS 免费接口，前端查询；内网 IP 跳过） ----------
-  const geoCache = new Map(); // ip -> 归属地标签（国家城市）
+  const geoCache = new Map(); // ip -> 归属地标签（内存缓存：同页会话命中）
+  const GEO_CACHE_KEY = 'cfpanel_geo_cache';
+  const GEO_CACHE_TTL = 7 * 24 * 3600 * 1000; // 持久化缓存 7 天（IP 变化少，避免跨刷新/跨会话重复查询）
+  const GEO_CACHE_MAX = 500;
+  // 启动时从 localStorage 恢复持久化缓存（仅未过期条目）
+  try {
+    const raw = JSON.parse(localStorage.getItem(GEO_CACHE_KEY) || '{}');
+    for (const [k, v] of Object.entries(raw)) {
+      if (Date.now() - v.ts < GEO_CACHE_TTL) geoCache.set(k, v.label);
+    }
+  } catch { /* localStorage 不可用则仅内存缓存 */ }
+  function geoCacheSave(ip, label) {
+    geoCache.set(ip, label);
+    try {
+      const store = JSON.parse(localStorage.getItem(GEO_CACHE_KEY) || '{}');
+      store[ip] = { label, ts: Date.now() };
+      const keys = Object.keys(store);
+      if (keys.length > GEO_CACHE_MAX) {
+        // 只保留最新 GEO_CACHE_MAX 条（按 ts 倒序），防无限增长
+        const trimmed = {};
+        keys.sort((a, b) => store[b].ts - store[a].ts).slice(0, GEO_CACHE_MAX).forEach((k) => { trimmed[k] = store[k]; });
+        localStorage.setItem(GEO_CACHE_KEY, JSON.stringify(trimmed));
+      } else {
+        localStorage.setItem(GEO_CACHE_KEY, JSON.stringify(store));
+      }
+    } catch { /* 写失败（配额满等）退化为纯内存缓存 */ }
+  }
   // 私网/保留地址不查询：10.x 172.16-31.x 192.168.x 127.x 169.254.x 0.x 100.64-127.x
   const GEO_PRIVATE = /^(0\.|10\.|127\.|169\.254\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.|100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.)/;
   async function geoLookup(ip) {
@@ -235,7 +261,8 @@
         if (j && j.success) label = (j.country || '') + (j.city ? ' ' + j.city : '');
       } catch { /* 查询失败则不显示 */ }
     }
-    geoCache.set(ip, label);
+    if (label) geoCacheSave(ip, label); // 成功：内存 + localStorage 持久化（跨会话复用）
+    else geoCache.set(ip, '');          // 失败：仅内存缓存（避免同批重复查，不持久化坏数据）
     return label;
   }
   // 渲染后异步补充卡片 IP 归属地（默认不查询第三方，保护服务器公网 IP 隐私）

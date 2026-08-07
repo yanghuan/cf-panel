@@ -130,18 +130,17 @@
     rows.push(['温度', e.temp != null ? Number(e.temp).toFixed(1) + ' °C' : 'N/A']);
     const items = rows.map(([k, v]) => `<div class="mt-row"><span>${k}</span><b>${v}</b></div>`).join('');
     // 系统信息：内核 / IP 等（info 仅在 info_json 变更时更新）
+    // IP 用 <cf-ip> 组件（自动归属地查询；私网/回环被 GEO_PRIVATE 过滤仅显示 IP）
     let sysHtml = '';
     if (info) {
       const sys = [
         ['系统', info.os],
         ['内核', info.kern],
-        ['IPv4', info.ip4],
-        ['IPv6', info.ip6],
       ].filter(([, v]) => v);
-      if (sys.length) {
-        sysHtml = `<div class="mt-sub">系统信息</div>` + sys.map(([k, v]) =>
-          `<div class="mt-row"><span>${k}</span><b>${escapeHtml(v)}</b></div>`).join('');
-      }
+      let sysRows = sys.map(([k, v]) => `<div class="mt-row"><span>${k}</span><b>${escapeHtml(v)}</b></div>`).join('');
+      if (info.ip4) sysRows += `<div class="mt-row"><span>IPv4</span><b><cf-ip ip="${escapeHtml(info.ip4)}"></cf-ip></b></div>`;
+      if (info.ip6) sysRows += `<div class="mt-row"><span>IPv6</span><b><cf-ip ip="${escapeHtml(info.ip6)}"></cf-ip></b></div>`;
+      if (sysRows) sysHtml = `<div class="mt-sub">系统信息</div>` + sysRows;
     }
     let diskHtml = '';
     if (Array.isArray(e.disk) && e.disk.length) {

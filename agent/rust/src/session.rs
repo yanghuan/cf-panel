@@ -291,7 +291,7 @@ pub async fn run_file_session(cfg: Config, sid: String) {
         // 混合帧协议：Text 为无数据命令（list/read/abort）；Binary 为 write 混合帧
         //（JSON 头 + '\n' + 原始字节）。响应按内容区分 Text/Binary
         let reply = match msg {
-            Message::Text(t) => handle_file_cmd(&t).await,
+            Message::Text(t) => handle_file_cmd(&t, &sid, &cfg.tmp_dir).await,
             Message::Binary(b) => handle_file_cmd_binary(b, created.clone()).await,
             _ => continue,
         };
@@ -303,7 +303,11 @@ pub async fn run_file_session(cfg: Config, sid: String) {
             break;
         }
     }
-    // 断线/会话结束：清理本会话创建的临时文件（防止 .upload.{id} 残留累积）
+    // 断线/会话结束：清理本会话创建的临时文件（.upload.{id} + 目录打包 dl-{sid}.zip）
+    let _ = std::fs::remove_file(format!(
+        "{}/dl-{sid}.zip",
+        cfg.tmp_dir.trim_end_matches('/')
+    ));
     // Mutex poison 容忍
     if let Ok(tmp) = created.lock() {
         for p in tmp.iter() {
@@ -313,13 +317,235 @@ pub async fn run_file_session(cfg: Config, sid: String) {
     log(format!("file session {sid} ended"));
 }
 
+// ---- 系统路径安全检查：重命名/删除/打包拒绝系统目录（防误操作破坏系统） ----
+const SYSTEM_PATHS: &[&str] = &[
+    "/proc",
+    "/sys",
+    "/dev",
+    "/etc",
+    "/usr",
+    "/var",
+    "/boot",
+    "/bin",
+    "/sbin",
+    "/lib",
+    "/lib64",
+    "/opt",
+    "/root",
+    "/run",
+    "/srv",
+    "/lost+found",
+];
+fn is_system_path(path: &str) -> bool {
+    let p = path.trim_end_matches('/');
+    if p.is_empty() || p == "/" {
+        return true;
+    }
+    SYSTEM_PATHS
+        .iter()
+        .any(|s| p == *s || p.starts_with(&format!("{s}/")))
+}
+
+// ---- CRC32（zip STORED 条目校验和） ----
+fn crc32(data: &[u8]) -> u32 {
+    static TABLE: std::sync::OnceLock<[u32; 256]> = std::sync::OnceLock::new();
+    let t = TABLE.get_or_init(|| {
+        let mut t = [0u32; 256];
+        for i in 0..256u32 {
+            let mut c = i;
+            for _ in 0..8 {
+                c = if c & 1 != 0 {
+                    0xEDB88320 ^ (c >> 1)
+                } else {
+                    c >> 1
+                };
+            }
+            t[i as usize] = c;
+        }
+        t
+    });
+    let mut c = 0xFFFFFFFFu32;
+    for &b in data {
+        c = t[((c ^ b as u32) & 0xFF) as usize] ^ (c >> 8);
+    }
+    !c
+}
+
+// 递归收集目录条目（相对路径，目录带尾 /）
+fn collect_zip_entries(
+    dir: &std::path::Path,
+    prefix: &str,
+    out: &mut Vec<(String, bool)>,
+) -> std::io::Result<()> {
+    for e in std::fs::read_dir(dir)? {
+        let e = e?;
+        let name = e.file_name().to_string_lossy().into_owned();
+        let rel = if prefix.is_empty() {
+            name.clone()
+        } else {
+            format!("{prefix}/{name}")
+        };
+        let ft = e.file_type()?;
+        if ft.is_dir() {
+            out.push((format!("{rel}/"), true));
+            collect_zip_entries(&e.path(), &rel, out)?;
+        } else {
+            out.push((rel, false));
+        }
+    }
+    Ok(())
+}
+
+// 目录 → zip（STORED 无压缩，手写格式；UTF-8 文件名标志；条目为相对路径）
+fn zip_directory(dir: &std::path::Path, out: &mut Vec<u8>) -> std::io::Result<()> {
+    let mut entries: Vec<(String, bool)> = Vec::new();
+    collect_zip_entries(dir, "", &mut entries)?;
+    let mut central: Vec<u8> = Vec::new();
+    let mut offset: u32 = 0;
+    for (rel, is_dir) in &entries {
+        let data = if *is_dir {
+            Vec::new()
+        } else {
+            std::fs::read(dir.join(rel))?
+        };
+        let crc = crc32(&data);
+        let name_bytes = rel.as_bytes();
+        let mut lh = Vec::new();
+        lh.extend_from_slice(&0x04034b50u32.to_le_bytes()); // local header signature
+        lh.extend_from_slice(&20u16.to_le_bytes()); // version needed
+        lh.extend_from_slice(&0x0800u16.to_le_bytes()); // flags: UTF-8 names
+        lh.extend_from_slice(&0u16.to_le_bytes()); // method STORED
+        lh.extend_from_slice(&0u16.to_le_bytes()); // mod time
+        lh.extend_from_slice(&0x21u16.to_le_bytes()); // mod date (1980-01-01)
+        lh.extend_from_slice(&crc.to_le_bytes());
+        lh.extend_from_slice(&(data.len() as u32).to_le_bytes()); // compressed = uncompressed
+        lh.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        lh.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
+        lh.extend_from_slice(&0u16.to_le_bytes()); // extra len
+        lh.extend_from_slice(name_bytes);
+        out.extend_from_slice(&lh);
+        out.extend_from_slice(&data);
+        let mut ch = Vec::new();
+        ch.extend_from_slice(&0x02014b50u32.to_le_bytes()); // central signature
+        ch.extend_from_slice(&20u16.to_le_bytes()); // version made by
+        ch.extend_from_slice(&20u16.to_le_bytes()); // version needed
+        ch.extend_from_slice(&0x0800u16.to_le_bytes()); // flags
+        ch.extend_from_slice(&0u16.to_le_bytes()); // method
+        ch.extend_from_slice(&0u16.to_le_bytes()); // mod time
+        ch.extend_from_slice(&0x21u16.to_le_bytes()); // mod date
+        ch.extend_from_slice(&crc.to_le_bytes());
+        ch.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        ch.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        ch.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
+        ch.extend_from_slice(&0u16.to_le_bytes()); // extra len
+        ch.extend_from_slice(&0u16.to_le_bytes()); // comment len
+        ch.extend_from_slice(&0u16.to_le_bytes()); // disk number
+        ch.extend_from_slice(&0u16.to_le_bytes()); // internal attrs
+        ch.extend_from_slice(&0u32.to_le_bytes()); // external attrs
+        ch.extend_from_slice(&offset.to_le_bytes()); // local header offset
+        ch.extend_from_slice(name_bytes);
+        central.extend_from_slice(&ch);
+        offset += lh.len() as u32 + data.len() as u32;
+    }
+    out.extend_from_slice(&central);
+    // EOCD
+    out.extend_from_slice(&0x06054b50u32.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+    out.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+    out.extend_from_slice(&(central.len() as u32).to_le_bytes());
+    out.extend_from_slice(&offset.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes()); // comment len
+    Ok(())
+}
+
+// 目录打包 zip（STORED）到临时文件，返回 (zip 路径, 字节数)；前端分段下载后发 delete 清理
+async fn file_zip(path: &str, sid: &str, tmp_dir: &str) -> Result<(String, u64), String> {
+    if is_system_path(path) {
+        return Err("system path not allowed".into());
+    }
+    let meta = std::fs::metadata(path).map_err(|_| "path not found")?;
+    if !meta.is_dir() {
+        return Err("not a directory".into());
+    }
+    let zip_path = format!("{}/dl-{sid}.zip", tmp_dir.trim_end_matches('/'));
+    let path = path.to_string();
+    let r = blocking_with_timeout(120, move || -> Result<(String, u64), String> {
+        let mut buf: Vec<u8> = Vec::new();
+        zip_directory(std::path::Path::new(&path), &mut buf).map_err(|e| e.to_string())?;
+        let size = buf.len() as u64;
+        std::fs::write(&zip_path, &buf).map_err(|e| e.to_string())?;
+        Ok((zip_path, size))
+    })
+    .await;
+    r.ok_or_else(|| "zip timeout".to_string())?
+}
+
+// 重命名（仅改名，不允许跨目录移动）；new_name 不含路径分隔符
+async fn file_rename(path: &str, new_name: &str) -> String {
+    if is_system_path(path) {
+        return err_json("system path not allowed");
+    }
+    let new_name = new_name.trim();
+    if new_name.is_empty() || new_name.contains('/') || new_name == "." || new_name == ".." {
+        return err_json("bad new name");
+    }
+    let path = path.to_string();
+    let new_name = new_name.to_string();
+    let r = blocking_with_timeout(10, move || -> Result<String, String> {
+        if !std::path::Path::new(&path).exists() {
+            return Err("path not found".into());
+        }
+        let parent = std::path::Path::new(&path)
+            .parent()
+            .unwrap_or(std::path::Path::new("/"));
+        let target = parent.join(new_name);
+        if target.exists() {
+            return Err("target already exists".into());
+        }
+        std::fs::rename(path, &target).map_err(|e| format!("rename failed: {e}"))?;
+        Ok(target.to_string_lossy().into_owned())
+    })
+    .await;
+    match r {
+        Some(Ok(t)) => {
+            serde_json::json!({ "type": "rename_result", "ok": true, "path": t }).to_string()
+        }
+        Some(Err(e)) => err_json(&e),
+        None => err_json("rename timeout"),
+    }
+}
+
+// 删除（文件或目录递归）；系统路径拒绝
+async fn file_delete(path: &str) -> String {
+    if is_system_path(path) {
+        return err_json("system path not allowed");
+    }
+    let path = path.to_string();
+    let r = blocking_with_timeout(60, move || -> Result<(), String> {
+        let meta = std::fs::metadata(&path).map_err(|_| "path not found")?;
+        if meta.is_dir() {
+            std::fs::remove_dir_all(&path).map_err(|e| e.to_string())
+        } else {
+            std::fs::remove_file(&path).map_err(|e| e.to_string())
+        }
+    })
+    .await;
+    match r {
+        Some(Ok(())) => serde_json::json!({ "type": "delete_result", "ok": true }).to_string(),
+        Some(Err(e)) => err_json(&e),
+        None => err_json("delete timeout"),
+    }
+}
+
 // 文件命令响应：Text（list_result/write_result/error 等无数据）或 Binary（read_result 混合帧）
 enum FileReply {
     Text(String),
     Binary(Vec<u8>),
 }
 
-async fn handle_file_cmd(line: &str) -> FileReply {
+async fn handle_file_cmd(line: &str, sid: &str, tmp_dir: &str) -> FileReply {
     let v: serde_json::Value = match serde_json::from_str(line) {
         Ok(v) => v,
         Err(_) => return FileReply::Text(err_json("bad json")),
@@ -345,7 +571,6 @@ async fn handle_file_cmd(line: &str) -> FileReply {
                 Err(e) => FileReply::Text(err_json(&e)),
             }
         }
-
         "abort" => {
             let upload_id = v
                 .get("upload_id")
@@ -354,6 +579,19 @@ async fn handle_file_cmd(line: &str) -> FileReply {
                 .to_string();
             FileReply::Text(file_abort(path, upload_id).await)
         }
+        // 目录打包 zip：返回临时 zip 路径与大小，前端分段下载后发 delete 清理
+        "zip" => match file_zip(&path, sid, tmp_dir).await {
+            Ok((zip_path, size)) => FileReply::Text(
+                serde_json::json!({ "type": "zip_result", "ok": true, "path": zip_path, "size": size })
+                    .to_string(),
+            ),
+            Err(e) => FileReply::Text(err_json(&e)),
+        },
+        "rename" => {
+            let new_name = v.get("new_name").and_then(|x| x.as_str()).unwrap_or("");
+            FileReply::Text(file_rename(&path, new_name).await)
+        }
+        "delete" => FileReply::Text(file_delete(&path).await),
         _ => FileReply::Text(err_json("unknown cmd")),
     }
 }
@@ -703,6 +941,66 @@ mod tests {
         assert!(wildcard_match("", ""));
         assert!(!wildcard_match("", "x"));
         assert!(wildcard_match("*", "anything"));
+    }
+
+    #[test]
+    fn system_path_check() {
+        // 系统目录及其子路径拒绝
+        assert!(is_system_path("/"));
+        assert!(is_system_path("/proc"));
+        assert!(is_system_path("/etc/passwd"));
+        assert!(is_system_path("/usr/local/bin"));
+        assert!(is_system_path("/var/log"));
+        assert!(is_system_path("/root"));
+        // 用户目录/挂载点允许
+        assert!(!is_system_path("/home/user"));
+        assert!(!is_system_path("/tmp"));
+        assert!(!is_system_path("/mnt/data"));
+        assert!(!is_system_path("/home/user/dir"));
+    }
+
+    #[test]
+    fn crc32_known_vector() {
+        // 标准测试向量：CRC32("123456789") = 0xCBF43926
+        assert_eq!(crc32(b"123456789"), 0xCBF43926);
+        assert_eq!(crc32(b""), 0);
+    }
+
+    #[test]
+    fn zip_directory_packs_entries() {
+        let tmp = std::env::temp_dir().join(format!("cfp-zip-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("sub")).unwrap();
+        std::fs::write(tmp.join("a.txt"), b"hello").unwrap();
+        std::fs::write(tmp.join("sub/b.txt"), b"world").unwrap();
+        let mut buf = Vec::new();
+        zip_directory(&tmp, &mut buf).unwrap();
+        // 校验 zip 结构：local header 签名、EOCD 签名、条目名出现
+        assert!(
+            buf.starts_with(&0x04034b50u32.to_le_bytes()),
+            "local header"
+        );
+        assert_eq!(
+            &buf[buf.len() - 22..buf.len() - 18],
+            &0x06054b50u32.to_le_bytes(),
+            "EOCD"
+        );
+        let text = String::from_utf8_lossy(&buf);
+        assert!(text.contains("a.txt"), "条目 a.txt");
+        assert!(text.contains("sub/b.txt"), "嵌套条目");
+        assert!(text.contains("sub/"), "目录条目");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn rename_delete_rejects_system_path() {
+        assert!(file_rename("/etc/passwd", "x")
+            .await
+            .contains("system path not allowed"));
+        assert!(file_delete("/usr")
+            .await
+            .contains("system path not allowed"));
+        assert!(file_delete("/").await.contains("system path not allowed"));
     }
 
     #[test]

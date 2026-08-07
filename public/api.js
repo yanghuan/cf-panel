@@ -93,6 +93,14 @@
         if (this.h.onList) this.h.onList(j.entries, !!j.truncated);
       } else if (j.type === 'write_result' && j.ok) {
         this._onWriteResult(j);
+      } else if (j.type === 'zip_result' && j.ok) {
+        this._startZipDownload(j.path, j.size);
+      } else if (j.type === 'rename_result' && j.ok) {
+        if (this.h.onRenameDone) this.h.onRenameDone(j.path);
+      } else if (j.type === 'delete_result' && j.ok) {
+        // zip 下载完成的临时文件清理（silent 标志，不触发 UI 刷新）
+        if (this._zipCleanup) this._zipCleanup = false;
+        else if (this.h.onDeleteDone) this.h.onDeleteDone();
       } else if (j.type === 'error') {
         if (this.h.onError) this.h.onError(j.message);
       }
@@ -158,11 +166,30 @@
       this.downloadState = null;
       if (this.h.onDownloadCanceled) this.h.onDownloadCanceled();
     }
+    // 目录打包 zip 下载：agent 端生成临时 dl-{sid}.zip（zip_result 带 path/size），
+    // 分段 read 拉取完成后发 delete 清理临时文件（文件名用目录名.zip）
+    zipDownload(path) {
+      if (this.downloadState) { if (this.h.onError) this.h.onError('已有下载进行中，请等待完成'); return; }
+      this._zipBaseName = (CfUtils.fileJoin('', path).split('/').pop() || 'download') + '.zip';
+      this.send({ type: 'zip', path });
+    }
+    _startZipDownload(zipPath, size) {
+      if (size <= 0) { if (this.h.onError) this.h.onError('目录为空，无内容可打包'); return; }
+      this.downloadState = { path: zipPath, size, parts: [], received: 0, isZip: true, dlName: this._zipBaseName };
+      if (this.h.onDownloadProgress) this.h.onDownloadProgress(0);
+      this.send({ type: 'read', path: zipPath, offset: 0, limit: FILE_CHUNK });
+    }
+    // 重命名（仅改名，不支持跨目录；newName 不含 /）
+    rename(path, newName) { this.send({ type: 'rename', path, new_name: newName }); }
+    // 删除（文件或目录递归；系统路径 agent 端拒绝）
+    delete(path) { this._zipCleanup = false; this.send({ type: 'delete', path }); }
+
     _onReadResult(j, data) {
       const d = this.downloadState;
       if (!d || j.path !== d.path) return; // 取消后的迟到响应：静默丢弃
       if (j.got === 0) {
-        // EOF 未达预期 size → 文件已缩短/被替换，中止
+        // EOF 未达预期 size → 文件已缩短/被替换，中止（zip 临时文件同步清理）
+        if (d.isZip) { this._zipCleanup = true; this.send({ type: 'delete', path: d.path }); }
         const msg = `文件已变化或缩短，中止下载（已完成 ${d.received}/${d.size} 字节）`;
         this.downloadState = null;
         if (this.h.onDownloadCanceled) this.h.onDownloadCanceled();
@@ -173,9 +200,11 @@
       d.parts.push(data);
       d.received += j.got;
       if (d.received >= d.size) {
-        const { path, parts } = d;
+        const { path, parts, isZip, dlName } = d;
         this.downloadState = null;
-        if (this.h.onDownloadDone) this.h.onDownloadDone(path, parts);
+        // zip 下载完成：清理 agent 端临时文件（silent，不触发 onDeleteDone 刷新）
+        if (isZip) { this._zipCleanup = true; this.send({ type: 'delete', path }); }
+        if (this.h.onDownloadDone) this.h.onDownloadDone(path, parts, dlName);
       } else {
         if (this.h.onDownloadProgress) this.h.onDownloadProgress(Math.min(100, Math.round((d.received / d.size) * 100)));
         this.send({ type: 'read', path: j.path, offset: d.received, limit: FILE_CHUNK });

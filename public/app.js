@@ -479,21 +479,24 @@
     onUploadDone: (path) => { $('#btn-file-cancel').classList.add('hidden'); reloadFileList(); },
     onUploadCanceled: () => { $('#btn-file-cancel').classList.add('hidden'); $('#file-msg').textContent = '已取消上传'; },
     onDownloadProgress: (pct) => { $('#file-msg').textContent = `下载中：${pct}%`; },
-    onDownloadDone: (path, parts) => {
+    onDownloadDone: (path, parts, dlName) => {
       $('#btn-dl-cancel').classList.add('hidden');
       try {
         // Blob 直接引用分块数组（不复制），避免 500MB 级文件的二次内存拷贝
         const a = document.createElement('a');
         a.href = URL.createObjectURL(new Blob(parts));
-        a.download = path.split('/').pop() || 'download';
+        a.download = dlName || path.split('/').pop() || 'download';
         document.body.appendChild(a);
         a.click();
         a.remove();
         URL.revokeObjectURL(a.href);
-        $('#file-msg').textContent = `已下载：${path}`;
+        $('#file-msg').textContent = `已下载：${dlName || path}`;
       } catch { $('#file-msg').textContent = '下载失败'; }
     },
     onDownloadCanceled: () => { $('#btn-dl-cancel').classList.add('hidden'); $('#file-msg').textContent = '已取消下载'; },
+    // 重命名/删除成功后刷新列表（zip 下载完成的 delete 清理不回执，不会误触 onDeleteDone）
+    onRenameDone: (path) => { reloadFileList(); toast(`已重命名为：${path}`); },
+    onDeleteDone: () => { reloadFileList(); toast('已删除'); },
     onError: (msg) => { $('#file-msg').textContent = `错误：${msg}`; },
     onDisconnected: () => { if (!$('#file-modal').classList.contains('hidden')) $('#file-msg').textContent = '连接断开，点击「刷新」重连'; },
   });
@@ -527,11 +530,20 @@
     const rows = entries.map((e) => {
       const size = e.type === 'dir' ? '—' : fmtBytes(e.size);
       const time = e.mtime ? new Date(e.mtime * 1000).toLocaleString('zh-CN') : '—';
+      const path = fileJoin(fileSess.cwd, e.name);
       const nameCell = e.type === 'dir'
-        ? `<a class="f-dir" data-path="${escapeHtml(fileJoin(fileSess.cwd, e.name))}">📁 ${escapeHtml(e.name)}</a>`
+        ? `<a class="f-dir" data-path="${escapeHtml(path)}">📁 ${escapeHtml(e.name)}</a>`
         : `<span class="f-file">📄 ${escapeHtml(e.name)}</span>`;
-      const dl = e.type === 'file' ? `<button class="ghost f-dl" data-path="${escapeHtml(fileJoin(fileSess.cwd, e.name))}" data-size="${e.size}">下载</button>` : '';
-      return `<tr><td>${nameCell}</td><td>${size}</td><td>${escapeHtml(time)}</td><td>${dl}</td></tr>`;
+      // 行操作：⋯ 下拉菜单（下载/重命名/删除）。目录下载 = 打包 zip。
+      const menu = `<div class="row-menu-wrap">
+        <button class="row-menu" type="button" title="操作" aria-label="操作">⋯</button>
+        <div class="row-menu-pop hidden">
+          <button class="f-act-dl" type="button" data-path="${escapeHtml(path)}" data-type="${e.type}" data-size="${e.size}">下载</button>
+          <button class="f-act-ren" type="button" data-path="${escapeHtml(path)}">重命名</button>
+          <button class="f-act-del danger" type="button" data-path="${escapeHtml(path)}" data-type="${e.type}">删除</button>
+        </div>
+      </div>`;
+      return `<tr><td>${nameCell}</td><td>${size}</td><td>${escapeHtml(time)}</td><td class="f-ops">${menu}</td></tr>`;
     });
     $('#file-list').innerHTML = rows.join('') || '<tr><td colspan="4" class="muted">空目录</td></tr>';
   }
@@ -1160,13 +1172,49 @@
     clearTimeout(fileFilterTimer);
     fileFilterTimer = setTimeout(reloadFileList, 200);
   });
+  // 行操作下拉菜单：⋯ 切换显隐；点菜单项执行操作；点其他区域关闭
   $('#file-list').addEventListener('click', (e) => {
     const dir = e.target.closest('.f-dir');
     // 目录点击统一走 reloadFileList（保持当前过滤词，与「刷新」行为一致）
     if (dir) { fileSess.cwd = dir.dataset.path; $('#file-path').value = fileSess.cwd; reloadFileList(); return; }
-    const dl = e.target.closest('.f-dl');
-    if (dl) downloadFile(dl.dataset.path, Number(dl.dataset.size) || 0);
+    const menuBtn = e.target.closest('.row-menu');
+    if (menuBtn) {
+      e.stopPropagation(); // 阻止冒泡到 document（否则点 ⋯ 立即关闭）
+      closeRowMenus(menuBtn);
+      const pop = menuBtn.parentElement.querySelector('.row-menu-pop');
+      if (pop) pop.classList.toggle('hidden');
+      return;
+    }
+    const dl = e.target.closest('.f-act-dl');
+    if (dl) {
+      closeRowMenus();
+      const path = dl.dataset.path;
+      if (dl.dataset.type === 'dir') { $('#file-msg').textContent = '正在打包目录，请稍候...'; fileSess.zipDownload(path); }
+      else downloadFile(path, Number(dl.dataset.size) || 0);
+      return;
+    }
+    const ren = e.target.closest('.f-act-ren');
+    if (ren) {
+      closeRowMenus();
+      const old = ren.dataset.path.split('/').pop();
+      const name = prompt(`重命名：\n${ren.dataset.path}\n\n新名称（仅改名，不支持跨目录）：`, old);
+      if (name !== null && name.trim()) fileSess.rename(ren.dataset.path, name.trim());
+      return;
+    }
+    const del = e.target.closest('.f-act-del');
+    if (del) {
+      closeRowMenus();
+      const isDir = del.dataset.type === 'dir';
+      confirmDialog(`确认删除「${del.dataset.path}」${isDir ? '（目录将递归删除）' : ''}？\n此操作不可恢复！`, () => fileSess.delete(del.dataset.path));
+    }
   });
+  // 点击表格外任意位置关闭已展开的菜单
+  document.addEventListener('click', () => closeRowMenus());
+  function closeRowMenus(except) {
+    document.querySelectorAll('#file-list .row-menu-pop').forEach((p) => {
+      if (p.parentElement.querySelector('.row-menu') !== except) p.classList.add('hidden');
+    });
+  }
 
   // ---------- 弹窗可访问性（role/aria + Esc 关闭 + 焦点管理） ----------
   // 对所有 .modal 注入 dialog 语义；用 MutationObserver 统一做"打开聚焦首个可聚焦元素、

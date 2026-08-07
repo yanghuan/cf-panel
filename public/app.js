@@ -4,6 +4,7 @@
 
   const $ = (sel) => document.querySelector(sel);
   let token = localStorage.getItem('cfpanel_token') || '';
+  let canExec = true; // 当前用户是否有 exec 权限（PAT 按 scopes，admin 恒有；控制终端/文件菜单显隐）
   let serversCache = [];
   let pushWs = null;       // 服务器列表实时推送 WS
   let pushTimer = null;    // 每 3 秒发一次 sync 请求的定时器
@@ -69,12 +70,20 @@
     $('#auth').classList.add('hidden');
     $('#app').classList.remove('hidden');
     $('#whoami').textContent = user.is_pat ? `令牌（${escapeHtml(user.username)}）` : escapeHtml(user.username || 'admin');
+    // PAT：exec 权限决定终端/文件菜单显隐（admin 恒有 exec）
+    canExec = user.role === 1 || (user.pat && user.pat.scopes.includes('server:exec'));
     loadServers(); // 先拉一次，WS 建立后每 3 秒由服务端推送覆盖
     startPush();
     resetIdle(); // 空闲观看保护：登录后开始计时
   }
 
+  let loginBusy = false;
   async function doLogin() {
+    if (loginBusy) return; // 防重复提交
+    loginBusy = true;
+    const btn = $('#btn-login');
+    btn.disabled = true;
+    btn.textContent = '登录中...';
     const password = $('#auth-pass').value;
     const msg = $('#auth-msg');
     msg.textContent = '';
@@ -85,6 +94,10 @@
       showApp(data.user);
     } catch (e) {
       msg.textContent = e.message;
+    } finally {
+      loginBusy = false;
+      btn.disabled = false;
+      btn.textContent = '登录';
     }
   }
 
@@ -179,8 +192,8 @@
             <span class="name">${escapeHtml(s.name)}</span>
             <button class="more-btn" title="节点操作">⋯</button>
             <div class="card-menu hidden">
-              <button data-act="term" data-id="${s.id}" data-name="${escapeHtml(s.name)}">终端</button>
-              <button data-act="file" data-id="${s.id}" data-name="${escapeHtml(s.name)}">文件</button>
+              ${canExec ? `<button data-act="term" data-id="${s.id}" data-name="${escapeHtml(s.name)}">终端</button>
+              <button data-act="file" data-id="${s.id}" data-name="${escapeHtml(s.name)}">文件</button>` : ''}
               <button data-act="mon" data-id="${s.id}" data-name="${escapeHtml(s.name)}">监控</button>
               <button data-act="custom" data-id="${s.id}" data-name="${escapeHtml(s.name)}">自定义指标</button>
               <button data-act="del" data-id="${s.id}" data-name="${escapeHtml(s.name)}" class="dd-danger">删除</button>
@@ -229,15 +242,16 @@
   async function lookupGeo() {
     if (!geoEnabled) return;
     const els = [...document.querySelectorAll('#servers .card .meta[data-ip]')];
-    for (const el of els) {
+    // 并行查询（每个查询有独立 5s 超时，顺序无关），避免多机时串行等待数十秒
+    await Promise.allSettled(els.map(async (el) => {
       const ip = el.dataset.ip;
-      if (!ip || el.dataset.geoDone) continue;
+      if (!ip || el.dataset.geoDone) return;
       const label = await geoLookup(ip);
       if (label && el.isConnected) {
         el.dataset.geoDone = '1';
         el.textContent = `${el.textContent} （${label}）`;
       }
-    }
+    }));
   }
 
   // 顶部概览条：服务器总数/在线数/平均 CPU/平均负载/总内存
@@ -307,6 +321,9 @@
   function updateServerCards() {
     const box = $('#servers');
     agingServers();
+    // 推送数据已更新：关闭可能过期的指标 tooltip 静态快照（数据时点已变）
+    metricTip.classList.remove('show');
+    tipSource = null;
     // 服务器增删或分组结构变化 → 低频全量重建
     const domIds = new Set([...box.querySelectorAll('.card')].map((c) => Number(c.dataset.id)));
     const wantIds = new Set(serversCache.map((s) => s.id));
@@ -441,7 +458,9 @@
         pushRetries += 1;
         setTimeout(startPush, 3000);
       } else {
-        toast('实时刷新连接失败，请刷新页面');
+        toast('实时刷新连接失败，正在自动重试...');
+        // 重连耗尽后 30s 兜底重试：服务恢复后自动连回，无需手动刷新
+        setTimeout(startPush, 30000);
       }
     };
     ws.onerror = () => { try { ws.close(); } catch { /* ignore */ } };
@@ -463,23 +482,26 @@
   let idleTimer = null;
   let idlePromptTimer = null;
   let idlePaused = false;
+  let idlePrompting = false; // 提示弹窗显示中（期间用户活动不清自动暂停倒计时）
 
   function resetIdle() {
     if (idlePaused || !token) return;
     clearTimeout(idleTimer);
-    clearTimeout(idlePromptTimer);
+    if (!idlePrompting) clearTimeout(idlePromptTimer); // 提示中保留 60s 自动暂停兜底
     idleTimer = setTimeout(onIdleTimeout, IDLE_TIMEOUT_MS);
   }
   function onIdleTimeout() {
-    if (!token || idlePaused) return;
-    const pause = () => pauseViewing();
+    if (!token || idlePaused || idlePrompting) return;
+    idlePrompting = true;
+    const pause = () => { idlePrompting = false; pauseViewing(); };
     // 确认=继续观看（重置计时）；取消=立即暂停；关闭弹窗=忽略提示（60s 倒计时自动暂停兜底）
-    confirmDialog('长时间未操作。为节省 Cloudflare 额度，将暂停实时刷新（agent 将恢复慢采）。\n\n点击「确认」继续观看，或「取消」暂停；60 秒无响应将自动暂停。', resetIdle, pause);
-    idlePromptTimer = setTimeout(pause, IDLE_PROMPT_MS);
+    confirmDialog('长时间未操作。为节省 Cloudflare 额度，将暂停实时刷新（agent 将恢复慢采）。\n\n点击「确认」继续观看，或「取消」暂停；60 秒无响应将自动暂停。', () => { idlePrompting = false; resetIdle(); }, pause);
+    idlePromptTimer = setTimeout(() => { idlePrompting = false; pauseViewing(); }, IDLE_PROMPT_MS);
   }
   function pauseViewing() {
     if (idlePaused) return;
     idlePaused = true;
+    idlePrompting = false;
     clearTimeout(idleTimer);
     clearTimeout(idlePromptTimer);
     stopPush(); // 断开 /ws/push → 观看者减 1 → agent 恢复慢采
@@ -488,6 +510,7 @@
   function resumeViewing() {
     if (!idlePaused) return;
     idlePaused = false;
+    idlePrompting = false;
     startPush(); // 重连 /ws/push → 观看者加 1 → agent 恢复快采
     resetIdle();
     toast('已恢复实时刷新。');
@@ -659,6 +682,8 @@
   // ---------- 文件管理（目录浏览 / 上传 / 下载） ----------
   let fileWs = null;
   let fileCwd = '/';
+  let fileServerId = 0;      // 当前文件会话所属服务器（断线重连用）
+  let fileServerName = '';
   const FILE_CHUNK = 512 * 1024;       // 分段传输块大小 512KB（base64 后 ~683KB < workerd 入站 1MB 限制）
   const FILE_MAX = 500 * 1024 * 1024;  // 单文件大小上限 500MB
   let fileUpload = null;               // { size, sent } 上传进度
@@ -688,6 +713,8 @@
 
   async function openFileManager(serverId, serverName) {
     try {
+      fileServerId = serverId;
+      fileServerName = serverName;
       const res = await api('/api/file/open', { method: 'POST', body: JSON.stringify({ server_id: serverId }) });
       fileCwd = '/';
       $('#file-title').textContent = `文件管理 · ${serverName}`;
@@ -720,12 +747,18 @@
         let j; try { j = JSON.parse(ev.data); } catch { return; }
         if (j.type === 'list_result' && j.ok) {
           renderFileList(j.entries); // agent 端已按过滤规则返回
-          if (j.truncated) $('#file-msg').textContent = '目录条目过多，仅显示前 1000 项';
+          // 截断提示随状态更新（从截断目录切到正常目录时清除残留提示）
+          $('#file-msg').textContent = j.truncated ? '目录条目过多，仅显示前 1000 项' : '';
         }
         else if (j.type === 'write_result' && j.ok) onWriteResult(j);
         else if (j.type === 'error') $('#file-msg').textContent = `错误：${j.message}`;
       };
-      ws.onclose = () => { if (fileWs === ws) fileWs = null; };
+      ws.onclose = () => {
+        if (fileWs !== ws) return;
+        fileWs = null;
+        // 断线提示（弹窗仍打开时）；点「刷新」会重新建立会话（M2：与终端一致，不静默失效）
+        if (!$('#file-modal').classList.contains('hidden')) $('#file-msg').textContent = '连接断开，点击「刷新」重连';
+      };
       ws.onerror = () => { try { ws.close(); } catch { /* ignore */ } };
     } catch (e) {
       toast(e.message);
@@ -760,24 +793,35 @@
   }
 
   // 分段下载：按 1MB 逐段拉取，累计到文件大小后组装 Blob 下载
+  // 下载进行中显示/结束隐藏取消按钮
+  function setDlCancelVisible(v) { $('#btn-dl-cancel').classList.toggle('hidden', !v); }
   function downloadFile(path, size) {
+    if (fileDownload) { $('#file-msg').textContent = '已有下载进行中，请等待完成'; return; } // 并发防护
     if (size > FILE_MAX) { $('#file-msg').textContent = '文件超过 500MB 限制'; return; }
     if (size <= 0) { $('#file-msg').textContent = '空文件，无需下载'; return; }
     fileDownload = { path, size, parts: [], received: 0 };
     $('#file-msg').textContent = '开始下载...';
+    setDlCancelVisible(true);
     fileSend({ type: 'read', path, offset: 0, limit: FILE_CHUNK });
+  }
+  // 取消下载：停止后续 read 请求（并发已被 downloadFile 防护拦截）
+  function cancelDownload() {
+    if (!fileDownload) return;
+    fileDownload = null;
+    $('#file-msg').textContent = '已取消下载';
+    setDlCancelVisible(false);
   }
 
   function onReadResult(j, data) {
     if (!fileDownload || j.path !== fileDownload.path) {
-      $('#file-msg').textContent = '下载状态异常，请重试';
-      fileDownload = null;
+      // 取消后的迟到响应：静默丢弃（正常异常路径已由 downloadFile 并发防护覆盖）
       return;
     }
     if (j.got === 0) {
       // 读取到 EOF 但未达预期 size → 文件已缩短/被替换，中止避免无限循环
       $('#file-msg').textContent = `文件已变化或缩短，中止下载（已完成 ${fileDownload.received}/${fileDownload.size} 字节）`;
       fileDownload = null;
+      setDlCancelVisible(false);
       return;
     }
     // 混合帧：data 为原始字节（Uint8Array），由 onmessage Binary 分支传入
@@ -801,6 +845,7 @@
         $('#file-msg').textContent = '下载失败';
       }
       fileDownload = null;
+      setDlCancelVisible(false);
     } else {
       fileSend({ type: 'read', path: j.path, offset: fileDownload.received, limit: FILE_CHUNK });
     }
@@ -819,6 +864,7 @@
       if (!fileUpload || fileUpload.sent >= fileUpload.size) return;
       const chunk = file.slice(fileUpload.sent, Math.min(fileUpload.sent + FILE_CHUNK, file.size));
       reader.onload = () => {
+        if (!fileUpload) return; // 取消上传后 reader 异步完成，避免引用已置空对象
         const commit = fileUpload.sent + chunk.size >= file.size;
         // 混合帧：JSON 头 + '\n' + 原始字节（Binary 帧，无 base64 膨胀）
         const head = new TextEncoder().encode(JSON.stringify({ type: 'write', path: fileUpload.path, offset: fileUpload.sent, commit, upload_id: fileUpload.uploadId }) + '\n');
@@ -884,12 +930,15 @@
     return out;
   }
 
+  let monitorReqSeq = 0; // 监控 range 请求序号（快速切换时丢弃过期响应）
   async function showMonitor(serverId, serverName, range) {
     range = range || '12h';
     monitorState = { serverId, serverName, range };
+    const seq = ++monitorReqSeq;
     document.querySelectorAll('.range-btn').forEach((b) => b.classList.toggle('active', b.dataset.range === range));
     try {
       const data = await api(`/api/monitor?server_id=${serverId}&range=${range}`);
+      if (seq !== monitorReqSeq) return; // 过期响应（慢的旧 range 先返回）丢弃，防覆盖新 range 图表
       const rows = data.system || data; // 兼容：新结构 {system, custom}
       const custom = data.custom || {};
       const label = MONITOR_RANGE_LABEL[range] || range;
@@ -1011,13 +1060,17 @@
     names.forEach((n) => (custom[n] || []).forEach((p) => tsSet.add(p.ts)));
     const tsArr = [...tsSet].sort((a, b) => a - b);
     const labels = tsArr.map((t) => new Date(t * 60000).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }));
-    const datasets = names.map((n, i) => ({
-      label: n,
-      data: tsArr.map((t) => { const p = (custom[n] || []).find((x) => x.ts === t); return p ? p.value : null; }),
-      borderColor: MONITOR_COLORS[i % MONITOR_COLORS.length],
-      backgroundColor: 'transparent',
-      tension: 0.3, pointRadius: 0, borderWidth: 1.5, spanGaps: true,
-    }));
+    const datasets = names.map((n, i) => {
+      // Map 索引：O(n) 建索引 + O(1) 查询，避免逐点 find 的 O(n²)（对齐监控图）
+      const pMap = new Map((custom[n] || []).map((p) => [p.ts, p.value]));
+      return {
+        label: n,
+        data: tsArr.map((t) => (pMap.has(t) ? pMap.get(t) : null)),
+        borderColor: MONITOR_COLORS[i % MONITOR_COLORS.length],
+        backgroundColor: 'transparent',
+        tension: 0.3, pointRadius: 0, borderWidth: 1.5, spanGaps: true,
+      };
+    });
     customChart = new Chart($('#custom-chart'), {
       type: 'line',
       data: { labels, datasets },
@@ -1473,7 +1526,15 @@
   // 文件管理操作
   $('#btn-file-close').onclick = closeFileModal;
   $('#btn-file-cancel').onclick = cancelUpload;
-  $('#file-refresh').onclick = reloadFileList;
+  $('#btn-dl-cancel').onclick = cancelDownload;
+  $('#file-refresh').onclick = () => {
+    // WS 断开时重建会话（旧会话已失效）；在线则正常刷新列表
+    if (!fileWs || fileWs.readyState !== 1) {
+      if (fileServerId) openFileManager(fileServerId, fileServerName);
+      return;
+    }
+    reloadFileList();
+  };
   $('#file-up').onclick = () => { fileCwd = fileParent(fileCwd); $('#file-path').value = fileCwd; reloadFileList(); };
   $('#file-go').onclick = () => { const p = $('#file-path').value.trim(); if (!p) return; fileCwd = p; reloadFileList(); };
   $('#file-path').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('#file-go').click(); });
@@ -1485,7 +1546,8 @@
   });
   $('#file-list').addEventListener('click', (e) => {
     const dir = e.target.closest('.f-dir');
-    if (dir) { fileCwd = dir.dataset.path; $('#file-path').value = fileCwd; fileSend({ type: 'list', path: fileCwd }); return; }
+    // 目录点击统一走 reloadFileList（保持当前过滤词，与「刷新」行为一致）
+    if (dir) { fileCwd = dir.dataset.path; $('#file-path').value = fileCwd; reloadFileList(); return; }
     const dl = e.target.closest('.f-dl');
     if (dl) downloadFile(dl.dataset.path, Number(dl.dataset.size) || 0);
   });

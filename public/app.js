@@ -1,11 +1,13 @@
 // cf-panel 前端逻辑：登录、分组服务器列表、xterm 终端（自动重连）、公告/设置、PAT 管理
 (() => {
   'use strict';
-  // 工具函数与 <cf-ip> 组件从 utils.js 解构（index.html 中 utils.js 须先加载）
+  // 工具函数与 <cf-ip> 组件从 utils.js 解构；api 层从 api.js 解构（index.html 中均须先加载）
   const { $, escapeHtml, fmtBytes, fileJoin, fileParent, downsample, lockScroll, unlockScroll,
           MONITOR_STEP_MAX, MONITOR_RANGE_LABEL, MONITOR_COLORS, FILE_CHUNK, FILE_MAX,
           GEO_PRIVATE, setGeoEnabled } = CfUtils;
+  const { api, setTokenGetter, FileSession } = CfApi;
   let token = localStorage.getItem('cfpanel_token') || '';
+  setTokenGetter(() => token); // api 层通过 getter 读取当前 token
   let canExec = true; // 当前用户是否有 exec 权限（PAT 按 scopes，admin 恒有；控制终端/文件菜单显隐）
   let serversCache = [];
   let pushWs = null;       // 服务器列表实时推送 WS
@@ -16,15 +18,6 @@
   const TERM_RETRY_MAX = 3; // 终端断线自动重连次数
 
   // ---------- 基础 ----------
-  async function api(path, opts = {}) {
-    const headers = { 'content-type': 'application/json', ...(opts.headers || {}) };
-    if (token) headers.authorization = `Bearer ${token}`;
-    const resp = await fetch(path, { ...opts, headers });
-    const data = await resp.json().catch(() => ({}));
-    if (!resp.ok) throw new Error(data.error || `HTTP ${resp.status}`);
-    return data;
-  }
-
   function toast(msg, ms = 2500) {
     const el = $('#toast');
     el.textContent = msg;
@@ -616,93 +609,63 @@
     connect();
   }
 
-  // ---------- 文件管理（目录浏览 / 上传 / 下载） ----------
-  let fileWs = null;
-  let fileCwd = '/';
+  // ---------- 文件管理（目录浏览 / 上传 / 下载；连接/协议/状态机在 api.js 的 FileSession） ----------
   let fileServerId = 0;      // 当前文件会话所属服务器（断线重连用）
   let fileServerName = '';
-  let fileUpload = null;               // { size, sent } 上传进度
-  let fileDownload = null;             // { path, size, parts, received } 下载进度
   let fileFilterTimer = null;          // 过滤输入框 debounce 定时器
 
-  // 重新拉取列表（带当前通配符过滤规则）。过滤在 agent 端完成（先过滤再截断 1000 条），
+  // FileSession：连接/协议/上传下载状态机（api.js，零 DOM），UI 通过回调处理
+  const fileSess = new FileSession({
+    onList: (entries, truncated) => {
+      renderFileList(entries);
+      $('#file-msg').textContent = truncated ? '目录条目过多，仅显示前 1000 项' : '';
+    },
+    onUploadProgress: (pct) => { $('#file-msg').textContent = `上传中：${pct}%`; },
+    onUploadDone: (path) => { $('#btn-file-cancel').classList.add('hidden'); reloadFileList(); },
+    onUploadCanceled: () => { $('#btn-file-cancel').classList.add('hidden'); $('#file-msg').textContent = '已取消上传'; },
+    onDownloadProgress: (pct) => { $('#file-msg').textContent = `下载中：${pct}%`; },
+    onDownloadDone: (path, parts) => {
+      $('#btn-dl-cancel').classList.add('hidden');
+      try {
+        // Blob 直接引用分块数组（不复制），避免 500MB 级文件的二次内存拷贝
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(new Blob(parts));
+        a.download = path.split('/').pop() || 'download';
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        URL.revokeObjectURL(a.href);
+        $('#file-msg').textContent = `已下载：${path}`;
+      } catch { $('#file-msg').textContent = '下载失败'; }
+    },
+    onDownloadCanceled: () => { $('#btn-dl-cancel').classList.add('hidden'); $('#file-msg').textContent = '已取消下载'; },
+    onError: (msg) => { $('#file-msg').textContent = `错误：${msg}`; },
+    onDisconnected: () => { if (!$('#file-modal').classList.contains('hidden')) $('#file-msg').textContent = '连接断开，点击「刷新」重连'; },
+  });
+
+  // 重新拉取列表（带当前过滤规则）。过滤在 agent 端完成（先过滤再截断 1000 条），
   // 避免大目录下前端只拿到截断区间子集而遗漏匹配文件
   function reloadFileList() {
-    let pattern = $('#file-filter').value.trim();
-    // Everything 风格：无通配符的纯文本按「子串包含」匹配（*文本*）——输入 dotnet 能匹配
-    // dotnet-sdk-*.exe 等任意位置包含的文件；含 * 或 ? 时保留通配符语义（*.log、dotnet*）
-    if (pattern && !/[*?]/.test(pattern)) pattern = `*${pattern}*`;
-    const body = { type: 'list', path: fileCwd };
-    if (pattern) body.pattern = pattern;
-    fileSend(body);
+    fileSess.list(fileSess.cwd, $('#file-filter').value);
   }
 
   async function openFileManager(serverId, serverName) {
-    try {
-      fileServerId = serverId;
-      fileServerName = serverName;
-      const res = await api('/api/file/open', { method: 'POST', body: JSON.stringify({ server_id: serverId }) });
-      fileCwd = '/';
-      $('#file-title').textContent = `文件管理 · ${serverName}`;
-      $('#file-path').value = '/';
-      $('#file-filter').value = '';
-      $('#file-msg').textContent = '';
-      $('#file-list').innerHTML = '<tr><td colspan="4" class="muted">连接中...</td></tr>';
-      $('#file-modal').classList.remove('hidden');
-      lockScroll();
-      closeFileWs();
-      const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-      // token 不放 URL（避免进访问日志/浏览器历史），连接后首帧发送鉴权
-      const ws = new WebSocket(`${proto}://${location.host}/ws/file/${res.session_id}`);
-      fileWs = ws;
-      ws.onopen = () => { fileSend({ type: 'auth', token }); reloadFileList(); };
-      ws.onmessage = (ev) => {
-        if (typeof ev.data !== 'string') {
-          // Binary 混合帧：read_result（JSON 头\n + 原始字节，无 base64 膨胀）
-          const p = ev.data instanceof ArrayBuffer
-            ? Promise.resolve(new Uint8Array(ev.data))
-            : ev.data.arrayBuffer().then((b) => new Uint8Array(b));
-          p.then((buf) => {
-            const nl = buf.indexOf(10);
-            if (nl < 0) return;
-            let j; try { j = JSON.parse(new TextDecoder().decode(buf.subarray(0, nl))); } catch { return; }
-            if (j.type === 'read_result' && j.ok) onReadResult(j, buf.subarray(nl + 1));
-          }).catch(() => { /* ignore */ });
-          return;
-        }
-        let j; try { j = JSON.parse(ev.data); } catch { return; }
-        if (j.type === 'list_result' && j.ok) {
-          renderFileList(j.entries); // agent 端已按过滤规则返回
-          // 截断提示随状态更新（从截断目录切到正常目录时清除残留提示）
-          $('#file-msg').textContent = j.truncated ? '目录条目过多，仅显示前 1000 项' : '';
-        }
-        else if (j.type === 'write_result' && j.ok) onWriteResult(j);
-        else if (j.type === 'error') $('#file-msg').textContent = `错误：${j.message}`;
-      };
-      ws.onclose = () => {
-        if (fileWs !== ws) return;
-        fileWs = null;
-        // 断线提示（弹窗仍打开时）；点「刷新」会重新建立会话（M2：与终端一致，不静默失效）
-        if (!$('#file-modal').classList.contains('hidden')) $('#file-msg').textContent = '连接断开，点击「刷新」重连';
-      };
-      ws.onerror = () => { try { ws.close(); } catch { /* ignore */ } };
-    } catch (e) {
-      toast(e.message);
-    }
-  }
-
-  function closeFileWs() {
-    if (fileWs) { try { fileWs.close(); } catch { /* ignore */ } fileWs = null; }
+    fileServerId = serverId;
+    fileServerName = serverName;
+    $('#file-title').textContent = `文件管理 · ${serverName}`;
+    $('#file-path').value = '/';
+    $('#file-filter').value = '';
+    $('#file-msg').textContent = '';
+    $('#file-list').innerHTML = '<tr><td colspan="4" class="muted">连接中...</td></tr>';
+    $('#file-modal').classList.remove('hidden');
+    lockScroll();
+    fileSess.open(serverId, '/'); // 建会话 + WS + auth + 初始列表
   }
 
   function closeFileModal() {
-    closeFileWs();
+    fileSess.close();
     $('#file-modal').classList.add('hidden');
     unlockScroll();
-  }
-
-  function fileSend(obj) {
-    if (fileWs && fileWs.readyState === 1) fileWs.send(JSON.stringify(obj));
   }
 
   function renderFileList(entries) {
@@ -710,128 +673,25 @@
       const size = e.type === 'dir' ? '—' : fmtBytes(e.size);
       const time = e.mtime ? new Date(e.mtime * 1000).toLocaleString('zh-CN') : '—';
       const nameCell = e.type === 'dir'
-        ? `<a class="f-dir" data-path="${escapeHtml(fileJoin(fileCwd, e.name))}">📁 ${escapeHtml(e.name)}</a>`
+        ? `<a class="f-dir" data-path="${escapeHtml(fileJoin(fileSess.cwd, e.name))}">📁 ${escapeHtml(e.name)}</a>`
         : `<span class="f-file">📄 ${escapeHtml(e.name)}</span>`;
-      const dl = e.type === 'file' ? `<button class="ghost f-dl" data-path="${escapeHtml(fileJoin(fileCwd, e.name))}" data-size="${e.size}">下载</button>` : '';
+      const dl = e.type === 'file' ? `<button class="ghost f-dl" data-path="${escapeHtml(fileJoin(fileSess.cwd, e.name))}" data-size="${e.size}">下载</button>` : '';
       return `<tr><td>${nameCell}</td><td>${size}</td><td>${escapeHtml(time)}</td><td>${dl}</td></tr>`;
     });
     $('#file-list').innerHTML = rows.join('') || '<tr><td colspan="4" class="muted">空目录</td></tr>';
   }
 
-  // 分段下载：按 1MB 逐段拉取，累计到文件大小后组装 Blob 下载
-  // 下载进行中显示/结束隐藏取消按钮
-  function setDlCancelVisible(v) { $('#btn-dl-cancel').classList.toggle('hidden', !v); }
-  function downloadFile(path, size) {
-    if (fileDownload) { $('#file-msg').textContent = '已有下载进行中，请等待完成'; return; } // 并发防护
-    if (size > FILE_MAX) { $('#file-msg').textContent = '文件超过 500MB 限制'; return; }
-    if (size <= 0) { $('#file-msg').textContent = '空文件，无需下载'; return; }
-    fileDownload = { path, size, parts: [], received: 0 };
-    $('#file-msg').textContent = '开始下载...';
-    setDlCancelVisible(true);
-    fileSend({ type: 'read', path, offset: 0, limit: FILE_CHUNK });
-  }
-  // 取消下载：停止后续 read 请求（并发已被 downloadFile 防护拦截）
-  function cancelDownload() {
-    if (!fileDownload) return;
-    fileDownload = null;
-    $('#file-msg').textContent = '已取消下载';
-    setDlCancelVisible(false);
-  }
-
-  function onReadResult(j, data) {
-    if (!fileDownload || j.path !== fileDownload.path) {
-      // 取消后的迟到响应：静默丢弃（正常异常路径已由 downloadFile 并发防护覆盖）
-      return;
-    }
-    if (j.got === 0) {
-      // 读取到 EOF 但未达预期 size → 文件已缩短/被替换，中止避免无限循环
-      $('#file-msg').textContent = `文件已变化或缩短，中止下载（已完成 ${fileDownload.received}/${fileDownload.size} 字节）`;
-      fileDownload = null;
-      setDlCancelVisible(false);
-      return;
-    }
-    // 混合帧：data 为原始字节（Uint8Array），由 onmessage Binary 分支传入
-    if (!data) return;
-    fileDownload.parts.push(data);
-    fileDownload.received += j.got;
-    const pct = fileDownload.size ? Math.min(100, Math.round((fileDownload.received / fileDownload.size) * 100)) : 0;
-    $('#file-msg').textContent = `下载中：${pct}%`;
-    if (fileDownload.received >= fileDownload.size) {
-      try {
-        // Blob 直接引用分块数组（不复制），避免 500MB 级文件的二次内存拷贝
-        const a = document.createElement('a');
-        a.href = URL.createObjectURL(new Blob(fileDownload.parts));
-        a.download = fileDownload.path.split('/').pop() || 'download';
-        document.body.appendChild(a);
-        a.click();
-        a.remove();
-        URL.revokeObjectURL(a.href);
-        $('#file-msg').textContent = `已下载：${fileDownload.path}`;
-      } catch {
-        $('#file-msg').textContent = '下载失败';
-      }
-      fileDownload = null;
-      setDlCancelVisible(false);
-    } else {
-      fileSend({ type: 'read', path: j.path, offset: fileDownload.received, limit: FILE_CHUNK });
-    }
-  }
-
-  // 分段上传：1MB 一段，最后一块 commit=true（agent 端原子写）。
-  // stop-and-wait——每块等 write_result 确认后才发下一块，队列有界（1 块）。
-  // upload_id：唯一标识本次上传（临时文件 {path}.upload.{id}），并发/重复上传互不冲突；
-  // acked 按 agent 返回的真实 written 字节累计。
+  // 上传/下载入口：状态机在 FileSession（api.js），这里只负责 UI 接线
   function uploadFile(file) {
-    if (file.size > FILE_MAX) { $('#file-msg').textContent = '文件超过 500MB 限制'; return; }
-    const uploadId = (window.crypto && crypto.randomUUID) ? crypto.randomUUID() : String(Date.now()) + '-' + Math.random().toString(36).slice(2);
-    fileUpload = { size: file.size, sent: 0, acked: 0, uploadId, path: fileJoin(fileCwd, file.name) };
-    const reader = new FileReader();
-    const sendNext = () => {
-      if (!fileUpload || fileUpload.sent >= fileUpload.size) return;
-      const chunk = file.slice(fileUpload.sent, Math.min(fileUpload.sent + FILE_CHUNK, file.size));
-      reader.onload = () => {
-        if (!fileUpload) return; // 取消上传后 reader 异步完成，避免引用已置空对象
-        const commit = fileUpload.sent + chunk.size >= file.size;
-        // 混合帧：JSON 头 + '\n' + 原始字节（Binary 帧，无 base64 膨胀）
-        const head = new TextEncoder().encode(JSON.stringify({ type: 'write', path: fileUpload.path, offset: fileUpload.sent, commit, upload_id: fileUpload.uploadId }) + '\n');
-        const data = new Uint8Array(reader.result);
-        const frame = new Uint8Array(head.length + data.length);
-        frame.set(head, 0);
-        frame.set(data, head.length);
-        if (fileWs && fileWs.readyState === 1) fileWs.send(frame.buffer);
-        fileUpload.sent += chunk.size; // 下一块在 onWriteResult 确认后发送
-      };
-      reader.readAsArrayBuffer(chunk);
-    };
-    fileUpload.sendNext = sendNext;
     $('#btn-file-cancel').classList.remove('hidden');
-    sendNext();
+    fileSess.upload(file);
   }
-
-  // 取消上传：发 abort 清理 agent 临时文件
-  function cancelUpload() {
-    if (!fileUpload) return;
-    fileSend({ type: 'abort', path: fileUpload.path, upload_id: fileUpload.uploadId });
-    fileUpload = null;
-    $('#file-msg').textContent = '已取消上传';
-    $('#btn-file-cancel').classList.add('hidden');
+  function cancelUpload() { fileSess.cancelUpload(); }
+  function downloadFile(path, size) {
+    $('#btn-dl-cancel').classList.remove('hidden');
+    fileSess.download(path, size);
   }
-
-  // 只有所有块都收到 write_result 确认后才算完成；acked 按真实 written 累计
-  function onWriteResult(j) {
-    if (!fileUpload) return; // 无进行中的上传任务，忽略
-    const w = Number(j.written) || 0;
-    fileUpload.acked = Math.min(fileUpload.size, fileUpload.acked + w);
-    if (fileUpload.acked >= fileUpload.size) {
-      fileUpload = null;
-      $('#file-msg').textContent = '上传完成';
-      $('#btn-file-cancel').classList.add('hidden');
-      reloadFileList(); // 刷新列表（此时文件已完整写入，保留当前过滤规则）
-    } else {
-      $('#file-msg').textContent = `上传中：${Math.round((fileUpload.acked / fileUpload.size) * 100)}%`;
-      if (fileUpload.sendNext) fileUpload.sendNext(); // 确认后发下一块
-    }
-  }
+  function cancelDownload() { fileSess.cancelDownload(); }
 
   // ---------- 监控（简易文本图，支持时间范围） ----------
   let monitorReqSeq = 0; // 监控 range 请求序号（快速切换时丢弃过期响应）
@@ -1433,14 +1293,11 @@
   $('#btn-dl-cancel').onclick = cancelDownload;
   $('#file-refresh').onclick = () => {
     // WS 断开时重建会话（旧会话已失效）；在线则正常刷新列表
-    if (!fileWs || fileWs.readyState !== 1) {
-      if (fileServerId) openFileManager(fileServerId, fileServerName);
-      return;
-    }
-    reloadFileList();
+    if (fileSess.connected) reloadFileList();
+    else if (fileServerId) fileSess.reconnect();
   };
-  $('#file-up').onclick = () => { fileCwd = fileParent(fileCwd); $('#file-path').value = fileCwd; reloadFileList(); };
-  $('#file-go').onclick = () => { const p = $('#file-path').value.trim(); if (!p) return; fileCwd = p; reloadFileList(); };
+  $('#file-up').onclick = () => { fileSess.cwd = fileParent(fileSess.cwd); $('#file-path').value = fileSess.cwd; reloadFileList(); };
+  $('#file-go').onclick = () => { const p = $('#file-path').value.trim(); if (!p) return; fileSess.cwd = p; reloadFileList(); };
   $('#file-path').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('#file-go').click(); });
   $('#file-input').addEventListener('change', (e) => { const f = e.target.files[0]; if (f) uploadFile(f); e.target.value = ''; });
   // 文件名通配符过滤：debounce 后发 list（pattern 由 agent 端匹配，先过滤再截断）
@@ -1451,7 +1308,7 @@
   $('#file-list').addEventListener('click', (e) => {
     const dir = e.target.closest('.f-dir');
     // 目录点击统一走 reloadFileList（保持当前过滤词，与「刷新」行为一致）
-    if (dir) { fileCwd = dir.dataset.path; $('#file-path').value = fileCwd; reloadFileList(); return; }
+    if (dir) { fileSess.cwd = dir.dataset.path; $('#file-path').value = fileSess.cwd; reloadFileList(); return; }
     const dl = e.target.closest('.f-dl');
     if (dl) downloadFile(dl.dataset.path, Number(dl.dataset.size) || 0);
   });

@@ -5,14 +5,12 @@
   const { $, escapeHtml, fmtBytes, fileJoin, fileParent, downsample, lockScroll, unlockScroll,
           MONITOR_STEP_MAX, MONITOR_RANGE_LABEL, MONITOR_COLORS,
           GEO_PRIVATE, setGeoEnabled } = CfUtils;
-  const { api, setTokenGetter, FileSession, TermSession } = CfApi;
+  const { api, setTokenGetter, FileSession, TermSession, PushSession } = CfApi;
   let token = localStorage.getItem('cfpanel_token') || '';
   setTokenGetter(() => token); // api 层通过 getter 读取当前 token
   let canExec = true; // 当前用户是否有 exec 权限（PAT 按 scopes，admin 恒有；控制终端/文件菜单显隐）
   let serversCache = [];
-  let pushWs = null;       // 服务器列表实时推送 WS
-  let pushTimer = null;    // 每 3 秒发一次 sync 请求的定时器
-  let pushRetries = 0;     // 推送重连计数
+  let pushTimer = null;    // 每 3 秒发一次 sync 请求的定时器（老化）
   let monitorState = null; // { serverId, serverName, range } 当前监控视图
   let monitorChart = null; // Chart.js 实例（切换范围时销毁重建）
 
@@ -342,7 +340,7 @@
   // 自动判离线，死机服务器不再永远显示在线）；不重建 DOM，防 hover 高亮抖动/菜单被打断
   function startPushTimer() {
     if (pushTimer) clearInterval(pushTimer);
-    try { if (pushWs && pushWs.readyState === WebSocket.OPEN) pushWs.send('sync'); } catch { /* ignore */ }
+    pushSess.sync(); // 连接后立即拉最新列表
     pushTimer = setInterval(() => {
       if (document.hidden) return; // 后台由 visibilitychange 关 WS，无需老化
       updateAging();
@@ -352,58 +350,21 @@
     if (pushTimer) { clearInterval(pushTimer); pushTimer = null; }
   }
 
-  // ---------- 服务器列表实时刷新（WS /ws/push，客户端每 3 秒发 sync 请求一次） ----------
+  // ---------- 服务器列表实时刷新（WS /ws/push；连接/重连在 api.js 的 PushSession） ----------
+  // PushSession：连接生命周期 + 指数重连 + 30s 兜底 + 1008 权限失效，数据经回调交给 UI
+  const pushSess = new PushSession({
+    onOpen: () => startPushTimer(), // 连接建立后启动老化计时器
+    onData: (list) => { serversCache = list; updateServerCards(); },
+    onAuthFail: () => { token = ''; localStorage.removeItem('cfpanel_token'); showAuth(); },
+    onLongRetry: () => toast('实时刷新连接失败，正在自动重试...'),
+  });
   function startPush() {
-    if (pushWs && (pushWs.readyState === WebSocket.CONNECTING || pushWs.readyState === WebSocket.OPEN)) return;
     if (!token) return;
-    const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-    // token 不放 URL（避免进访问日志/浏览器历史），连接后首帧发送鉴权
-    const ws = new WebSocket(`${proto}://${location.host}/ws/push`);
-    pushWs = ws;
-
-    ws.onopen = () => {
-      pushRetries = 0;
-      try { ws.send(JSON.stringify({ type: 'auth', token })); } catch { /* ignore */ }
-      startPushTimer();
-    };
-    ws.onmessage = (ev) => {
-      try {
-        const list = JSON.parse(ev.data);
-        if (Array.isArray(list)) {
-          serversCache = list;
-          updateServerCards();
-        }
-      } catch { /* 忽略非 JSON 帧 */ }
-    };
-    ws.onclose = (ev) => {
-      stopPushTimer();
-      if (pushWs !== ws) return; // 已被 stopPush 主动关闭
-      if (!token) return;
-      if (ev && ev.code === 1008) {
-        // 鉴权已失效（PAT 撤销/连接被服务端拒绝）：清除登录态回登录页，避免 3s 重连死循环
-        token = '';
-        localStorage.removeItem('cfpanel_token');
-        showAuth();
-        return;
-      }
-      if (pushRetries < 5) {
-        pushRetries += 1;
-        setTimeout(startPush, 3000);
-      } else {
-        toast('实时刷新连接失败，正在自动重试...');
-        // 重连耗尽后 30s 兜底重试：服务恢复后自动连回，无需手动刷新
-        setTimeout(startPush, 30000);
-      }
-    };
-    ws.onerror = () => { try { ws.close(); } catch { /* ignore */ } };
+    pushSess.open();
   }
-
   function stopPush() {
     stopPushTimer();
-    if (!pushWs) return;
-    const w = pushWs;
-    pushWs = null;
-    try { w.close(); } catch { /* ignore */ }
+    pushSess.close(); // 主动关闭（idle 暂停/后台隐藏/登出），不再重连
   }
 
   // ---------- 空闲观看保护（类似视频网站"继续观看？"） ----------

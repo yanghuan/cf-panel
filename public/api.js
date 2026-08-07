@@ -282,5 +282,68 @@
     }
   }
 
-  window.CfApi = { api, setTokenGetter, FileSession, TermSession };
+  // ---------- 实时推送（PushSession）：/ws/push 常驻连接 + 重连，数据经回调交给 UI ----------
+  class PushSession {
+    constructor(handlers = {}) {
+      this.h = handlers; // { onOpen, onData(list), onAuthFail, onLongRetry }
+      this.ws = null;
+      this.closed = true;
+      this.retries = 0;
+    }
+    get connected() { return this.ws && this.ws.readyState === 1; }
+
+    open() {
+      this.closed = false;
+      this.retries = 0;
+      if (this.ws && (this.ws.readyState === WebSocket.CONNECTING || this.ws.readyState === WebSocket.OPEN)) return;
+      this._connect();
+    }
+    _connect() {
+      if (this.closed || !tokenGetter()) return;
+      const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+      // token 不放 URL（避免进访问日志/浏览器历史），连接后首帧发送鉴权
+      const ws = new WebSocket(`${proto}://${location.host}/ws/push`);
+      this.ws = ws;
+      ws.onopen = () => {
+        this.retries = 0;
+        try { ws.send(JSON.stringify({ type: 'auth', token: tokenGetter() })); } catch { /* ignore */ }
+        if (this.h.onOpen) this.h.onOpen();
+      };
+      ws.onmessage = (ev) => {
+        try {
+          const list = JSON.parse(ev.data);
+          if (Array.isArray(list) && this.h.onData) this.h.onData(list);
+        } catch { /* 忽略非 JSON 帧 */ }
+      };
+      ws.onclose = (ev) => {
+        if (this.ws !== ws) return; // 已被主动关闭/新连接替换
+        this.ws = null;
+        if (this.closed) return; // 主动关闭不再重连
+        if (!tokenGetter()) return;
+        if (ev && ev.code === 1008) {
+          // 鉴权已失效（PAT 撤销/连接被服务端拒绝）：清除登录态回登录页，避免重连死循环
+          this.closed = true;
+          if (this.h.onAuthFail) this.h.onAuthFail();
+          return;
+        }
+        if (this.retries < 5) {
+          this.retries += 1;
+          setTimeout(() => this._connect(), 3000);
+        } else {
+          // 重连耗尽后 30s 兜底重试（服务恢复后自动连回，无需手动刷新）
+          if (this.h.onLongRetry) this.h.onLongRetry();
+          setTimeout(() => this._connect(), 30000);
+        }
+      };
+      ws.onerror = () => { try { ws.close(); } catch { /* ignore */ } };
+    }
+    // 主动关闭（idle 暂停/后台隐藏/登出），不再重连
+    close() {
+      this.closed = true;
+      if (this.ws) { const w = this.ws; this.ws = null; try { w.close(); } catch { /* ignore */ } }
+    }
+    sync() { if (this.connected) this.ws.send('sync'); } // 拉最新列表
+  }
+
+  window.CfApi = { api, setTokenGetter, FileSession, TermSession, PushSession };
 })();

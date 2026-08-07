@@ -183,5 +183,104 @@
     }
   }
 
-  window.CfApi = { api, setTokenGetter, FileSession };
+  // ---------- 终端会话（TermSession）：WS 连接 + 重连 + 无响应自愈，渲染走注入的 xterm ----------
+  const TERM_RETRY_MAX = 3; // 终端断线自动重连次数
+
+  class TermSession {
+    constructor(term, fit, handlers = {}) {
+      this.term = term;   // xterm 实例（渲染输出）
+      this.fit = fit;     // FitAddon（尺寸）
+      this.h = handlers;  // { onAuthFail }
+      this.serverId = 0;
+      this.ws = null;
+      this.closed = false;
+      this.retries = 0;
+      this.noDataTimer = null; // 连接后无数据超时（open_terminal 可能丢失）
+      this.rebuilding = false; // 无响应重建中，避免与 onclose 重连重复
+    }
+    get connected() { return this.ws && this.ws.readyState === 1; }
+
+    // 建会话 + WS + auth + fit + resize + noData 自愈
+    open(serverId) {
+      this.serverId = serverId;
+      api('/api/terminal', { method: 'POST', body: JSON.stringify({ server_id: serverId }) })
+        .then((res) => {
+          if (this.closed) return;
+          const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+          // token 不放 URL（避免进访问日志/浏览器历史），连接后首帧发送鉴权
+          const w = new WebSocket(`${proto}://${location.host}/ws/terminal/${res.session_id}`);
+          this.ws = w;
+          w.binaryType = 'arraybuffer';
+          w.onopen = () => this._onOpen(w);
+          w.onmessage = (ev) => this._onMessage(ev);
+          w.onclose = (ev) => this._onClose(ev);
+          w.onerror = () => { try { w.close(); } catch { /* ignore */ } };
+        })
+        .catch((e) => {
+          if (this.closed) return;
+          if (this.retries < TERM_RETRY_MAX) {
+            this.retries += 1;
+            this.term.write(`\r\n[创建会话失败：${e.message}，${this.retries}s 后重试]\r\n`);
+            setTimeout(() => this.open(this.serverId), this.retries * 1000);
+          } else {
+            this.term.write(`\r\n[创建会话失败：${e.message}]\r\n`);
+          }
+        });
+    }
+    _onOpen(w) {
+      this.retries = 0;
+      this.rebuilding = false;
+      this.term.focus();
+      // 必须先发 auth（服务端首帧鉴权），再调用会触发 onResize 发 resize 帧的 fit.fit()，
+      // 否则 resize 抢在 auth 前被当作未鉴权拒绝（表现为首次"连接断开"，重连才成功）
+      try { w.send(JSON.stringify({ type: 'auth', token: tokenGetter() })); } catch { /* ignore */ }
+      this.fit.fit();
+      w.send(JSON.stringify({ type: 'resize', cols: this.term.cols, rows: this.term.rows }));
+      // 自愈：连接后长时间无数据（open_terminal 在 agent 重连窗口丢失）→ 重建会话
+      if (this.noDataTimer) clearTimeout(this.noDataTimer);
+      this.noDataTimer = setTimeout(() => {
+        this.noDataTimer = null;
+        if (this.closed || this.rebuilding) return;
+        this.term.write('\r\n\x1b[90m[会话无响应，正在重建...]\x1b[0m\r\n');
+        this.rebuilding = true;
+        try { w.close(); } catch { /* ignore */ }
+        this.open(this.serverId);
+      }, 8000);
+    }
+    _onMessage(ev) {
+      if (this.noDataTimer) { clearTimeout(this.noDataTimer); this.noDataTimer = null; } // 有数据即会话正常
+      if (typeof ev.data === 'string') this.term.write(ev.data);
+      else this.term.write(new Uint8Array(ev.data));
+    }
+    _onClose(ev) {
+      if (this.closed) return;
+      if (this.rebuilding) return; // 重建已由无响应分支的 open() 接管
+      if (this.noDataTimer) { clearTimeout(this.noDataTimer); this.noDataTimer = null; }
+      if (ev && ev.code === 1008) {
+        // 鉴权已失效（PAT 撤销/服务端拒绝）：关闭会话并回登录页，不再重连
+        this.closed = true;
+        this.term.write('\r\n\x1b[90m[权限已失效，连接已关闭]\x1b[0m\r\n');
+        if (this.h.onAuthFail) this.h.onAuthFail();
+        return;
+      }
+      if (this.retries < TERM_RETRY_MAX) {
+        this.retries += 1;
+        this.term.write(`\r\n\x1b[90m[连接断开，${this.retries}s 后自动重连...]\x1b[0m\r\n`);
+        setTimeout(() => this.open(this.serverId), this.retries * 1000);
+      } else {
+        this.term.write('\r\n\x1b[90m[连接已关闭]\x1b[0m\r\n');
+      }
+    }
+    send(data) { if (this.connected) this.ws.send(data); }
+    resize(cols, rows) { if (this.connected) this.ws.send(JSON.stringify({ type: 'resize', cols, rows })); }
+    close() {
+      if (this.closed) return;
+      this.closed = true;
+      if (this.noDataTimer) { clearTimeout(this.noDataTimer); this.noDataTimer = null; }
+      try { this.ws && this.ws.close(); } catch { /* ignore */ }
+      this.term.dispose();
+    }
+  }
+
+  window.CfApi = { api, setTokenGetter, FileSession, TermSession };
 })();

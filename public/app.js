@@ -5,7 +5,7 @@
   const { $, escapeHtml, fmtBytes, fileJoin, fileParent, downsample, lockScroll, unlockScroll,
           MONITOR_STEP_MAX, MONITOR_RANGE_LABEL, MONITOR_COLORS,
           GEO_PRIVATE, setGeoEnabled } = CfUtils;
-  const { api, setTokenGetter, FileSession } = CfApi;
+  const { api, setTokenGetter, FileSession, TermSession } = CfApi;
   let token = localStorage.getItem('cfpanel_token') || '';
   setTokenGetter(() => token); // api 层通过 getter 读取当前 token
   let canExec = true; // 当前用户是否有 exec 权限（PAT 按 scopes，admin 恒有；控制终端/文件菜单显隐）
@@ -15,7 +15,6 @@
   let pushRetries = 0;     // 推送重连计数
   let monitorState = null; // { serverId, serverName, range } 当前监控视图
   let monitorChart = null; // Chart.js 实例（切换范围时销毁重建）
-  const TERM_RETRY_MAX = 3; // 终端断线自动重连次数
 
   // ---------- 基础 ----------
   function toast(msg, ms = 2500) {
@@ -512,101 +511,23 @@
     term.loadAddon(fit);
     term.open($('#term'));
 
-    let ws = null;
-    let closed = false;
-    let retries = 0;
-    let noDataTimer = null;  // 连接后无数据超时（open_terminal 可能丢失）
-    let rebuilding = false;  // 无响应重建中，避免与 onclose 重连重复
-
-    const close = () => {
-      if (closed) return;
-      closed = true;
-      if (noDataTimer) { clearTimeout(noDataTimer); noDataTimer = null; }
-      try { ws && ws.close(); } catch { /* ignore */ }
-      term.dispose();
+    // 终端会话（连接/重连/自愈状态机在 api.js 的 TermSession，渲染走注入的 xterm）
+    const sess = new TermSession(term, fit, {
+      onAuthFail: () => { token = ''; localStorage.removeItem('cfpanel_token'); showAuth(); },
+    });
+    // 键盘输入 → WS；窗口变化 → resize 帧（走 DO → 控制 WS → stty）
+    term.onData((data) => sess.send(data));
+    term.onResize(({ cols, rows }) => sess.resize(cols, rows));
+    const onResize = () => { if (!sess.closed) { try { fit.fit(); } catch { /* ignore */ } } };
+    window.addEventListener('resize', onResize);
+    $('#btn-term-close').onclick = () => {
+      sess.close(); // 内部 dispose + 关 WS + 清定时器
+      window.removeEventListener('resize', onResize); // 防多次开关终端累积内存泄漏
       $('#term-modal').classList.add('hidden');
       unlockScroll();
-      // 移除 resize 监听器，防多次开关终端累积内存泄漏
-      window.removeEventListener('resize', onResize);
     };
-    $('#btn-term-close').onclick = close;
 
-    function connect() {
-      api('/api/terminal', { method: 'POST', body: JSON.stringify({ server_id: serverId }) })
-        .then((res) => {
-          const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-          // token 不放 URL（避免进访问日志/浏览器历史），连接后首帧发送鉴权
-          const w = new WebSocket(`${proto}://${location.host}/ws/terminal/${res.session_id}`);
-          ws = w;
-          w.binaryType = 'arraybuffer';
-
-          w.onopen = () => {
-            retries = 0;
-            rebuilding = false;
-            term.focus();
-            // 必须先发 auth（服务端首帧鉴权），再调用会触发 onResize 发 resize 帧的 fit.fit()，
-            // 否则 resize 抢在 auth 前被当作未鉴权拒绝（表现为首次"连接断开"，重连才成功）
-            try { w.send(JSON.stringify({ type: 'auth', token })); } catch { /* ignore */ }
-            fit.fit();
-            w.send(JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows }));
-            // 自愈：连接后长时间无数据（open_terminal 在 agent 重连窗口丢失）→ 重建会话
-            if (noDataTimer) clearTimeout(noDataTimer);
-            noDataTimer = setTimeout(() => {
-              noDataTimer = null;
-              if (closed || rebuilding) return;
-              term.write('\r\n\x1b[90m[会话无响应，正在重建...]\x1b[0m\r\n');
-              rebuilding = true;
-              try { w.close(); } catch { /* ignore */ }
-              connect();
-            }, 8000);
-          };
-          w.onmessage = (ev) => {
-            if (noDataTimer) { clearTimeout(noDataTimer); noDataTimer = null; } // 有数据即会话正常
-            if (typeof ev.data === 'string') term.write(ev.data);
-            else term.write(new Uint8Array(ev.data));
-          };
-          w.onclose = (ev) => {
-            if (closed) return;
-            if (rebuilding) return; // 重建已由无响应分支的 connect() 接管
-            if (noDataTimer) { clearTimeout(noDataTimer); noDataTimer = null; }
-            if (ev && ev.code === 1008) {
-              // 鉴权已失效（PAT 撤销/服务端拒绝）：关闭会话并回登录页，不再重连
-              closed = true;
-              term.write('\r\n\x1b[90m[权限已失效，连接已关闭]\x1b[0m\r\n');
-              token = '';
-              localStorage.removeItem('cfpanel_token');
-              showAuth();
-              return;
-            }
-            if (retries < TERM_RETRY_MAX) {
-              retries += 1;
-              term.write(`\r\n\x1b[90m[连接断开，${retries}s 后自动重连...]\x1b[0m\r\n`);
-              setTimeout(connect, retries * 1000);
-            } else {
-              term.write('\r\n\x1b[90m[连接已关闭]\x1b[0m\r\n');
-            }
-          };
-          w.onerror = () => { try { w.close(); } catch { /* ignore */ } };
-        })
-        .catch((e) => {
-          if (closed) return;
-          if (retries < TERM_RETRY_MAX) {
-            retries += 1;
-            term.write(`\r\n[创建会话失败：${e.message}，${retries}s 后重试]\r\n`);
-            setTimeout(connect, retries * 1000);
-          } else {
-            term.write(`\r\n[创建会话失败：${e.message}]\r\n`);
-          }
-        });
-    }
-
-    // 键盘输入 → WS；窗口变化 → resize 帧（走 DO → 控制 WS → stty）
-    term.onData((data) => { if (ws && ws.readyState === 1) ws.send(data); });
-    term.onResize(({ cols, rows }) => { if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: 'resize', cols, rows })); });
-    const onResize = () => { if (!closed) { try { fit.fit(); } catch { /* ignore */ } } };
-    window.addEventListener('resize', onResize);
-
-    connect();
+    sess.open(serverId); // 建会话 + WS + auth + fit + 重连/自愈
   }
 
   // ---------- 文件管理（目录浏览 / 上传 / 下载；连接/协议/状态机在 api.js 的 FileSession） ----------

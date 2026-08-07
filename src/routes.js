@@ -190,7 +190,7 @@ export async function handleApi(request, env) {
     await env.DB.prepare('INSERT INTO servers (agent_key_id, name, "group", display_index, user_id, agent_key_hash) VALUES (?,?,?,?,?,?)')
       .bind(keyId, name, group, displayIndex, user.id, hash)
       .run();
-    await env.DB.prepare('INSERT INTO audit_logs (user_id, username, action) VALUES (?,?,?)').bind(user.id, user.username, 'server.create').run();
+    await env.DB.prepare('INSERT INTO audit_logs (user_id, username, client_ip, action) VALUES (?,?,?,?)').bind(user.id, user.username, clientIp(request), 'server.create').run();
     serverListCacheClear();
     return json({
       agent_key: key,
@@ -214,8 +214,8 @@ export async function handleApi(request, env) {
     await env.DB.prepare('DELETE FROM servers WHERE id = ?').bind(id).run();
     serverListCacheClear();
     // 3) 审计日志
-    await env.DB.prepare('INSERT INTO audit_logs (user_id, username, action, target_server_id, detail) VALUES (?,?,?,?,?)')
-      .bind(user.id, user.username, 'server.delete', id, server.name).run();
+    await env.DB.prepare('INSERT INTO audit_logs (user_id, username, client_ip, action, target_server_id, detail) VALUES (?,?,?,?,?,?)')
+      .bind(user.id, user.username, clientIp(request), 'server.delete', id, server.name).run();
     // 4) MetricsDO 清内存热区（避免残留数据被 alarm 重新归档回 D1）
     try {
       await doMetrics(env).fetch('https://do.internal/drop', {
@@ -273,8 +273,8 @@ export async function handleApi(request, env) {
       body: JSON.stringify({ op: 'create', streamId, serverId: server.id, creatorUserId: user.id }),
     });
     if (!resp.ok) return err(`agent not reachable: ${await resp.text()}`, 502);
-    await env.DB.prepare('INSERT INTO audit_logs (user_id, username, action, target_server_id) VALUES (?,?,?,?)')
-      .bind(user.id, user.username, 'terminal.open', server.id)
+    await env.DB.prepare('INSERT INTO audit_logs (user_id, username, client_ip, action, target_server_id) VALUES (?,?,?,?,?)')
+      .bind(user.id, user.username, clientIp(request), 'terminal.open', server.id)
       .run();
     return json({ session_id: streamId, server_id: server.id, server_name: server.name });
   }
@@ -293,8 +293,8 @@ export async function handleApi(request, env) {
       body: JSON.stringify({ op: 'open_file', streamId, serverId: server.id, creatorUserId: user.id }),
     });
     if (!resp.ok) return err(`agent not reachable: ${await resp.text()}`, 502);
-    await env.DB.prepare('INSERT INTO audit_logs (user_id, username, action, target_server_id) VALUES (?,?,?,?)')
-      .bind(user.id, user.username, 'file.open', server.id)
+    await env.DB.prepare('INSERT INTO audit_logs (user_id, username, client_ip, action, target_server_id) VALUES (?,?,?,?,?)')
+      .bind(user.id, user.username, clientIp(request), 'file.open', server.id)
       .run();
     return json({ session_id: streamId, server_id: server.id, server_name: server.name });
   }
@@ -359,7 +359,7 @@ export async function handleApi(request, env) {
   if (method === 'GET' && path === '/api/audit-logs') {
     if (!isAdmin(user)) return err('forbidden', 403);
     const limit = Math.min(Math.max(Number(url.searchParams.get('limit')) || 100, 1), 500);
-    const rows = await env.DB.prepare('SELECT id, user_id, username, action, target_server_id, detail, created_at FROM audit_logs ORDER BY id DESC LIMIT ?').bind(limit).all();
+    const rows = await env.DB.prepare('SELECT id, user_id, username, client_ip, action, target_server_id, detail, created_at FROM audit_logs ORDER BY id DESC LIMIT ?').bind(limit).all();
     return json(rows.results);
   }
 

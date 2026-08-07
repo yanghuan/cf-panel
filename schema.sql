@@ -35,6 +35,7 @@ CREATE TABLE IF NOT EXISTS audit_logs (
   id               INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id          INTEGER NOT NULL,
   username         TEXT,                      -- 操作者用户名（显示用，uid 仅为配置序号）
+  client_ip        TEXT,                      -- 操作者来源 IP（前端 <cf-ip> 显示归属地）
   action           TEXT    NOT NULL,         -- terminal.open / server.create ...
   target_server_id INTEGER,
   detail           TEXT,

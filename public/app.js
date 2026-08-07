@@ -184,7 +184,7 @@
     // 归属地优先用节点公网出口 IP（wan_ip，仅非私网才使用，能查到地理位置），回退 agent 上报的网卡 IP
     const wan = (s.wan_ip && !GEO_PRIVATE.test(s.wan_ip)) ? s.wan_ip : '';
     const ip = (wan || (s.info && s.info.ip4) || '').trim();
-    const info = s.info ? [s.info.os, up, ip].filter(Boolean).join(' · ') : up;
+    const info = s.info ? [s.info.os, up].filter(Boolean).join(' · ') : up;
     return `
       <div class="card" data-id="${s.id}">
         <div class="card-head">
@@ -203,7 +203,7 @@
         </div>
         ${metricBlockHtml(s)}
         ${probesBlockHtml(s)}
-        <div class="meta" data-ip="${escapeHtml(ip)}"><span class="cid">#${s.id}</span>${info ? ' · ' + escapeHtml(info) : ''}</div>
+        <div class="meta"><span class="cid">#${s.id}</span>${info ? ' · ' + escapeHtml(info) : ''}${ip ? ` · <cf-ip ip="${escapeHtml(ip)}"></cf-ip>` : ''}</div>
       </div>`;
   }
 
@@ -265,21 +265,24 @@
     else geoCache.set(ip, '');          // 失败：仅内存缓存（避免同批重复查，不持久化坏数据）
     return label;
   }
-  // 渲染后异步补充卡片 IP 归属地（默认不查询第三方，保护服务器公网 IP 隐私）
-  async function lookupGeo() {
-    if (!geoEnabled) return;
-    const els = [...document.querySelectorAll('#servers .card .meta[data-ip]')];
-    // 并行查询（每个查询有独立 5s 超时，顺序无关），避免多机时串行等待数十秒
-    await Promise.allSettled(els.map(async (el) => {
-      const ip = el.dataset.ip;
-      if (!ip || el.dataset.geoDone) return;
-      const label = await geoLookup(ip);
-      if (label && el.isConnected) {
-        el.dataset.geoDone = '1';
-        el.textContent = `${el.textContent} （${label}）`;
-      }
-    }));
+  // <cf-ip> 组件：显示 IP 并自动查询归属地（复用 Geo 缓存；geoEnabled 关闭时仅显示 IP）。
+  // 任意位置可用：<cf-ip ip="1.2.3.4"></cf-ip>（卡片 meta、审计日志、未来任何 IP 展示）
+  class CfIp extends HTMLElement {
+    static observedAttributes = ['ip'];
+    connectedCallback() { this.render(); }
+    attributeChangedCallback(name) { if (name === 'ip') this.render(); }
+    render() {
+      const ip = this.getAttribute('ip') || '';
+      this.textContent = ip; // 先显示 IP，归属地异步补全
+      if (!ip || !geoEnabled) return;
+      geoLookup(ip).then((label) => {
+        if (label && this.isConnected && this.getAttribute('ip') === ip) {
+          this.textContent = `${ip} （${label}）`; // 归属地查询结果（缓存命中即时）
+        }
+      });
+    }
   }
+  customElements.define('cf-ip', CfIp);
 
   // 顶部概览条：服务器总数/在线数/平均 CPU/平均负载/总内存
   function renderOverview() {
@@ -341,7 +344,6 @@
     box.innerHTML = groups.map((g) => `
       <h3 class="group-title">${escapeHtml(g)}（${byGroup(g).length}）</h3>
       <div class="grid">${byGroup(g).map(cardHtml).join('')}</div>`).join('');
-    lookupGeo(); // 异步补充各卡片 IP 归属地
   }
   // 推送到达：增量更新已有卡片（指标/探活/徽章），不重建卡片 DOM——
   // 防每秒/每推送全量重建导致 hover 高亮抖动、打开的节点菜单被销毁
@@ -1345,7 +1347,7 @@
         ? rows.map((r) => `
             <li><div class="audit-row">
               <span class="audit-action">${escapeHtml(AUDIT_ACTION_LABEL[r.action] || r.action)}</span>
-              <span class="audit-info">${escapeHtml(r.username || `uid=${r.user_id}`)}${r.target_server_id ? ` · server#${escapeHtml(r.target_server_id)}` : ''}${r.detail ? ` · ${escapeHtml(r.detail)}` : ''}</span>
+              <span class="audit-info">${escapeHtml(r.username || `uid=${r.user_id}`)}${r.client_ip ? ` · <cf-ip ip="${escapeHtml(r.client_ip)}"></cf-ip>` : ''}${r.target_server_id ? ` · server#${escapeHtml(r.target_server_id)}` : ''}${r.detail ? ` · ${escapeHtml(r.detail)}` : ''}</span>
               <span class="audit-time">${escapeHtml(r.created_at || '')}</span>
             </div></li>`).join('')
         : '<li class="muted">暂无审计记录</li>';

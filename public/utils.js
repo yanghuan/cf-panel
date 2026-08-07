@@ -117,6 +117,62 @@
     return label;
   }
 
+  // ---------- 空闲观看保护（IdleGuard）：无操作计时 + 提示 + 自动暂停，动作经回调注入 ----------
+  // 类似视频网站"继续观看？"：长时间无浏览器操作 → 提示 → 60s 无响应自动暂停；
+  // 任何活动恢复。暂停/恢复/提示等 UI 动作由 handlers 提供（app.js 注入 stopPush/startPush/confirmDialog）
+  class IdleGuard {
+    constructor(handlers = {}) {
+      this.h = handlers; // { timeout, promptMs, isActive, onPrompt(continueFn, pauseFn), onPause, onResume }
+      this.timeout = handlers.timeout || 10 * 60 * 1000;  // 无操作判定阈值
+      this.promptMs = handlers.promptMs || 60 * 1000;     // 提示后无响应自动暂停
+      this.timer = null;
+      this.promptTimer = null;
+      this.paused = false;
+      this.prompting = false; // 提示弹窗显示中（期间用户活动不清自动暂停倒计时）
+    }
+    _active() { return this.h.isActive ? this.h.isActive() : true; }
+
+    start() { this.reset(); }
+    reset() {
+      if (this.paused || !this._active()) return;
+      clearTimeout(this.timer);
+      if (!this.prompting) clearTimeout(this.promptTimer); // 提示中保留自动暂停兜底
+      this.timer = setTimeout(() => this._onTimeout(), this.timeout);
+    }
+    _onTimeout() {
+      if (!this._active() || this.paused || this.prompting) return;
+      this.prompting = true;
+      const pause = () => { this.prompting = false; this.pause(); };
+      // 确认=继续（重置计时）；取消=立即暂停；关闭弹窗=忽略（promptMs 倒计时自动暂停兜底）
+      if (this.h.onPrompt) this.h.onPrompt(() => { this.prompting = false; this.reset(); }, pause);
+      this.promptTimer = setTimeout(() => { this.prompting = false; this.pause(); }, this.promptMs);
+    }
+    pause() {
+      if (this.paused) return;
+      this.paused = true;
+      this.prompting = false;
+      clearTimeout(this.timer);
+      clearTimeout(this.promptTimer);
+      if (this.h.onPause) this.h.onPause();
+    }
+    resume() {
+      if (!this.paused) return;
+      this.paused = false;
+      this.prompting = false;
+      if (this.h.onResume) this.h.onResume();
+      this.reset();
+    }
+    // 用户活动监听：暂停中 → 恢复；观看中 → 重置计时
+    bind() {
+      ['mousemove', 'mousedown', 'keydown', 'scroll', 'touchstart'].forEach((ev) => {
+        document.addEventListener(ev, () => {
+          if (this.paused) this.resume();
+          else this.reset();
+        }, { passive: true });
+      });
+    }
+  }
+
   // <cf-ip> 组件：显示 IP 并自动查询归属地（复用 Geo 缓存；geoEnabled 关闭时仅显示 IP）。
   // 任意位置可用：<cf-ip ip="1.2.3.4"></cf-ip>（卡片 meta、审计日志、未来任何 IP 展示）
   class CfIp extends HTMLElement {
@@ -141,6 +197,6 @@
     $, escapeHtml, fmtBytes, fileJoin, fileParent, downsample,
     lockScroll, unlockScroll,
     MONITOR_STEP_MAX, MONITOR_RANGE_LABEL, MONITOR_COLORS,
-    GEO_PRIVATE, geoLookup, setGeoEnabled,
+    GEO_PRIVATE, geoLookup, setGeoEnabled, IdleGuard,
   };
 })();

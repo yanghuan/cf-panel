@@ -4,7 +4,7 @@
   // 工具函数与 <cf-ip> 组件从 utils.js 解构；api 层从 api.js 解构（index.html 中均须先加载）
   const { $, escapeHtml, fmtBytes, fileJoin, fileParent, downsample, lockScroll, unlockScroll,
           MONITOR_STEP_MAX, MONITOR_RANGE_LABEL, MONITOR_COLORS,
-          GEO_PRIVATE, setGeoEnabled } = CfUtils;
+          GEO_PRIVATE, setGeoEnabled, IdleGuard } = CfUtils;
   const { api, setTokenGetter, FileSession, TermSession, PushSession } = CfApi;
   let token = localStorage.getItem('cfpanel_token') || '';
   setTokenGetter(() => token); // api 层通过 getter 读取当前 token
@@ -53,7 +53,7 @@
     canExec = user.role === 1 || (user.pat && user.pat.scopes.includes('server:exec'));
     loadServers(); // 先拉一次，WS 建立后每 3 秒由服务端推送覆盖
     startPush();
-    resetIdle(); // 空闲观看保护：登录后开始计时
+    idleGuard.start(); // 空闲观看保护：登录后开始计时
   }
 
   let loginBusy = false;
@@ -367,54 +367,27 @@
     pushSess.close(); // 主动关闭（idle 暂停/后台隐藏/登出），不再重连
   }
 
-  // ---------- 空闲观看保护（类似视频网站"继续观看？"） ----------
+  // ---------- 空闲观看保护（IdleGuard 在 utils.js；计时/状态机，动作回调注入） ----------
   // 长时间无浏览器操作 → 提示并暂停实时刷新：断开 /ws/push → 观看者数减 1 →
   // 服务端下发慢采 → agent 恢复 120s 上报，节省 Cloudflare 额度（快采 5s ≈ 17,280 帧/天/机）
-  const IDLE_TIMEOUT_MS = 10 * 60 * 1000; // 无操作 10 分钟判定空闲
-  const IDLE_PROMPT_MS = 60 * 1000;       // 提示后 60s 无响应自动暂停
-  let idleTimer = null;
-  let idlePromptTimer = null;
-  let idlePaused = false;
-  let idlePrompting = false; // 提示弹窗显示中（期间用户活动不清自动暂停倒计时）
-
-  function resetIdle() {
-    if (idlePaused || !token) return;
-    clearTimeout(idleTimer);
-    if (!idlePrompting) clearTimeout(idlePromptTimer); // 提示中保留 60s 自动暂停兜底
-    idleTimer = setTimeout(onIdleTimeout, IDLE_TIMEOUT_MS);
-  }
-  function onIdleTimeout() {
-    if (!token || idlePaused || idlePrompting) return;
-    idlePrompting = true;
-    const pause = () => { idlePrompting = false; pauseViewing(); };
-    // 确认=继续观看（重置计时）；取消=立即暂停；关闭弹窗=忽略提示（60s 倒计时自动暂停兜底）
-    confirmDialog('长时间未操作。为节省 Cloudflare 额度，将暂停实时刷新（agent 将恢复慢采）。\n\n点击「确认」继续观看，或「取消」暂停；60 秒无响应将自动暂停。', () => { idlePrompting = false; resetIdle(); }, pause);
-    idlePromptTimer = setTimeout(() => { idlePrompting = false; pauseViewing(); }, IDLE_PROMPT_MS);
-  }
-  function pauseViewing() {
-    if (idlePaused) return;
-    idlePaused = true;
-    idlePrompting = false;
-    clearTimeout(idleTimer);
-    clearTimeout(idlePromptTimer);
-    stopPush(); // 断开 /ws/push → 观看者减 1 → agent 恢复慢采
-    toast('已暂停实时刷新（agent 恢复慢采，节省额度）。移动鼠标或按键即可恢复。');
-  }
-  function resumeViewing() {
-    if (!idlePaused) return;
-    idlePaused = false;
-    idlePrompting = false;
-    startPush(); // 重连 /ws/push → 观看者加 1 → agent 恢复快采
-    resetIdle();
-    toast('已恢复实时刷新。');
-  }
-  // 用户活动：暂停中 → 恢复观看；观看中 → 重置空闲计时
-  ['mousemove', 'mousedown', 'keydown', 'scroll', 'touchstart'].forEach((ev) => {
-    document.addEventListener(ev, () => {
-      if (idlePaused) resumeViewing();
-      else resetIdle();
-    }, { passive: true });
+  const idleGuard = new IdleGuard({
+    timeout: 10 * 60 * 1000, // 无操作 10 分钟判定空闲
+    promptMs: 60 * 1000,     // 提示后 60s 无响应自动暂停
+    isActive: () => !!token,
+    onPrompt: (onContinue, onPause) => {
+      // 确认=继续观看（重置计时）；取消=立即暂停；关闭弹窗=忽略提示（60s 倒计时自动暂停兜底）
+      confirmDialog('长时间未操作。为节省 Cloudflare 额度，将暂停实时刷新（agent 将恢复慢采）。\n\n点击「确认」继续观看，或「取消」暂停；60 秒无响应将自动暂停。', onContinue, onPause);
+    },
+    onPause: () => {
+      stopPush(); // 断开 /ws/push → 观看者减 1 → agent 恢复慢采
+      toast('已暂停实时刷新（agent 恢复慢采，节省额度）。移动鼠标或按键即可恢复。');
+    },
+    onResume: () => {
+      startPush(); // 重连 /ws/push → 观看者加 1 → agent 恢复快采
+      toast('已恢复实时刷新。');
+    },
   });
+  idleGuard.bind();
 
   // 后台标签页隐藏时关闭整个 WS（观看者计数减 1 → agent 恢复慢采，后台接近零成本）；
   // 恢复可见时重建连接：onopen 发 auth + startPushTimer 立即拉取一次并恢复 3s 定时

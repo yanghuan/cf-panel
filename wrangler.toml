@@ -50,3 +50,7 @@ invocation_logs = true
 
 [observability.traces]
 enabled = true
+
+# ---------- Smart Placement（智能放置：权衡用户/后端距离；启用后 Dashboard 可看性能对比） ----------
+[placement]
+mode = "smart"

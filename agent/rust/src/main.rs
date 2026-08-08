@@ -166,6 +166,10 @@ async fn run_control(
                 if is_auth_error(e.as_ref()) {
                     log("auth failed (401): retrying slowly");
                     backoff = AUTH_FAIL_SECS;
+                } else if started.elapsed().as_secs() >= MIN_UPTIME_RESET_SECS {
+                    // 健康连接存活 ≥10s 后被重置（代理空闲超时/网络抖动）：连接本身没问题，
+                    // 快速重连（不翻倍）；否则退避单调膨胀到 300s，表现为"长时间重连不上"
+                    backoff = RETRY_INITIAL_SECS;
                 } else {
                     backoff = (backoff * 2).min(RETRY_MAX_SECS);
                 }

@@ -74,12 +74,6 @@ header {
   display: flex;
   flex-direction: column;
 }
-/* 主操作强调：菜单「添加服务器」文字带下划线，点击打开添加服务器弹窗 */
-.dd-item[data-menu="add-server"] {
-  text-decoration: underline;
-  text-underline-offset: 3px;
-  text-decoration-color: var(--accent-2);
-}
 .dd-item {
   background: transparent;
   border: none;

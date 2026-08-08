@@ -4,6 +4,8 @@
 name = "cf-panel"
 main = "src/index.js"
 compatibility_date = "2026-08-02"
+# 关闭 workers.dev 预置 URL（已有自定义域名，wrangler deploy 默认开启会导致重复暴露）
+workers_dev = false
 
 # ---------- D1 数据库（面板核心数据 + 键值表 kv_json） ----------
 # 创建：wrangler d1 create cf-panel → 把 database_id 填进来

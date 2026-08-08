@@ -585,9 +585,21 @@ async fn report_loop(
 }
 
 // ---------------- 入口 ----------------
+// 版本号：优先取构建时注入的 AGENT_BUILD_TS（格式 2026.08.08-2000，CI 编译时传入），
+// 未注入时回退 Cargo.toml 的 [package] version（本地调试可见）
+const VERSION: &str = match option_env!("AGENT_BUILD_TS") {
+    Some(ts) if !ts.is_empty() => ts,
+    _ => env!("CARGO_PKG_VERSION"),
+};
+
+fn print_version() {
+    println!("cf-panel-agent {VERSION}");
+}
+
 fn print_help() {
     println!("cf-panel agent（Rust 版）——与 agent.sh 同协议的对等实现");
     println!("用法：AGENT_WSS_URL=wss://<面板>/ws/agent AGENT_KEY=<key> ./cf-panel-agent [--help]");
+    println!("版本：./cf-panel-agent --version");
     println!();
     println!("可配置环境变量：");
     println!("  AGENT_WSS_URL     必填  面板 agent WebSocket 地址（wss://<域名>/ws/agent）");
@@ -605,6 +617,11 @@ fn print_help() {
 
 #[tokio::main]
 async fn main() {
+    // --version：打印版本号（Release 标题/故障排查用）
+    if std::env::args().any(|a| a == "--version" || a == "-V") {
+        print_version();
+        std::process::exit(0);
+    }
     // --help：打印配置说明
     if std::env::args().any(|a| a == "--help" || a == "-h" || a == "help") {
         print_help();

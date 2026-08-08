@@ -7,7 +7,7 @@
 #   （本机无 sudo/系统 gcc 时，需先搭宿主机 C 工具链供 ring 等 build script 使用）
 [package]
 name = "cf-panel-agent"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "cf-panel agent（Rust 版）：控制通道 + 监控上报 + 终端 PTY + 文件管理"
 

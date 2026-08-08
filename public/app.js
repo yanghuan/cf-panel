@@ -160,9 +160,8 @@
     const m = s.metric;
     // 开机时间（秒 → 天）
     const up = m && m.extra && m.extra.uptime ? `开机 ${(m.extra.uptime / 86400).toFixed(1)}天` : '';
-    // 归属地优先用节点公网出口 IP（wan_ip，仅非私网才使用，能查到地理位置），回退 agent 上报的网卡 IP
-    const wan = (s.wan_ip && !GEO_PRIVATE.test(s.wan_ip)) ? s.wan_ip : '';
-    const ip = (wan || (s.info && s.info.ip4) || '').trim();
+    // IP 优先 wan_ip，回退 agent 上报的网卡 IP；私网与否不再这里过滤（<cf-ip> 内部 GEO_PRIVATE 守卫生效，私网仅显示 IP 不查归属地）
+    const ip = (s.wan_ip || (s.info && s.info.ip4) || '').trim();
     const info = s.info ? [s.info.os, up].filter(Boolean).join(' · ') : up;
     return `
       <div class="card" data-id="${s.id}">

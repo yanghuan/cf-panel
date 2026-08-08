@@ -10,7 +10,7 @@ compatibility_date = "2026-08-02"
 [[d1_databases]]
 binding = "DB"
 database_name = "cf-panel"
-database_id = "REPLACE_WITH_D1_DATABASE_ID"
+database_id = "944616cf-9364-483d-a65a-22a60c7bdb74"
 
 # ---------- Durable Object（WebSocket 中转 + 监控时序热区 + 面板实时推送） ----------
 [[durable_objects.bindings]]

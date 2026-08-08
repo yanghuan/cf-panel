@@ -89,13 +89,11 @@ jobs:
           - `cf-panel-agent.upx`：UPX `--lzma` 压缩版（约 0.9MB，省磁盘 ~58%），启动约 +60ms、常驻内存 +0.5MB
 
           用法：
-
           ```
           AGENT_WSS_URL=wss://<面板域名>/ws/agent \
           AGENT_KEY=<agent key> \
           ./cf-panel-agent
           ```
-
           EOF
           # 终端命令行（模拟输入）+ --help 实际输出
           cat >> /tmp/release-body.md <<'EOF'

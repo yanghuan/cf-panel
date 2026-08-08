@@ -88,7 +88,10 @@ header {
 .dd-item.dd-danger { color: var(--bad); }
 .dd-item.dd-danger:hover { background: rgba(248, 113, 113, .1); }
 
-main { max-width: 1000px; margin: 24px auto; padding: 0 24px; }
+main { max-width: 1000px; width: 100%; margin: 24px auto; padding: 0 24px; flex: 1; }
+
+/* 内容少时把页脚推到视口底部（sticky footer）：#app 撑满 viewport 高，main 用 flex: 1 吞掉剩余空间 */
+#app { display: flex; flex-direction: column; min-height: 100vh; }
 
 /* 页脚：GitHub 项目链接 */
 .site-footer {

@@ -603,9 +603,8 @@ fn print_version() {
 }
 
 fn print_help() {
-    println!("cf-panel agent（Rust 版）——与 agent.sh 同协议的对等实现");
+    println!("cf-panel agent（Rust 版）v{VERSION}");
     println!("用法：AGENT_WSS_URL=wss://<面板>/ws/agent AGENT_KEY=<key> ./cf-panel-agent [--help]");
-    println!("版本：./cf-panel-agent --version");
     println!();
     println!("可配置环境变量：");
     println!("  AGENT_WSS_URL     必填  面板 agent WebSocket 地址（wss://<域名>/ws/agent）");

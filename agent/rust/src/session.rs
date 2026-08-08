@@ -50,6 +50,9 @@ impl TermSession {
         })?;
         let mut cmd = CommandBuilder::new("bash");
         cmd.arg("-i");
+        // systemd 环境无 TERM：TUI 程序（top/htop/vim）检测不到终端类型会输出一屏立即退出；
+        // 显式声明 xterm-256color，保证全屏交互正常
+        cmd.env("TERM", "xterm-256color");
         let child = pair.slave.spawn_command(cmd)?;
         let child_pid = child.process_id().unwrap_or(0);
         drop(pair.slave);

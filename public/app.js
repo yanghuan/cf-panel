@@ -1062,6 +1062,7 @@
 
   // 添加服务器弹窗
   $('#btn-add-server').onclick = addServer;
+  $('#btn-add-server-plus').onclick = openAddModal; // toolbar「＋」入口与菜单「添加服务器」同入口
   $('#btn-add-close').onclick = () => { $('#add-modal').classList.add('hidden'); unlockScroll(); };
   $('#inp-name').addEventListener('keydown', (e) => { if (e.key === 'Enter') addServer(); });
 

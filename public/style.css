@@ -74,6 +74,12 @@ header {
   display: flex;
   flex-direction: column;
 }
+/* 主操作强调：菜单「添加服务器」文字带下划线，点击打开添加服务器弹窗 */
+.dd-item[data-menu="add-server"] {
+  text-decoration: underline;
+  text-underline-offset: 3px;
+  text-decoration-color: var(--accent-2);
+}
 .dd-item {
   background: transparent;
   border: none;
@@ -127,7 +133,27 @@ main { max-width: 1000px; width: 100%; margin: 24px auto; padding: 0 24px; flex:
   margin-bottom: 16px;
 }
 .toolbar h2 { margin: 0; font-size: 16px; font-weight: 700; }
+.toolbar-title { display: flex; align-items: center; gap: 8px; }
 .toolbar-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+
+/* 「＋」添加服务器按钮（toolbar 标题旁，与下拉菜单「添加服务器」同入口） */
+.toolbar-add {
+  width: 24px;
+  height: 24px;
+  border-radius: 6px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  color: var(--accent-2);
+  font-size: 15px;
+  line-height: 1;
+  padding: 0;
+  cursor: pointer;
+  transition: color .15s ease, border-color .15s ease, transform .15s ease;
+}
+.toolbar-add:hover { color: var(--text); border-color: var(--accent); transform: translateY(-1px); }
 
 input[type="text"], input[type="password"], input[type="number"] {
   background: rgba(20, 25, 40, .6);

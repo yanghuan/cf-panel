@@ -10,7 +10,7 @@
   <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' ws: wss: https://ipapi.co https://ipwho.is; frame-ancestors 'none'">
   <!-- 依赖已本地化（public/vendor），避免外部 CDN 不可达/供应链风险 -->
   <link rel="stylesheet" href="/vendor/xterm.min.css" />
-  <link rel="stylesheet" href="/style.css?v=21" />
+  <link rel="stylesheet" href="/style.css?v=22" />
   <script defer src="/vendor/chart.umd.min.js"></script>
 </head>
 <body>
@@ -43,7 +43,10 @@
         <div class="ov-item"><span class="ov-num" id="ov-mem">-</span><span class="ov-label">内存占用</span></div>
       </section>
       <section class="toolbar">
-        <h2>服务器</h2>
+        <div class="toolbar-title">
+          <h2>服务器</h2>
+          <button id="btn-add-server-plus" class="toolbar-add" title="添加服务器" aria-label="添加服务器">＋</button>
+        </div>
       </section>
       <section id="servers" class="servers-list"></section>
     </main>

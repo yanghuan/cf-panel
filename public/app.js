@@ -236,7 +236,10 @@
     agingServers();
     renderOverview();
     if (!serversCache.length) {
-      box.innerHTML = '<div class="empty"><p>还没有服务器</p><p class="muted">点「添加服务器」生成 agent 配置后开始监控</p></div>';
+      box.innerHTML = '<div class="empty"><p>还没有服务器</p><p class="muted">点<a href="#" class="empty-add" id="empty-add">「添加服务器」</a>生成 agent 配置后开始监控</p></div>';
+      // 事件绑定：内嵌链接点击直接打开添加服务器弹窗（与 toolbar「＋」同入口）
+      const emptyAdd = $('#empty-add');
+      if (emptyAdd) emptyAdd.onclick = (e) => { e.preventDefault(); openAddModal(); };
       return;
     }
     const groups = groupList();

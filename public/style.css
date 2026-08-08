@@ -369,6 +369,16 @@ button.danger:hover { background: rgba(248, 113, 113, .12); }
 .empty { text-align: center; padding: 60px 0; color: var(--muted); }
 .empty p { margin: 4px 0; font-size: 15px; }
 .empty .muted { font-size: 13px; color: var(--muted); opacity: .8; }
+/* 空状态里「添加服务器」内嵌链接：可点击 + 下划线强调，与其他入口行为一致 */
+.empty .empty-add {
+  color: var(--accent-2);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+  text-decoration-color: var(--accent-2);
+  cursor: pointer;
+  transition: color .15s ease;
+}
+.empty .empty-add:hover { color: var(--text); }
 
 /* ---------- 登录 ---------- */
 .auth-wrap {

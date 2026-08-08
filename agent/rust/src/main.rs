@@ -393,9 +393,162 @@ async fn dispatch(
                 term.resize(rows as u16, cols as u16);
             }
         }
+        "exec" => {
+            // MCP 一次性命令执行：sh -c 跑命令，收集 stdout/stderr/exit_code 经控制通道回执
+            let exec_id = v
+                .get("exec_id")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string();
+            let command = v
+                .get("command")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string();
+            if exec_id.is_empty() || command.is_empty() {
+                return Ok(());
+            }
+            // clamp 1..=60：服务端上限 25s，双端钳制防异常值
+            let timeout_s = v
+                .get("timeout_s")
+                .and_then(|x| x.as_u64())
+                .unwrap_or(25)
+                .clamp(1, 60);
+            let write = write.clone();
+            let cfg2 = cfg.clone();
+            tokio::spawn(async move {
+                // DISABLE_EXEC=1：立即回执错误，不等 DO 侧 25s 超时（避免误导性超时提示）
+                if cfg2.disable_exec {
+                    let mut w = write.lock().await;
+                    let _ = w
+                        .send(Message::Text(
+                            serde_json::json!({
+                                "type": "exec_result",
+                                "exec_id": exec_id,
+                                "stdout": "",
+                                "stderr": "",
+                                "exit_code": null,
+                                "timed_out": false,
+                                "error": "exec disabled (DISABLE_EXEC=1)",
+                            })
+                            .to_string(),
+                        ))
+                        .await;
+                    return;
+                }
+                log(format!("exec {exec_id}: {command}"));
+                // agent 用原始 timeout_s 执行；DO 兜底定时器比这晚 5s（EXEC_TIMEOUT_GRACE_MS），
+                // 正常路径 agent 先回执（超时=无输出：output() 超时分支的缓冲区随 future drop
+                // 丢弃，不存在"部分输出"），DO 定时器仅防悬挂。
+                // 防孤儿：process_group(0) 让子进程成为新进程组组长，超时后 kill(-pid) 连同
+                // 孙进程一并清理（与终端会话 cleanup 的进程组语义一致，见 session.rs）。
+                let mut child = match tokio::process::Command::new("sh")
+                    .arg("-c")
+                    .arg(&command)
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .process_group(0)
+                    .spawn()
+                {
+                    Ok(c) => c,
+                    Err(e) => {
+                        // spawn 失败（如 fork 资源不足）：立即回执，无需等待
+                        let msg = serde_json::json!({
+                            "type": "exec_result",
+                            "exec_id": exec_id,
+                            "stdout": "",
+                            "stderr": format!("spawn failed: {e}"),
+                            "exit_code": -1,
+                            "timed_out": false,
+                        });
+                        let mut w = write.lock().await;
+                        let _ = w.send(Message::Text(msg.to_string())).await;
+                        return;
+                    }
+                };
+                let pid = child.id().unwrap_or(0);
+                // 手动收集 stdout/stderr（timeout 到期时随 future drop 丢弃，无部分输出语义）
+                let mut out_pipe = child.stdout.take();
+                let mut err_pipe = child.stderr.take();
+                let out = tokio::time::timeout(Duration::from_secs(timeout_s), async {
+                    let (o, e) = tokio::join!(
+                        async {
+                            let mut buf = Vec::new();
+                            if let Some(r) = out_pipe.as_mut() {
+                                let _ = tokio::io::AsyncReadExt::read_to_end(r, &mut buf).await;
+                            }
+                            buf
+                        },
+                        async {
+                            let mut buf = Vec::new();
+                            if let Some(r) = err_pipe.as_mut() {
+                                let _ = tokio::io::AsyncReadExt::read_to_end(r, &mut buf).await;
+                            }
+                            buf
+                        },
+                    );
+                    let status = child.wait().await;
+                    (o, e, status)
+                })
+                .await;
+                let (stdout, stderr, exit_code, timed_out) = match out {
+                    Ok((o, e, Ok(status))) => (
+                        String::from_utf8_lossy(&o).into_owned(),
+                        String::from_utf8_lossy(&e).into_owned(),
+                        status.code().unwrap_or(-1),
+                        false,
+                    ),
+                    Ok((o, _e, Err(w))) => (
+                        String::from_utf8_lossy(&o).into_owned(),
+                        format!("wait failed: {w}"),
+                        -1,
+                        false,
+                    ),
+                    Err(_) => {
+                        // 超时：kill 整个进程组（SIGKILL 不可忽略，孙进程一并清理），再 wait 回收防僵尸
+                        if pid > 0 {
+                            unsafe {
+                                libc::kill(-(pid as i32), libc::SIGKILL);
+                            }
+                        }
+                        let _ = child.wait().await;
+                        (String::new(), format!("timed out after {timeout_s}s"), -1, true)
+                    }
+                };
+                // 截断：控制通道对端（DO）入站 64KB，stdout 为主通道
+                let stdout = truncate_utf8(&stdout, 44 * 1024);
+                let stderr = truncate_utf8(&stderr, 12 * 1024);
+                let msg = serde_json::json!({
+                    "type": "exec_result",
+                    "exec_id": exec_id,
+                    "stdout": stdout,
+                    "stderr": stderr,
+                    "exit_code": exit_code,
+                    "timed_out": timed_out,
+                });
+                let mut w = write.lock().await;
+                let _ = w.send(Message::Text(msg.to_string())).await;
+            });
+        }
         _ => {}
     }
     Ok(())
+}
+
+// 按 UTF-8 字符边界截断字符串到 max_bytes，超长追加截断标记
+// （防截断到多字节字符中间产生非法 UTF-8，导致 JSON 序列化/解析失败）
+fn truncate_utf8(s: &str, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s.to_string();
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut out = s[..end].to_string();
+    out.push_str("...[truncated]");
+    out
 }
 
 // 上报循环：立即上报 + 分段等待（每 5s 重读间隔，interval 变更立即生效）

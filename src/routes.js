@@ -25,6 +25,20 @@ const MCP_TOOLS = [
       required: [],
     },
   },
+  {
+    name: 'exec_command',
+    description: '在指定服务器上通过 agent 执行一次 shell 命令并返回输出（一次性执行、非交互、无 PTY，经控制通道直达；适合只读查询、进程/服务管理、快速运维）。需要 exec 权限（管理员或带 server:exec scope 的 PAT）。提供 server_id 或 server_name 之一；command 必填；timeout 可选（秒，默认 25，最大 25）；输出上限约 44KB（stdout）。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        server_id: { type: 'integer', description: '服务器 ID（见 list_servers 返回值中的 id）' },
+        server_name: { type: 'string', description: '服务器名称（与 server_id 二选一）' },
+        command: { type: 'string', description: '要执行的 shell 命令（agent 端以 sh -c 执行）' },
+        timeout: { type: 'integer', description: '超时秒数，默认 25，最大 25' },
+      },
+      required: ['command'],
+    },
+  },
 ];
 import {
   json, err, requireJwtSecret, signJwt, randomHex, sha256Hex, hashSecret,
@@ -436,6 +450,46 @@ async function mcpListServers(user, env) {
   }));
 }
 
+// 工具：在 agent 上执行一次性命令（经 TerminalDO 控制通道，等待 exec_result）
+// 鉴权：管理员或 PAT 带 server:exec scope 且命中 server_ids 白名单（canExec）
+async function mcpExecCommand(user, env, args) {
+  const serverId = Number(args.server_id) || 0;
+  const command = String(args.command || '').trim();
+  if (!command) throw new Error('command is required');
+  let server = null;
+  if (serverId) {
+    server = await env.DB.prepare('SELECT * FROM servers WHERE id = ?').bind(serverId).first();
+  } else if (args.server_name) {
+    // exec 是写操作：重名时拒绝静默取第一条（防在错误的机器上执行）
+    const rows = await env.DB.prepare('SELECT * FROM servers WHERE name = ?').bind(String(args.server_name)).all();
+    if (rows.results.length > 1) {
+      throw new Error(
+        `ambiguous server_name "${args.server_name}": matches ${rows.results.length} servers (ids: ${rows.results.map((r) => r.id).join(', ')}); use server_id to disambiguate`
+      );
+    }
+    server = rows.results[0] || null;
+  }
+  if (!server) throw new Error(`server not found (server_id=${args.server_id || ''}, server_name=${args.server_name || ''})`);
+  if (!canExec(user, server)) throw new Error(`no exec permission on server ${server.id} (${server.name})`);
+  const timeout = Math.min(Math.max(Number(args.timeout) || 25, 1), 25);
+  const resp = await doForShard(env, shardForServerId(server.id)).fetch('https://do.internal/rpc/exec', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ serverId: server.id, command, timeoutMs: timeout * 1000 }),
+  });
+  const result = await resp.json();
+  if (!resp.ok) throw new Error(result.error || `exec failed (${resp.status})`);
+  return {
+    server_id: server.id,
+    server_name: server.name,
+    exit_code: typeof result.exit_code === 'number' ? result.exit_code : null,
+    stdout: result.stdout || '',
+    stderr: result.stderr || '',
+    timed_out: !!result.timed_out,
+    error: result.error || null,
+  };
+}
+
 // 工具：监控历史（内存热区 ≤12h，D1 归档更长；长区间 SQL 抽样）
 async function mcpGetMonitor(user, env, args) {
   const serverId = Number(args.server_id) || 0;
@@ -444,7 +498,14 @@ async function mcpGetMonitor(user, env, args) {
   if (serverId) {
     server = await env.DB.prepare('SELECT * FROM servers WHERE id = ?').bind(serverId).first();
   } else if (args.server_name) {
-    server = await env.DB.prepare('SELECT * FROM servers WHERE name = ?').bind(String(args.server_name)).first();
+    // 重名时同样拒绝静默取第一条（与 exec_command 行为一致，避免"看错机器"）
+    const rows = await env.DB.prepare('SELECT * FROM servers WHERE name = ?').bind(String(args.server_name)).all();
+    if (rows.results.length > 1) {
+      throw new Error(
+        `ambiguous server_name "${args.server_name}": matches ${rows.results.length} servers (ids: ${rows.results.map((r) => r.id).join(', ')}); use server_id to disambiguate`
+      );
+    }
+    server = rows.results[0] || null;
   }
   if (!server) throw new Error('server not found（请先用 list_servers 确认 id 或名称）');
   if (!canAccessServer(user, server)) throw new Error('forbidden');
@@ -496,7 +557,7 @@ export async function handleMcp(request, env) {
         protocolVersion: MCP_VERSION,
         capabilities: { tools: {} },
         serverInfo: { name: 'cf-panel', version: '0.1.0' },
-        instructions: 'cf-panel 面板只读查询。可用工具：list_servers（服务器状态）、get_monitor（监控历史）。认证：Authorization: Bearer <JWT 或 PAT>',
+        instructions: 'cf-panel 面板。可用工具：list_servers（服务器状态）、get_monitor（监控历史）、exec_command（在服务器上执行命令，需 exec 权限）。认证：Authorization: Bearer <JWT 或 PAT>',
       });
     case 'notifications/initialized':
     case 'notifications/cancelled':
@@ -513,6 +574,7 @@ export async function handleMcp(request, env) {
         let content;
         if (params.name === 'list_servers') content = await mcpListServers(user, env);
         else if (params.name === 'get_monitor') content = await mcpGetMonitor(user, env, params.arguments || {});
+        else if (params.name === 'exec_command') content = await mcpExecCommand(user, env, params.arguments || {});
         return mcpResult(id, { content: [{ type: 'text', text: JSON.stringify(content) }], isError: false });
       } catch (e) {
         // 工具执行错误作为 isError 结果返回（MCP 客户端可读）

@@ -10,6 +10,9 @@ const SESSION_ABS_MS = 4 * 60 * 60 * 1000; // 会话绝对最长时长（含活�
 const PAT_CHECK_INTERVAL_MS = 10 * 1000; // PAT 终端连接重校验间隔（每条消息 → 10s 一次，−98%）
 const REPORT_FAST_INTERVAL_S = 5;  // 有观看者：5 秒上报（快采 28,800 → 17,280 帧/天/机）
 const REPORT_SLOW_INTERVAL_S = 120; // 无人查看：120 秒上报
+const EXEC_DEFAULT_TIMEOUT_MS = 25 * 1000; // MCP exec 默认超时（须 < DO fetch 默认 30s 超时，由内部先返回）
+const EXEC_MAX_TIMEOUT_MS = 25 * 1000;
+const EXEC_TIMEOUT_GRACE_MS = 5 * 1000; // DO 兜底定时器比 agent 实际超时晚 5s：agent 先回执（含部分 stdout），DO 定时器仅兜底防悬挂
 
 export class TerminalDO {
   constructor(state, env) {
@@ -19,6 +22,7 @@ export class TerminalDO {
     this.agents = new Map(); // serverId -> 控制 WS
     this.agentInterval = new Map(); // serverId -> 当前下发的上报间隔（秒），避免重复下发
     this.pendingOpen = new Map(); // streamId -> {tries, timer, type} open_terminal/open_file 确认重发
+    this.pendingExec = new Map(); // execId -> {resolve, timer, serverId} MCP 一次性命令等待
     this.lastPingAt = new Map(); // serverId -> 上次心跳时间（控制通道保活，防健康连接被 read -t 180 误判半开）
   }
 
@@ -121,6 +125,36 @@ export class TerminalDO {
         return json({ ok: true });
       }
       return err('bad op');
+    }
+
+    // 内部 RPC：MCP 一次性命令执行（不建终端会话，控制通道直达，等 agent 返回 exec_result）
+    // 调用方（routes.mcpExecCommand）已完成 canExec 鉴权；此处只负责下发与等待。
+    if (path === '/rpc/exec' && request.method === 'POST') {
+      const body = await request.json();
+      const serverId = Number(body.serverId) || 0;
+      const command = String(body.command || '').trim();
+      if (!command) return err('empty command');
+      const timeoutMs = Math.min(Math.max(Number(body.timeoutMs) || EXEC_DEFAULT_TIMEOUT_MS, 1000), EXEC_MAX_TIMEOUT_MS);
+      const agentWs = this.agents.get(serverId);
+      if (!agentWs) return json({ error: 'agent offline' }, 502);
+      const execId = `e-${crypto.randomUUID()}`;
+      const result = await new Promise((resolve) => {
+        // 兜底定时器晚于 agent 实际超时（EXEC_TIMEOUT_GRACE_MS）：正常路径 agent 先回执
+        // exec_result（超时=无输出，agent 侧已 kill 进程组），此处仅防 agent 失联/回执丢失导致的悬挂。
+        const timer = setTimeout(() => {
+          this.pendingExec.delete(execId);
+          resolve({ error: `command timed out after ${Math.floor(timeoutMs / 1000)}s` });
+        }, timeoutMs + EXEC_TIMEOUT_GRACE_MS);
+        this.pendingExec.set(execId, { resolve, timer, serverId });
+        try {
+          agentWs.send(JSON.stringify({ type: 'exec', exec_id: execId, command, timeout_s: Math.floor(timeoutMs / 1000) }));
+        } catch {
+          clearTimeout(timer);
+          this.pendingExec.delete(execId);
+          resolve({ error: 'failed to send exec command' });
+        }
+      });
+      return json(result);
     }
 
     // GET /ws/terminal/:id | /ws/file/:id —— 浏览器会话（防 UUID 劫持）
@@ -419,6 +453,22 @@ export class TerminalDO {
             this.pendingOpen.delete(j.stream_id);
             return;
           }
+          if (j && j.type === 'exec_result') {
+            // MCP 一次性命令结果：resolve 等待中的 /rpc/exec（Promise resolve 幂等，超时/断连兜底）
+            const r = this.pendingExec.get(j.exec_id);
+            if (r) {
+              clearTimeout(r.timer);
+              this.pendingExec.delete(j.exec_id);
+              r.resolve({
+                exit_code: j.exit_code,
+                stdout: j.stdout || '',
+                stderr: j.stderr || '',
+                timed_out: !!j.timed_out,
+                error: j.error || null,
+              });
+            }
+            return;
+          }
           if (j && j.type === 'report') {
             const serverId = this.wsServerId(ws);
             if (serverId) {
@@ -550,6 +600,14 @@ export class TerminalDO {
           if (r.serverId === serverId) {
             if (r.timer) clearTimeout(r.timer);
             this.pendingOpen.delete(sid);
+          }
+        }
+        // 未完成的 MCP exec 一并失败返回（Promise resolve 幂等，超时定时器已清）
+        for (const [execId, r] of [...this.pendingExec]) {
+          if (r.serverId === serverId) {
+            if (r.timer) clearTimeout(r.timer);
+            this.pendingExec.delete(execId);
+            r.resolve({ error: 'agent disconnected' });
           }
         }
       }

@@ -782,17 +782,54 @@ test('MCP：tools/list 与 tools/call', async () => {
   await addServer(env, token, { name: 'web-1', group: 'prod' });
 
   const list = await (await mcp(env, { token, body: { jsonrpc: '2.0', id: 1, method: 'tools/list' } })).json();
-  assert.deepEqual(list.result.tools.map((t) => t.name), ['list_servers', 'get_monitor']);
+  assert.deepEqual(list.result.tools.map((t) => t.name), ['list_servers', 'get_monitor', 'exec_command']);
 
-  // list_servers
+  // exec_command：DO stub 返回 200（无 agent 语义）→ 结构正确
+  const ex = await (await mcp(env, { token, body: { jsonrpc: '2.0', id: 6, method: 'tools/call', params: { name: 'exec_command', arguments: { server_name: 'web-1', command: 'echo hi' } } } })).json();
+  assert.equal(ex.result.isError, false);
+  const exRes = JSON.parse(ex.result.content[0].text);
+  assert.equal(exRes.server_name, 'web-1');
+  assert.equal(exRes.exit_code, null);
+
+  // exec_command：agent 离线（DO 返回 502）→ isError
+  const offlineTerminal = {
+    idFromName: () => 'shard-x',
+    get: () => ({ fetch: async () => new Response(JSON.stringify({ error: 'agent offline' }), { status: 502 }) }),
+  };
+  const envOffline = makeEnv({ TERMINAL: offlineTerminal });
+  const tokenOffline = await login(envOffline);
+  await addServer(envOffline, tokenOffline, { name: 'web-1' });
+  const exOff = await (await mcp(envOffline, { token: tokenOffline, body: { jsonrpc: '2.0', id: 8, method: 'tools/call', params: { name: 'exec_command', arguments: { server_name: 'web-1', command: 'echo hi' } } } })).json();
+  assert.equal(exOff.result.isError, true);
+  assert.match(exOff.result.content[0].text, /agent offline/);
+
+  // exec_command：未知服务器 → isError
+  const exNf = await (await mcp(env, { token, body: { jsonrpc: '2.0', id: 7, method: 'tools/call', params: { name: 'exec_command', arguments: { server_name: 'nope', command: 'echo hi' } } } })).json();
+  assert.equal(exNf.result.isError, true);
+  assert.match(exNf.result.content[0].text, /server not found/);
+
+  // exec_command：重名服务器 → 歧义错误（不静默取第一条）
+  await addServer(env, token, { name: 'web-1', group: 'dup' });
+  const exAmb = await (await mcp(env, { token, body: { jsonrpc: '2.0', id: 9, method: 'tools/call', params: { name: 'exec_command', arguments: { server_name: 'web-1', command: 'echo hi' } } } })).json();
+  assert.equal(exAmb.result.isError, true);
+  assert.match(exAmb.result.content[0].text, /ambiguous server_name/);
+  // 用 server_id 仍可精确执行（不歧义）
+  const exId = await (await mcp(env, { token, body: { jsonrpc: '2.0', id: 10, method: 'tools/call', params: { name: 'exec_command', arguments: { server_id: 1, command: 'echo hi' } } } })).json();
+  assert.equal(exId.result.isError, false);
+  // get_monitor 重名同样歧义
+  const gmAmb = await (await mcp(env, { token, body: { jsonrpc: '2.0', id: 11, method: 'tools/call', params: { name: 'get_monitor', arguments: { server_name: 'web-1', range: '1h' } } } })).json();
+  assert.equal(gmAmb.result.isError, true);
+  assert.match(gmAmb.result.content[0].text, /ambiguous server_name/);
+
+  // list_servers（含后面的重名测试共 2 台）
   const ls = await (await mcp(env, { token, body: { jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'list_servers', arguments: {} } } })).json();
   const servers = JSON.parse(ls.result.content[0].text);
-  assert.equal(servers.length, 1);
-  assert.equal(servers[0].name, 'web-1');
-  assert.equal(servers[0].group, 'prod');
+  assert.equal(servers.length, 2);
+  assert.ok(servers.some((s) => s.name === 'web-1' && s.group === 'prod'), '含 prod 组 web-1');
+  assert.ok(servers.some((s) => s.name === 'web-1' && s.group === 'dup'), '含 dup 组 web-1');
 
-  // get_monitor（server_name）
-  const gm = await (await mcp(env, { token, body: { jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'get_monitor', arguments: { server_name: 'web-1', range: '1h' } } } })).json();
+  // get_monitor（server_id 精确；当前有两台重名 web-1，name 会歧义）
+  const gm = await (await mcp(env, { token, body: { jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'get_monitor', arguments: { server_id: 1, range: '1h' } } } })).json();
   const mon = JSON.parse(gm.result.content[0].text);
   assert.equal(mon.server.name, 'web-1');
   assert.equal(mon.range, '1h');

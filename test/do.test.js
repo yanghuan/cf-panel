@@ -1106,6 +1106,88 @@ test('TerminalDO: file_ready 确认后停止 open_file 重发（L10）', async (
   }
 });
 
+test('TerminalDO: /rpc/exec 下发 exec 指令，收到 exec_result 后返回结果', async () => {
+  const env = makeEnv();
+  const sent = [];
+  const agentWs = { send: (m) => sent.push(m), readyState: 1 };
+  const inst = new TerminalDO(mockState(), env);
+  inst.agents.set(1, agentWs);
+
+  const pending = inst.fetch(new Request('https://do.internal/rpc/exec', {
+    method: 'POST',
+    body: JSON.stringify({ serverId: 1, command: 'echo hi', timeoutMs: 5000 }),
+  }));
+  // fetch 内部先 await request.json()，send 发生在下一微任务；等一拍再断言
+  await new Promise((r) => setTimeout(r, 0));
+  assert.equal(sent.length, 1, 'exec 指令已下发');
+  const cmd = JSON.parse(sent[0]);
+  assert.equal(cmd.type, 'exec');
+  assert.equal(cmd.command, 'echo hi');
+  assert.equal(cmd.timeout_s, 5);
+  assert.ok(cmd.exec_id.startsWith('e-'));
+
+  // agent 回 exec_result → resolve
+  await inst.webSocketMessage(agentWs, JSON.stringify({
+    type: 'exec_result', exec_id: cmd.exec_id,
+    stdout: 'hi\n', stderr: '', exit_code: 0, timed_out: false,
+  }));
+  const res = await pending;
+  assert.equal(res.status, 200);
+  const body = await res.json();
+  assert.deepEqual(body, { exit_code: 0, stdout: 'hi\n', stderr: '', timed_out: false, error: null });
+  assert.equal(inst.pendingExec.size, 0, '完成后清理 pending');
+});
+
+test('TerminalDO: /rpc/exec agent 回执 error（DISABLE_EXEC）透传', async () => {
+  const env = makeEnv();
+  const sent = [];
+  const agentWs = { send: (m) => sent.push(m), readyState: 1 };
+  const inst = new TerminalDO(mockState(), env);
+  inst.agents.set(1, agentWs);
+  const pending = inst.fetch(new Request('https://do.internal/rpc/exec', {
+    method: 'POST',
+    body: JSON.stringify({ serverId: 1, command: 'echo hi', timeoutMs: 5000 }),
+  }));
+  await new Promise((r) => setTimeout(r, 0));
+  const cmd = JSON.parse(sent[0]);
+  // agent 回执带 error（exec disabled）
+  await inst.webSocketMessage(agentWs, JSON.stringify({
+    type: 'exec_result', exec_id: cmd.exec_id,
+    stdout: '', stderr: '', exit_code: null, timed_out: false, error: 'exec disabled (DISABLE_EXEC=1)',
+  }));
+  const res = await pending;
+  const body = await res.json();
+  assert.equal(body.error, 'exec disabled (DISABLE_EXEC=1)');
+  assert.equal(body.exit_code, null);
+});
+
+test('TerminalDO: /rpc/exec agent 离线 → 502', async () => {
+  const env = makeEnv();
+  const inst = new TerminalDO(mockState(), env);
+  const res = await inst.fetch(new Request('https://do.internal/rpc/exec', {
+    method: 'POST',
+    body: JSON.stringify({ serverId: 1, command: 'echo hi' }),
+  }));
+  assert.equal(res.status, 502);
+  assert.equal((await res.json()).error, 'agent offline');
+});
+
+test('TerminalDO: /rpc/exec 超时未收到结果 → 返回超时错误并清理 pending', async () => {
+  const env = makeEnv();
+  const agentWs = { send: () => {}, readyState: 1 };
+  const inst = new TerminalDO(mockState(), env);
+  inst.agents.set(1, agentWs);
+  const pending = inst.fetch(new Request('https://do.internal/rpc/exec', {
+    method: 'POST',
+    body: JSON.stringify({ serverId: 1, command: 'sleep 99', timeoutMs: 1000 }),
+  }));
+  const res = await pending; // 真实 1s 超时 → resolve
+  assert.equal(res.status, 200);
+  const body = await res.json();
+  assert.match(body.error, /timed out after 1s/);
+  assert.equal(inst.pendingExec.size, 0, '超时后清理 pending');
+});
+
 test('TerminalDO: 僵尸会话超 TTL 由 alarm 清理，未到期安排下次 alarm', async () => {
   const env = makeEnv();
   const st = mockState();

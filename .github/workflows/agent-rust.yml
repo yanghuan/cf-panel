@@ -100,7 +100,8 @@ jobs:
           ```
           $ ./cf-panel-agent --help
           EOF
-          sed 's/^/          /' /tmp/agent-help.txt >> /tmp/release-body.md
+          # heredoc 内容经 yaml 剥离公共缩进后顶格，此处同样不加缩进，保证代码块内对齐
+          cat /tmp/agent-help.txt >> /tmp/release-body.md
           cat >> /tmp/release-body.md <<'EOF'
           ```
 

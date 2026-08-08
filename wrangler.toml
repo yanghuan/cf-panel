@@ -52,5 +52,6 @@ invocation_logs = true
 enabled = true
 
 # ---------- Smart Placement（智能放置：权衡用户/后端距离；启用后 Dashboard 可看性能对比） ----------
+# 已关闭：mode = "off" 显式关闭，恢复边缘执行
 [placement]
-mode = "smart"
+mode = "off"

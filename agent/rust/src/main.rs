@@ -513,7 +513,12 @@ async fn dispatch(
                             }
                         }
                         let _ = child.wait().await;
-                        (String::new(), format!("timed out after {timeout_s}s"), -1, true)
+                        (
+                            String::new(),
+                            format!("timed out after {timeout_s}s"),
+                            -1,
+                            true,
+                        )
                     }
                 };
                 // 截断：控制通道对端（DO）入站 64KB，stdout 为主通道

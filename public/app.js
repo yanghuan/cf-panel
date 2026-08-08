@@ -115,6 +115,7 @@
       const sys = [
         ['系统', info.os],
         ['内核', info.kern],
+        ['Agent', info.agent_version],
       ].filter(([, v]) => v);
       let sysRows = sys.map(([k, v]) => `<div class="mt-row"><span>${k}</span><b>${escapeHtml(v)}</b></div>`).join('');
       if (info.ip4) sysRows += `<div class="mt-row"><span>IPv4</span><b><cf-ip ip="${escapeHtml(info.ip4)}"></cf-ip></b></div>`;

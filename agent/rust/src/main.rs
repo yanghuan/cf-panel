@@ -586,8 +586,9 @@ async fn report_loop(
 
 // ---------------- 入口 ----------------
 // 版本号：优先取构建时注入的 AGENT_BUILD_TS（格式 2026.08.08-2000，CI 编译时传入），
-// 未注入时回退 Cargo.toml 的 [package] version（本地调试可见）
-const VERSION: &str = match option_env!("AGENT_BUILD_TS") {
+// 未注入时回退 Cargo.toml 的 [package] version（本地调试可见）。
+// pub：metrics::collect_info 将其写入系统信息上报，前端节点 tooltip 展示
+pub const VERSION: &str = match option_env!("AGENT_BUILD_TS") {
     Some(ts) if !ts.is_empty() => ts,
     _ => env!("CARGO_PKG_VERSION"),
 };

@@ -277,7 +277,7 @@ async fn info_cache(
         .await
 }
 
-// 系统信息：OS / 内核 / IP（uname/hostname 放线程池+超时）
+// 系统信息：OS / 内核 / IP / agent 版本（uname/hostname 放线程池+超时）
 async fn collect_info() -> serde_json::Value {
     let now = std::time::Instant::now();
     if let Some((ts, v)) = info_cache().await.as_ref() {
@@ -318,7 +318,13 @@ async fn collect_info() -> serde_json::Value {
             ip4 = p.to_string();
         }
     }
-    let val = json!({ "os": os, "kern": kern, "ip4": ip4, "ip6": ip6 });
+    let val = json!({
+        "os": os,
+        "kern": kern,
+        "ip4": ip4,
+        "ip6": ip6,
+        "agent_version": crate::VERSION,
+    });
     // uname/hostname 全空（采集超时/失败）不缓存：避免空结果（IP 字段空显）被缓存 10 分钟
     if !kern.is_empty() || !host.is_empty() {
         *info_cache().await = Some((now, val.clone()));

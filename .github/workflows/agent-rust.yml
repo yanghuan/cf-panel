@@ -78,6 +78,8 @@ jobs:
 
       - name: 组装 Release body（固定用法 + git 提交更新日志）
         run: |
+          # 运行时执行 --help 获取配置说明（与二进制同步，不手抄避免过期）
+          ./agent/rust/target/x86_64-unknown-linux-musl/release/cf-panel-agent --help > /tmp/agent-help.txt
           # 固定用法文本
           cat > /tmp/release-body.md <<'EOF'
           Rust 版 cf-panel agent 全静态二进制（musl，仅依赖系统调用，任意 Linux 发行版直跑）。
@@ -86,13 +88,10 @@ jobs:
           - `cf-panel-agent`：完整版（约 2MB），无启动额外开销
           - `cf-panel-agent.upx`：UPX `--lzma` 压缩版（约 0.9MB，省磁盘 ~58%），启动约 +60ms、常驻内存 +0.5MB
 
-          用法：
-          ```
-          AGENT_WSS_URL=wss://<面板域名>/ws/agent \
-          AGENT_KEY=<agent key> \
-          ./cf-panel-agent
-          ```
-          环境变量与 agent.sh 一致：AGENT_WSS_URL / AGENT_KEY / REPORT_INTERVAL / PROBES / CUSTOM_METRICS / DISABLE_EXEC / AGENT_TMPDIR / AGENT_LOG。
+          运行 `./cf-panel-agent --help` 完整输出：
+          EOF
+          sed 's/^/          /' /tmp/agent-help.txt >> /tmp/release-body.md
+          cat >> /tmp/release-body.md <<'EOF'
 
           ## 更新日志
           EOF

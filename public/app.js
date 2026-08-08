@@ -174,6 +174,7 @@
               <button data-act="file" data-id="${s.id}" data-name="${escapeHtml(s.name)}">文件</button>` : ''}
               <button data-act="mon" data-id="${s.id}" data-name="${escapeHtml(s.name)}">监控</button>
               <button data-act="custom" data-id="${s.id}" data-name="${escapeHtml(s.name)}">自定义指标</button>
+              <button data-act="edit" data-id="${s.id}" data-name="${escapeHtml(s.name)}" data-group="${escapeHtml(s.group || '')}" data-order="${s.display_index || 0}">修改</button>
               <button data-act="del" data-id="${s.id}" data-name="${escapeHtml(s.name)}" class="dd-danger">删除</button>
             </div>
           </div>
@@ -321,6 +322,9 @@
     });
   }
 
+  // 服务器表单双模式：editServerId = null 添加，否则为修改中的服务器 id
+  let editServerId = null;
+
   async function addServer() {
     const name = $('#inp-name').value.trim();
     const group = $('#inp-group').value.trim();
@@ -336,6 +340,45 @@
     } catch (e) {
       toast(e.message);
     }
+  }
+
+  // 修改服务器（菜单「修改」）：预填当前值，提交 PATCH；不动 agent key，在线状态不受影响
+  function openEditModal(id, name, group, order) {
+    editServerId = id;
+    $('#add-modal-title').textContent = '修改服务器';
+    $('#btn-add-server').textContent = '保存修改';
+    $('#inp-name').value = name || '';
+    $('#inp-group').value = group || '';
+    $('#inp-order').value = order != null ? String(order) : '';
+    $('#add-modal').classList.remove('hidden');
+    lockScroll();
+    setTimeout(() => $('#inp-name').focus(), 50);
+  }
+
+  async function saveEditServer() {
+    const name = $('#inp-name').value.trim();
+    const group = $('#inp-group').value.trim();
+    const sortOrder = Number($('#inp-order').value) || 0;
+    if (!name) return toast('请输入服务器名称');
+    try {
+      await api(`/api/servers/${editServerId}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ name, group, sort_order: sortOrder }),
+      });
+      $('#add-modal').classList.add('hidden');
+      unlockScroll();
+      editServerId = null;
+      toast('服务器信息已更新');
+      loadServers();
+    } catch (e) {
+      toast(e.message);
+    }
+  }
+
+  // 表单提交分发：添加 / 修改共用 Enter 与按钮
+  function submitServerForm() {
+    if (editServerId) saveEditServer();
+    else addServer();
   }
 
   // 连接建立发一次 sync 拉初始列表，此后数据由服务端上报驱动推送（WS 被动接收，不再 3s 轮询）。
@@ -796,6 +839,9 @@
 
   // ---------- 下拉菜单各功能入口 ----------
   function openAddModal() {
+    editServerId = null;
+    $('#add-modal-title').textContent = '添加服务器';
+    $('#btn-add-server').textContent = '添加服务器';
     $('#inp-name').value = '';
     $('#inp-group').value = '';
     $('#inp-order').value = '';
@@ -939,7 +985,7 @@
   }
 
   // ---------- 审计日志（仅管理员，保留 90 天） ----------
-  const AUDIT_ACTION_LABEL = { 'server.create': '添加服务器', 'server.delete': '删除服务器', 'terminal.open': '打开终端', 'file.open': '文件管理' };
+  const AUDIT_ACTION_LABEL = { 'server.create': '添加服务器', 'server.update': '修改服务器', 'server.delete': '删除服务器', 'terminal.open': '打开终端', 'file.open': '文件管理' };
   async function openAuditModal() {
     $('#audit-modal').classList.remove('hidden');
     lockScroll();
@@ -1062,11 +1108,11 @@
     else if (act === 'logout') { token = ''; localStorage.removeItem('cfpanel_token'); showAuth(); }
   });
 
-  // 添加服务器弹窗
-  $('#btn-add-server').onclick = addServer;
+  // 添加服务器弹窗（添加/修改双模式：按钮与 Enter 走同一分发）
+  $('#btn-add-server').onclick = submitServerForm;
   $('#btn-add-server-plus').onclick = openAddModal; // toolbar「＋」入口与菜单「添加服务器」同入口
   $('#btn-add-close').onclick = () => { $('#add-modal').classList.add('hidden'); unlockScroll(); };
-  $('#inp-name').addEventListener('keydown', (e) => { if (e.key === 'Enter') addServer(); });
+  $('#inp-name').addEventListener('keydown', (e) => { if (e.key === 'Enter') submitServerForm(); });
 
   // 站点信息弹窗
   $('#btn-site-close').onclick = () => { $('#site-modal').classList.add('hidden'); unlockScroll(); };
@@ -1129,6 +1175,7 @@
     else if (act === 'file') openFileManager(Number(id), name);
     else if (act === 'mon') showMonitor(Number(id), name);
     else if (act === 'custom') openCustomModal(Number(id), name);
+    else if (act === 'edit') openEditModal(Number(id), name, btn.dataset.group, btn.dataset.order);
     else if (act === 'del') {
       confirmDialog(`确认删除服务器「${name}」？`, () => {
         api(`/api/servers/${id}`, { method: 'DELETE' }).then(loadServers).catch((e2) => toast(e2.message));

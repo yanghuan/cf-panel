@@ -213,6 +213,25 @@ export async function handleApi(request, env) {
     });
   }
 
+  // PATCH /api/servers/:id —— 仅管理员；修改名称/分组/序号（不动 agent key，在线状态不受影响）
+  if (method === 'PATCH' && path.startsWith('/api/servers/')) {
+    if (!isAdmin(user)) return err('forbidden', 403);
+    const id = Number(path.split('/')[3]) || 0;
+    const server = await env.DB.prepare('SELECT name FROM servers WHERE id = ?').bind(id).first();
+    if (!server) return err('not found', 404);
+    const body = await request.json().catch(() => ({}));
+    const name = body.name !== undefined ? String(body.name).trim() : server.name;
+    if (!name) return err('name required');
+    const group = body.group !== undefined ? String(body.group).trim() : server.group;
+    const displayIndex = body.sort_order !== undefined ? Number(body.sort_order) || 0 : server.display_index;
+    await env.DB.prepare('UPDATE servers SET name = ?, "group" = ?, display_index = ? WHERE id = ?')
+      .bind(name, group, displayIndex, id).run();
+    serverListCacheClear();
+    await env.DB.prepare('INSERT INTO audit_logs (user_id, username, client_ip, action, target_server_id, detail) VALUES (?,?,?,?,?,?)')
+      .bind(user.id, user.username, clientIp(request), 'server.update', id, `${server.name} → ${name}`).run();
+    return json({ ok: true, id, name, group, display_index: displayIndex });
+  }
+
   // DELETE /api/servers/:id —— 仅管理员；清理历史数据 + 审计 + 通知 DO 断开 agent
   if (method === 'DELETE' && path.startsWith('/api/servers/')) {
     if (!isAdmin(user)) return err('forbidden', 403);

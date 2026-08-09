@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# 提交前自动运行 agent/rust CI 检查（check.sh：fmt/clippy/test）。
+# 仅当暂存区包含 agent/rust/** 变更时触发，其余提交零开销。
+# 配置：git config core.hooksPath .githooks（README 已说明）
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+
+if ! git -C "$ROOT" diff --cached --name-only | grep -q '^agent/rust/'; then
+  exit 0
+fi
+
+echo "== pre-commit: agent/rust 有变更，运行 CI 检查（bash check.sh）=="
+(cd "$ROOT/agent/rust" && bash check.sh)
+echo "== pre-commit: 检查通过 ✔ =="

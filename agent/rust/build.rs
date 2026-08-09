@@ -1,6 +1,6 @@
 // 格式门禁：编译前强制 rustfmt --check（与 CI 的 cargo fmt --check 对齐）。
 // 任何触发编译的命令（build/check/test/IDE 保存检查/CI）都会先过格式检查，
-// 格式不合规直接编译失败；rustfmt 组件未安装时降级为警告（不阻塞编译）。
+// 格式不合规或 rustfmt 组件未安装时直接编译失败。
 use std::process::Command;
 
 fn main() {
@@ -8,10 +8,9 @@ fn main() {
     println!("cargo:rerun-if-changed=src/");
     println!("cargo:rerun-if-changed=Cargo.toml");
 
-    // rustfmt 未安装：跳过检查（CI 的 agent-rust test job 已装组件，会强制检查）
+    // rustfmt 未安装：直接报错（与 CI 对齐：agent-rust test job 已装组件，格式检查是硬性要求）
     if Command::new("rustfmt").arg("--version").output().is_err() {
-        println!("cargo:warning=rustfmt 未安装，跳过格式检查（CI 仍会强制 cargo fmt --check）");
-        return;
+        panic!("rustfmt 未安装：请先运行 `rustup component add rustfmt`（CI 会强制 cargo fmt --check）");
     }
 
     // 收集 src/ 下所有 .rs（新增文件自动纳入）

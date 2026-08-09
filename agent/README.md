@@ -27,6 +27,23 @@ cargo build --release --target x86_64-unknown-linux-musl
 
 也可直接从 GitHub **Releases** 下载已构建的全静态二进制（由 CI 自动发布，仅 Rust 代码变更时触发）。
 
+**构建时自动检查**（与 CI `agent-rust.yml` test job 完全一致，保证编译产物可过 CI）：
+
+```bash
+cd agent/rust
+bash build.sh  # = check.sh（fmt/clippy/test 全检）+ cargo build --release，可透传参数如 --target x86_64-unknown-linux-musl
+```
+
+> 为什么不用 `cargo build` 直接挂检查：build.rs 内调 `cargo clippy`/`cargo test` 会因 target 目录锁死锁（cargo 硬限制），`[alias]` 重定向 `build` 又会波及 CI 自身的 `cargo build`——所以检查与编译的顺序执行放在包装器里。格式门禁（rustfmt --check）仍由 build.rs 在任意编译时自动执行。
+
+**提交前自动检查**（git pre-commit hook，暂存区含 `agent/rust/**` 变更时自动跑 check.sh）：
+
+```bash
+git config core.hooksPath .githooks   # 仓库级配置（随仓库分发，克隆后各成员需执行一次）
+```
+
+单次手动检查：`bash check.sh`
+
 ## Rust 版：使用
 
 ```bash

@@ -556,7 +556,13 @@ export class MetricsDO {
     this.usage = { report: 0, latest: 0, query: 0, alarm: 0 };
     await this.ensureHousekeepLoaded();
     const archiveOn = this.env.ARCHIVE_TO_D1 !== '0';
-    alertOn = (await getAlertCfg(this.env)).enabled;
+    try {
+      alertOn = (await getAlertCfg(this.env)).enabled;
+    } catch {
+      // 告警配置读取失败（D1 瞬时故障）：按"告警开启"处理（保持 10min 正常周期）——
+      // 避免与 data.size===0 组合误判闲置而退避 1h，导致归档/离线告警最长停摆 1h；D1 恢复后由下轮拉回
+      alertOn = true;
+    }
     if (alertOn) await this.checkOfflineAlerts();
     const now = Date.now();
     let housekeepChanged = false;

@@ -475,19 +475,27 @@ async fn dispatch(
                 // 手动收集 stdout/stderr（timeout 到期时随 future drop 丢弃，无部分输出语义）
                 let mut out_pipe = child.stdout.take();
                 let mut err_pipe = child.stderr.take();
+                // 有界读取：stdout/stderr 分别取 48KB/16KB 上限（稍大于截断阈值，留 UTF-8 边界余量），
+                // 避免刷屏命令（25s 窗口）无界物化导致峰值内存数百 MB
                 let out = tokio::time::timeout(Duration::from_secs(timeout_s), async {
                     let (o, e) = tokio::join!(
                         async {
                             let mut buf = Vec::new();
                             if let Some(r) = out_pipe.as_mut() {
-                                let _ = tokio::io::AsyncReadExt::read_to_end(r, &mut buf).await;
+                                let mut limited = tokio::io::AsyncReadExt::take(r, 48 * 1024);
+                                let _ =
+                                    tokio::io::AsyncReadExt::read_to_end(&mut limited, &mut buf)
+                                        .await;
                             }
                             buf
                         },
                         async {
                             let mut buf = Vec::new();
                             if let Some(r) = err_pipe.as_mut() {
-                                let _ = tokio::io::AsyncReadExt::read_to_end(r, &mut buf).await;
+                                let mut limited = tokio::io::AsyncReadExt::take(r, 16 * 1024);
+                                let _ =
+                                    tokio::io::AsyncReadExt::read_to_end(&mut limited, &mut buf)
+                                        .await;
                             }
                             buf
                         },

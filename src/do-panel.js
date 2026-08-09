@@ -72,6 +72,12 @@ export class PanelDO {
       this.authCache.clear();
       return json({ ok: true });
     }
+    // 内部 RPC：服务器增删改后清列表缓存（否则已删服务器最多 4.5s 内仍出现在推送列表；清失败由 TTL 兜底）
+    if (url.pathname === '/rpc/clear_list_cache' && request.method === 'POST') {
+      this.listCache = null;
+      this.latestCache = null;
+      return json({ ok: true });
+    }
     // 内部 RPC：MetricsDO 上报驱动推送全部最新指标 → 按观看者权限过滤组装后广播（出站不计费）
     if (url.pathname === '/rpc/latest_push' && request.method === 'POST') {
       const pb = await request.json();

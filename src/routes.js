@@ -47,7 +47,7 @@ import {
 } from './utils.js';
 import { queryMonitorRows, queryCustomMetrics, kvClearCache } from './db.js';
 import { authUser, isAdmin, canAccessServer, canExec, listServersWithState, serverListCache } from './auth.js';
-import { handleReport, serverRowCache } from './report.js';
+import { handleReport, serverRowCache, lastSeenWrite, customWritten } from './report.js';
 
 // ---------------- 登录失败限流 ----------------
 // 登录失败限流（应用层纵深防御）。内存窗口按 IP 计数，缓解单 IP 爆破；
@@ -128,10 +128,14 @@ export async function handleApi(request, env) {
       return json({ error: `too many failed logins, retry in ${lockRemain}s` }, 429, { 'retry-after': String(lockRemain) });
     }
     const body = await request.json().catch(() => ({}));
+    const inputUsername = String(body.username || '').trim();
     const password = String(body.password || '');
     const users = parsePanelUsers(env);
     if (!users.length) return err('server misconfigured: PANEL_USERS/PANEL_PASSWORD not set', 500);
-    const userIdx = users.findIndex((u) => u.password === password);
+    // 用户名可选：填写则要求用户名+密码双字段匹配（多用户同密码不再取第一个）；留空仅按密码匹配（单管理员兼容）
+    const userIdx = inputUsername
+      ? users.findIndex((u) => u.username === inputUsername && u.password === password)
+      : users.findIndex((u) => u.password === password);
     if (userIdx < 0) {
       recordLoginFail(ip);
       return err('bad password', 401);
@@ -201,10 +205,13 @@ export async function handleApi(request, env) {
     const key = randomHex(32); // key 即唯一身份 + 凭证，agent 侧只保留这一个
     const keyId = await sha256Hex(key);
     const hash = await hashSecret(key, env);
-    await env.DB.prepare('INSERT INTO servers (agent_key_id, name, "group", display_index, user_id, agent_key_hash) VALUES (?,?,?,?,?,?)')
-      .bind(keyId, name, group, displayIndex, user.id, hash)
-      .run();
-    await env.DB.prepare('INSERT INTO audit_logs (user_id, username, client_ip, action) VALUES (?,?,?,?)').bind(user.id, user.username, clientIp(request), 'server.create').run();
+    // 服务器 + 审计同一事务（D1 batch 原子）：audit 失败时整体回滚，不再"操作已生效但返回 500"
+    await env.DB.batch([
+      env.DB.prepare('INSERT INTO servers (agent_key_id, name, "group", display_index, user_id, agent_key_hash) VALUES (?,?,?,?,?,?)')
+        .bind(keyId, name, group, displayIndex, user.id, hash),
+      env.DB.prepare('INSERT INTO audit_logs (user_id, username, client_ip, action) VALUES (?,?,?,?)')
+        .bind(user.id, user.username, clientIp(request), 'server.create'),
+    ]);
     serverListCacheClear();
     return json({
       agent_key: key,
@@ -224,11 +231,14 @@ export async function handleApi(request, env) {
     if (!name) return err('name required');
     const group = body.group !== undefined ? String(body.group).trim() : server.group;
     const displayIndex = body.sort_order !== undefined ? Number(body.sort_order) || 0 : server.display_index;
-    await env.DB.prepare('UPDATE servers SET name = ?, "group" = ?, display_index = ? WHERE id = ?')
-      .bind(name, group, displayIndex, id).run();
+    // 更新 + 审计同一事务（D1 batch 原子）
+    await env.DB.batch([
+      env.DB.prepare('UPDATE servers SET name = ?, "group" = ?, display_index = ? WHERE id = ?')
+        .bind(name, group, displayIndex, id),
+      env.DB.prepare('INSERT INTO audit_logs (user_id, username, client_ip, action, target_server_id, detail) VALUES (?,?,?,?,?,?)')
+        .bind(user.id, user.username, clientIp(request), 'server.update', id, `${server.name} → ${name}`),
+    ]);
     serverListCacheClear();
-    await env.DB.prepare('INSERT INTO audit_logs (user_id, username, client_ip, action, target_server_id, detail) VALUES (?,?,?,?,?,?)')
-      .bind(user.id, user.username, clientIp(request), 'server.update', id, `${server.name} → ${name}`).run();
     return json({ ok: true, id, name, group, display_index: displayIndex });
   }
 
@@ -238,17 +248,20 @@ export async function handleApi(request, env) {
     const id = Number(path.split('/')[3]) || 0;
     const server = await env.DB.prepare('SELECT name FROM servers WHERE id = ?').bind(id).first();
     if (!server) return err('not found', 404);
-    // 1) 清理该服务器的全部历史数据（归档时序 + 自定义指标）
+    // 1+2+3) 清历史数据 + 删服务器 + 审计同一事务（D1 batch 原子：任一失败整体回滚，
+    // 不再出现"服务器已删但返回 500"或"服务器残留但提示成功"的中间态）
     await env.DB.batch([
       env.DB.prepare('DELETE FROM metrics_min WHERE server_id = ?').bind(id),
       env.DB.prepare('DELETE FROM metrics_custom WHERE server_id = ?').bind(id),
+      env.DB.prepare('DELETE FROM servers WHERE id = ?').bind(id),
+      env.DB.prepare('INSERT INTO audit_logs (user_id, username, client_ip, action, target_server_id, detail) VALUES (?,?,?,?,?,?)')
+        .bind(user.id, user.username, clientIp(request), 'server.delete', id, server.name),
     ]);
-    // 2) 删除服务器本体（agent key 随之失效，重连返回 401）
-    await env.DB.prepare('DELETE FROM servers WHERE id = ?').bind(id).run();
     serverListCacheClear();
-    // 3) 审计日志
-    await env.DB.prepare('INSERT INTO audit_logs (user_id, username, client_ip, action, target_server_id, detail) VALUES (?,?,?,?,?,?)')
-      .bind(user.id, user.username, clientIp(request), 'server.delete', id, server.name).run();
+    // 清理上报侧残留状态（防内存 Map 随服务器删除无限增长；残留条目本身无害）
+    lastSeenWrite.delete(id);
+    customWritten.delete(id);
+    serverRowCache.delete(id);
     // 4) MetricsDO 清内存热区（避免残留数据被 alarm 重新归档回 D1）
     try {
       await doMetrics(env).fetch('https://do.internal/drop', {
@@ -267,6 +280,10 @@ export async function handleApi(request, env) {
         });
       } catch { /* 分片暂不可达；agent 重连会因 key 失效被拒 */ }
     }
+    // 6) 清 PanelDO 列表缓存（避免已删服务器最多 4.5s 内仍出现在观看者推送列表）
+    try {
+      await doPanel(env).fetch('https://do.internal/rpc/clear_list_cache', { method: 'POST' });
+    } catch { /* 清缓存失败由 listCache TTL 兜底 */ }
     return json({ ok: true });
   }
 
@@ -433,14 +450,20 @@ function serverListCacheClear() {
 // ---------------- MCP（Model Context Protocol）----------------
 // 无状态 Streamable HTTP：/mcp 仅 POST，每请求独立 Bearer 鉴权（JWT/PAT），复用现有数据查询
 
-function mcpResult(id, result, error) {
+function mcpResult(id, result, error, origin) {
   const payload = { jsonrpc: '2.0' };
   if (error) payload.error = error;
   else payload.result = result;
   if (id !== null && id !== undefined) payload.id = id;
   return new Response(JSON.stringify(payload), {
     status: error && !result ? 400 : 200,
-    headers: { 'content-type': 'application/json', 'access-control-allow-origin': '*' },
+    headers: {
+      'content-type': 'application/json',
+      // 有 Origin 头（浏览器跨域）回显 origin + Vary（缓存正确性）；无 Origin（curl/MCP 客户端）保持 '*' 兼容
+      ...(origin
+        ? { 'access-control-allow-origin': origin, vary: 'Origin' }
+        : { 'access-control-allow-origin': '*' }),
+    },
   });
 }
 
@@ -552,14 +575,16 @@ export async function handleMcp(request, env) {
       return new Response('forbidden', { status: 403 });
     }
   }
+  // 响应 CORS 回显同源 origin（见 mcpResult；无 Origin 的 curl/MCP 客户端自动 '*'）
+  const reply = (id, result, error) => mcpResult(id, result, error, origin);
 
   // 每请求独立鉴权（与现有 API 一致：Bearer JWT 或 PAT）
   const user = await authUser(request, env);
-  if (!user) return mcpResult(null, null, { code: -32001, message: 'unauthorized' });
+  if (!user) return reply(null, null, { code: -32001, message: 'unauthorized' });
 
   let body;
   try { body = await request.json(); } catch {
-    return mcpResult(null, null, { code: -32700, message: 'Parse error' });
+    return reply(null, null, { code: -32700, message: 'Parse error' });
   }
   const id = body.id;
 
@@ -567,12 +592,12 @@ export async function handleMcp(request, env) {
   const headerVersion = request.headers.get('mcp-protocol-version') || '2025-03-26';
   const metaVersion = body._meta && body._meta['io.modelcontextprotocol/protocolVersion'];
   if (metaVersion && metaVersion !== headerVersion) {
-    return mcpResult(id, null, { code: -32020, message: 'HeaderMismatch: MCP-Protocol-Version 与 body _meta 不一致' });
+    return reply(id, null, { code: -32020, message: 'HeaderMismatch: MCP-Protocol-Version 与 body _meta 不一致' });
   }
 
   switch (body.method) {
     case 'initialize':
-      return mcpResult(id, {
+      return reply(id, {
         protocolVersion: MCP_VERSION,
         capabilities: { tools: {} },
         serverInfo: { name: 'cf-panel', version: '0.1.0' },
@@ -582,26 +607,26 @@ export async function handleMcp(request, env) {
     case 'notifications/cancelled':
       return new Response(null, { status: 202 }); // 通知：接受无 body
     case 'ping':
-      return mcpResult(id, {});
+      return reply(id, {});
     case 'tools/list':
-      return mcpResult(id, { tools: MCP_TOOLS });
+      return reply(id, { tools: MCP_TOOLS });
     case 'tools/call': {
       const params = body.params || {};
       const tool = MCP_TOOLS.find((t) => t.name === params.name);
-      if (!tool) return mcpResult(id, null, { code: -32602, message: `Unknown tool: ${params.name}` });
+      if (!tool) return reply(id, null, { code: -32602, message: `Unknown tool: ${params.name}` });
       try {
         let content;
         if (params.name === 'list_servers') content = await mcpListServers(user, env);
         else if (params.name === 'get_monitor') content = await mcpGetMonitor(user, env, params.arguments || {});
         else if (params.name === 'exec_command') content = await mcpExecCommand(user, env, params.arguments || {});
-        return mcpResult(id, { content: [{ type: 'text', text: JSON.stringify(content) }], isError: false });
+        return reply(id, { content: [{ type: 'text', text: JSON.stringify(content) }], isError: false });
       } catch (e) {
         // 工具执行错误作为 isError 结果返回（MCP 客户端可读）
-        return mcpResult(id, { content: [{ type: 'text', text: String(e.message || e) }], isError: true });
+        return reply(id, { content: [{ type: 'text', text: String(e.message || e) }], isError: true });
       }
     }
     default:
-      return mcpResult(id, null, { code: -32601, message: `Method not found: ${body.method}` });
+      return reply(id, null, { code: -32601, message: `Method not found: ${body.method}` });
   }
 }
 

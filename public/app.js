@@ -9,6 +9,7 @@
   let token = localStorage.getItem('cfpanel_token') || '';
   setTokenGetter(() => token); // api 层通过 getter 读取当前 token
   let canExec = true; // 当前用户是否有 exec 权限（PAT 按 scopes，admin 恒有；控制终端/文件菜单显隐）
+  let isAdmin = true; // 当前用户是否面板管理员（JWT 登录；PAT 恒 false；控制修改/删除等管理菜单显隐）
   let serversCache = [];
   let pushTimer = null;    // 每 3 秒发一次 sync 请求的定时器（老化）
   let monitorState = null; // { serverId, serverName, range } 当前监控视图
@@ -49,8 +50,9 @@
     $('#auth').classList.add('hidden');
     $('#app').classList.remove('hidden');
     $('#whoami').textContent = user.is_pat ? `令牌（${escapeHtml(user.username)}）` : escapeHtml(user.username || 'admin');
-    // PAT：exec 权限决定终端/文件菜单显隐（admin 恒有 exec）
+    // PAT：exec 权限决定终端/文件菜单显隐（admin 恒有 exec）；修改/删除等管理操作仅 admin（PAT 恒隐藏）
     canExec = user.role === 1 || (user.scopes && user.scopes.includes('server:exec'));
+    isAdmin = !user.is_pat;
     loadServers(); // 先拉一次，WS 建立后每 3 秒由服务端推送覆盖
     startPush();
     idleGuard.start(); // 空闲观看保护：登录后开始计时
@@ -67,7 +69,8 @@
     const msg = $('#auth-msg');
     msg.textContent = '';
     try {
-      const data = await api('/api/login', { method: 'POST', body: JSON.stringify({ password }) });
+      // 用户名可选：多用户（PANEL_USERS）区分同名密码，单管理员可留空
+      const data = await api('/api/login', { method: 'POST', body: JSON.stringify({ username: $('#auth-user').value.trim(), password }) });
       token = data.token;
       localStorage.setItem('cfpanel_token', token);
       showApp(data.user);
@@ -174,8 +177,8 @@
               <button data-act="file" data-id="${s.id}" data-name="${escapeHtml(s.name)}">文件</button>` : ''}
               <button data-act="mon" data-id="${s.id}" data-name="${escapeHtml(s.name)}">监控</button>
               <button data-act="custom" data-id="${s.id}" data-name="${escapeHtml(s.name)}">自定义指标</button>
-              <button data-act="edit" data-id="${s.id}" data-name="${escapeHtml(s.name)}" data-group="${escapeHtml(s.group || '')}" data-order="${s.display_index || 0}">修改</button>
-              <button data-act="del" data-id="${s.id}" data-name="${escapeHtml(s.name)}" class="dd-danger">删除</button>
+              ${isAdmin ? `<button data-act="edit" data-id="${s.id}" data-name="${escapeHtml(s.name)}" data-group="${escapeHtml(s.group || '')}" data-order="${s.display_index || 0}">修改</button>
+              <button data-act="del" data-id="${s.id}" data-name="${escapeHtml(s.name)}" class="dd-danger">删除</button>` : ''}
             </div>
           </div>
           <span class="badge ${s.online ? 'on' : 'off'}"><i class="dot"></i>${s.online ? '在线' : '离线'}</span>

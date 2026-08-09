@@ -473,7 +473,6 @@ async fn file_zip(path: &str, sid: &str, tmp_dir: &str) -> Result<(String, u64),
         return Err("not a directory".into());
     }
     // 目录大小上限使用 FILE_LIMIT（500 MB），防止 OOM
-    let mut total_size: u64 = 0;
     fn walk_dir_size(path: &std::path::Path) -> Result<u64, std::io::Error> {
         let mut size: u64 = 0;
         for entry in std::fs::read_dir(path)? {
@@ -487,7 +486,7 @@ async fn file_zip(path: &str, sid: &str, tmp_dir: &str) -> Result<(String, u64),
         }
         Ok(size)
     }
-    total_size = walk_dir_size(std::path::Path::new(&path))
+    let total_size = walk_dir_size(std::path::Path::new(&path))
         .map_err(|e| format!("failed to read directory: {}", e))?;
     if total_size > FILE_LIMIT {
         return Err(format!(

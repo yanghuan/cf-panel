@@ -182,7 +182,7 @@ export async function handleApi(request, env) {
 
   // GET /api/me —— 当前用户
   if (method === 'GET' && path === '/api/me') {
-    return json({ id: user.id, username: user.username, role: user.role, is_pat: !!user.pat });
+    return json({ id: user.id, username: user.username, role: user.role, is_pat: !!user.pat, scopes: user.pat ? user.pat.scopes : null });
   }
 
   // GET /api/servers —— 服务器列表（权限过滤由 queryServersForUser 在 SQL 层完成；列表短 TTL 缓存降读放大）

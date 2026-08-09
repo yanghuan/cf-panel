@@ -96,7 +96,7 @@ export function safeJson(s) {
 }
 // 清洗告警配置（PUT /api/settings 用）：只保留合法字段，空 webhook_url 即禁用
 export function sanitizeAlerts(a) {
-  if (!a || typeof a !== 'object') return undefined;
+  if (!a || typeof a !== 'object') return {};
   const out = {};
   const num = (v, def) => {
     const n = Number(v);

@@ -472,6 +472,30 @@ async fn file_zip(path: &str, sid: &str, tmp_dir: &str) -> Result<(String, u64),
     if !meta.is_dir() {
         return Err("not a directory".into());
     }
+    // 目录大小上限使用 FILE_LIMIT（500 MB），防止 OOM
+    let mut total_size: u64 = 0;
+    fn walk_dir_size(path: &std::path::Path) -> Result<u64, std::io::Error> {
+        let mut size: u64 = 0;
+        for entry in std::fs::read_dir(path)? {
+            let entry = entry?;
+            let meta = entry.metadata()?;
+            if meta.is_dir() {
+                size += walk_dir_size(&entry.path())?;
+            } else {
+                size += meta.len();
+            }
+        }
+        Ok(size)
+    }
+    total_size = walk_dir_size(std::path::Path::new(&path))
+        .map_err(|e| format!("failed to read directory: {}", e))?;
+    if total_size > FILE_LIMIT {
+        return Err(format!(
+            "directory too large ({:.1} MB > {:.1} MB limit)",
+            total_size as f64 / 1_048_576.0,
+            FILE_LIMIT as f64 / 1_048_576.0
+        ));
+    }
     let zip_path = format!("{}/dl-{sid}.zip", tmp_dir.trim_end_matches('/'));
     let path = path.to_string();
     let r = blocking_with_timeout(120, move || -> Result<(String, u64), String> {

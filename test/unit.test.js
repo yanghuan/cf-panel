@@ -134,8 +134,8 @@ test('safeJson', () => {
 
 // ---------------- 告警配置清洗 ----------------
 test('sanitizeAlerts', () => {
-  assert.equal(I.sanitizeAlerts(null), undefined);
-  assert.equal(I.sanitizeAlerts('x'), undefined);
+  assert.deepEqual(I.sanitizeAlerts(null), {});
+  assert.deepEqual(I.sanitizeAlerts('x'), {});
   assert.deepEqual(I.sanitizeAlerts({}), {});
 
   const out = I.sanitizeAlerts({

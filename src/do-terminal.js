@@ -470,30 +470,32 @@ export class TerminalDO {
             return;
           }
           if (j && j.type === 'report') {
-            const serverId = this.wsServerId(ws);
-            if (serverId) {
-              await handleReport(this.env, {
-                serverId,
-                cpu: j.cpu,
-                mem_used: j.mem_used,
-                mem_total: j.mem_total,
-                net_in: j.net_in,
-                net_out: j.net_out,
-                extra: j.extra,
-                info: j.info,
-                probes: j.probes,
-                custom: j.custom,
-              });
-              await this.syncAgentInterval(ws, serverId);
-              // 控制通道保活心跳（30s 限频）：agent 端 read -t 180 需要周期性下行流量，
-              // 否则健康但安静（无指令下发）时会被误判半开而每 ~180s 重连
-              const nowP = Date.now();
-              const lastP = this.lastPingAt.get(serverId) || 0;
-              if (nowP - lastP > 30000) {
-                this.lastPingAt.set(serverId, nowP);
-                try { ws.send(JSON.stringify({ type: 'ping' })); } catch { /* ignore */ }
+            try {
+              const serverId = this.wsServerId(ws);
+              if (serverId) {
+                await handleReport(this.env, {
+                  serverId,
+                  cpu: j.cpu,
+                  mem_used: j.mem_used,
+                  mem_total: j.mem_total,
+                  net_in: j.net_in,
+                  net_out: j.net_out,
+                  extra: j.extra,
+                  info: j.info,
+                  probes: j.probes,
+                  custom: j.custom,
+                });
+                await this.syncAgentInterval(ws, serverId);
+                // 控制通道保活心跳（30s 限频）：agent 端 read -t 180 需要周期性下行流量，
+                // 否则健康但安静（无指令下发）时会被误判半开而每 ~180s 重连
+                const nowP = Date.now();
+                const lastP = this.lastPingAt.get(serverId) || 0;
+                if (nowP - lastP > 30000) {
+                  this.lastPingAt.set(serverId, nowP);
+                  try { ws.send(JSON.stringify({ type: 'ping' })); } catch { /* ignore */ }
+                }
               }
-            }
+            } catch (e) { console.error('handleReport failed:', e); }
           }
         } catch { /* 忽略非 JSON 的控制消息 */ }
       }

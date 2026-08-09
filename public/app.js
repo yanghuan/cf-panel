@@ -50,7 +50,7 @@
     $('#app').classList.remove('hidden');
     $('#whoami').textContent = user.is_pat ? `令牌（${escapeHtml(user.username)}）` : escapeHtml(user.username || 'admin');
     // PAT：exec 权限决定终端/文件菜单显隐（admin 恒有 exec）
-    canExec = user.role === 1 || (user.pat && user.pat.scopes.includes('server:exec'));
+    canExec = user.role === 1 || (user.scopes && user.scopes.includes('server:exec'));
     loadServers(); // 先拉一次，WS 建立后每 3 秒由服务端推送覆盖
     startPush();
     idleGuard.start(); // 空闲观看保护：登录后开始计时

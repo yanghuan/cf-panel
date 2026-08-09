@@ -10,7 +10,7 @@
   <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' ws: wss: https://ipapi.co https://ipwho.is; frame-ancestors 'none'">
   <!-- 依赖已本地化（public/vendor），避免外部 CDN 不可达/供应链风险 -->
   <link rel="stylesheet" href="/vendor/xterm.min.css" />
-  <link rel="stylesheet" href="/style.css?v=25" />
+  <link rel="stylesheet" href="/style.css?v=26" />
   <script defer src="/vendor/chart.umd.min.js"></script>
 </head>
 <body>
@@ -127,13 +127,22 @@
     </div>
     <div class="settings-body">
       <div class="settings-row">
-        <input id="inp-name" type="text" placeholder="服务器名称" />
+        <div class="field">
+          <input id="inp-name" type="text" placeholder="服务器名称" />
+          <span class="field-tag">名称</span>
+        </div>
       </div>
       <div class="settings-row">
-        <input id="inp-group" type="text" placeholder="分组(可选)" />
+        <div class="field">
+          <input id="inp-group" type="text" placeholder="分组(可选)" />
+          <span class="field-tag">分组</span>
+        </div>
       </div>
       <div class="settings-row">
-        <input id="inp-order" type="number" placeholder="序号(可选)" />
+        <div class="field">
+          <input id="inp-order" type="number" placeholder="序号(可选)" />
+          <span class="field-tag">序号</span>
+        </div>
       </div>
       <div class="settings-row">
         <button id="btn-add-server">添加服务器</button>

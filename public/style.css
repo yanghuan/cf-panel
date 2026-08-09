@@ -495,6 +495,24 @@ button.danger:hover { background: rgba(248, 113, 113, .12); }
 .settings-body h4:first-child { margin-top: 0; }
 .settings-row { display: flex; gap: 8px; align-items: center; margin-bottom: 8px; flex-wrap: wrap; }
 .settings-row input { flex: 1; min-width: 160px; }
+/* 输入框右端常驻字段标签：输入为空时 placeholder 可见（标签隐藏），
+   有文字时 placeholder 消失、标签显示在内部右端 —— 修改弹窗预填时仍能识别字段 */
+.field { position: relative; flex: 1; min-width: 160px; }
+.field input { width: 100%; padding-right: 48px; }
+.field-tag {
+  position: absolute;
+  right: 10px;
+  top: 50%;
+  transform: translateY(-50%);
+  font-size: 11px;
+  color: var(--muted);
+  pointer-events: none;
+  max-width: 55%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.field input:placeholder-shown ~ .field-tag { display: none; }
 /* checkbox 例外：不被 flex:1 拉伸成长条，固定尺寸 + 主题色 */
 .settings-row input[type="checkbox"] {
   flex: 0 0 auto;
@@ -674,7 +692,7 @@ button.danger:hover { background: rgba(248, 113, 113, .12); }
   .auth-card { width: calc(100vw - 40px); max-width: 320px; }
   .settings-body { padding: 14px; }
   .settings-row { flex-direction: column; align-items: stretch; }
-  .settings-row input { min-width: 0; }
+  .settings-row input, .field { min-width: 0; }
 }
 
 /* ---------- 手机窄屏（≤420px）：卡片单列 ---------- */

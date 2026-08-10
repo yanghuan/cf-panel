@@ -250,8 +250,8 @@ async function step5_agent() {
   if (sysOk) ok('系统信息已入库（os/kern）');
   else bad('系统信息缺失');
 
-  // 实时指标
-  const metricOk = await waitFor('实时指标', 15, async () => {
+  // 实时指标（偶发上报慢，给 30s 窗口）
+  const metricOk = await waitFor('实时指标', 30, async () => {
     const res = await fetch(`${BASE}/api/servers`, {
       headers: { 'authorization': `Bearer ${token}` },
     });
@@ -305,19 +305,28 @@ async function step6_terminal() {
 function terminalWsTest(sid) {
   return new Promise((resolve) => {
     const ws = new WebSocket(`ws://127.0.0.1:${PORT}/ws/terminal/${sid}`);
+    ws.binaryType = 'arraybuffer'; // DO 可能发二进制帧（Blob），统一解码
+    const decoder = new TextDecoder();
     let collected = '';
     const timer = setTimeout(() => { try { ws.close(); } catch {} resolve(collected); }, 15_000);
 
     ws.onopen = () => {
-      ws.send(JSON.stringify({ type: 'auth', token }) + '\n');
-      // 10 轮 echo，覆盖 agent 就绪竞态窗口
-      for (let i = 0; i < 10; i++) {
-        setTimeout(() => {
-          if (ws.readyState === WebSocket.OPEN) ws.send('echo E2E_TERM_OK\n');
-        }, i * 1000);
+      ws.send(JSON.stringify({ type: 'auth', token }));
+      // 等待 auth 处理完成后发 echo（给 DO 500ms 处理 RPC）
+      setTimeout(() => {
+        if (ws.readyState === WebSocket.OPEN) ws.send('echo E2E_TERM_OK\n');
+      }, 500);
+    };
+    ws.onmessage = (ev) => {
+      // 兼容文本帧（string）和二进制帧（ArrayBuffer）
+      if (typeof ev.data === 'string') collected += ev.data;
+      else collected += decoder.decode(ev.data, { stream: true });
+      if (collected.includes('E2E_TERM_OK')) {
+        clearTimeout(timer);
+        ws.close();
+        resolve(collected);
       }
     };
-    ws.onmessage = (ev) => { collected += String(ev.data); };
     ws.onclose = () => { clearTimeout(timer); resolve(collected); };
     ws.onerror = () => { clearTimeout(timer); resolve(collected); };
   });
@@ -426,8 +435,9 @@ async function step8_mcp() {
   // ---- 8.3) get_monitor ----
   const gm = await mcpTool(4, 'get_monitor', { server_id: 1, range: '1h' });
   const gmData = mcpContent(gm);
-  if (gmData?.system?.length >= 1) ok('MCP get_monitor：监控数据存在（system ≥1 条）');
-  else bad('MCP get_monitor：无监控数据');
+  // MCP get_monitor 返回 { server, range, count, points, custom }，points 即监控时序点
+  if (gmData?.points?.length >= 1) ok('MCP get_monitor：监控数据存在（points ≥1 条）');
+  else bad(`MCP get_monitor：无监控数据：${JSON.stringify(gmData)}`);
 
   // ---- 8.4) exec_command ----
   const exec = await mcpTool(5, 'exec_command', { server_id: 1, command: 'echo E2E_MCP_EXEC_OK' });

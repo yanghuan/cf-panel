@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # ============================================================
-# cf-panel E2E：真实环境联调（wrangler dev --local + agent.sh）
+# cf-panel E2E：真实环境联调（wrangler dev --local + Rust agent）
 # 验证链路：worker 启动 → D1 建表 → 登录 → 注册服务器 →
-#           agent 控制通道上线 → 监控上报落库 → 终端双向透传
+#           agent 控制通道上线 → 监控上报落库 → 终端双向透传 →
+#           文件上传/下载 → MCP 全量工具（14 个）
 # 依赖：
 #   - node >= 22（含 wrangler，npm i -D wrangler）
 #   - curl / jq 在 PATH（CI 用 apt 安装，agent 本身也依赖 jq）
@@ -256,6 +257,245 @@ else
   echo "  （跳过：未检测到 node，文件用例仅在 CI 运行）"
 fi
 rm -f /tmp/e2e-upload.bin "$TMP/upload.bin.down"
+
+# 8) MCP 接口测试（14 个工具全覆盖）
+echo "[8/8] MCP 接口测试（14 个工具）..."
+
+# MCP 辅助：通用 JSON-RPC 调用
+mcp_call() {
+  local id=${1:?} method=${2:?} params=${3:-}
+  local body
+  if [ -z "$params" ]; then
+    body="{\"jsonrpc\":\"2.0\",\"id\":$id,\"method\":\"$method\"}"
+  else
+    body="{\"jsonrpc\":\"2.0\",\"id\":$id,\"method\":\"$method\",\"params\":$params}"
+  fi
+  curl -s -X POST "$BASE/mcp" \
+    -H "authorization: Bearer $TOKEN" \
+    -H 'content-type: application/json' \
+    -d "$body"
+}
+
+# MCP 辅助：tools/call 快捷调用，返回原始 JSON
+mcp_tool() {
+  local id=${1:?} name=${2:?} args=${3:-{}}
+  mcp_call "$id" "tools/call" "{\"name\":\"$name\",\"arguments\":$args}"
+}
+
+# MCP 辅助：从 tools/call 成功结果中提取 content[0].text 并解析为 JSON
+mcp_text() {
+  jq -r '.result.content[0].text' 2>/dev/null
+}
+
+# ---------- 8.0) initialize ----------
+INIT=$(mcp_call 1 initialize '{"protocolVersion":"2025-11-25","capabilities":{}}')
+INIT_VER=$(jq -r '.result.protocolVersion' <<<"$INIT" 2>/dev/null || true)
+if [ "$INIT_VER" = "2025-11-25" ]; then
+  ok "MCP initialize：协议版本 2025-11-25"
+else
+  bad "MCP initialize 失败：$INIT"
+fi
+
+# ---------- 8.1) tools/list ----------
+LIST=$(mcp_call 2 tools/list)
+TOOL_COUNT=$(jq -r '.result.tools | length' <<<"$LIST" 2>/dev/null || true)
+if [ "$TOOL_COUNT" = "14" ]; then
+  ok "MCP tools/list：14 个工具全部注册"
+else
+  bad "MCP tools/list：期望 14 个工具，实际 $TOOL_COUNT"
+  jq -r '.result.tools[].name' <<<"$LIST" 2>/dev/null || true
+fi
+
+# ---------- 8.2) list_servers ----------
+LS=$(mcp_tool 3 list_servers)
+LS_TEXT=$(echo "$LS" | mcp_text)
+if echo "$LS_TEXT" | jq -e '.[] | select(.name=="e2e-node" and .online==true)' >/dev/null 2>&1; then
+  ok "MCP list_servers：e2e-node 在线，含实时指标"
+else
+  bad "MCP list_servers：e2e-node 未找到或不在线"
+fi
+
+# ---------- 8.3) get_monitor ----------
+GM=$(mcp_tool 4 get_monitor '{"server_id":1,"range":"1h"}')
+GM_TEXT=$(echo "$GM" | mcp_text)
+if echo "$GM_TEXT" | jq -e '.system | length >= 1' >/dev/null 2>&1; then
+  ok "MCP get_monitor：监控数据存在（system ≥1 条）"
+else
+  bad "MCP get_monitor：无监控数据"
+fi
+
+# ---------- 8.4) exec_command ----------
+EXEC=$(mcp_tool 5 exec_command '{"server_id":1,"command":"echo E2E_MCP_EXEC_OK"}')
+EXEC_TEXT=$(echo "$EXEC" | mcp_text)
+if echo "$EXEC_TEXT" | jq -e '.stdout | test("E2E_MCP_EXEC_OK")' >/dev/null 2>&1; then
+  ok "MCP exec_command：agent 真实执行，输出匹配"
+else
+  bad "MCP exec_command 失败：$EXEC"
+fi
+
+# ---------- 8.5) create_upload + Bearer 上传 + 验证 ----------
+# 签名 URL 使用 https:// 协议，wrangler dev --local 仅 HTTP，因此工具响应做结构校验，
+# 实际上传走 Bearer 鉴权路径（验证全链路流式分片 → agent 原子写）
+CU=$(mcp_tool 6 create_upload '{"server_id":1,"path":"/tmp/e2e-mcp-upload.txt"}')
+CU_TEXT=$(echo "$CU" | mcp_text)
+CU_URL=$(jq -r '.upload_url // ""' <<<"$CU_TEXT" 2>/dev/null || true)
+CU_EXP=$(jq -r '.expires_in_seconds // 0' <<<"$CU_TEXT" 2>/dev/null || true)
+if [ -n "$CU_URL" ] && [ "$CU_EXP" -gt 0 ] 2>/dev/null && [ "$CU_EXP" -le 600 ]; then
+  ok "MCP create_upload：签名 URL 结构正确（expires_in_seconds=$CU_EXP）"
+else
+  bad "MCP create_upload：响应结构异常：$CU_TEXT"
+fi
+
+# Bearer 鉴权上传测试文件并验证内容一致性
+UP_RES=$(curl -s -X POST "$BASE/api/file_upload?server_id=1&path=/tmp/e2e-mcp-upload.txt" \
+  -H "authorization: Bearer $TOKEN" --data-binary "E2E_MCP_UPLOAD_CONTENT" || true)
+UP_OK=$(jq -r '.ok // false' <<<"$UP_RES" 2>/dev/null || true)
+if [ "$UP_OK" = "true" ]; then
+  # 通过 exec_command 验证文件内容
+  VERIFY=$(mcp_tool 7 exec_command '{"server_id":1,"command":"cat /tmp/e2e-mcp-upload.txt"}')
+  VERIFY_TEXT=$(echo "$VERIFY" | mcp_text)
+  if echo "$VERIFY_TEXT" | jq -e '.stdout | test("E2E_MCP_UPLOAD_CONTENT")' >/dev/null 2>&1; then
+    ok "MCP 上传：Bearer 上传 + exec_command 验证内容一致"
+  else
+    bad "MCP 上传：内容验证不匹配：$VERIFY_TEXT"
+  fi
+else
+  bad "MCP 上传：Bearer POST 失败：$UP_RES"
+fi
+# 清理上传测试文件
+mcp_tool 8 exec_command '{"server_id":1,"command":"rm -f /tmp/e2e-mcp-upload.txt"}' >/dev/null 2>&1 || true
+
+# ---------- 8.6) add_server ----------
+AS=$(mcp_tool 10 add_server '{"name":"e2e-mcp","group":"e2e-mcp","sort_order":10}')
+AS_TEXT=$(echo "$AS" | mcp_text)
+AS_KEY=$(jq -r '.agent_key // ""' <<<"$AS_TEXT" 2>/dev/null || true)
+AS_ID=$(jq -r '.server_id // 0' <<<"$AS_TEXT" 2>/dev/null || true)
+AS_WSS=$(jq -r '.wss_base // ""' <<<"$AS_TEXT" 2>/dev/null || true)
+if [ "${#AS_KEY}" -eq 64 ]; then
+  ok "MCP add_server：agent_key 64 位，wss_base=$AS_WSS"
+else
+  bad "MCP add_server 失败：$AS_TEXT"
+fi
+
+# ---------- 8.7) update_server ----------
+if [ "$AS_ID" -gt 0 ] 2>/dev/null; then
+  US=$(mcp_tool 11 update_server "{\"server_id\":$AS_ID,\"name\":\"e2e-mcp-renamed\"}")
+  US_TEXT=$(echo "$US" | mcp_text)
+  US_NAME=$(jq -r '.name // ""' <<<"$US_TEXT" 2>/dev/null || true)
+  if [ "$US_NAME" = "e2e-mcp-renamed" ]; then
+    ok "MCP update_server：重命名成功"
+  else
+    bad "MCP update_server 失败：$US_TEXT"
+  fi
+else
+  bad "MCP update_server：跳过（add_server 未返回有效 ID）"
+fi
+
+# ---------- 8.8) delete_server ----------
+if [ "$AS_ID" -gt 0 ] 2>/dev/null; then
+  DS=$(mcp_tool 12 delete_server "{\"server_id\":$AS_ID}")
+  DS_TEXT=$(echo "$DS" | mcp_text)
+  DS_OK=$(jq -r '.ok // false' <<<"$DS_TEXT" 2>/dev/null || true)
+  if [ "$DS_OK" = "true" ]; then
+    ok "MCP delete_server：删除成功"
+  else
+    bad "MCP delete_server 失败：$DS_TEXT"
+  fi
+else
+  bad "MCP delete_server：跳过（add_server 未返回有效 ID）"
+fi
+
+# ---------- 8.9) Token CRUD + PAT 权限 ----------
+# create_token → 提取 PAT 明文 → PAT 调管理工具应被拒 → list_tokens 取 ID → revoke_token
+CT=$(mcp_tool 13 create_token '{"name":"e2e-mcp-pat","scopes":["server:read"],"server_ids":[1]}')
+CT_TEXT=$(echo "$CT" | mcp_text)
+PAT_TOKEN=$(jq -r '.token // ""' <<<"$CT_TEXT" 2>/dev/null || true)
+if echo "$PAT_TOKEN" | grep -q '^cfp_'; then
+  ok "MCP create_token：PAT 创建成功（cfp_ 前缀）"
+else
+  bad "MCP create_token 失败：$CT_TEXT"
+fi
+
+# PAT 被拒管理工具：用 PAT 调 add_server → expect "admin only"
+if [ -n "$PAT_TOKEN" ] && echo "$PAT_TOKEN" | grep -q '^cfp_'; then
+  PAT_DENIED=$(curl -s -X POST "$BASE/mcp" \
+    -H "authorization: Bearer $PAT_TOKEN" \
+    -H 'content-type: application/json' \
+    -d '{"jsonrpc":"2.0","id":30,"method":"tools/call","params":{"name":"add_server","arguments":{"name":"evil"}}}' || true)
+  PAT_ERR=$(echo "$PAT_DENIED" | jq -r '.result.content[0].text // ""' 2>/dev/null || true)
+  if echo "$PAT_ERR" | grep -q 'admin only'; then
+    ok "MCP 权限：PAT 被拒管理工具（admin only）"
+  else
+    bad "MCP 权限：PAT 未正确拒绝：$PAT_DENIED"
+  fi
+else
+  bad "MCP 权限测试跳过（无有效 PAT）"
+fi
+
+# list_tokens → 按名称找到 e2e-mcp-pat 的 id，用于 revoke
+LT=$(mcp_tool 14 list_tokens)
+LT_TEXT=$(echo "$LT" | mcp_text)
+LT_COUNT=$(jq -r 'length' <<<"$LT_TEXT" 2>/dev/null || true)
+if [ "$LT_COUNT" -ge 1 ] 2>/dev/null; then
+  ok "MCP list_tokens：至少 1 个 token"
+else
+  bad "MCP list_tokens：无 token"
+fi
+
+PAT_TID=$(jq -r '.[] | select(.name=="e2e-mcp-pat") | .id' <<<"$LT_TEXT" 2>/dev/null || true)
+if [ -n "$PAT_TID" ] && [ "$PAT_TID" -gt 0 ] 2>/dev/null; then
+  RV=$(mcp_tool 15 revoke_token "{\"token_id\":$PAT_TID}")
+  RV_TEXT=$(echo "$RV" | mcp_text)
+  RV_OK=$(jq -r '.ok // false' <<<"$RV_TEXT" 2>/dev/null || true)
+  if [ "$RV_OK" = "true" ]; then
+    ok "MCP revoke_token：撤销成功"
+  else
+    bad "MCP revoke_token 失败：$RV_TEXT"
+  fi
+else
+  bad "MCP revoke_token：跳过（list_tokens 未返回 e2e-mcp-pat 的 ID）"
+fi
+
+# ---------- 8.10) get_audit_logs ----------
+AL=$(mcp_tool 16 get_audit_logs '{"limit":5}')
+AL_TEXT=$(echo "$AL" | mcp_text)
+AL_COUNT=$(jq -r 'length' <<<"$AL_TEXT" 2>/dev/null || true)
+if [ "$AL_COUNT" -ge 1 ] 2>/dev/null; then
+  ok "MCP get_audit_logs：有审计记录（≥1 条）"
+else
+  bad "MCP get_audit_logs：无审计记录"
+fi
+
+# ---------- 8.11) get_usage ----------
+GU=$(mcp_tool 17 get_usage)
+GU_TEXT=$(echo "$GU" | mcp_text)
+if echo "$GU_TEXT" | jq -e '.estimates_per_day' >/dev/null 2>&1; then
+  ok "MCP get_usage：用量数据存在"
+else
+  bad "MCP get_usage 失败：$GU_TEXT"
+fi
+
+# ---------- 8.12) get_settings / update_settings ----------
+GS=$(mcp_tool 18 get_settings)
+GS_TEXT=$(echo "$GS" | mcp_text)
+GS_NAME=$(jq -r '.site_name // ""' <<<"$GS_TEXT" 2>/dev/null || true)
+if [ -n "$GS_TEXT" ] && [ "$GS_TEXT" != "null" ]; then
+  ok "MCP get_settings：读取成功"
+else
+  bad "MCP get_settings 失败：$GS_TEXT"
+fi
+
+# update_settings 改 site_name 后验证并恢复
+UPS=$(mcp_tool 19 update_settings '{"site_name":"E2E MCP Test"}')
+UPS_TEXT=$(echo "$UPS" | mcp_text)
+UPS_NAME=$(jq -r '.site_name // ""' <<<"$UPS_TEXT" 2>/dev/null || true)
+if [ "$UPS_NAME" = "E2E MCP Test" ]; then
+  ok "MCP update_settings：更新 site_name 成功"
+  # 恢复原始值
+  mcp_tool 20 update_settings "{\"site_name\":$(jq -R . <<<"$GS_NAME")}" >/dev/null 2>&1 || true
+else
+  bad "MCP update_settings 失败：$UPS_TEXT"
+fi
 
 # 清理由 trap 统一处理
 exit 0

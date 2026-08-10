@@ -318,6 +318,15 @@ wrangler secret put PANEL_USERS      # 回车后粘贴值，如 alice:pass1,bob:
 | `get_monitor` | 监控历史（`server_id`/`server_name` + `range`：1h/12h/3d/7d/30d） |
 | `exec_command` | 在指定服务器上执行一次性 shell 命令并返回输出（`server_id`/`server_name` + `command`，`timeout` 1~25s 默认 25s，stdout 上限约 44KB）；**写操作**，需 exec 权限（管理员或带 `server:exec` scope 的 PAT）；经控制通道直达 agent（`sh -c` 执行，超时 kill 进程组） |
 | `create_upload` | 创建一次性文件上传**签名 URL**（大文件/二进制通道，不经过 LLM 上下文）：`path`（绝对路径）+ 可选 `overwrite`；返回 `upload_url` 供 curl/fetch POST（body=原始字节），HMAC 签名绑定 server/path/overwrite、10 分钟过期、无需 Bearer；AI 将 URL 转给用户/程序执行 |
+| `add_server` | 注册新服务器（**仅管理员**），返回一次性 `agent_key` 明文与部署地址 |
+| `update_server` | 修改服务器名称/分组/排序（仅管理员；`server_id`/`server_name` + 要改的字段） |
+| `delete_server` | 删除服务器（仅管理员；清监控历史 + 审计 + 断开 agent） |
+| `list_tokens` | 列出 PAT 概要（仅管理员，不含哈希/明文） |
+| `create_token` | 创建 PAT（仅管理员；`name` + `scopes`/`server_ids`，明文只返回一次） |
+| `revoke_token` | 撤销 PAT（仅管理员，立即失效） |
+| `get_audit_logs` | 审计日志（仅管理员，`limit` 默认 100 最大 500，保留 90 天） |
+| `get_usage` | 用量观测（仅管理员：上报帧/DO 事件/D1 写行估算） |
+| `get_settings` / `update_settings` | 读取/更新面板设置（仅管理员：站点名/公告/IP 归属地开关/告警配置） |
 
 **客户端配置示例**（Claude Desktop / 支持 MCP 的客户端，`claude_desktop_config.json`）：
 

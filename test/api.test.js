@@ -782,7 +782,12 @@ test('MCP：tools/list 与 tools/call', async () => {
   await addServer(env, token, { name: 'web-1', group: 'prod' });
 
   const list = await (await mcp(env, { token, body: { jsonrpc: '2.0', id: 1, method: 'tools/list' } })).json();
-  assert.deepEqual(list.result.tools.map((t) => t.name), ['list_servers', 'get_monitor', 'exec_command', 'create_upload']);
+  assert.deepEqual(list.result.tools.map((t) => t.name), [
+    'list_servers', 'get_monitor', 'exec_command', 'create_upload',
+    'add_server', 'delete_server', 'update_server',
+    'list_tokens', 'create_token', 'revoke_token',
+    'get_audit_logs', 'get_usage', 'get_settings', 'update_settings',
+  ]);
 
   // create_upload：签发签名 URL（结构 + 权限 + 绑定字段）
   const cu = await (await mcp(env, { token, body: { jsonrpc: '2.0', id: 12, method: 'tools/call', params: { name: 'create_upload', arguments: { server_name: 'web-1', path: '/opt/app.tar.gz' } } } })).json();
@@ -858,6 +863,73 @@ test('MCP：tools/list 与 tools/call', async () => {
   // 未知工具 → -32602
   const bad = await (await mcp(env, { token, body: { jsonrpc: '2.0', id: 5, method: 'tools/call', params: { name: 'rm_rf' } } })).json();
   assert.equal(bad.error.code, -32602);
+
+  // ---- 管理类工具（仅管理员）----
+  // add_server：新增服务器，返回 agent_key 明文
+  const as = await (await mcp(env, { token, body: { jsonrpc: '2.0', id: 20, method: 'tools/call', params: { name: 'add_server', arguments: { name: 'mcp-new', group: 'mcp', sort_order: 3 } } } })).json();
+  assert.equal(as.result.isError, false);
+  const asRes = JSON.parse(as.result.content[0].text);
+  assert.equal(asRes.name, 'mcp-new');
+  assert.equal(asRes.server_id, 3);
+  assert.ok(asRes.agent_key && asRes.agent_key.length === 64, 'agent_key 明文返回');
+  // add_server：缺 name → isError
+  const asBad = await (await mcp(env, { token, body: { jsonrpc: '2.0', id: 21, method: 'tools/call', params: { name: 'add_server', arguments: {} } } })).json();
+  assert.equal(asBad.result.isError, true);
+  assert.match(asBad.result.content[0].text, /name required/);
+
+  // update_server：改名（server_name 定位）
+  const us = await (await mcp(env, { token, body: { jsonrpc: '2.0', id: 22, method: 'tools/call', params: { name: 'update_server', arguments: { server_name: 'mcp-new', name: 'mcp-renamed' } } } })).json();
+  assert.equal(us.result.isError, false);
+  const usRes = JSON.parse(us.result.content[0].text);
+  assert.equal(usRes.name, 'mcp-renamed');
+
+  // create_token / list_tokens / revoke_token
+  const ct = await (await mcp(env, { token, body: { jsonrpc: '2.0', id: 23, method: 'tools/call', params: { name: 'create_token', arguments: { name: 'mcp-tok', scopes: ['server:read'], server_ids: [1] } } } })).json();
+  assert.equal(ct.result.isError, false);
+  const ctRes = JSON.parse(ct.result.content[0].text);
+  assert.match(ctRes.token, /^cfp_/);
+  const lt = await (await mcp(env, { token, body: { jsonrpc: '2.0', id: 24, method: 'tools/call', params: { name: 'list_tokens', arguments: {} } } })).json();
+  const ltRes = JSON.parse(lt.result.content[0].text);
+  assert.equal(ltRes.length, 1);
+  assert.equal(ltRes[0].name, 'mcp-tok');
+  assert.ok(!('token_hash' in ltRes[0]), '不含哈希');
+  const rk = await (await mcp(env, { token, body: { jsonrpc: '2.0', id: 25, method: 'tools/call', params: { name: 'revoke_token', arguments: { token_id: ltRes[0].id } } } })).json();
+  assert.equal(rk.result.isError, false);
+
+  // get_audit_logs：应有 server.create / server.update / server.delete 前的记录
+  const al = await (await mcp(env, { token, body: { jsonrpc: '2.0', id: 26, method: 'tools/call', params: { name: 'get_audit_logs', arguments: { limit: 10 } } } })).json();
+  const alRes = JSON.parse(al.result.content[0].text);
+  assert.ok(alRes.length >= 2, '有审计记录');
+  assert.ok(alRes.some((r) => r.action === 'server.create'));
+
+  // get_settings / update_settings
+  const gs = await (await mcp(env, { token, body: { jsonrpc: '2.0', id: 27, method: 'tools/call', params: { name: 'get_settings', arguments: {} } } })).json();
+  const gsRes = JSON.parse(gs.result.content[0].text);
+  assert.equal(typeof gsRes.site_name, 'undefined', '初始无设置');
+  const us2 = await (await mcp(env, { token, body: { jsonrpc: '2.0', id: 28, method: 'tools/call', params: { name: 'update_settings', arguments: { site_name: 'MCP 面板' } } } })).json();
+  assert.equal(us2.result.isError, false);
+  const us2Res = JSON.parse(us2.result.content[0].text);
+  assert.equal(us2Res.site_name, 'MCP 面板');
+  const gs2 = await (await mcp(env, { token, body: { jsonrpc: '2.0', id: 29, method: 'tools/call', params: { name: 'get_settings', arguments: {} } } })).json();
+  assert.equal(JSON.parse(gs2.result.content[0].text).site_name, 'MCP 面板');
+
+  // get_usage：结构完整
+  const gu = await (await mcp(env, { token, body: { jsonrpc: '2.0', id: 30, method: 'tools/call', params: { name: 'get_usage', arguments: {} } } })).json();
+  const guRes = JSON.parse(gu.result.content[0].text);
+  assert.ok('estimates_per_day' in guRes && 'metrics_do' in guRes);
+
+  // PAT 不能使用管理工具（仅管理员）
+  const pat = await requestBuilder(worker)(env, { method: 'POST', path: '/api/tokens', token, body: { name: 'pat-x', scopes: ['server:read'] } });
+  const patToken = (await pat.json()).token;
+  const patDenied = await (await mcp(env, { token: patToken, body: { jsonrpc: '2.0', id: 31, method: 'tools/call', params: { name: 'add_server', arguments: { name: 'x' } } } })).json();
+  assert.equal(patDenied.result.isError, true);
+  assert.match(patDenied.result.content[0].text, /admin only/);
+
+  // delete_server：按 server_name 删除 mcp-renamed
+  const ds = await (await mcp(env, { token, body: { jsonrpc: '2.0', id: 32, method: 'tools/call', params: { name: 'delete_server', arguments: { server_name: 'mcp-renamed' } } } })).json();
+  assert.equal(ds.result.isError, false);
+  const dsRes = JSON.parse(ds.result.content[0].text);
+  assert.equal(dsRes.ok, true);
 });
 
 test('MCP：坏 JSON → Parse error；协议版本不一致 → HeaderMismatch', async () => {

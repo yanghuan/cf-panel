@@ -74,7 +74,10 @@
 
 #### 3.2.1 MCP（AI 接入端点）
 
-`/mcp` 实现标准 MCP **无状态 Streamable HTTP**（2026-07-28 修订版）：单一 POST 端点、无 `Mcp-Session-Id` 会话、每请求独立 `Authorization: Bearer` 鉴权（复用 JWT/PAT），服务端不返回 session-id 即天然无状态且兼容所有版本客户端。工具：`list_servers`（服务器状态 + 系统信息）、`get_monitor`（监控历史，复用内存热区/D1 归档查询与权限过滤）、`exec_command`（一次性 shell 命令执行，经 TerminalDO 控制通道直达 agent，`canExec` 鉴权：管理员或带 `server:exec` scope 的 PAT，超时 kill 进程组）、`create_upload`（签发一次性文件上传**签名 URL**——HMAC 无状态自验证，绑定 server_id/path/overwrite 并 10 分钟过期，AI 将 URL 转给用户/程序用 curl/fetch POST 原始字节上传，服务端流式分片写 agent；大文件/二进制不经过 LLM 上下文）。JSON-RPC 2.0：`initialize` / `tools/list` / `tools/call` / `ping`；通知返回 202；校验 `Origin` 防 DNS rebinding。
+`/mcp` 实现标准 MCP **无状态 Streamable HTTP**（2026-07-28 修订版）：单一 POST 端点、无 `Mcp-Session-Id` 会话、每请求独立 `Authorization: Bearer` 鉴权（复用 JWT/PAT），服务端不返回 session-id 即天然无状态且兼容所有版本客户端。工具：
+- **只读/操作**：`list_servers`（服务器状态 + 系统信息）、`get_monitor`（监控历史，复用内存热区/D1 归档查询与权限过滤）、`exec_command`（一次性 shell 命令执行，经 TerminalDO 控制通道直达 agent，`canExec` 鉴权：管理员或带 `server:exec` scope 的 PAT，超时 kill 进程组）、`create_upload`（签发一次性文件上传**签名 URL**——HMAC 无状态自验证，绑定 server_id/path/overwrite 并 10 分钟过期，AI 将 URL 转给用户/程序用 curl/fetch POST 原始字节上传，服务端流式分片写 agent；大文件/二进制不经过 LLM 上下文）。
+- **管理类（仅管理员，JWT 登录；PAT 一律拒绝）**：`add_server`（注册新服务器 + 生成 agent key）、`update_server` / `delete_server`（改名/分组/排序 / 删除含历史清理）、`list_tokens` / `create_token` / `revoke_token`（PAT 生命周期，明文只返回一次）、`get_audit_logs`（审计日志）、`get_usage`（用量观测）、`get_settings` / `update_settings`（站点名/公告/IP 归属地开关/告警配置）。
+JSON-RPC 2.0：`initialize` / `tools/list` / `tools/call` / `ping`；通知返回 202；校验 `Origin` 防 DNS rebinding。
 
 #### 3.2.2 告警通知与多用户
 

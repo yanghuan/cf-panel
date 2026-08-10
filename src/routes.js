@@ -53,9 +53,109 @@ const MCP_TOOLS = [
       required: ['path'],
     },
   },
+  {
+    name: 'add_server',
+    description: '注册一台新服务器（面板 D1 记录 + 生成一次性 agent key）。仅管理员。返回 agent_key（明文只返回一次，请妥善保存）与 wss_base/report_url 部署信息。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: '服务器名称（必填）' },
+        group: { type: 'string', description: '分组（可选，默认空=未分组）' },
+        sort_order: { type: 'integer', description: '组内排序序号（可选）' },
+      },
+      required: ['name'],
+    },
+  },
+  {
+    name: 'delete_server',
+    description: '删除一台服务器（清历史监控数据 + 审计 + 断开其 agent 连接）。仅管理员。提供 server_id 或 server_name 之一（重名时须用 server_id）。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        server_id: { type: 'integer', description: '服务器 ID' },
+        server_name: { type: 'string', description: '服务器名称（重名时拒绝，须用 server_id）' },
+      },
+      required: [],
+    },
+  },
+  {
+    name: 'update_server',
+    description: '修改服务器名称/分组/排序。仅管理员。提供 server_id 或 server_name 之一（重名时须用 server_id）；只需传要修改的字段。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        server_id: { type: 'integer', description: '服务器 ID' },
+        server_name: { type: 'string', description: '服务器名称（重名时拒绝，须用 server_id）' },
+        name: { type: 'string', description: '新名称（可选）' },
+        group: { type: 'string', description: '新分组（可选）' },
+        sort_order: { type: 'integer', description: '新排序序号（可选）' },
+      },
+      required: [],
+    },
+  },
+  {
+    name: 'list_tokens',
+    description: '列出全部访问令牌（PAT）概要（id/名称/scopes/server_ids/创建时间，不含哈希与明文）。仅管理员。',
+    inputSchema: { type: 'object', properties: {}, required: [] },
+  },
+  {
+    name: 'create_token',
+    description: '创建访问令牌（PAT）。仅管理员。返回明文 token（只显示一次，请妥善保存）。scopes 合法值：server:read / server:exec（默认 server:read）；server_ids 为空=全部服务器。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: '令牌名称（必填）' },
+        scopes: { type: 'array', items: { type: 'string' }, description: '权限 scope，如 ["server:read"] 或 ["server:read","server:exec"]' },
+        server_ids: { type: 'array', items: { type: 'integer' }, description: '服务器白名单（空=全部）' },
+      },
+      required: ['name'],
+    },
+  },
+  {
+    name: 'revoke_token',
+    description: '删除（撤销）访问令牌，立即失效（已建连接 ≤5s 内关闭）。仅管理员。',
+    inputSchema: {
+      type: 'object',
+      properties: { token_id: { type: 'integer', description: '令牌 ID（见 list_tokens）' } },
+      required: ['token_id'],
+    },
+  },
+  {
+    name: 'get_audit_logs',
+    description: '查询审计日志（倒序，保留 90 天）：谁在何时对哪台机器做了什么操作。仅管理员。',
+    inputSchema: {
+      type: 'object',
+      properties: { limit: { type: 'integer', description: '返回条数，默认 100，最大 500' } },
+      required: [],
+    },
+  },
+  {
+    name: 'get_usage',
+    description: '用量观测：近 24h 上报帧 / DO 事件 / D1 写行估算与当日 API 计数（额度评估参考）。仅管理员。',
+    inputSchema: { type: 'object', properties: {}, required: [] },
+  },
+  {
+    name: 'get_settings',
+    description: '读取面板设置：站点名称/公告/IP 归属地开关/告警 Webhook 配置。仅管理员。',
+    inputSchema: { type: 'object', properties: {}, required: [] },
+  },
+  {
+    name: 'update_settings',
+    description: '更新面板设置（只传要修改的字段）：site_name（站点名）/notice（公告）/geo_lookup（IP 归属地第三方查询开关）/alerts（告警配置，见 get_settings 当前结构）。仅管理员。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        site_name: { type: 'string', description: '站点名称（留空用默认）' },
+        notice: { type: 'string', description: '公告（留空隐藏）' },
+        geo_lookup: { type: 'boolean', description: 'IP 归属地查询（将公网 IP 发送到第三方地理服务）' },
+        alerts: { type: 'object', description: '告警配置对象（enabled/method/url/token/body/content_type/headers/cpu/mem/disk/load/cooldown_min/offline_after_s）' },
+      },
+      required: [],
+    },
+  },
 ];
 import {
-  json, err, requireJwtSecret, signJwt, randomHex, sha256Hex, hashSecret,
+  json, err, requireJwtSecret, signJwt, randomHex, sha256Hex, hashSecret, safeJson,
   kvGet, kvPut, sanitizeAlerts, parseRangeHours,
   doMetrics, doForShard, doPanel, shardForServerId, makeStreamId, shardFromStreamId,
   signUploadToken, verifyUploadToken,
@@ -636,6 +736,201 @@ async function mcpCreateUpload(user, env, args, host, ip) {
   };
 }
 
+// ---- 管理类工具（仅管理员：JWT 登录，PAT 一律拒绝；复用 REST API 语义）----
+
+// 按 server_id 或 server_name 定位服务器（重名拒绝，防在错误的机器上操作）
+async function mcpFindServer(env, args) {
+  const serverId = Number(args.server_id) || 0;
+  let server = null;
+  if (serverId) {
+    server = await env.DB.prepare('SELECT * FROM servers WHERE id = ?').bind(serverId).first();
+  } else if (args.server_name) {
+    const rows = await env.DB.prepare('SELECT * FROM servers WHERE name = ?').bind(String(args.server_name)).all();
+    if (rows.results.length > 1) {
+      throw new Error(
+        `ambiguous server_name "${args.server_name}": matches ${rows.results.length} servers (ids: ${rows.results.map((r) => r.id).join(', ')}); use server_id to disambiguate`
+      );
+    }
+    server = rows.results[0] || null;
+  }
+  if (!server) throw new Error('server not found（请先用 list_servers 确认 id 或名称）');
+  return server;
+}
+
+// 仅管理员守卫（管理类工具 PAT 一律拒绝）
+function requireAdmin(user) {
+  if (!isAdmin(user)) throw new Error('forbidden: admin only');
+}
+
+async function mcpAddServer(user, env, args, ip) {
+  requireAdmin(user);
+  const name = String(args.name || '').trim();
+  if (!name) throw new Error('name required');
+  const group = String(args.group || '').trim();
+  const displayIndex = Number(args.sort_order) || 0;
+  const key = randomHex(32);
+  const keyId = await sha256Hex(key);
+  const hash = await hashSecret(key, env);
+  // 服务器 + 审计同一事务（D1 batch 原子）
+  await env.DB.batch([
+    env.DB.prepare('INSERT INTO servers (agent_key_id, name, "group", display_index, user_id, agent_key_hash) VALUES (?,?,?,?,?,?)')
+      .bind(keyId, name, group, displayIndex, user.id, hash),
+    env.DB.prepare('INSERT INTO audit_logs (user_id, username, client_ip, action) VALUES (?,?,?,?)')
+      .bind(user.id, user.username, ip, 'server.create'),
+  ]);
+  serverListCacheClear();
+  // 回查 id（不依赖 batch meta，测试/真实环境一致）
+  const created = await env.DB.prepare('SELECT id FROM servers WHERE agent_key_id = ?').bind(keyId).first();
+  const id = created ? created.id : 0;
+  return {
+    server_id: id,
+    name,
+    agent_key: key, // 明文只返回一次
+    wss_base: 'wss://<面板域名>/ws/agent',
+    report_url: 'https://<面板域名>/api/report',
+  };
+}
+
+async function mcpDeleteServer(user, env, args, ip) {
+  requireAdmin(user);
+  const server = await mcpFindServer(env, args);
+  const id = server.id;
+  // 清历史数据 + 删服务器 + 审计同一事务（与 REST DELETE /api/servers/:id 完全一致）
+  await env.DB.batch([
+    env.DB.prepare('DELETE FROM metrics_min WHERE server_id = ?').bind(id),
+    env.DB.prepare('DELETE FROM metrics_custom WHERE server_id = ?').bind(id),
+    env.DB.prepare('DELETE FROM servers WHERE id = ?').bind(id),
+    env.DB.prepare('INSERT INTO audit_logs (user_id, username, client_ip, action, target_server_id, detail) VALUES (?,?,?,?,?,?)')
+      .bind(user.id, user.username, ip, 'server.delete', id, server.name),
+  ]);
+  serverListCacheClear();
+  lastSeenWrite.delete(id);
+  customWritten.delete(id);
+  serverRowCache.delete(id);
+  try {
+    await doMetrics(env).fetch('https://do.internal/drop', {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ server_id: id }),
+    });
+  } catch { /* 热区清理失败不影响删除 */ }
+  for (let i = 0; i < SHARDS; i++) {
+    try {
+      await doForShard(env, i).fetch('https://do.internal/rpc/drop_server', {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ serverId: id }),
+      });
+    } catch { /* 分片暂不可达；agent 重连会因 key 失效被拒 */ }
+  }
+  try {
+    await doPanel(env).fetch('https://do.internal/rpc/clear_list_cache', { method: 'POST' });
+  } catch { /* 清缓存失败由 listCache TTL 兜底 */ }
+  return { ok: true, server_id: id, name: server.name };
+}
+
+async function mcpUpdateServer(user, env, args, ip) {
+  requireAdmin(user);
+  const server = await mcpFindServer(env, args);
+  const name = args.name !== undefined ? String(args.name).trim() : server.name;
+  if (!name) throw new Error('name required');
+  const group = args.group !== undefined ? String(args.group).trim() : server.group;
+  const displayIndex = args.sort_order !== undefined ? Number(args.sort_order) || 0 : server.display_index;
+  await env.DB.batch([
+    env.DB.prepare('UPDATE servers SET name = ?, "group" = ?, display_index = ? WHERE id = ?')
+      .bind(name, group, displayIndex, server.id),
+    env.DB.prepare('INSERT INTO audit_logs (user_id, username, client_ip, action, target_server_id, detail) VALUES (?,?,?,?,?,?)')
+      .bind(user.id, user.username, ip, 'server.update', server.id, `${server.name} → ${name}`),
+  ]);
+  serverListCacheClear();
+  return { ok: true, server_id: server.id, name, group, display_index: displayIndex };
+}
+
+async function mcpListTokens(user, env) {
+  requireAdmin(user);
+  const rows = await env.DB.prepare('SELECT id, name, scopes, server_ids, created_at FROM api_tokens ORDER BY id').all();
+  return rows.results.map((t) => ({ ...t, scopes: safeJson(t.scopes) || t.scopes, server_ids: safeJson(t.server_ids) || t.server_ids }));
+}
+
+async function mcpCreateToken(user, env, args) {
+  requireAdmin(user);
+  const name = String(args.name || '').trim();
+  if (!name) throw new Error('name required');
+  let scopes;
+  if (Array.isArray(args.scopes) && args.scopes.length) {
+    scopes = [...new Set(args.scopes.filter((s) => ALLOWED_SCOPES.includes(s)))];
+    if (!scopes.length) throw new Error(`invalid scope, allowed: ${ALLOWED_SCOPES.join(', ')}`);
+  } else {
+    scopes = [SCOPE_READ];
+  }
+  const serverIDs = Array.isArray(args.server_ids) ? args.server_ids.map(Number).filter((n) => n > 0) : null;
+  const token = PAT_PREFIX + randomHex(32);
+  const hash = await hashSecret(token, env);
+  await env.DB.prepare('INSERT INTO api_tokens (user_id, name, token_hash, scopes, server_ids) VALUES (?,?,?,?,?)')
+    .bind(user.id, name, hash, JSON.stringify(scopes), serverIDs ? JSON.stringify(serverIDs) : null)
+    .run();
+  return { token }; // 明文只返回一次
+}
+
+async function mcpRevokeToken(user, env, args, ip) {
+  requireAdmin(user);
+  const id = Number(args.token_id) || 0;
+  if (!id) throw new Error('token_id is required');
+  const res = await env.DB.prepare('DELETE FROM api_tokens WHERE id = ?').bind(id).run();
+  if (!res.meta.changes) throw new Error(`token not found (id=${id})`);
+  // PAT 撤销即时生效：清 PanelDO 鉴权缓存
+  try {
+    await doPanel(env).fetch('https://do.internal/rpc/clear_auth_cache', { method: 'POST' });
+  } catch { /* 清缓存失败由 authCache 5s TTL 兜底 */ }
+  return { ok: true, token_id: id };
+}
+
+async function mcpGetAuditLogs(user, env, args) {
+  requireAdmin(user);
+  const limit = Math.min(Math.max(Number(args.limit) || 100, 1), 500);
+  const rows = await env.DB.prepare('SELECT id, user_id, username, client_ip, action, target_server_id, detail, created_at FROM audit_logs ORDER BY id DESC LIMIT ?').bind(limit).all();
+  return rows.results;
+}
+
+async function mcpGetUsage(user, env) {
+  requireAdmin(user);
+  let doUsage = {};
+  try {
+    doUsage = await (await doMetrics(env).fetch('https://do.internal/usage')).json();
+  } catch { /* 用量读取失败不影响 */ }
+  const reportFrames = Number(doUsage.persisted?.report || 0);
+  const api = {};
+  for (const [k, v] of apiCounts) api[k] = v;
+  return {
+    note: 'Worker 计数为实例级（evict/重启清零，趋势参考）；MetricsDO 计数每 10 分钟 alarm 汇总到 storage（跨 evict 保留）。',
+    api,
+    metrics_do: doUsage,
+    estimates_per_day: {
+      report_frames: reportFrames,
+      do_events: reportFrames * 2,
+      d1_writes: Math.round(reportFrames * 0.5),
+    },
+  };
+}
+
+async function mcpGetSettings(user, env) {
+  requireAdmin(user);
+  return (await kvGet(env, 'settings', {})) || {};
+}
+
+async function mcpUpdateSettings(user, env, args) {
+  requireAdmin(user);
+  const current = (await kvGet(env, 'settings', {})) || {};
+  const next = {
+    site_name: args.site_name !== undefined ? String(args.site_name).trim() : current.site_name,
+    notice: args.notice !== undefined ? String(args.notice).trim() : current.notice,
+    alerts: args.alerts !== undefined ? sanitizeAlerts(args.alerts) : current.alerts,
+    geo_lookup: args.geo_lookup !== undefined ? !!args.geo_lookup : !!current.geo_lookup,
+  };
+  await kvPut(env, 'settings', next);
+  kvClearCache('settings');
+  try {
+    await doMetrics(env).fetch('https://do.internal/rpc/clear_settings_cache', { method: 'POST' });
+  } catch { /* 清缓存失败：MetricsDO 侧按 300s TTL 自然过期 */ }
+  return next;
+}
+
 // 工具：监控历史（内存热区 ≤12h，D1 归档更长；长区间 SQL 抽样）
 async function mcpGetMonitor(user, env, args) {
   const serverId = Number(args.server_id) || 0;
@@ -705,7 +1000,7 @@ export async function handleMcp(request, env) {
         protocolVersion: MCP_VERSION,
         capabilities: { tools: {} },
         serverInfo: { name: 'cf-panel', version: '0.1.0' },
-        instructions: 'cf-panel 面板。可用工具：list_servers（服务器状态）、get_monitor（监控历史）、exec_command（在服务器上执行命令，需 exec 权限）、create_upload（签发文件上传签名 URL，大文件/二进制上传请用它，把返回的 upload_url 转给用户/程序 curl 执行）。认证：Authorization: Bearer <JWT 或 PAT>',
+        instructions: 'cf-panel 面板。工具：list_servers（服务器状态）、get_monitor（监控历史）、exec_command（执行命令，需 exec 权限）、create_upload（签发上传签名 URL）、管理类（仅管理员）：add_server/delete_server/update_server/list_tokens/create_token/revoke_token/get_audit_logs/get_usage/get_settings/update_settings。认证：Authorization: Bearer <JWT 或 PAT>',
       });
     case 'notifications/initialized':
     case 'notifications/cancelled':
@@ -724,6 +1019,16 @@ export async function handleMcp(request, env) {
         else if (params.name === 'get_monitor') content = await mcpGetMonitor(user, env, params.arguments || {});
         else if (params.name === 'exec_command') content = await mcpExecCommand(user, env, params.arguments || {});
         else if (params.name === 'create_upload') content = await mcpCreateUpload(user, env, params.arguments || {}, url.host, clientIp(request));
+        else if (params.name === 'add_server') content = await mcpAddServer(user, env, params.arguments || {}, clientIp(request));
+        else if (params.name === 'delete_server') content = await mcpDeleteServer(user, env, params.arguments || {}, clientIp(request));
+        else if (params.name === 'update_server') content = await mcpUpdateServer(user, env, params.arguments || {}, clientIp(request));
+        else if (params.name === 'list_tokens') content = await mcpListTokens(user, env);
+        else if (params.name === 'create_token') content = await mcpCreateToken(user, env, params.arguments || {});
+        else if (params.name === 'revoke_token') content = await mcpRevokeToken(user, env, params.arguments || {});
+        else if (params.name === 'get_audit_logs') content = await mcpGetAuditLogs(user, env, params.arguments || {});
+        else if (params.name === 'get_usage') content = await mcpGetUsage(user, env);
+        else if (params.name === 'get_settings') content = await mcpGetSettings(user, env);
+        else if (params.name === 'update_settings') content = await mcpUpdateSettings(user, env, params.arguments || {});
         return reply(id, { content: [{ type: 'text', text: JSON.stringify(content) }], isError: false });
       } catch (e) {
         // 工具执行错误作为 isError 结果返回（MCP 客户端可读）

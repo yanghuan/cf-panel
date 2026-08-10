@@ -782,7 +782,24 @@ test('MCP：tools/list 与 tools/call', async () => {
   await addServer(env, token, { name: 'web-1', group: 'prod' });
 
   const list = await (await mcp(env, { token, body: { jsonrpc: '2.0', id: 1, method: 'tools/list' } })).json();
-  assert.deepEqual(list.result.tools.map((t) => t.name), ['list_servers', 'get_monitor', 'exec_command']);
+  assert.deepEqual(list.result.tools.map((t) => t.name), ['list_servers', 'get_monitor', 'exec_command', 'create_upload']);
+
+  // create_upload：签发签名 URL（结构 + 权限 + 绑定字段）
+  const cu = await (await mcp(env, { token, body: { jsonrpc: '2.0', id: 12, method: 'tools/call', params: { name: 'create_upload', arguments: { server_name: 'web-1', path: '/opt/app.tar.gz' } } } })).json();
+  assert.equal(cu.result.isError, false);
+  const cuRes = JSON.parse(cu.result.content[0].text);
+  assert.equal(cuRes.server_name, 'web-1');
+  assert.match(cuRes.upload_url, /^https:\/\/panel\.local\/api\/upload\?/);
+  assert.match(cuRes.upload_url, /token=/);
+  assert.equal(cuRes.overwrite, false);
+  assert.ok(cuRes.expires_in_seconds > 0 && cuRes.expires_in_seconds <= 600);
+  // 签名 URL 篡改路径 → 403（验签失败；同一签名换了 path 重算对不上）
+  const tampered = cuRes.upload_url.replace(/path=%2Fopt%2Fapp.tar.gz/, 'path=%2Ftmp%2Fevil');
+  const badSigned = await worker.fetch(new Request(tampered, { method: 'POST', body: 'x' }), env);
+  assert.equal(badSigned.status, 403);
+  // 合法签名 URL 可上传（DO stub 透传 → 200，无需 Bearer）
+  const goodSigned = await worker.fetch(new Request(cuRes.upload_url, { method: 'POST', body: 'hello signed' }), env);
+  assert.equal(goodSigned.status, 200);
 
   // exec_command：DO stub 返回 200（无 agent 语义）→ 结构正确
   const ex = await (await mcp(env, { token, body: { jsonrpc: '2.0', id: 6, method: 'tools/call', params: { name: 'exec_command', arguments: { server_name: 'web-1', command: 'echo hi' } } } })).json();

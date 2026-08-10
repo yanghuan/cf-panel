@@ -229,6 +229,10 @@ async fn control_conn(
 
     // 读循环：指令分发（180s 无任何消息判定半开连接，断开触发重连——
     // NAT/防火墙静默断链不再依赖 TCP keepalive 2h 才发现；健康连接有服务端 30s 心跳必有下行）
+    // 控制连接级上传状态：本连接创建的 upload 临时文件（断开时清理）+ 已失败 upload（跳过后续帧）
+    let created: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let failed_uploads: Arc<std::sync::Mutex<std::collections::HashSet<String>>> =
+        Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
     let result: Result<(), Box<dyn Error + Send + Sync>> = loop {
         let msg =
             match tokio::time::timeout(Duration::from_secs(CONTROL_READ_TIMEOUT_S), read.next())
@@ -239,17 +243,147 @@ async fn control_conn(
                 Ok(None) => break Ok(()), // 服务端正常关闭
                 Err(_) => break Err("control read timeout (half-open connection)".into()),
             };
-        if let Message::Text(t) = msg {
-            if let Err(e) =
-                dispatch(cfg, sessions, file_sessions, &write, &interval, &note, &t).await
-            {
-                break Err(e);
+        match msg {
+            Message::Text(t) => {
+                if let Err(e) =
+                    dispatch(cfg, sessions, file_sessions, &write, &interval, &note, &t).await
+                {
+                    break Err(e);
+                }
             }
+            // Binary 混合帧：/api/upload 分片上传（JSON 头 + '\n' + 原始字节，与文件会话同构）
+            Message::Binary(b) => {
+                if let Err(e) =
+                    handle_upload_frame(cfg, &b, &created, &failed_uploads, &write).await
+                {
+                    break Err(e);
+                }
+            }
+            _ => {}
         }
     };
-    // 读循环退出（任何路径）：终止上报任务，防僵尸累积
+    // 读循环退出（任何路径）：终止上报任务 + 清理本连接创建的上传临时文件（防中断残留），防僵尸累积
     report_task.abort();
+    if let Ok(tmps) = created.lock() {
+        for p in tmps.iter() {
+            let _ = std::fs::remove_file(p);
+        }
+    }
     result
+}
+
+// 控制通道上传帧处理：Binary 混合帧（JSON 头 + '\n' + 原始字节，复用文件会话的 write_bytes 原子写语义）
+// 每帧：{type:"upload", upload_id, path, offset, commit, overwrite} + 原始字节。
+// 失败（系统路径/目标已存在/写错误）回执 upload_result{ok:false} 并记入 failed_uploads，后续帧直接跳过。
+async fn handle_upload_frame(
+    cfg: &Config,
+    frame: &[u8],
+    created: &Arc<std::sync::Mutex<Vec<String>>>,
+    failed: &Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    write: &Arc<Mutex<Sink>>,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let Some(nl) = frame.iter().position(|&b| b == b'\n') else {
+        return Ok(()); // 无 JSON 头：忽略
+    };
+    let v: serde_json::Value = match serde_json::from_slice(&frame[..nl]) {
+        Ok(v) => v,
+        Err(_) => return Ok(()),
+    };
+    if v.get("type").and_then(|x| x.as_str()).unwrap_or("") != "upload" {
+        return Ok(());
+    }
+    let path = v
+        .get("path")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
+    let upload_id = v
+        .get("upload_id")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
+    let offset = v.get("offset").and_then(|x| x.as_u64()).unwrap_or(0);
+    let commit = v.get("commit").and_then(|x| x.as_bool()).unwrap_or(false);
+    let overwrite = v
+        .get("overwrite")
+        .and_then(|x| x.as_bool())
+        .unwrap_or(false);
+    if path.is_empty() || upload_id.is_empty() {
+        return Ok(());
+    }
+    // 数据转 owned：spawn_blocking 闭包需 'static（块 ≤48KB，拷贝可接受）
+    let data = frame[nl + 1..].to_vec();
+    // 该 upload 已失败（首帧拒绝后跳过后续帧，避免重复回执/写入）
+    if failed.lock().unwrap().contains(&upload_id) {
+        return Ok(());
+    }
+    let reject = |write: &Arc<Mutex<Sink>>, msg: &str| {
+        let resp = serde_json::json!({
+            "type": "upload_result", "upload_id": upload_id, "path": path, "ok": false, "error": msg,
+        });
+        // 不 await：写入锁内的短消息发送失败（连接已断）时读循环自然退出
+        let w = write.clone();
+        tokio::spawn(async move {
+            let mut w = w.lock().await;
+            let _ = w.send(Message::Text(resp.to_string())).await;
+        });
+    };
+    // DISABLE_EXEC=1：上传属命令执行类写操作，与终端/文件管理一致拒绝
+    if cfg.disable_exec {
+        failed.lock().unwrap().insert(upload_id.clone());
+        reject(write, "exec disabled (DISABLE_EXEC=1)");
+        return Ok(());
+    }
+    // 系统路径保护：写操作拒绝系统目录（/proc /sys /etc /usr /var /root 等，与文件会话一致）
+    if session::is_system_path(&path) {
+        failed.lock().unwrap().insert(upload_id.clone());
+        reject(write, "system path not allowed");
+        return Ok(());
+    }
+    // 首帧（offset==0）：overwrite=false 且目标已存在 → 拒绝（防误覆盖）
+    if offset == 0 && !overwrite && std::path::Path::new(&path).exists() {
+        failed.lock().unwrap().insert(upload_id.clone());
+        reject(write, "target already exists (use overwrite=1)");
+        return Ok(());
+    }
+    // 复用文件会话的原子写：临时文件 {path}.upload.{upload_id}，offset 严格校验，commit 时 fsync+rename。
+    // 写入在 spawn_blocking 内完成（磁盘 IO 不阻塞 async 读循环）
+    let created = created.clone();
+    let failed = failed.clone();
+    let (upload_id_err, path_err) = (upload_id.clone(), path.clone());
+    let r = match tokio::task::spawn_blocking(move || {
+        let res = session::write_bytes(&path, offset, &data, commit, &upload_id, &created);
+        // 解析 write_bytes 回执（write_result / error），统一包装为 upload_result
+        let v: serde_json::Value = serde_json::from_str(&res).unwrap_or(serde_json::Value::Null);
+        if v.get("ok").and_then(|x| x.as_bool()).unwrap_or(false) {
+            serde_json::json!({
+                "type": "upload_result", "upload_id": upload_id, "path": path,
+                "ok": true, "size": offset + data.len() as u64, "commit": commit,
+            })
+        } else {
+            let msg = v
+                .get("message")
+                .and_then(|x| x.as_str())
+                .unwrap_or("write failed")
+                .to_string();
+            failed.lock().unwrap().insert(upload_id.clone());
+            serde_json::json!({
+                "type": "upload_result", "upload_id": upload_id, "path": path,
+                "ok": false, "error": msg,
+            })
+        }
+    })
+    .await
+    {
+        Ok(v) => v,
+        Err(_) => serde_json::json!({
+            "type": "upload_result", "upload_id": upload_id_err, "path": path_err,
+            "ok": false, "error": "write task failed",
+        }),
+    };
+    let mut w = write.lock().await;
+    let _ = w.send(Message::Text(r.to_string())).await;
+    Ok(())
 }
 
 // 上报间隔下限/上限校验（防异常/恶意 interval=0 导致采集紧循环打满 CPU）

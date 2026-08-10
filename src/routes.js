@@ -39,11 +39,26 @@ const MCP_TOOLS = [
       required: ['command'],
     },
   },
+  {
+    name: 'create_upload',
+    description: '创建一次性的文件上传签名 URL（大文件/二进制上传通道，不经过 LLM 上下文）。返回可直接 curl 使用的 POST URL，签名绑定目标服务器、路径与覆盖标志，10 分钟过期。AI 自身无法直接传大文件——把返回的 upload_url 转给用户/程序执行（或指导客户端用 fetch/curl POST 该 URL，body 为原始文件字节，支持任意大小流式分片）。需 exec 权限。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        server_id: { type: 'integer', description: '服务器 ID（见 list_servers 返回值中的 id）' },
+        server_name: { type: 'string', description: '服务器名称（与 server_id 二选一）' },
+        path: { type: 'string', description: '目标绝对路径（如 /opt/app.tar.gz）' },
+        overwrite: { type: 'boolean', description: '目标已存在时是否覆盖，默认 false（拒绝覆盖）' },
+      },
+      required: ['path'],
+    },
+  },
 ];
 import {
   json, err, requireJwtSecret, signJwt, randomHex, sha256Hex, hashSecret,
   kvGet, kvPut, sanitizeAlerts, parseRangeHours,
   doMetrics, doForShard, doPanel, shardForServerId, makeStreamId, shardFromStreamId,
+  signUploadToken, verifyUploadToken,
 } from './utils.js';
 import { queryMonitorRows, queryCustomMetrics, kvClearCache } from './db.js';
 import { authUser, isAdmin, canAccessServer, canExec, listServersWithState, serverListCache } from './auth.js';
@@ -175,6 +190,12 @@ export async function handleApi(request, env) {
       custom: body.custom,
     });
     return json({ ok: true });
+  }
+
+  // POST /api/upload?token= —— 签名 URL 直传（MCP create_upload 签发，无状态 HMAC 验签，无需 Bearer）
+  // 签名绑定 server_id/path/overwrite/exp；验证失败 403。审计在 create_upload 时已记录，此处不重复。
+  if (method === 'POST' && path === '/api/upload' && url.searchParams.get('token')) {
+    return handleUploadSigned(request, env, url);
   }
 
   // ---- 以下全部需要登录（JWT 或 PAT）----
@@ -309,6 +330,24 @@ export async function handleApi(request, env) {
     });
   }
 
+  // POST /api/upload?server_id=&path=&overwrite= —— 流式上传文件到 agent（body = 原始字节）
+  // 小文件（配置/脚本）与大文件（备份/包）统一入口：Worker 流式读 body → 自动分片 →
+  // 控制通道 Binary 混合帧 → agent 原子写。需 exec 权限（管理员或带 server:exec 的 PAT）。
+  if (method === 'POST' && path === '/api/upload') {
+    const u = new URL(request.url);
+    const serverId = Number(u.searchParams.get('server_id')) || 0;
+    const targetPath = u.searchParams.get('path') || '';
+    if (!serverId) return err('server_id is required', 400);
+    if (!targetPath || !targetPath.startsWith('/')) return err('path is required (absolute)', 400);
+    const server = await env.DB.prepare('SELECT * FROM servers WHERE id = ?').bind(serverId).first();
+    if (!server) return err('server not found', 404);
+    if (!canExec(user, server)) return err('forbidden', 403);
+    await env.DB.prepare('INSERT INTO audit_logs (user_id, username, client_ip, action, target_server_id, detail) VALUES (?,?,?,?,?,?)')
+      .bind(user.id, user.username, clientIp(request), 'file.upload', server.id, targetPath)
+      .run();
+    return forwardUpload(env, request, serverId, targetPath);
+  }
+
   // POST /api/terminal —— 创建终端会话（exec 权限 + 服务器归属）
   if (method === 'POST' && path === '/api/terminal') {
     const body = await request.json().catch(() => ({}));
@@ -441,6 +480,29 @@ export async function handleApi(request, env) {
   return err('not found', 404);
 }
 
+// 上传公共转发：流式转发到 TerminalDO（body 保持原始流，DO 内切分片）；query 参数原样传递。
+// 两条鉴权路径（Bearer JWT/PAT 与签名 URL）共用同一管道。
+function forwardUpload(env, request, serverId, targetPath) {
+  const target = new URL(request.url);
+  target.protocol = 'https:';
+  target.hostname = 'do.internal';
+  target.pathname = '/rpc/upload'; // DO 内部 RPC 路径（/api/upload 仅面板入口）
+  return doForShard(env, shardForServerId(serverId)).fetch(target.toString(), request);
+}
+
+// 签名 URL 直传（MCP create_upload 签发）：HMAC 验签无状态自验证，无需 Bearer。
+// 审计已在 create_upload 时记录（file.upload），此处不重复。
+async function handleUploadSigned(request, env, u) {
+  const serverId = Number(u.searchParams.get('server_id')) || 0;
+  const targetPath = u.searchParams.get('path') || '';
+  const overwrite = u.searchParams.get('overwrite') === '1';
+  if (!serverId) return err('server_id is required', 400);
+  if (!targetPath || !targetPath.startsWith('/')) return err('path is required (absolute)', 400);
+  const v = await verifyUploadToken(u.searchParams.get('token') || '', serverId, targetPath, overwrite, env);
+  if (!v.ok) return err(v.error, 403);
+  return forwardUpload(env, request, serverId, targetPath);
+}
+
 // 服务器增删改后清列表缓存（serverListCache 在 auth.js）
 function serverListCacheClear() {
   serverListCache.clear(); // 服务器增删改后立即使列表缓存失效
@@ -532,6 +594,48 @@ async function mcpExecCommand(user, env, args) {
   };
 }
 
+// 工具：创建一次性上传签名 URL（大文件上传通道，不经过 LLM 上下文）。
+// HMAC 签名无状态自验证（绑定 server_id/path/overwrite/exp，10 分钟过期）；
+// AI 把 upload_url 转给用户/程序执行（curl POST body 为原始字节），服务端自动分片写 agent。
+async function mcpCreateUpload(user, env, args, host, ip) {
+  const serverId = Number(args.server_id) || 0;
+  const path = String(args.path || '').trim();
+  if (!path || !path.startsWith('/')) throw new Error('path is required (absolute)');
+  let server = null;
+  if (serverId) {
+    server = await env.DB.prepare('SELECT * FROM servers WHERE id = ?').bind(serverId).first();
+  } else if (args.server_name) {
+    // 写操作：重名时拒绝静默取第一条（防在错误的机器上写入）
+    const rows = await env.DB.prepare('SELECT * FROM servers WHERE name = ?').bind(String(args.server_name)).all();
+    if (rows.results.length > 1) {
+      throw new Error(
+        `ambiguous server_name "${args.server_name}": matches ${rows.results.length} servers (ids: ${rows.results.map((r) => r.id).join(', ')}); use server_id to disambiguate`
+      );
+    }
+    server = rows.results[0] || null;
+  }
+  if (!server) throw new Error('server not found（请先用 list_servers 确认 id 或名称）');
+  if (!canExec(user, server)) throw new Error(`no exec permission on server ${server.id} (${server.name})`);
+  const overwrite = !!args.overwrite;
+  const { token, exp } = await signUploadToken(server.id, path, overwrite, env);
+  const q = new URLSearchParams({ server_id: String(server.id), path, overwrite: overwrite ? '1' : '0', token });
+  const uploadUrl = `https://${host}/api/upload?${q.toString()}`;
+  // 审计在签发时记录（实际 curl 上传经签名 URL 直传，不再重复记录）
+  await env.DB.prepare('INSERT INTO audit_logs (user_id, username, client_ip, action, target_server_id, detail) VALUES (?,?,?,?,?,?)')
+    .bind(user.id, user.username, ip, 'file.upload', server.id, path)
+    .run();
+  return {
+    server_id: server.id,
+    server_name: server.name,
+    path,
+    overwrite,
+    expires_at: exp, // unix 秒
+    expires_in_seconds: Math.max(0, exp - Math.floor(Date.now() / 1000)),
+    upload_url: uploadUrl,
+    usage: `curl -X POST '${uploadUrl}' --data-binary @<本地文件>  # body 为原始文件字节，支持任意大小（服务端自动分片）`,
+  };
+}
+
 // 工具：监控历史（内存热区 ≤12h，D1 归档更长；长区间 SQL 抽样）
 async function mcpGetMonitor(user, env, args) {
   const serverId = Number(args.server_id) || 0;
@@ -601,7 +705,7 @@ export async function handleMcp(request, env) {
         protocolVersion: MCP_VERSION,
         capabilities: { tools: {} },
         serverInfo: { name: 'cf-panel', version: '0.1.0' },
-        instructions: 'cf-panel 面板。可用工具：list_servers（服务器状态）、get_monitor（监控历史）、exec_command（在服务器上执行命令，需 exec 权限）。认证：Authorization: Bearer <JWT 或 PAT>',
+        instructions: 'cf-panel 面板。可用工具：list_servers（服务器状态）、get_monitor（监控历史）、exec_command（在服务器上执行命令，需 exec 权限）、create_upload（签发文件上传签名 URL，大文件/二进制上传请用它，把返回的 upload_url 转给用户/程序 curl 执行）。认证：Authorization: Bearer <JWT 或 PAT>',
       });
     case 'notifications/initialized':
     case 'notifications/cancelled':
@@ -619,6 +723,7 @@ export async function handleMcp(request, env) {
         if (params.name === 'list_servers') content = await mcpListServers(user, env);
         else if (params.name === 'get_monitor') content = await mcpGetMonitor(user, env, params.arguments || {});
         else if (params.name === 'exec_command') content = await mcpExecCommand(user, env, params.arguments || {});
+        else if (params.name === 'create_upload') content = await mcpCreateUpload(user, env, params.arguments || {}, url.host, clientIp(request));
         return reply(id, { content: [{ type: 'text', text: JSON.stringify(content) }], isError: false });
       } catch (e) {
         // 工具执行错误作为 isError 结果返回（MCP 客户端可读）

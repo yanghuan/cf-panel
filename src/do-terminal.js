@@ -13,6 +13,8 @@ const REPORT_SLOW_INTERVAL_S = 120; // 无人查看：120 秒上报
 const EXEC_DEFAULT_TIMEOUT_MS = 25 * 1000; // MCP exec 默认超时（须 < DO fetch 默认 30s 超时，由内部先返回）
 const EXEC_MAX_TIMEOUT_MS = 25 * 1000;
 const EXEC_TIMEOUT_GRACE_MS = 5 * 1000; // DO 兜底定时器比 agent 实际超时晚 5s：agent 先回执（含部分 stdout），DO 定时器仅兜底防悬挂
+const UPLOAD_CHUNK_BYTES = 48 * 1024; // /api/upload 分片帧数据上限（控制通道入站 64KB，留 JSON 头/边界余量）
+const UPLOAD_TIMEOUT_MS = 120 * 1000; // 上传总超时（流式转发 + agent 写盘；agent 失联时兜底返回，防悬挂）
 
 export class TerminalDO {
   constructor(state, env) {
@@ -23,6 +25,8 @@ export class TerminalDO {
     this.agentInterval = new Map(); // serverId -> 当前下发的上报间隔（秒），避免重复下发
     this.pendingOpen = new Map(); // streamId -> {tries, timer, type} open_terminal/open_file 确认重发
     this.pendingExec = new Map(); // execId -> {resolve, timer, serverId} MCP 一次性命令等待
+    this.pendingUpload = new Map(); // uploadId -> {resolve, timer} /api/upload 等待 upload_result
+    this.uploading = new Set(); // serverId -> 上传进行中（控制通道单 WS，防并发帧交错）
     this.lastPingAt = new Map(); // serverId -> 上次心跳时间（控制通道保活，防健康连接被 read -t 180 误判半开）
   }
 
@@ -157,6 +161,27 @@ export class TerminalDO {
       return json(result);
     }
 
+    // 内部 RPC：/api/upload 流式上传（调用方 routes 已鉴权 canExec）
+    // Worker 流式读请求 body → 自动切成 ≤48KB 分片 → 控制通道 Binary 混合帧发给 agent →
+    // agent 写临时文件（offset 校验）→ 最后一帧 commit 原子替换 → 回执 upload_result。
+    // 客户端零分片逻辑：curl --data-binary @file 一行即可，大文件天然流式（不占内存）。
+    if (path === '/rpc/upload' && request.method === 'POST') {
+      const serverId = Number(url.searchParams.get('server_id')) || 0;
+      const targetPath = url.searchParams.get('path') || '';
+      const overwrite = url.searchParams.get('overwrite') === '1';
+      if (!serverId) return err('server_id is required');
+      if (!targetPath || !targetPath.startsWith('/')) return err('path is required (absolute)');
+      const agentWs = this.agents.get(serverId);
+      if (!agentWs) return json({ error: 'agent offline' }, 502);
+      if (this.uploading.has(serverId)) return json({ error: 'upload already in progress for this server' }, 409);
+      this.uploading.add(serverId);
+      try {
+        return await this.doUpload(agentWs, serverId, targetPath, overwrite, request);
+      } finally {
+        this.uploading.delete(serverId);
+      }
+    }
+
     // GET /ws/terminal/:id | /ws/file/:id —— 浏览器会话（防 UUID 劫持）
     // 鉴权改为首条消息（{type:'auth', token}），token 不进 URL（防访问日志/浏览器历史泄露）；
     // 未鉴权前不挂接 userWs，任何数据都不会流向浏览器，防劫持语义不变
@@ -237,6 +262,67 @@ export class TerminalDO {
     }
 
     return new Response('not found', { status: 404 });
+  }
+
+  // /api/upload 核心：流式读 body → 自动切 ≤48KB 分片 → 控制通道 Binary 混合帧 → 等 upload_result。
+  // 客户端零分片逻辑（curl --data-binary @file 一行）；分片顺序由 offset 严格保证（agent 端校验）。
+  async doUpload(agentWs, serverId, targetPath, overwrite, request) {
+    const uploadId = `u-${crypto.randomUUID()}`;
+    let resolveResult;
+    const resultPromise = new Promise((resolve) => { resolveResult = resolve; });
+    const timer = setTimeout(() => {
+      this.pendingUpload.delete(uploadId);
+      resolveResult({ ok: false, error: 'upload timed out' });
+    }, UPLOAD_TIMEOUT_MS);
+    this.pendingUpload.set(uploadId, { resolve: resolveResult, timer });
+    try {
+      const encoder = new TextEncoder();
+      // 发一帧：JSON 头 + '\n' + 原始字节（Binary 混合帧，与文件会话同构）
+      const sendFrame = (offset, piece, commit) => {
+        const head = encoder.encode(JSON.stringify({
+          type: 'upload', upload_id: uploadId, path: targetPath, offset, commit, overwrite,
+        }) + '\n');
+        const frame = new Uint8Array(head.length + piece.length);
+        frame.set(head, 0);
+        frame.set(piece, head.length);
+        try {
+          agentWs.send(frame.buffer);
+        } catch {
+          resolveResult({ ok: false, error: 'agent disconnected during upload' });
+        }
+      };
+      // 流式读 body：跨块拼接后切帧，不整体缓冲（大文件内存友好）
+      const reader = request.body ? request.body.getReader() : null;
+      let offset = 0;
+      let buf = new Uint8Array(0);
+      while (reader) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (value && value.length) {
+          const combined = new Uint8Array(buf.length + value.length);
+          combined.set(buf, 0);
+          combined.set(value, buf.length);
+          buf = combined;
+        }
+        while (buf.length >= UPLOAD_CHUNK_BYTES) {
+          sendFrame(offset, buf.slice(0, UPLOAD_CHUNK_BYTES), false);
+          offset += UPLOAD_CHUNK_BYTES;
+          buf = buf.slice(UPLOAD_CHUNK_BYTES);
+        }
+      }
+      if (buf.length > 0) {
+        sendFrame(offset, buf, false);
+        offset += buf.length;
+      }
+      // commit 帧（空数据）：agent 端 fsync + rename 原子替换
+      sendFrame(offset, new Uint8Array(0), true);
+      const result = await resultPromise;
+      if (!result.ok) return json({ error: result.error || 'upload failed' }, 400);
+      return json({ ok: true, path: targetPath, size: offset, upload_id: uploadId });
+    } finally {
+      clearTimeout(timer);
+      this.pendingUpload.delete(uploadId);
+    }
   }
 
   // 控制通道（重）连接时调用：关闭该服务器旧的终端/文件会话流。
@@ -466,6 +552,16 @@ export class TerminalDO {
                 timed_out: !!j.timed_out,
                 error: j.error || null,
               });
+            }
+            return;
+          }
+          if (j && j.type === 'upload_result') {
+            // /api/upload 结果：resolve 等待中的 /rpc/upload（每个 upload_id 只回执一次，幂等）
+            const r = this.pendingUpload.get(j.upload_id);
+            if (r) {
+              clearTimeout(r.timer);
+              this.pendingUpload.delete(j.upload_id);
+              r.resolve({ ok: !!j.ok, error: j.error || null, size: j.size || 0 });
             }
             return;
           }

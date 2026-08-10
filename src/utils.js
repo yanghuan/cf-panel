@@ -134,6 +134,36 @@ export async function hashSecret(value, env) {
   return bytesToHex(await hmacSha256(new TextEncoder().encode(hashKey), new TextEncoder().encode(value)));
 }
 
+// 上传签名 URL（无状态自验证）：HMAC(secret, serverId|path|overwrite|exp)。
+// 验证所需信息全部编码在 URL（server_id/path/overwrite/exp），secret 只在环境变量——
+// 不落任何存储；篡改任一字段签名对不上，过期即失效。密钥复用 HASH_SECRET（回退 JWT_SECRET）。
+export async function signUploadToken(serverId, path, overwrite, env, ttlS = 600) {
+  const exp = Math.floor(Date.now() / 1000) + ttlS;
+  const payload = `${serverId}|${path}|${overwrite ? 1 : 0}|${exp}`;
+  const hashKey = env.HASH_SECRET || secret(env);
+  const sig = b64u(await hmacSha256(new TextEncoder().encode(hashKey), new TextEncoder().encode(payload)));
+  return { token: `${exp}.${sig}`, exp };
+}
+export async function verifyUploadToken(token, serverId, path, overwrite, env) {
+  try {
+    const dot = token.indexOf('.');
+    if (dot <= 0) return { ok: false, error: 'bad token' };
+    const exp = Number(token.slice(0, dot));
+    if (!Number.isFinite(exp) || exp < Math.floor(Date.now() / 1000)) return { ok: false, error: 'token expired' };
+    const payload = `${serverId}|${path}|${overwrite ? 1 : 0}|${exp}`;
+    const hashKey = env.HASH_SECRET || secret(env);
+    const expect = b64u(await hmacSha256(new TextEncoder().encode(hashKey), new TextEncoder().encode(payload)));
+    const got = token.slice(dot + 1);
+    // 恒定时间比较（防时序侧信道）
+    if (expect.length !== got.length) return { ok: false, error: 'bad token' };
+    let diff = 0;
+    for (let i = 0; i < expect.length; i++) diff |= expect.charCodeAt(i) ^ got.charCodeAt(i);
+    return diff === 0 ? { ok: true } : { ok: false, error: 'bad token' };
+  } catch {
+    return { ok: false, error: 'bad token' };
+  }
+}
+
 // D1 键值表（替代 Workers KV）：value 直接存 JSON 字符串
 export async function kvGet(env, key, fallback) {
   const row = await env.DB.prepare('SELECT value FROM kv_json WHERE key = ?').bind(key).first();

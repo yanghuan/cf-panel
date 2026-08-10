@@ -288,6 +288,7 @@ wrangler secret put PANEL_USERS      # 回车后粘贴值，如 alice:pass1,bob:
 | DELETE | `/api/servers/:id` | 删除服务器（仅管理员） |
 | POST | `/api/terminal` | 创建终端会话（exec 权限 + 归属校验），返回 session_id |
 | POST | `/api/file/open` | 创建文件管理会话（exec 权限 + 归属校验），返回 session_id |
+| POST | `/api/upload?server_id=&path=&overwrite=` | 流式上传文件到 agent（body=原始字节，Worker 自动分片；Bearer 鉴权或签名 URL token 均可） |
 | GET | `/api/usage` | 用量观测（近 24h 上报帧 / DO 事件 / D1 写行估算，仅管理员） |
 | GET | `/ws/terminal/{id}` | 浏览器终端 WebSocket（校验创建者/admin） |
 | GET | `/ws/file/{id}` | 浏览器文件管理 WebSocket（JSON 行协议：list/read/write/zip/rename/delete，校验创建者/admin） |
@@ -297,7 +298,7 @@ wrangler secret put PANEL_USERS      # 回车后粘贴值，如 alice:pass1,bob:
 | GET | `/ws/agent/terminal` | agent 终端数据流（key 校验 + stream 归属校验） |
 | POST | `/api/report` | agent 监控上报 HTTP 备用入口（key 指纹定位 + 校验） |
 | GET | `/api/monitor?server_id=&range=` | 监控历史（range: 1h/12h/3d/7d/30d，默认 12h 走内存，更早走 D1） |
-| POST | `/mcp` | MCP 端点（无状态 Streamable HTTP，JSON-RPC 2.0；Bearer 鉴权，只读工具） |
+| POST | `/mcp` | MCP 端点（无状态 Streamable HTTP，JSON-RPC 2.0；Bearer 鉴权） |
 | GET | `/api/tokens` | PAT 列表（仅管理员） |
 | POST | `/api/tokens` | 创建 PAT（scopes + server_ids 白名单，明文只返回一次） |
 | DELETE | `/api/tokens/:id` | 删除 PAT（仅管理员） |
@@ -309,12 +310,14 @@ wrangler secret put PANEL_USERS      # 回车后粘贴值，如 alice:pass1,bob:
 
 `/mcp` 实现标准 [Model Context Protocol](https://modelcontextprotocol.io) **无状态 Streamable HTTP**（2026-07-28 修订版：单 POST 端点、无会话、每请求独立鉴权）。鉴权复用现有 `Authorization: Bearer <JWT 或 PAT>`。
 
-**工具**（只读）：
+**工具**：
 
 | 工具 | 说明 |
 | --- | --- |
 | `list_servers` | 服务器列表 + 实时状态（CPU/内存/负载/在线）+ 系统信息 |
 | `get_monitor` | 监控历史（`server_id`/`server_name` + `range`：1h/12h/3d/7d/30d） |
+| `exec_command` | 在指定服务器上执行一次性 shell 命令并返回输出（`server_id`/`server_name` + `command`，`timeout` 1~25s 默认 25s，stdout 上限约 44KB）；**写操作**，需 exec 权限（管理员或带 `server:exec` scope 的 PAT）；经控制通道直达 agent（`sh -c` 执行，超时 kill 进程组） |
+| `create_upload` | 创建一次性文件上传**签名 URL**（大文件/二进制通道，不经过 LLM 上下文）：`path`（绝对路径）+ 可选 `overwrite`；返回 `upload_url` 供 curl/fetch POST（body=原始字节），HMAC 签名绑定 server/path/overwrite、10 分钟过期、无需 Bearer；AI 将 URL 转给用户/程序执行 |
 
 **客户端配置示例**（Claude Desktop / 支持 MCP 的客户端，`claude_desktop_config.json`）：
 

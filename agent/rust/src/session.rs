@@ -339,7 +339,7 @@ const SYSTEM_PATHS: &[&str] = &[
     "/srv",
     "/lost+found",
 ];
-fn is_system_path(path: &str) -> bool {
+pub fn is_system_path(path: &str) -> bool {
     let p = path.trim_end_matches('/');
     if p.is_empty() || p == "/" {
         return true;
@@ -846,7 +846,7 @@ async fn file_read(path: String, offset: u64, limit: u64) -> Result<Vec<u8>, Str
 // 临时文件 {path}.upload.{upload_id}（上传 ID 唯一，同路径并发上传互不冲突），
 // commit（最后一块）时 fsync + rename 原子替换目标。失败/中断只留临时残留、不破坏目标。
 // 严格 offset 校验：必须与临时文件当前长度一致（防丢块/乱序/并发块错写）。
-fn write_bytes(
+pub fn write_bytes(
     path: &str,
     offset: u64,
     data: &[u8],

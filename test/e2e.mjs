@@ -63,10 +63,6 @@ async function waitFor(desc, secs, fn) {
   return false;
 }
 
-function hasCommand(cmd) {
-  try { execSync(`which ${cmd}`, { stdio: 'ignore' }); return true; } catch { return false; }
-}
-
 // ---- 清理 ----
 let _cleaned = false;
 async function cleanup() {
@@ -268,10 +264,7 @@ async function step5_agent() {
 // ============================================================
 async function step6_terminal() {
   section('终端会话');
-  if (!hasCommand('socat')) {
-    console.log('  （跳过：未检测到 socat）');
-    return;
-  }
+  // Rust agent 用 portable_pty 直接实现 PTY，无需 socat；测试端用内置 WebSocket
 
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {

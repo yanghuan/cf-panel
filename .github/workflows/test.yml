@@ -1,6 +1,6 @@
 # cf-panel CI：提交/推送后自动运行测试
 # 1) 单元/集成测试（node:test + node:sqlite，零依赖）
-# 2) E2E 真实环境联调（wrangler dev --local + agent.sh + 终端透传）
+# 2) E2E 真实环境联调（wrangler dev --local + Rust agent，纯 Node 零外部二进制依赖）
 name: CI
 
 on:
@@ -33,14 +33,6 @@ jobs:
         with:
           node-version: 24
 
-      - name: 安装系统依赖（socat/jq）与 websocat
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y socat jq
-          # --fail 确保下载成功才继续（失败即构建失败，不静默用坏二进制）
-          curl -f --retry 2 -sSL -o /usr/local/bin/websocat https://github.com/vi/websocat/releases/download/v1.14.0/websocat.x86_64-unknown-linux-musl
-          chmod +x /usr/local/bin/websocat
-
       - name: 安装 wrangler
         run: npm i -D wrangler
 
@@ -54,4 +46,4 @@ jobs:
       - run: cargo build --release --manifest-path agent/rust/Cargo.toml
 
       - name: 运行 E2E（wrangler dev + Rust agent 真实联调）
-        run: bash test/e2e.sh
+        run: node test/e2e.mjs

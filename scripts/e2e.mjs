@@ -4,7 +4,7 @@
 // 验证链路：wrangler dev → D1 建表 → 登录 → 注册服务器 →
 //           agent 控制通道上线 → 监控上报落库 → 终端双向透传 →
 //           文件上传/下载 → MCP 全量工具（14 个）
-// 用法：node test/e2e.mjs
+// 用法：node scripts/e2e.mjs
 // 环境变量：E2E_PORT（默认 8787）、E2E_PASSWORD（默认读 .dev.vars）
 //           AGENT_CMD（默认 agent/rust/target/release/cf-panel-agent）
 // ============================================================
@@ -351,9 +351,9 @@ async function step7_file() {
       // 等待 agent 数据流挂接
       await sleep(2000);
 
-      // 调用 e2e-file.mjs 执行上传 + 下载
+      // 调用 e2e-file.mjs 执行上传 + 下载（同目录）
       const r = spawnSync('node', [
-        join(ROOT, 'scripts/e2e-file.mjs'),
+        join(__dirname, 'e2e-file.mjs'),
         BASE, token, fsid, uploadSrc, '/tmp/e2e-upload.bin',
       ], { timeout: 120_000, encoding: 'utf8', stdio: 'pipe' });
 

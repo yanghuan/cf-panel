@@ -1,6 +1,6 @@
 // E2E 文件管理测试客户端（node >= 22，内置 WebSocket）：
 // 连接 /ws/file/{sid} → 鉴权 → 分块上传（write 混合帧，按 write_result 确认推进）→
-// 分块下载（read）→ 校验内容写回。供 test/e2e.mjs 调用。
+// 分块下载（read）→ 校验内容写回。供 scripts/e2e.mjs 调用。
 // 用法：node e2e-file.mjs <base> <token> <sid> <srcLocal> <dstAgent>
 // 上传写 agent 端 <dstAgent>，下载结果写到 <srcLocal>.down，退出码 0 表示成功。
 import { readFileSync, writeFileSync } from 'node:fs';

@@ -13,8 +13,9 @@ const REPORT_SLOW_INTERVAL_S = 120; // 无人查看：120 秒上报
 const EXEC_DEFAULT_TIMEOUT_MS = 25 * 1000; // MCP exec 默认超时（须 < DO fetch 默认 30s 超时，由内部先返回）
 const EXEC_MAX_TIMEOUT_MS = 25 * 1000;
 const EXEC_TIMEOUT_GRACE_MS = 5 * 1000; // DO 兜底定时器比 agent 实际超时晚 5s：agent 先回执（含部分 stdout），DO 定时器仅兜底防悬挂
-const UPLOAD_CHUNK_BYTES = 48 * 1024; // /api/upload 分片帧数据上限（控制通道入站 64KB，留 JSON 头/边界余量）
+const UPLOAD_CHUNK_BYTES = 48 * 1024; // /api/file_upload 分片帧数据上限（控制通道入站 64KB，留 JSON 头/边界余量）
 const UPLOAD_TIMEOUT_MS = 120 * 1000; // 上传总超时（流式转发 + agent 写盘；agent 失联时兜底返回，防悬挂）
+const UPLOAD_MAX_DEFAULT = 100 * 1024 * 1024; // 单次上传大小上限默认 100MB（磁盘耗尽防护；agent 端 FILE_LIMIT 500MB 兜底）
 
 export class TerminalDO {
   constructor(state, env) {
@@ -25,7 +26,7 @@ export class TerminalDO {
     this.agentInterval = new Map(); // serverId -> 当前下发的上报间隔（秒），避免重复下发
     this.pendingOpen = new Map(); // streamId -> {tries, timer, type} open_terminal/open_file 确认重发
     this.pendingExec = new Map(); // execId -> {resolve, timer, serverId} MCP 一次性命令等待
-    this.pendingUpload = new Map(); // uploadId -> {resolve, timer} /api/upload 等待 upload_result
+    this.pendingUpload = new Map(); // uploadId -> {resolve, timer} /api/file_upload 等待 upload_result
     this.uploading = new Set(); // serverId -> 上传进行中（控制通道单 WS，防并发帧交错）
     this.lastPingAt = new Map(); // serverId -> 上次心跳时间（控制通道保活，防健康连接被 read -t 180 误判半开）
   }
@@ -161,7 +162,7 @@ export class TerminalDO {
       return json(result);
     }
 
-    // 内部 RPC：/api/upload 流式上传（调用方 routes 已鉴权 canExec）
+    // 内部 RPC：/api/file_upload 流式上传（调用方 routes 已鉴权 canExec）
     // Worker 流式读请求 body → 自动切成 ≤48KB 分片 → 控制通道 Binary 混合帧发给 agent →
     // agent 写临时文件（offset 校验）→ 最后一帧 commit 原子替换 → 回执 upload_result。
     // 客户端零分片逻辑：curl --data-binary @file 一行即可，大文件天然流式（不占内存）。
@@ -176,7 +177,7 @@ export class TerminalDO {
       if (this.uploading.has(serverId)) return json({ error: 'upload already in progress for this server' }, 409);
       this.uploading.add(serverId);
       try {
-        return await this.doUpload(agentWs, serverId, targetPath, overwrite, request);
+        return await this.doUpload(agentWs, targetPath, overwrite, request);
       } finally {
         this.uploading.delete(serverId);
       }
@@ -264,9 +265,9 @@ export class TerminalDO {
     return new Response('not found', { status: 404 });
   }
 
-  // /api/upload 核心：流式读 body → 自动切 ≤48KB 分片 → 控制通道 Binary 混合帧 → 等 upload_result。
+  // /api/file_upload 核心：流式读 body → 自动切 ≤48KB 分片 → 控制通道 Binary 混合帧 → 等 upload_result。
   // 客户端零分片逻辑（curl --data-binary @file 一行）；分片顺序由 offset 严格保证（agent 端校验）。
-  async doUpload(agentWs, serverId, targetPath, overwrite, request) {
+  async doUpload(agentWs, targetPath, overwrite, request) {
     const uploadId = `u-${crypto.randomUUID()}`;
     let resolveResult;
     const resultPromise = new Promise((resolve) => { resolveResult = resolve; });
@@ -275,10 +276,14 @@ export class TerminalDO {
       resolveResult({ ok: false, error: 'upload timed out' });
     }, UPLOAD_TIMEOUT_MS);
     this.pendingUpload.set(uploadId, { resolve: resolveResult, timer });
+    // 大小上限：优先环境变量 UPLOAD_MAX_MB（磁盘耗尽防护）
+    const maxBytes = (Number(this.env.UPLOAD_MAX_MB) || UPLOAD_MAX_DEFAULT / (1024 * 1024)) * 1024 * 1024;
     try {
       const encoder = new TextEncoder();
+      let failed = false; // agent 断连/超限后置位：停止发帧并提前退出读循环
       // 发一帧：JSON 头 + '\n' + 原始字节（Binary 混合帧，与文件会话同构）
       const sendFrame = (offset, piece, commit) => {
+        if (failed) return;
         const head = encoder.encode(JSON.stringify({
           type: 'upload', upload_id: uploadId, path: targetPath, offset, commit, overwrite,
         }) + '\n');
@@ -288,6 +293,7 @@ export class TerminalDO {
         try {
           agentWs.send(frame.buffer);
         } catch {
+          failed = true;
           resolveResult({ ok: false, error: 'agent disconnected during upload' });
         }
       };
@@ -295,29 +301,34 @@ export class TerminalDO {
       const reader = request.body ? request.body.getReader() : null;
       let offset = 0;
       let buf = new Uint8Array(0);
-      while (reader) {
+      while (reader && !failed) {
         const { done, value } = await reader.read();
         if (done) break;
         if (value && value.length) {
+          if (offset + value.length > maxBytes) {
+            failed = true;
+            resolveResult({ ok: false, error: `upload exceeds ${Math.round(maxBytes / (1024 * 1024))}MB limit` });
+            break;
+          }
           const combined = new Uint8Array(buf.length + value.length);
           combined.set(buf, 0);
           combined.set(value, buf.length);
           buf = combined;
         }
-        while (buf.length >= UPLOAD_CHUNK_BYTES) {
+        while (!failed && buf.length >= UPLOAD_CHUNK_BYTES) {
           sendFrame(offset, buf.slice(0, UPLOAD_CHUNK_BYTES), false);
           offset += UPLOAD_CHUNK_BYTES;
           buf = buf.slice(UPLOAD_CHUNK_BYTES);
         }
       }
-      if (buf.length > 0) {
+      if (!failed && buf.length > 0) {
         sendFrame(offset, buf, false);
         offset += buf.length;
       }
-      // commit 帧（空数据）：agent 端 fsync + rename 原子替换
-      sendFrame(offset, new Uint8Array(0), true);
+      // commit 帧（空数据）：agent 端 fsync + rename 原子替换（失败路径不发，避免残留 commit）
+      if (!failed) sendFrame(offset, new Uint8Array(0), true);
       const result = await resultPromise;
-      if (!result.ok) return json({ error: result.error || 'upload failed' }, 400);
+      if (!result.ok) return json({ error: result.error || 'upload failed' }, result.error && /too large|exceeds/.test(result.error) ? 413 : 400);
       return json({ ok: true, path: targetPath, size: offset, upload_id: uploadId });
     } finally {
       clearTimeout(timer);
@@ -556,7 +567,7 @@ export class TerminalDO {
             return;
           }
           if (j && j.type === 'upload_result') {
-            // /api/upload 结果：resolve 等待中的 /rpc/upload（每个 upload_id 只回执一次，幂等）
+            // /api/file_upload 结果：resolve 等待中的 /rpc/upload（每个 upload_id 只回执一次，幂等）
             const r = this.pendingUpload.get(j.upload_id);
             if (r) {
               clearTimeout(r.timer);

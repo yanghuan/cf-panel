@@ -251,7 +251,7 @@ async fn control_conn(
                     break Err(e);
                 }
             }
-            // Binary 混合帧：/api/upload 分片上传（JSON 头 + '\n' + 原始字节，与文件会话同构）
+            // Binary 混合帧：/api/file_upload 分片上传（JSON 头 + '\n' + 原始字节，与文件会话同构）
             Message::Binary(b) => {
                 if let Err(e) =
                     handle_upload_frame(cfg, &b, &created, &failed_uploads, &write).await

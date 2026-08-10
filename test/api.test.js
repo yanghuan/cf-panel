@@ -794,7 +794,7 @@ test('MCP：tools/list 与 tools/call', async () => {
   assert.equal(cu.result.isError, false);
   const cuRes = JSON.parse(cu.result.content[0].text);
   assert.equal(cuRes.server_name, 'web-1');
-  assert.match(cuRes.upload_url, /^https:\/\/panel\.local\/api\/upload\?/);
+  assert.match(cuRes.upload_url, /^https:\/\/panel\.local\/api\/file_upload\?/);
   assert.match(cuRes.upload_url, /token=/);
   assert.equal(cuRes.overwrite, false);
   assert.ok(cuRes.expires_in_seconds > 0 && cuRes.expires_in_seconds <= 600);
@@ -872,6 +872,9 @@ test('MCP：tools/list 与 tools/call', async () => {
   assert.equal(asRes.name, 'mcp-new');
   assert.equal(asRes.server_id, 3);
   assert.ok(asRes.agent_key && asRes.agent_key.length === 64, 'agent_key 明文返回');
+  // H1：部署地址动态生成（host = panel.local，非占位符）
+  assert.equal(asRes.wss_base, 'wss://panel.local/ws/agent');
+  assert.equal(asRes.report_url, 'https://panel.local/api/report');
   // add_server：缺 name → isError
   const asBad = await (await mcp(env, { token, body: { jsonrpc: '2.0', id: 21, method: 'tools/call', params: { name: 'add_server', arguments: {} } } })).json();
   assert.equal(asBad.result.isError, true);

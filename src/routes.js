@@ -292,9 +292,12 @@ export async function handleApi(request, env) {
     return json({ ok: true });
   }
 
-  // POST /api/upload?token= —— 签名 URL 直传（MCP create_upload 签发，无状态 HMAC 验签，无需 Bearer）
+  // POST /api/file_upload?token= —— 签名 URL 直传（MCP create_upload 签发，无状态 HMAC 验签，无需 Bearer）
   // 签名绑定 server_id/path/overwrite/exp；验证失败 403。审计在 create_upload 时已记录，此处不重复。
-  if (method === 'POST' && path === '/api/upload' && url.searchParams.get('token')) {
+  // JWT_SECRET 仍是必需安全边界（验签密钥回退依赖它）：缺失时签名上传同样 503，防止绕过配置错误。
+  if (method === 'POST' && path === '/api/file_upload' && url.searchParams.get('token')) {
+    const configError = requireJwtSecret(env);
+    if (configError) return configError;
     return handleUploadSigned(request, env, url);
   }
 
@@ -430,10 +433,10 @@ export async function handleApi(request, env) {
     });
   }
 
-  // POST /api/upload?server_id=&path=&overwrite= —— 流式上传文件到 agent（body = 原始字节）
+  // POST /api/file_upload?server_id=&path=&overwrite= —— 流式上传文件到 agent（body = 原始字节）
   // 小文件（配置/脚本）与大文件（备份/包）统一入口：Worker 流式读 body → 自动分片 →
   // 控制通道 Binary 混合帧 → agent 原子写。需 exec 权限（管理员或带 server:exec 的 PAT）。
-  if (method === 'POST' && path === '/api/upload') {
+  if (method === 'POST' && path === '/api/file_upload') {
     const u = new URL(request.url);
     const serverId = Number(u.searchParams.get('server_id')) || 0;
     const targetPath = u.searchParams.get('path') || '';
@@ -445,7 +448,7 @@ export async function handleApi(request, env) {
     await env.DB.prepare('INSERT INTO audit_logs (user_id, username, client_ip, action, target_server_id, detail) VALUES (?,?,?,?,?,?)')
       .bind(user.id, user.username, clientIp(request), 'file.upload', server.id, targetPath)
       .run();
-    return forwardUpload(env, request, serverId, targetPath);
+    return forwardUpload(env, request, serverId);
   }
 
   // POST /api/terminal —— 创建终端会话（exec 权限 + 服务器归属）
@@ -582,11 +585,11 @@ export async function handleApi(request, env) {
 
 // 上传公共转发：流式转发到 TerminalDO（body 保持原始流，DO 内切分片）；query 参数原样传递。
 // 两条鉴权路径（Bearer JWT/PAT 与签名 URL）共用同一管道。
-function forwardUpload(env, request, serverId, targetPath) {
+function forwardUpload(env, request, serverId) {
   const target = new URL(request.url);
   target.protocol = 'https:';
   target.hostname = 'do.internal';
-  target.pathname = '/rpc/upload'; // DO 内部 RPC 路径（/api/upload 仅面板入口）
+  target.pathname = '/rpc/upload'; // DO 内部 RPC 路径（/api/file_upload 仅面板入口）
   return doForShard(env, shardForServerId(serverId)).fetch(target.toString(), request);
 }
 
@@ -600,7 +603,7 @@ async function handleUploadSigned(request, env, u) {
   if (!targetPath || !targetPath.startsWith('/')) return err('path is required (absolute)', 400);
   const v = await verifyUploadToken(u.searchParams.get('token') || '', serverId, targetPath, overwrite, env);
   if (!v.ok) return err(v.error, 403);
-  return forwardUpload(env, request, serverId, targetPath);
+  return forwardUpload(env, request, serverId);
 }
 
 // 服务器增删改后清列表缓存（serverListCache 在 auth.js）
@@ -719,7 +722,7 @@ async function mcpCreateUpload(user, env, args, host, ip) {
   const overwrite = !!args.overwrite;
   const { token, exp } = await signUploadToken(server.id, path, overwrite, env);
   const q = new URLSearchParams({ server_id: String(server.id), path, overwrite: overwrite ? '1' : '0', token });
-  const uploadUrl = `https://${host}/api/upload?${q.toString()}`;
+  const uploadUrl = `https://${host}/api/file_upload?${q.toString()}`;
   // 审计在签发时记录（实际 curl 上传经签名 URL 直传，不再重复记录）
   await env.DB.prepare('INSERT INTO audit_logs (user_id, username, client_ip, action, target_server_id, detail) VALUES (?,?,?,?,?,?)')
     .bind(user.id, user.username, ip, 'file.upload', server.id, path)
@@ -762,7 +765,7 @@ function requireAdmin(user) {
   if (!isAdmin(user)) throw new Error('forbidden: admin only');
 }
 
-async function mcpAddServer(user, env, args, ip) {
+async function mcpAddServer(user, env, args, ip, host) {
   requireAdmin(user);
   const name = String(args.name || '').trim();
   if (!name) throw new Error('name required');
@@ -786,8 +789,8 @@ async function mcpAddServer(user, env, args, ip) {
     server_id: id,
     name,
     agent_key: key, // 明文只返回一次
-    wss_base: 'wss://<面板域名>/ws/agent',
-    report_url: 'https://<面板域名>/api/report',
+    wss_base: `wss://${host}/ws/agent`, // agent 部署地址（与 REST 版一致，动态生成）
+    report_url: `https://${host}/api/report`,
   };
 }
 
@@ -868,7 +871,7 @@ async function mcpCreateToken(user, env, args) {
   return { token }; // 明文只返回一次
 }
 
-async function mcpRevokeToken(user, env, args, ip) {
+async function mcpRevokeToken(user, env, args) {
   requireAdmin(user);
   const id = Number(args.token_id) || 0;
   if (!id) throw new Error('token_id is required');
@@ -1019,7 +1022,7 @@ export async function handleMcp(request, env) {
         else if (params.name === 'get_monitor') content = await mcpGetMonitor(user, env, params.arguments || {});
         else if (params.name === 'exec_command') content = await mcpExecCommand(user, env, params.arguments || {});
         else if (params.name === 'create_upload') content = await mcpCreateUpload(user, env, params.arguments || {}, url.host, clientIp(request));
-        else if (params.name === 'add_server') content = await mcpAddServer(user, env, params.arguments || {}, clientIp(request));
+        else if (params.name === 'add_server') content = await mcpAddServer(user, env, params.arguments || {}, clientIp(request), url.host);
         else if (params.name === 'delete_server') content = await mcpDeleteServer(user, env, params.arguments || {}, clientIp(request));
         else if (params.name === 'update_server') content = await mcpUpdateServer(user, env, params.arguments || {}, clientIp(request));
         else if (params.name === 'list_tokens') content = await mcpListTokens(user, env);

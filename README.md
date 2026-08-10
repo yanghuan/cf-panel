@@ -288,7 +288,7 @@ wrangler secret put PANEL_USERS      # 回车后粘贴值，如 alice:pass1,bob:
 | DELETE | `/api/servers/:id` | 删除服务器（仅管理员） |
 | POST | `/api/terminal` | 创建终端会话（exec 权限 + 归属校验），返回 session_id |
 | POST | `/api/file/open` | 创建文件管理会话（exec 权限 + 归属校验），返回 session_id |
-| POST | `/api/upload?server_id=&path=&overwrite=` | 流式上传文件到 agent（body=原始字节，Worker 自动分片；Bearer 鉴权或签名 URL token 均可） |
+| POST | `/api/file_upload?server_id=&path=&overwrite=` | 流式上传文件到 agent（body=原始字节，Worker 自动分片；Bearer 鉴权或签名 URL token 均可） |
 | GET | `/api/usage` | 用量观测（近 24h 上报帧 / DO 事件 / D1 写行估算，仅管理员） |
 | GET | `/ws/terminal/{id}` | 浏览器终端 WebSocket（校验创建者/admin） |
 | GET | `/ws/file/{id}` | 浏览器文件管理 WebSocket（JSON 行协议：list/read/write/zip/rename/delete，校验创建者/admin） |

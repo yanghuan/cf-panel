@@ -37,6 +37,7 @@ const AGENT_TMPDIR = join(TMP, 'agent');
 let pass = 0, fail = 0;
 let wranglerProc = null, agentProc = null;
 let token = '', agentKey = '';
+let serverName = '', serverId = 0; // 本测试注册的服务器（随机名 + 动态 id，防残留串台）
 
 // ---- 辅助函数 ----
 
@@ -179,16 +180,25 @@ async function step3_login() {
 // ============================================================
 async function step4_register() {
   section('注册服务器');
+  // 随机后缀：多轮/多环境运行时不与其他记录同名（否则 find 断言可能命中残留旧数据）
+  serverName = `e2e-node-${randomBytes(4).toString('hex')}`;
   const res = await fetch(`${BASE}/api/servers`, {
     method: 'POST',
     headers: { 'authorization': `Bearer ${token}`, 'content-type': 'application/json' },
-    body: JSON.stringify({ name: 'e2e-node', group: 'e2e', sort_order: 1 }),
+    body: JSON.stringify({ name: serverName, group: 'e2e', sort_order: 1 }),
   });
   if (!res.ok) { bad(`注册服务器失败：HTTP ${res.status}`); process.exit(1); }
   const body = await res.json();
   if (!body.agent_key) { bad('注册服务器失败：无 agent_key'); process.exit(1); }
   agentKey = body.agent_key;
-  ok(`已注册服务器（agent_key=${agentKey.slice(0, 8)}...）`);
+  // 从列表按名字查真实 id（不硬编码 server_id=1：残留数据/并发运行下 id 会错位）
+  const list = await (await fetch(`${BASE}/api/servers`, {
+    headers: { 'authorization': `Bearer ${token}` },
+  })).json();
+  const srv = (list || []).find((s) => s.name === serverName);
+  if (!srv) { bad('注册后列表未找到该服务器'); process.exit(1); }
+  serverId = srv.id;
+  ok(`已注册服务器 ${serverName}（id=${serverId}，agent_key=${agentKey.slice(0, 8)}...）`);
 }
 
 // ============================================================
@@ -218,14 +228,14 @@ async function step5_agent() {
       headers: { 'authorization': `Bearer ${token}` },
     });
     const servers = await res.json();
-    return servers.some((s) => s.name === 'e2e-node' && s.online === true);
+    return servers.some((s) => s.name === serverName && s.online === true);
   });
   if (!online) { bad('agent 未在 60s 内上线'); process.exit(1); }
   ok('agent 控制通道上线，面板判定在线');
 
   // 等待监控数据
   const monitor = await waitFor('监控上报', 60, async () => {
-    const res = await fetch(`${BASE}/api/monitor?server_id=1&range=1h`, {
+    const res = await fetch(`${BASE}/api/monitor?server_id=${serverId}&range=1h`, {
       headers: { 'authorization': `Bearer ${token}` },
     });
     const body = await res.json();
@@ -240,7 +250,7 @@ async function step5_agent() {
       headers: { 'authorization': `Bearer ${token}` },
     });
     const servers = await res.json();
-    const srv = servers.find((s) => s.name === 'e2e-node');
+    const srv = servers.find((s) => s.name === serverName);
     return srv?.info?.os && srv?.info?.kern;
   });
   if (sysOk) ok('系统信息已入库（os/kern）');
@@ -252,7 +262,7 @@ async function step5_agent() {
       headers: { 'authorization': `Bearer ${token}` },
     });
     const servers = await res.json();
-    const srv = servers.find((s) => s.name === 'e2e-node');
+    const srv = servers.find((s) => s.name === serverName);
     return srv?.metric?.cpu != null && srv?.metric?.mem_used != null;
   });
   if (metricOk) ok('实时指标可见（cpu/mem_used）');
@@ -272,7 +282,7 @@ async function step6_terminal() {
       const tres = await fetch(`${BASE}/api/terminal`, {
         method: 'POST',
         headers: { 'authorization': `Bearer ${token}`, 'content-type': 'application/json' },
-        body: JSON.stringify({ server_id: 1 }),
+        body: JSON.stringify({ server_id: serverId }),
       });
       if (!tres.ok) { bad(`创建终端会话失败：HTTP ${tres.status}`); return; }
       const { session_id: sid } = await tres.json();
@@ -342,7 +352,7 @@ async function step7_file() {
       const fres = await fetch(`${BASE}/api/file/open`, {
         method: 'POST',
         headers: { 'authorization': `Bearer ${token}`, 'content-type': 'application/json' },
-        body: JSON.stringify({ server_id: 1 }),
+        body: JSON.stringify({ server_id: serverId }),
       });
       if (!fres.ok) { bad(`创建文件会话失败：HTTP ${fres.status}`); return; }
       const { session_id: fsid } = await fres.json();
@@ -421,25 +431,25 @@ async function step8_mcp() {
   // ---- 8.2) list_servers ----
   const ls = await mcpTool(3, 'list_servers');
   const lsData = mcpContent(ls);
-  if (Array.isArray(lsData) && lsData.some((s) => s.name === 'e2e-node' && s.online === true))
-    ok('MCP list_servers：e2e-node 在线，含实时指标');
-  else bad('MCP list_servers：e2e-node 未找到或不在线');
+  if (Array.isArray(lsData) && lsData.some((s) => s.name === serverName && s.online === true))
+    ok(`MCP list_servers：${serverName} 在线，含实时指标`);
+  else bad(`MCP list_servers：${serverName} 未找到或不在线`);
 
   // ---- 8.3) get_monitor ----
-  const gm = await mcpTool(4, 'get_monitor', { server_id: 1, range: '1h' });
+  const gm = await mcpTool(4, 'get_monitor', { server_id: serverId, range: '1h' });
   const gmData = mcpContent(gm);
   // MCP get_monitor 返回 { server, range, count, points, custom }，points 即监控时序点
   if (gmData?.points?.length >= 1) ok('MCP get_monitor：监控数据存在（points ≥1 条）');
   else bad(`MCP get_monitor：无监控数据：${JSON.stringify(gmData)}`);
 
   // ---- 8.4) exec_command ----
-  const exec = await mcpTool(5, 'exec_command', { server_id: 1, command: 'echo E2E_MCP_EXEC_OK' });
+  const exec = await mcpTool(5, 'exec_command', { server_id: serverId, command: 'echo E2E_MCP_EXEC_OK' });
   const execData = mcpContent(exec);
   if (execData?.stdout?.includes('E2E_MCP_EXEC_OK')) ok('MCP exec_command：agent 真实执行，输出匹配');
   else bad(`MCP exec_command 失败：${JSON.stringify(exec)}`);
 
   // ---- 8.5) create_upload + Bearer 上传 + 验证 ----
-  const cu = await mcpTool(6, 'create_upload', { server_id: 1, path: '/tmp/e2e-mcp-upload.txt' });
+  const cu = await mcpTool(6, 'create_upload', { server_id: serverId, path: '/tmp/e2e-mcp-upload.txt' });
   const cuData = mcpContent(cu);
   const cuUrl = cuData?.upload_url || '';
   const cuExp = cuData?.expires_in_seconds || 0;
@@ -447,7 +457,7 @@ async function step8_mcp() {
   else bad(`MCP create_upload：响应结构异常：${JSON.stringify(cuData)}`);
 
   // Bearer 上传
-  const upRes = await fetch(`${BASE}/api/file_upload?server_id=1&path=/tmp/e2e-mcp-upload.txt`, {
+  const upRes = await fetch(`${BASE}/api/file_upload?server_id=${serverId}&path=/tmp/e2e-mcp-upload.txt`, {
     method: 'POST',
     headers: { 'authorization': `Bearer ${token}` },
     body: 'E2E_MCP_UPLOAD_CONTENT',
@@ -455,14 +465,14 @@ async function step8_mcp() {
   const upBody = await upRes.json();
   if (upBody.ok) {
     // exec_command 验证内容
-    const verify = await mcpTool(7, 'exec_command', { server_id: 1, command: 'cat /tmp/e2e-mcp-upload.txt' });
+    const verify = await mcpTool(7, 'exec_command', { server_id: serverId, command: 'cat /tmp/e2e-mcp-upload.txt' });
     const vData = mcpContent(verify);
     if (vData?.stdout?.includes('E2E_MCP_UPLOAD_CONTENT')) ok('MCP 上传：Bearer 上传 + exec_command 验证内容一致');
     else bad(`MCP 上传：内容验证不匹配：${JSON.stringify(vData)}`);
   } else bad(`MCP 上传：Bearer POST 失败：${JSON.stringify(upBody)}`);
 
   // 清理
-  await mcpTool(8, 'exec_command', { server_id: 1, command: 'rm -f /tmp/e2e-mcp-upload.txt' });
+  await mcpTool(8, 'exec_command', { server_id: serverId, command: 'rm -f /tmp/e2e-mcp-upload.txt' });
 
   // ---- 8.6) add_server ----
   const addSrv = await mcpTool(10, 'add_server', { name: 'e2e-mcp', group: 'e2e-mcp', sort_order: 10 });
@@ -490,7 +500,7 @@ async function step8_mcp() {
   } else bad('MCP delete_server：跳过（add_server 未返回有效 ID）');
 
   // ---- 8.9) Token CRUD + PAT 权限 ----
-  const ct = await mcpTool(13, 'create_token', { name: 'e2e-mcp-pat', scopes: ['server:read'], server_ids: [1] });
+  const ct = await mcpTool(13, 'create_token', { name: 'e2e-mcp-pat', scopes: ['server:read'], server_ids: [serverId] });
   const ctData = mcpContent(ct);
   const patToken = ctData?.token || '';
   if (patToken.startsWith('cfp_')) ok('MCP create_token：PAT 创建成功（cfp_ 前缀）');
@@ -555,6 +565,20 @@ async function step8_mcp() {
 }
 
 // ============================================================
+// 第 9 步：清理本测试注册的服务器（随机名 + 结束后删除，防残留）
+// ============================================================
+async function step9_removeServer() {
+  section('清理测试服务器');
+  if (!serverId) return;
+  const res = await fetch(`${BASE}/api/servers/${serverId}`, {
+    method: 'DELETE',
+    headers: { 'authorization': `Bearer ${token}` },
+  });
+  if (res.ok) ok(`已删除测试服务器 ${serverName}（id=${serverId}）`);
+  else bad(`删除测试服务器失败：HTTP ${res.status}`);
+}
+
+// ============================================================
 // 主流程
 // ============================================================
 async function main() {
@@ -577,6 +601,7 @@ async function main() {
     await step6_terminal();
     await step7_file();
     await step8_mcp();
+    await step9_removeServer(); // 测试结束删除本测试服务器（wrangler 退出前执行）
   } catch (e) {
     console.error(`\n致命错误：${e.message || e}`);
     console.error(e.stack);

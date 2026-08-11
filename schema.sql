@@ -30,6 +30,9 @@ CREATE TABLE IF NOT EXISTS api_tokens (
   created_at TEXT    NOT NULL DEFAULT (datetime('now'))
 );
 
+-- PAT 鉴权 `WHERE token_hash = ?` 走索引（迁移 0006；无索引时全表扫）
+CREATE INDEX IF NOT EXISTS idx_api_tokens_hash ON api_tokens(token_hash);
+
 -- 审计日志
 CREATE TABLE IF NOT EXISTS audit_logs (
   id               INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -41,6 +44,9 @@ CREATE TABLE IF NOT EXISTS audit_logs (
   detail           TEXT,
   created_at       TEXT    NOT NULL DEFAULT (datetime('now'))
 );
+
+-- 保留期清理 `DELETE FROM audit_logs WHERE created_at < ?` 走索引（迁移 0006；无索引时全表扫）
+CREATE INDEX IF NOT EXISTS idx_audit_logs_created ON audit_logs(created_at);
 
 -- 监控时序（分钟级聚合：1 行/分钟/机器；默认归档开启，保留 30 天）
 CREATE TABLE IF NOT EXISTS metrics_min (

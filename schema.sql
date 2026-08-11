@@ -27,6 +27,7 @@ CREATE TABLE IF NOT EXISTS api_tokens (
   token_hash TEXT    NOT NULL,
   scopes     TEXT    NOT NULL,               -- JSON 数组，如 ["server:read","server:exec"]
   server_ids TEXT,                           -- NULL=全部，否则 JSON 白名单
+  expires_at INTEGER,                        -- unix 秒，NULL=永久有效（迁移 0007；鉴权时校验过期）
   created_at TEXT    NOT NULL DEFAULT (datetime('now'))
 );
 

@@ -1019,12 +1019,17 @@
     }
   }
 
+  function fmtTokenExpiry(exp) {
+    if (!exp) return '永久有效';
+    const expired = exp * 1000 < Date.now();
+    return `${new Date(exp * 1000).toLocaleString()}${expired ? '（已过期）' : ''}`;
+  }
   async function loadTokens() {
     try {
       const rows = await api('/api/tokens');
       $('#token-list').innerHTML = rows.length
         ? rows.map((r) => `
-            <li>${escapeHtml(r.name)} · ${escapeHtml(r.scopes)}${r.server_ids ? ' · ids=' + escapeHtml(r.server_ids) : ''}
+            <li>${escapeHtml(r.name)} · ${escapeHtml(r.scopes)}${r.server_ids ? ' · ids=' + escapeHtml(r.server_ids) : ''} · 到期：${escapeHtml(fmtTokenExpiry(r.expires_at))}
               <button data-tok-del="${r.id}" class="danger">删除</button></li>`).join('')
         : '<li class="muted">暂无令牌</li>';
     } catch (e) {
@@ -1038,14 +1043,21 @@
     if ($('#tok-exec').checked) scopes.push('server:exec');
     if (!scopes.length) return toast('至少勾选一个权限');
     const serverIDs = $('#tok-servers').value.split(',').map((s) => Number(s.trim())).filter((n) => n > 0);
+    const expDays = Number($('#tok-expires').value);
     try {
       const res = await api('/api/tokens', {
         method: 'POST',
-        body: JSON.stringify({ name: $('#tok-name').value.trim(), scopes, server_ids: serverIDs.length ? serverIDs : null }),
+        body: JSON.stringify({
+          name: $('#tok-name').value.trim(),
+          scopes,
+          server_ids: serverIDs.length ? serverIDs : null,
+          expires_in_days: expDays > 0 ? expDays : undefined,
+        }),
       });
-      infoDialog('令牌已创建（仅显示一次）', `令牌：\n${res.token}\n\n用法：Authorization: Bearer ${res.token}`);
+      infoDialog('令牌已创建（仅显示一次）', `令牌：\n${res.token}\n\n用法：Authorization: Bearer ${res.token}\n\n有效期：${res.expires_at ? new Date(res.expires_at * 1000).toLocaleString() : '永久有效'}`);
       $('#tok-name').value = '';
       $('#tok-servers').value = '';
+      $('#tok-expires').value = '';
       loadTokens();
     } catch (e) {
       toast(e.message);

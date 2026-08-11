@@ -10,6 +10,8 @@ export async function authUserByToken(token, env) {
     const hash = await hashSecret(token, env);
     const row = await env.DB.prepare('SELECT * FROM api_tokens WHERE token_hash = ?').bind(hash).first();
     if (!row) return null;
+    // 有效期：expires_at 为 unix 秒，NULL=永久；已过期拒绝（token 本身不删除，列表可见）
+    if (row.expires_at && row.expires_at < Math.floor(Date.now() / 1000)) return null;
     let scopes = [];
     try { scopes = JSON.parse(row.scopes || '[]'); } catch { /* ignore */ }
     let serverIDs = null;

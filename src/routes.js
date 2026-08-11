@@ -100,13 +100,14 @@ const MCP_TOOLS = [
   },
   {
     name: 'create_token',
-    description: '创建访问令牌（PAT）。仅管理员。返回明文 token（只显示一次，请妥善保存）。scopes 合法值：server:read / server:exec（默认 server:read）；server_ids 为空=全部服务器。',
+    description: '创建访问令牌（PAT）。仅管理员。返回明文 token（只显示一次，请妥善保存）。scopes 合法值：server:read / server:exec（默认 server:read）；server_ids 为空=全部服务器；expires_in_days 为空=永久有效。',
     inputSchema: {
       type: 'object',
       properties: {
         name: { type: 'string', description: '令牌名称（必填）' },
         scopes: { type: 'array', items: { type: 'string' }, description: '权限 scope，如 ["server:read"] 或 ["server:read","server:exec"]' },
         server_ids: { type: 'array', items: { type: 'integer' }, description: '服务器白名单（空=全部）' },
+        expires_in_days: { type: 'integer', description: '有效期天数（正整数，可选；缺省=永久有效）' },
       },
       required: ['name'],
     },
@@ -510,7 +511,7 @@ async function handleApiInner(request, env) {
   if (path === '/api/tokens') {
     if (!isAdmin(user)) return err('forbidden', 403);
     if (method === 'GET') {
-      const rows = await env.DB.prepare('SELECT id, name, scopes, server_ids, created_at FROM api_tokens ORDER BY id').all();
+      const rows = await env.DB.prepare('SELECT id, name, scopes, server_ids, expires_at, created_at FROM api_tokens ORDER BY id').all();
       return json(rows.results);
     }
     if (method === 'POST') {
@@ -526,12 +527,17 @@ async function handleApiInner(request, env) {
         scopes = [SCOPE_READ];
       }
       const serverIDs = Array.isArray(body.server_ids) ? body.server_ids.map(Number).filter((n) => n > 0) : null;
+      // 有效期：expires_in_days 正整数（可选；缺省/0/非法 → 永久有效）
+      const days = Number(body.expires_in_days);
+      const expiresAt = Number.isFinite(days) && days > 0
+        ? Math.floor(Date.now() / 1000) + days * 86400
+        : null;
       const token = PAT_PREFIX + randomHex(32);
       const hash = await hashSecret(token, env);
-      await env.DB.prepare('INSERT INTO api_tokens (user_id, name, token_hash, scopes, server_ids) VALUES (?,?,?,?,?)')
-        .bind(user.id, name, hash, JSON.stringify(scopes), serverIDs ? JSON.stringify(serverIDs) : null)
+      await env.DB.prepare('INSERT INTO api_tokens (user_id, name, token_hash, scopes, server_ids, expires_at) VALUES (?,?,?,?,?,?)')
+        .bind(user.id, name, hash, JSON.stringify(scopes), serverIDs ? JSON.stringify(serverIDs) : null, expiresAt)
         .run();
-      return json({ token }); // 明文只返回一次
+      return json({ token, expires_at: expiresAt }); // 明文只返回一次
     }
     return err('method not allowed', 405);
   }
@@ -901,7 +907,7 @@ async function mcpUpdateServer(user, env, args, ip) {
 
 async function mcpListTokens(user, env) {
   requireAdmin(user);
-  const rows = await env.DB.prepare('SELECT id, name, scopes, server_ids, created_at FROM api_tokens ORDER BY id').all();
+  const rows = await env.DB.prepare('SELECT id, name, scopes, server_ids, expires_at, created_at FROM api_tokens ORDER BY id').all();
   return rows.results.map((t) => ({ ...t, scopes: safeJson(t.scopes) || t.scopes, server_ids: safeJson(t.server_ids) || t.server_ids }));
 }
 
@@ -917,12 +923,16 @@ async function mcpCreateToken(user, env, args) {
     scopes = [SCOPE_READ];
   }
   const serverIDs = Array.isArray(args.server_ids) ? args.server_ids.map(Number).filter((n) => n > 0) : null;
+  const days = Number(args.expires_in_days);
+  const expiresAt = Number.isFinite(days) && days > 0
+    ? Math.floor(Date.now() / 1000) + days * 86400
+    : null;
   const token = PAT_PREFIX + randomHex(32);
   const hash = await hashSecret(token, env);
-  await env.DB.prepare('INSERT INTO api_tokens (user_id, name, token_hash, scopes, server_ids) VALUES (?,?,?,?,?)')
-    .bind(user.id, name, hash, JSON.stringify(scopes), serverIDs ? JSON.stringify(serverIDs) : null)
+  await env.DB.prepare('INSERT INTO api_tokens (user_id, name, token_hash, scopes, server_ids, expires_at) VALUES (?,?,?,?,?,?)')
+    .bind(user.id, name, hash, JSON.stringify(scopes), serverIDs ? JSON.stringify(serverIDs) : null, expiresAt)
     .run();
-  return { token }; // 明文只返回一次
+  return { token, expires_at: expiresAt }; // 明文只返回一次
 }
 
 async function mcpRevokeToken(user, env, args) {

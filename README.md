@@ -274,7 +274,7 @@ wrangler secret put PANEL_USERS      # 回车后粘贴值，如 alice:pass1,bob:
 - **登录**：`PANEL_USERS` 多用户（`user:pass,user:pass`）或单管理员（`PANEL_PASSWORD`），登录即管理员。**应用内置失败限流**（同一 IP 在 15 分钟窗口内失败 ≥5 次 → 锁定 15 分钟并返回 `429` + `Retry-After`，登录成功自动清零）；生产部署**必须**再前置 **Cloudflare Access**（登录密码作为第二层），以覆盖跨边缘实例的限流一致性。
   > ⚠️ Access 需为 agent 路径放行：`/ws/agent/*` 使用 `X-Agent-Key` 头（非浏览器 SSO），必须配置 Bypass 或 Service Token 策略，否则 agent 无法连接。
 - **公告**：设置里可改站点名/公告（存 D1 `kv_json` 表），公告对所有访客可见。
-- **PAT**：设置里可创建访问令牌（scopes + server_ids 白名单），供 API 调用（`Authorization: Bearer cfp_xxx`）。
+- **PAT**：设置里可创建访问令牌（scopes + server_ids 白名单 + 可选有效期天数，留空=永久有效，到期自动拒绝鉴权），供 API 调用（`Authorization: Bearer cfp_xxx`）。
 - **审计日志**：右上角菜单「审计日志」可查看（添加/删除服务器、终端/文件会话、文件写操作（上传/打包/重命名/删除）、执行命令均记录），支持按动作/用户/服务器筛选、分页与 CSV 导出，D1 保留 90 天后自动清理。
 
 ## 四、API 一览
@@ -300,7 +300,7 @@ wrangler secret put PANEL_USERS      # 回车后粘贴值，如 alice:pass1,bob:
 | GET | `/api/monitor?server_id=&range=` | 监控历史（range: 1h/12h/3d/7d/30d，默认 12h 走内存，更早走 D1） |
 | POST | `/mcp` | MCP 端点（无状态 Streamable HTTP，JSON-RPC 2.0；Bearer 鉴权） |
 | GET | `/api/tokens` | PAT 列表（仅管理员） |
-| POST | `/api/tokens` | 创建 PAT（scopes + server_ids 白名单，明文只返回一次） |
+| POST | `/api/tokens` | 创建 PAT（scopes + server_ids 白名单 + 可选 `expires_in_days` 有效期，缺省永久；明文只返回一次） |
 | DELETE | `/api/tokens/:id` | 删除 PAT（仅管理员） |
 | GET | `/api/audit-logs` | 审计日志（仅管理员，倒序分页：`?limit=&offset=&action=&user=&server_id=`，`?format=csv` 导出，保留 90 天） |
 | GET | `/api/settings` | 读取全部设置（含告警配置，仅管理员） |
@@ -323,7 +323,7 @@ wrangler secret put PANEL_USERS      # 回车后粘贴值，如 alice:pass1,bob:
 | `update_server` | 修改服务器名称/分组/排序（仅管理员；`server_id`/`server_name` + 要改的字段） |
 | `delete_server` | 删除服务器（仅管理员；清监控历史 + 审计 + 断开 agent） |
 | `list_tokens` | 列出 PAT 概要（仅管理员，不含哈希/明文） |
-| `create_token` | 创建 PAT（仅管理员；`name` + `scopes`/`server_ids`，明文只返回一次） |
+| `create_token` | 创建 PAT（仅管理员；`name` + `scopes`/`server_ids`/`expires_in_days`（缺省永久），明文只返回一次） |
 | `revoke_token` | 撤销 PAT（仅管理员，立即失效） |
 | `get_audit_logs` | 审计日志（仅管理员，`limit`/`offset`/`action`/`user`/`server_id` 分页筛选，返回 `{rows,total}`，保留 90 天） |
 | `get_usage` | 用量观测（仅管理员：上报帧/DO 事件/D1 写行估算） |

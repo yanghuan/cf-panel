@@ -654,6 +654,41 @@ test('PAT：server_ids 语义 — 未提供=全量，空数组=空集', async ()
   assert.equal(scopedList.length, 1);
 });
 
+test('PAT：有效期 — 到期后鉴权拒绝，不设置=永久有效', async () => {
+  const env = makeEnv();
+  const adminToken = await login(env);
+  await addServer(env, adminToken, { name: 'a1' });
+
+  // 带有效期（30 天）创建：expires_at 为将来 unix 秒
+  const limited = await (await call(env, {
+    method: 'POST', path: '/api/tokens', token: adminToken,
+    body: { name: 'limited', scopes: ['server:read'], expires_in_days: 30 },
+  })).json();
+  assert.ok(limited.expires_at > Math.floor(Date.now() / 1000), '返回将来到期时间');
+  const row = await env.DB.prepare("SELECT expires_at FROM api_tokens WHERE name = 'limited'").first();
+  assert.equal(row.expires_at, limited.expires_at, '落库到期时间一致');
+  assert.equal((await call(env, { path: '/api/me', token: limited.token })).status, 200, '未到期可用');
+
+  // 列表返回 expires_at
+  const list = await (await call(env, { path: '/api/tokens', token: adminToken })).json();
+  const limRow = list.find((t) => t.name === 'limited');
+  assert.equal(limRow.expires_at, limited.expires_at);
+
+  // 直接改库把 expires_at 拨到过去 → 鉴权拒绝（401）
+  await env.DB.prepare("UPDATE api_tokens SET expires_at = ? WHERE name = 'limited'").bind(Math.floor(Date.now() / 1000) - 10).run();
+  assert.equal((await call(env, { path: '/api/me', token: limited.token })).status, 401, '过期 PAT 拒绝');
+
+  // 未设置 → 永久（expires_at NULL）
+  const perm = await (await call(env, {
+    method: 'POST', path: '/api/tokens', token: adminToken,
+    body: { name: 'perm', scopes: ['server:read'] },
+  })).json();
+  assert.equal(perm.expires_at, null, '缺省 = 永久');
+  assert.equal((await call(env, { path: '/api/me', token: perm.token })).status, 200);
+  const permRow = await env.DB.prepare("SELECT expires_at FROM api_tokens WHERE name = 'perm'").first();
+  assert.equal(permRow.expires_at, null);
+});
+
 test('审计日志：管理员可查（倒序 + limit），非管理员 403', async () => {
   const env = makeEnv();
   const adminToken = await login(env);
@@ -1014,10 +1049,11 @@ test('MCP：tools/list 与 tools/call', async () => {
   assert.equal(usRes.name, 'mcp-renamed');
 
   // create_token / list_tokens / revoke_token
-  const ct = await (await mcp(env, { token, body: { jsonrpc: '2.0', id: 23, method: 'tools/call', params: { name: 'create_token', arguments: { name: 'mcp-tok', scopes: ['server:read'], server_ids: [1] } } } })).json();
+  const ct = await (await mcp(env, { token, body: { jsonrpc: '2.0', id: 23, method: 'tools/call', params: { name: 'create_token', arguments: { name: 'mcp-tok', scopes: ['server:read'], server_ids: [1], expires_in_days: 7 } } } })).json();
   assert.equal(ct.result.isError, false);
   const ctRes = JSON.parse(ct.result.content[0].text);
   assert.match(ctRes.token, /^cfp_/);
+  assert.ok(ctRes.expires_at > Math.floor(Date.now() / 1000), 'MCP 创建支持有效期');
   const lt = await (await mcp(env, { token, body: { jsonrpc: '2.0', id: 24, method: 'tools/call', params: { name: 'list_tokens', arguments: {} } } })).json();
   const ltRes = JSON.parse(lt.result.content[0].text);
   assert.equal(ltRes.length, 1);

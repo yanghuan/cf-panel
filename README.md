@@ -272,7 +272,7 @@ wrangler secret put PANEL_USERS      # 回车后粘贴值，如 alice:pass1,bob:
 - **监控**：点「监控」默认看近 12 小时分钟数据（内存 DO 热区，秒回）；可切 1小时/3天/7天/30天查看 D1 归档历史（分钟粒度，超长区间自动降采样）。指标：CPU / 内存 / Swap / 磁盘（根分区）/ 负载 / 温度 / 进程数；服务器卡片显示 OS / 内核 / IP 系统信息。
 - **分组与排序**：添加服务器可填「分组」和「序号」，列表按分组展示、组内按序号排序（未填归入「未分组」）。
 - **登录**：`PANEL_USERS` 多用户（`user:pass,user:pass`）或单管理员（`PANEL_PASSWORD`），登录即管理员。**应用内置失败限流**（同一 IP 在 15 分钟窗口内失败 ≥5 次 → 锁定 15 分钟并返回 `429` + `Retry-After`，登录成功自动清零）；生产部署**必须**再前置 **Cloudflare Access**（登录密码作为第二层），以覆盖跨边缘实例的限流一致性。
-  > ⚠️ Access 需为 agent 路径放行：`/ws/agent/*` 使用 `X-Agent-Key` 头（非浏览器 SSO），必须配置 Bypass 或 Service Token 策略，否则 agent 无法连接。
+  > ⚠️ Access 需为非浏览器会话路径放行（使用 `X-Agent-Key` 头 / Bearer 鉴权，非浏览器 SSO，必须配置 Bypass 或 Service Token 策略）：`/ws/agent/*`（agent 控制/终端/文件流，否则 agent 无法连接）与 `/mcp*`（MCP JSON-RPC + `/mcp/file_upload` 签名 URL 直传，否则 MCP 客户端与 curl 上传被拦）。
 - **公告**：设置里可改站点名/公告（存 D1 `kv_json` 表），公告对所有访客可见。
 - **PAT**：设置里可创建访问令牌（scopes + server_ids 白名单 + 可选有效期天数，留空=永久有效，到期自动拒绝鉴权），供 API 调用（`Authorization: Bearer cfp_xxx`）。
 - **审计日志**：右上角菜单「审计日志」可查看（添加/删除服务器、终端/文件会话、文件写操作（上传/打包/重命名/删除）、执行命令均记录），支持按动作/用户/服务器筛选、分页与 CSV 导出，D1 保留 90 天后自动清理。
@@ -289,7 +289,7 @@ wrangler secret put PANEL_USERS      # 回车后粘贴值，如 alice:pass1,bob:
 | DELETE | `/api/servers/:id` | 删除服务器（仅管理员） |
 | POST | `/api/terminal` | 创建终端会话（exec 权限 + 归属校验），返回 session_id |
 | POST | `/api/file/open` | 创建文件管理会话（exec 权限 + 归属校验），返回 session_id |
-| POST | `/api/file_upload?server_id=&path=&overwrite=` | 流式上传文件到 agent（body=原始字节，Worker 自动分片；Bearer 鉴权或签名 URL token 均可） |
+| POST | `/mcp/file_upload?server_id=&path=&overwrite=` | 流式上传文件到 agent（body=原始字节，Worker 自动分片；Bearer 鉴权或签名 URL token 均可。位于 `/mcp` 前缀下以绕过 CF Access 拦截，供 curl 直传） |
 | GET | `/api/usage` | 用量观测（近 24h 上报帧 / DO 事件 / D1 写行估算，仅管理员） |
 | GET | `/ws/terminal/{id}` | 浏览器终端 WebSocket（校验创建者/admin） |
 | GET | `/ws/file/{id}` | 浏览器文件管理 WebSocket（JSON 行协议：list/read/write/zip/rename/delete，校验创建者/admin） |

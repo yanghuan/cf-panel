@@ -293,15 +293,6 @@ async function handleApiInner(request, env) {
     return json({ site_name: settings.site_name || 'cf-panel', notice: settings.notice || '', geo_lookup: !!settings.geo_lookup });
   }
 
-  // POST /api/file_upload?token= —— 签名 URL 直传（MCP create_upload 签发，无状态 HMAC 验签，无需 Bearer）
-  // 签名绑定 server_id/path/overwrite/exp；验证失败 403。审计在 create_upload 时已记录，此处不重复。
-  // JWT_SECRET 仍是必需安全边界（验签密钥回退依赖它）：缺失时签名上传同样 503，防止绕过配置错误。
-  if (method === 'POST' && path === '/api/file_upload' && url.searchParams.get('token')) {
-    const configError = requireJwtSecret(env);
-    if (configError) return configError;
-    return handleUploadSigned(request, env, url);
-  }
-
   // ---- 以下全部需要登录（JWT 或 PAT）----
   // JWT_SECRET 是整个面板鉴权的必需安全边界；缺失时 PAT 也不得绕过配置错误继续访问。
   const configError = requireJwtSecret(env);
@@ -431,24 +422,6 @@ async function handleApiInner(request, env) {
         d1_writes: Math.round(reportFrames * 0.5), // last_seen 60s 节流(~0.08/帧) + custom 去重 + info/probe 变更
       },
     });
-  }
-
-  // POST /api/file_upload?server_id=&path=&overwrite= —— 流式上传文件到 agent（body = 原始字节）
-  // 小文件（配置/脚本）与大文件（备份/包）统一入口：Worker 流式读 body → 自动分片 →
-  // 控制通道 Binary 混合帧 → agent 原子写。需 exec 权限（管理员或带 server:exec 的 PAT）。
-  if (method === 'POST' && path === '/api/file_upload') {
-    const u = new URL(request.url);
-    const serverId = Number(u.searchParams.get('server_id')) || 0;
-    const targetPath = u.searchParams.get('path') || '';
-    if (!serverId) return err('server_id is required', 400);
-    if (!targetPath || !targetPath.startsWith('/')) return err('path is required (absolute)', 400);
-    const server = await env.DB.prepare('SELECT * FROM servers WHERE id = ?').bind(serverId).first();
-    if (!server) return err('server not found', 404);
-    if (!canExec(user, server)) return err('forbidden', 403);
-    await env.DB.prepare('INSERT INTO audit_logs (user_id, username, client_ip, action, target_server_id, detail) VALUES (?,?,?,?,?,?)')
-      .bind(user.id, user.username, clientIp(request), 'file.upload', server.id, targetPath)
-      .run();
-    return forwardUpload(env, request, serverId);
   }
 
   // POST /api/terminal —— 创建终端会话（exec 权限 + 服务器归属）
@@ -783,7 +756,8 @@ async function mcpCreateUpload(user, env, args, host, ip) {
   const overwrite = !!args.overwrite;
   const { token, exp } = await signUploadToken(server.id, path, overwrite, env);
   const q = new URLSearchParams({ server_id: String(server.id), path, overwrite: overwrite ? '1' : '0', token });
-  const uploadUrl = `https://${host}/api/file_upload?${q.toString()}`;
+  // 上传通道走 /mcp/file_upload（/mcp 前缀为 CF Access 放行区，签名 URL 供 curl 直传不受拦截）
+  const uploadUrl = `https://${host}/mcp/file_upload?${q.toString()}`;
   // 审计在签发时记录（实际 curl 上传经签名 URL 直传，不再重复记录）
   await env.DB.prepare('INSERT INTO audit_logs (user_id, username, client_ip, action, target_server_id, detail) VALUES (?,?,?,?,?,?)')
     .bind(user.id, user.username, ip, 'file.upload', server.id, path)
@@ -1066,9 +1040,36 @@ async function handleMcpInner(request, env) {
   // 响应 CORS 回显同源 origin（见 mcpResult；无 Origin 的 curl/MCP 客户端自动 '*'）
   const reply = (id, result, error) => mcpResult(id, result, error, origin);
 
+  // POST /mcp/file_upload —— 上传通道（签名 URL 直传 / Bearer 鉴权），非 JSON-RPC
+  // 签名 URL 直传（MCP create_upload 签发，无状态 HMAC 验签，无需 Bearer）：
+  // 签名绑定 server_id/path/overwrite/exp；验证失败 403。审计在 create_upload 时已记录，此处不重复。
+  // JWT_SECRET 仍是必需安全边界（验签密钥回退依赖它）：缺失时签名上传同样 503，防止绕过配置错误。
+  if (request.method === 'POST' && url.pathname === '/mcp/file_upload' && url.searchParams.get('token')) {
+    const configError = requireJwtSecret(env);
+    if (configError) return configError;
+    return handleUploadSigned(request, env, url);
+  }
+
   // 每请求独立鉴权（与现有 API 一致：Bearer JWT 或 PAT）
   const user = await authUser(request, env);
   if (!user) return reply(null, null, { code: -32001, message: 'unauthorized' });
+
+  // POST /mcp/file_upload?server_id=&path=&overwrite= —— Bearer 流式上传文件到 agent（body = 原始字节）
+  // 小文件（配置/脚本）与大文件（备份/包）统一入口：Worker 流式读 body → 自动分片 →
+  // 控制通道 Binary 混合帧 → agent 原子写。需 exec 权限（管理员或带 server:exec 的 PAT）。
+  if (request.method === 'POST' && url.pathname === '/mcp/file_upload') {
+    const serverId = Number(url.searchParams.get('server_id')) || 0;
+    const targetPath = url.searchParams.get('path') || '';
+    if (!serverId) return json({ error: 'server_id is required' }, 400);
+    if (!targetPath || !targetPath.startsWith('/')) return json({ error: 'path is required (absolute)' }, 400);
+    const server = await env.DB.prepare('SELECT * FROM servers WHERE id = ?').bind(serverId).first();
+    if (!server) return json({ error: 'server not found' }, 404);
+    if (!canExec(user, server)) return json({ error: 'forbidden' }, 403);
+    await env.DB.prepare('INSERT INTO audit_logs (user_id, username, client_ip, action, target_server_id, detail) VALUES (?,?,?,?,?,?)')
+      .bind(user.id, user.username, clientIp(request), 'file.upload', server.id, targetPath)
+      .run();
+    return forwardUpload(env, request, serverId);
+  }
 
   let body;
   try { body = await request.json(); } catch {

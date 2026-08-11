@@ -457,7 +457,7 @@ async function step8_mcp() {
   else bad(`MCP create_upload：响应结构异常：${JSON.stringify(cuData)}`);
 
   // Bearer 上传
-  const upRes = await fetch(`${BASE}/api/file_upload?server_id=${serverId}&path=/tmp/e2e-mcp-upload.txt`, {
+  const upRes = await fetch(`${BASE}/mcp/file_upload?server_id=${serverId}&path=/tmp/e2e-mcp-upload.txt`, {
     method: 'POST',
     headers: { 'authorization': `Bearer ${token}` },
     body: 'E2E_MCP_UPLOAD_CONTENT',

@@ -932,7 +932,7 @@ test('MCP：tools/list 与 tools/call', async () => {
   assert.equal(cu.result.isError, false);
   const cuRes = JSON.parse(cu.result.content[0].text);
   assert.equal(cuRes.server_name, 'web-1');
-  assert.match(cuRes.upload_url, /^https:\/\/panel\.local\/api\/file_upload\?/);
+  assert.match(cuRes.upload_url, /^https:\/\/panel\.local\/mcp\/file_upload\?/);
   assert.match(cuRes.upload_url, /token=/);
   assert.equal(cuRes.overwrite, false);
   assert.ok(cuRes.expires_in_seconds > 0 && cuRes.expires_in_seconds <= 600);
@@ -944,10 +944,10 @@ test('MCP：tools/list 与 tools/call', async () => {
   const goodSigned = await worker.fetch(new Request(cuRes.upload_url, { method: 'POST', body: 'hello signed' }), env);
   assert.equal(goodSigned.status, 200);
 
-  // Bearer 路径（非签名分支）：/api/file_upload 带 token + server_id/path → 审计 + DO /rpc/upload 透传
+  // Bearer 路径（非签名分支）：/mcp/file_upload 带 token + server_id/path → 审计 + DO /rpc/upload 透传
   const serverRow = await env.DB.prepare("SELECT id FROM servers WHERE name = 'web-1'").first();
   const bearerUp = await worker.fetch(
-    new Request(`http://panel.local/api/file_upload?server_id=${serverRow.id}&path=/tmp/t.txt`, {
+    new Request(`http://panel.local/mcp/file_upload?server_id=${serverRow.id}&path=/tmp/t.txt`, {
       method: 'POST',
       headers: { authorization: `Bearer ${token}` },
       body: 'raw bytes',
@@ -960,7 +960,7 @@ test('MCP：tools/list 与 tools/call', async () => {
   assert.equal(upAudit.results[0].c, 2, '签名签发 1 次 + Bearer 直传 1 次审计');
   // 非绝对路径拒绝
   const badPath = await worker.fetch(
-    new Request(`http://panel.local/api/file_upload?server_id=${serverRow.id}&path=rel.txt`, {
+    new Request(`http://panel.local/mcp/file_upload?server_id=${serverRow.id}&path=rel.txt`, {
       method: 'POST',
       headers: { authorization: `Bearer ${token}` },
       body: 'x',
@@ -968,6 +968,17 @@ test('MCP：tools/list 与 tools/call', async () => {
     env
   );
   assert.equal(badPath.status, 400);
+  // 无鉴权访问 Bearer 上传 → 400（JSON-RPC error 语义，code=-32001）
+  const noAuth = await worker.fetch(
+    new Request(`http://panel.local/mcp/file_upload?server_id=${serverRow.id}&path=/tmp/t.txt`, {
+      method: 'POST',
+      body: 'x',
+    }),
+    env
+  );
+  assert.equal(noAuth.status, 400, 'JSON-RPC error 返回 400');
+  const noAuthBody = await noAuth.json();
+  assert.equal(noAuthBody.error.code, -32001, '未授权返回 JSON-RPC unauthorized');
 
   // exec_command：DO stub 返回 200（无 agent 语义）→ 结构正确
   const ex = await (await mcp(env, { token, body: { jsonrpc: '2.0', id: 6, method: 'tools/call', params: { name: 'exec_command', arguments: { server_name: 'web-1', command: 'echo hi' } } } })).json();

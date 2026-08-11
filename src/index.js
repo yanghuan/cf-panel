@@ -28,7 +28,8 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
     if (url.pathname.startsWith('/ws/')) return handleWs(request, env);
-    if (url.pathname === '/mcp') return handleMcp(request, env);
+    // /mcp 前缀：JSON-RPC 端点 + /mcp/file_upload 上传通道（签名 URL 直传需绕过 CF Access 放行区）
+    if (url.pathname.startsWith('/mcp')) return handleMcp(request, env);
     return handleApi(request, env);
   },
 };

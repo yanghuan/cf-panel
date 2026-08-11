@@ -1,5 +1,5 @@
 // cf-panel — agent 监控上报落库（handleReport）与上报链路状态
-import { doMetrics } from './utils.js';
+import { doMetrics, numOrNull } from './utils.js';
 
 // last_seen D1 落盘节流（秒）：快采 5s 上报时，D1 写从 17,280 → ~1,440 行/天/机（−92%）。
 // 在线判定主用 MetricsDO 秒级 last_seen_s（零 D1 成本），不受本节流影响；D1 last_seen 仅
@@ -35,7 +35,103 @@ export function setReportFlushAt(v) { reportFlushAt = v; } // let 原始值无�
 // agent 监控上报落库：更新 last_seen（在线判定唯一依据；系统信息变更才写 info_json，探活变更才写 probe_json），
 // 时序写入 MetricsDO 热区（供 /api/report 与控制通道复用）。
 // 告警冷却/探活去重判定在 MetricsDO 内部完成（见 MetricsDO.checkAlerts / checkProbeAlerts）。
+
+// ---- 收口：agent 上报视为不可信输入（agent 运行在被控机，可能被入侵/异常）----
+// 入口处归一化 + 白名单 + 条数/体积上限，一处收口消除四类后果：
+// 注入（extra 键白名单）、告警丢失/归档停摆（数值归一化，杜绝对象/数组混入）、容量放大（条数与体积上限）。
+const EXTRA_NUM_KEYS = ['swap', 'load1', 'load5', 'load15', 'procs', 'tcp', 'udp', 'uptime', 'temp'];
+const EXTRA_DISK_MAX = 20;    // 挂载点条数上限（agent 正常 <10）
+const DISK_PATH_MAX = 128;    // 挂载点路径长度上限
+const CUSTOM_MAX = 50;        // 自定义指标条数上限
+const CUSTOM_NAME_MAX = 64;   // 指标名长度上限
+const PROBES_MAX = 50;        // 探活条目上限
+const EXTRA_JSON_MAX = 8192;  // extra 序列化体积上限
+const INFO_JSON_MAX = 8192;   // info 序列化体积上限（自由文本，前端 escapeHtml 渲染）
+
+export function sanitizeReportPayload(p) {
+  const out = { ...p };
+  // 数值字段归一化：字符串数字转 number，对象/数组/NaN → null
+  out.cpu = numOrNull(p.cpu);
+  out.mem_used = numOrNull(p.mem_used);
+  out.mem_total = numOrNull(p.mem_total);
+  out.net_in = numOrNull(p.net_in);
+  out.net_out = numOrNull(p.net_out);
+  // extra：仅保留已知键，数值归一化，超限置 null（丢弃整帧扩展数据，不阻断主指标）
+  if (p.extra && typeof p.extra === 'object' && !Array.isArray(p.extra)) {
+    const e = {};
+    for (const k of EXTRA_NUM_KEYS) {
+      const v = numOrNull(p.extra[k]);
+      if (v != null) e[k] = v;
+    }
+    if (Array.isArray(p.extra.disk)) {
+      const disk = [];
+      for (const d of p.extra.disk.slice(0, EXTRA_DISK_MAX)) {
+        if (!d || typeof d !== 'object') continue;
+        const m = String(d.m == null ? '' : d.m).slice(0, DISK_PATH_MAX);
+        const u = numOrNull(d.u);
+        if (m && u != null) disk.push({ m, u });
+      }
+      if (disk.length) e.disk = disk;
+    }
+    try {
+      out.extra = JSON.stringify(e).length <= EXTRA_JSON_MAX ? e : null;
+    } catch {
+      out.extra = null;
+    }
+  } else {
+    out.extra = null;
+  }
+  // probes：条数上限 + 只保留已知键（name/ok/code/ms，agent 合法上报字段）
+  if (Array.isArray(p.probes)) {
+    out.probes = [];
+    for (const pr of p.probes.slice(0, PROBES_MAX)) {
+      if (!pr || typeof pr !== 'object' || pr.name == null) continue;
+      const o = { name: String(pr.name).slice(0, 128), ok: !!pr.ok };
+      const code = numOrNull(pr.code);
+      if (code != null) o.code = code;
+      const ms = numOrNull(pr.ms);
+      if (ms != null) o.ms = ms;
+      out.probes.push(o);
+    }
+    if (!out.probes.length) out.probes = null;
+  } else {
+    out.probes = null;
+  }
+  // custom：条数 + 名称长度 + 数值归一化（后续 INSERT 直接使用，杜绝类型错误）
+  if (Array.isArray(p.custom)) {
+    out.custom = p.custom
+      .filter((c) => c && typeof c === 'object' && c.name && c.value != null)
+      .slice(0, CUSTOM_MAX)
+      .map((c) => ({ name: String(c.name).slice(0, CUSTOM_NAME_MAX), value: numOrNull(c.value) }))
+      .filter((c) => c.value != null);
+  } else {
+    out.custom = null;
+  }
+  // info：仅限体积（自由文本字段，前端已 escapeHtml）
+  if (p.info && typeof p.info === 'object') {
+    try {
+      out.info = JSON.stringify(p.info).length <= INFO_JSON_MAX ? p.info : null;
+    } catch {
+      out.info = null;
+    }
+  } else {
+    out.info = null;
+  }
+  return out;
+}
+
+// last_seen 节流写（在线宽限 15s，60s 节流留余量；在线判定主用 MetricsDO last_seen_s），
+// info 变更/未变更/无 info 三分支共用；force=true 时无条件写（系统信息变更必须落）
+async function touchLastSeen(env, serverId, ts, force) {
+  const last = lastSeenWrite.get(serverId) || 0;
+  if (!force && ts - last < LAST_SEEN_THROTTLE_S) return false;
+  await env.DB.prepare('UPDATE servers SET last_seen = ? WHERE id = ?').bind(ts, serverId).run();
+  lastSeenWrite.set(serverId, ts);
+  return true;
+}
+
 export async function handleReport(env, payload) {
+  payload = sanitizeReportPayload(payload);
   const ts = Math.floor(Date.now() / 1000);
   const minTs = Math.floor(ts / 60);
   // 服务器行读缓存同时承担存在性复核（缓存未命中才查 D1；删除窗口孤儿写无害，
@@ -73,25 +169,16 @@ export async function handleReport(env, payload) {
   if (payload.info) {
     const infoJson = JSON.stringify(payload.info);
     if (server.info_json !== infoJson) {
-      // 系统信息变化：必须写（含 last_seen），写后更新行缓存
-      await env.DB.prepare('UPDATE servers SET last_seen = ?, info_json = ? WHERE id = ?')
-        .bind(ts, infoJson, payload.serverId).run();
+      // 系统信息变化：必须写（含 last_seen，force），写后更新行缓存
+      await env.DB.prepare('UPDATE servers SET info_json = ? WHERE id = ?')
+        .bind(infoJson, payload.serverId).run();
       serverRowCache.set(payload.serverId, { ...server, info_json: infoJson, ts: Date.now() });
-      lastSeenWrite.set(payload.serverId, ts);
+      await touchLastSeen(env, payload.serverId, ts, true);
     } else {
-      // info 未变：last_seen 节流写（在线宽限 15s，60s 节流留余量；在线判定主用 last_seen_s）
-      const last = lastSeenWrite.get(payload.serverId) || 0;
-      if (ts - last >= LAST_SEEN_THROTTLE_S) {
-        await env.DB.prepare('UPDATE servers SET last_seen = ? WHERE id = ?').bind(ts, payload.serverId).run();
-        lastSeenWrite.set(payload.serverId, ts);
-      }
+      await touchLastSeen(env, payload.serverId, ts);
     }
   } else {
-    const last = lastSeenWrite.get(payload.serverId) || 0;
-    if (ts - last >= LAST_SEEN_THROTTLE_S) {
-      await env.DB.prepare('UPDATE servers SET last_seen = ? WHERE id = ?').bind(ts, payload.serverId).run();
-      lastSeenWrite.set(payload.serverId, ts);
-    }
+    await touchLastSeen(env, payload.serverId, ts);
   }
   // 时序写入 MetricsDO 热区；告警/探活判定也在该调用内顺带完成（零额外请求）。
   // 批量上报：入队本机最新帧（同机 5s 窗口内保留最后一帧），距上次 flush ≥5s 时

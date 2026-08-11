@@ -42,12 +42,12 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: x86_64-unknown-linux-musl
+          targets: x86_64-unknown-linux-musl, aarch64-unknown-linux-musl
 
-      - name: 安装 musl 工具链（ring 等 build script 与静态链接需要）
-        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: 安装 musl 工具链与交叉编译工具（ring 等 build script 与静态链接需要）
+        run: sudo apt-get update && sudo apt-get install -y musl-tools clang llvm
 
-      - name: 编译全静态二进制（musl）
+      - name: 编译 x86_64 全静态二进制（musl）
         working-directory: agent/rust
         env:
           CC_x86_64_unknown_linux_musl: musl-gcc
@@ -55,6 +55,20 @@ jobs:
         # AGENT_BUILD_TS：构建时间戳注入二进制（--version 输出 2026.08.08-2000 格式）
         run: |
           AGENT_BUILD_TS=$(date -u +'%Y.%m.%d-%H%M') cargo build --release --target x86_64-unknown-linux-musl
+
+      # M8：aarch64（树莓派/ARM 小主机）——clang 交叉链接（ring 汇编交叉编译需要 clang）
+      - name: 编译 aarch64 全静态二进制（musl）
+        working-directory: agent/rust
+        env:
+          CC_aarch64_unknown_linux_musl: clang
+          AR_aarch64_unknown_linux_musl: llvm-ar
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: clang
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_RUSTFLAGS: -C link-arg=--target=aarch64-unknown-linux-musl -C strip=symbols
+        run: |
+          AGENT_BUILD_TS=$(date -u +'%Y.%m.%d-%H%M') cargo build --release --target aarch64-unknown-linux-musl
+          cd target/aarch64-unknown-linux-musl/release
+          mv cf-panel-agent cf-panel-agent-aarch64
+          sha256sum cf-panel-agent-aarch64 > cf-panel-agent-aarch64.sha256
 
       - name: 生成 UPX --lzma 压缩版（省磁盘 ~58%，启动约 +60ms / RSS +0.5MB）
         run: |
@@ -84,9 +98,10 @@ jobs:
           cat > /tmp/release-body.md <<'EOF'
           Rust 版 cf-panel agent 全静态二进制（musl，仅依赖系统调用，任意 Linux 发行版直跑）。
 
-          两个版本（校验和见同名 `.sha256` 文件）：
-          - `cf-panel-agent`：完整版（约 2MB），无启动额外开销
-          - `cf-panel-agent.upx`：UPX `--lzma` 压缩版（约 0.9MB，省磁盘 ~58%），启动约 +60ms、常驻内存 +0.5MB
+          平台（校验和见同名 `.sha256` 文件）：
+          - `cf-panel-agent`：x86_64 完整版（约 2MB），无启动额外开销
+          - `cf-panel-agent.upx`：x86_64 UPX `--lzma` 压缩版（约 0.9MB，省磁盘 ~58%），启动约 +60ms、常驻内存 +0.5MB
+          - `cf-panel-agent-aarch64`：ARM64（树莓派 4/5、ARM 小主机等）
 
           用法：
           ```
@@ -128,6 +143,8 @@ jobs:
             agent/rust/target/x86_64-unknown-linux-musl/release/cf-panel-agent.sha256
             agent/rust/target/x86_64-unknown-linux-musl/release/cf-panel-agent.upx
             agent/rust/target/x86_64-unknown-linux-musl/release/cf-panel-agent.upx.sha256
+            agent/rust/target/aarch64-unknown-linux-musl/release/cf-panel-agent-aarch64
+            agent/rust/target/aarch64-unknown-linux-musl/release/cf-panel-agent-aarch64.sha256
           name: ${{ steps.release.outputs.title }}
           tag_name: ${{ steps.release.outputs.tag }}
           body_path: /tmp/release-body.md

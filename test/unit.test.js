@@ -165,9 +165,10 @@ test('sanitizeAlerts', () => {
   assert.equal(out.cooldown_min, 10);
   assert.equal(out.offline_after_s, 120);
 
-  // 非法 method 被丢弃；坏 headers JSON 被丢弃
+  // 非法 method 被丢弃；坏 headers JSON 被丢弃；PUT 在白名单内保留
   assert.equal(I.sanitizeAlerts({ method: 'DELETE' }).method, undefined);
   assert.equal(I.sanitizeAlerts({ headers: '{{{' }).headers, undefined);
+  assert.equal(I.sanitizeAlerts({ method: 'put' }).method, 'PUT'); // 大小写归一 + PUT 允许
 });
 
 // ---------------- 模板渲染 / Headers ----------------

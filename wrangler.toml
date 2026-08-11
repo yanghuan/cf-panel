@@ -8,11 +8,12 @@ compatibility_date = "2026-08-02"
 workers_dev = false
 
 # ---------- D1 数据库（面板核心数据 + 键值表 kv_json） ----------
-# 创建：wrangler d1 create cf-panel → 把 database_id 填进来
+# 创建：wrangler d1 create cf-panel → 把返回的 database_id 填到这里
+# （占位符仅用于演示；不替换直接部署会指向不存在的库）
 [[d1_databases]]
 binding = "DB"
 database_name = "cf-panel"
-database_id = "944616cf-9364-483d-a65a-22a60c7bdb74"
+database_id = "REPLACE_WITH_D1_DATABASE_ID"
 
 # ---------- Durable Object（WebSocket 中转 + 监控时序热区 + 面板实时推送） ----------
 [[durable_objects.bindings]]

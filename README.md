@@ -173,6 +173,7 @@ wrangler secret put PANEL_USERS      # 回车后粘贴值，如 alice:pass1,bob:
 - **`METRICS_RETENTION_DAYS`**（可选变量，默认 30）：历史保留天数，缩短可线性降低 D1 容量占用（如 7 天则 `metrics_min` 约 `10,080×S` 行）。Worker → Settings → Variables（非 Secret）配置。
 - **自定义指标建议每机 ≤20 个**：面板「自定义指标设置」弹窗已给出容量提示。
 - **用量观测**：管理员访问 `GET /api/usage` 可查看近 24h 上报帧 / DO 事件 / D1 写行估算（Worker 请求计数 + MetricsDO 用量，仅管理员）。
+- **invocation_logs 额度说明**：`wrangler.toml` 开启了 `invocation_logs`（每个 Worker/DO 调用一条日志）；快采 5s 意味着每机每天约 **17,280** 次上报帧调用（每帧至少 1 次 Worker/DO 调用），日志事件量随机器数线性增长，免费档日志额度约在 **10 台规模触顶**。规模化时建议在 `wrangler.toml` 关闭 `invocation_logs`（仅影响日志，不影响功能）。
 
 **Webhook 告警配置**（可选，**模板化**）：登录面板 → **设置**弹窗 → 「告警」区填写即启用（存 D1 `settings.alerts`，**无需环境变量**）。支持 **GET/POST**、**JSON/纯文本**、**token 放 URL/Header/Body 任意位置**，任意渠道由用户侧对接。
 
@@ -246,14 +247,14 @@ wrangler secret put PANEL_USERS      # 回车后粘贴值，如 alice:pass1,bob:
    journalctl -u cf-panel-agent -f   # 看日志
    ```
    > 旧版 Shell agent（`agent/shell/agent.sh`）已废弃：需安装 websocat/socat/jq，环境变量与 Rust 版一致，仅作过渡/参考。
-5. 监控上报已内置：agent 经控制通道 WS 上报 CPU / 内存 / Swap / 磁盘 / 负载 / 温度 / 进程数 / TCP-UDP 连接数 / 网络速率 / 系统信息（无需 crontab）。**省配额策略**：有面板观看者时约 3 秒上报（服务端动态下发），无人查看时 120 秒低频采样；`REPORT_INTERVAL` 可设默认值。
-6. 可选：服务探活（agent 上配置 `PROBES` 探测本机 HTTP/TCP 服务，结果随上报展示在卡片 + 失败告警）：
+4. 监控上报已内置：agent 经控制通道 WS 上报 CPU / 内存 / Swap / 磁盘 / 负载 / 温度 / 进程数 / TCP-UDP 连接数 / 网络速率 / 系统信息（无需 crontab）。**省配额策略**：有面板观看者时约 5 秒上报（服务端动态下发），无人查看时 120 秒低频采样；`REPORT_INTERVAL` 可设默认值。
+5. 可选：服务探活（agent 上配置 `PROBES` 探测本机 HTTP/TCP 服务，结果随上报展示在卡片 + 失败告警）：
    ```bash
    # 追加到 /etc/cf-panel-agent.env
    PROBES="web:http:http://127.0.0.1/,mysql:tcp:127.0.0.1:3306"
    ```
    `PROBES` 格式：`名称:类型:目标,...`；类型 `http`（目标为 URL，检查 2xx/3xx）或 `tcp`（目标为 `host:port`，测连通）。
-7. 可选：自定义监控项（agent 上配置 `CUSTOM_METRICS`，执行任意命令采集数值指标，随上报存入 D1 并可看历史曲线）：
+6. 可选：自定义监控项（agent 上配置 `CUSTOM_METRICS`，执行任意命令采集数值指标，随上报存入 D1 并可看历史曲线）：
    ```bash
    # 追加到 /etc/cf-panel-agent.env
    CUSTOM_METRICS='[{"name":"cpu_temp","cmd":"cat /sys/class/thermal/thermal_zone0/temp"},{"name":"estab_conns","cmd":"ss -t state established | wc -l"}]'
@@ -262,12 +263,12 @@ wrangler secret put PANEL_USERS      # 回车后粘贴值，如 alice:pass1,bob:
 
 ## 三、使用
 
-- **概览与实时指标**：顶部概览条显示服务器总数/在线数/平均 CPU/负载/总内存；每张服务器卡片实时显示 CPU / 内存 / 负载（经 `/ws/push` 每 3 秒随列表推送，PanelDO 从 MetricsDO 取最新值）。
+- **概览与实时指标**：顶部概览条显示服务器总数/在线数/平均 CPU/负载/总内存；每张服务器卡片实时显示 CPU / 内存 / 负载（经 `/ws/push` 上报驱动实时推送，PanelDO 从 MetricsDO 取最新值；前端仅首帧 sync，1s 定时器只做本地老化）。
 - **服务探活**：agent 配置 `PROBES` 后，卡片显示每个服务的状态徽章（绿=正常/红=异常，悬停显示 HTTP 码）；探测失败持续超冷却会触发 Webhook（`event: probe_down`，恢复发 `probe_recovered`）。
 - **自定义监控项**：agent 配置 `CUSTOM_METRICS`（JSON：`name`+`cmd`）后，执行任意命令采集数值指标；监控图中以独立曲线展示（按 ts 对齐系统时间轴，共用右轴看趋势），数据直写 D1 `metrics_custom` 表（30 天保留）。
 - **实时列表**：登录后前端与 `/ws/push` 保持 WebSocket，连接建立发一次 sync 拉初始列表，此后由 MetricsDO 上报驱动推送（PanelDO，Hibernation 休眠态，费用趋近普通 Worker）按权限广播服务器列表（在线状态前端本地老化自动更新），无需手动刷新。
 - **终端**：面板服务器卡片点「终端」→ xterm.js 弹出 → 按键实时到达被控机 shell；窗口拉伸自动 resize（经控制通道 `stty` 下发）；断线自动重连（最多 3 次）。
-- **文件管理**：面板服务器卡片点「文件」→ 弹出文件管理器，可浏览目录（点击进入/上级/路径跳转）、**上传**（本地文件写入 agent）、**下载**（agent 文件回传浏览器）；文件经独立 WS 会话**分段传输**（512KB/段，Binary 混合帧 = JSON 头 + 原始字节，无 base64 膨胀），支持文件名通配符过滤（`*`/`?`，agent 端先过滤再截断），**单文件上限 500MB**。每行最右侧 **⋯** 下拉菜单提供：下载（目录自动打包 ZIP 下载，文件名为 `目录名.zip`）、重命名（仅改名，不支持跨目录）、删除（目录递归删除）；**重命名/删除/打包对系统目录（`/proc`、`/sys`、`/etc`、`/usr`、`/var`、`/root` 等）自动拒绝**，防止误操作破坏系统。
+- **文件管理**：面板服务器卡片点「文件」→ 弹出文件管理器，可浏览目录（点击进入/上级/路径跳转）、**上传**（本地文件写入 agent）、**下载**（agent 文件回传浏览器）；文件经独立 WS 会话**分段传输**（512KB/段，Binary 混合帧 = JSON 头 + 原始字节，无 base64 膨胀），支持文件名通配符过滤（`*`/`?`，agent 端先过滤再截断），**单文件默认上限 100MB**（`UPLOAD_MAX_MB` 可调高，受 agent 端 500MB 硬上限约束）。每行最右侧 **⋯** 下拉菜单提供：下载（目录自动打包 ZIP 下载，文件名为 `目录名.zip`）、重命名（仅改名，不支持跨目录）、删除（目录递归删除）；**重命名/删除/打包对系统目录（`/proc`、`/sys`、`/etc`、`/usr`、`/var`、`/root` 等）自动拒绝**，防止误操作破坏系统。
 - **监控**：点「监控」默认看近 12 小时分钟数据（内存 DO 热区，秒回）；可切 1小时/3天/7天/30天查看 D1 归档历史（分钟粒度，超长区间自动降采样）。指标：CPU / 内存 / Swap / 磁盘（根分区）/ 负载 / 温度 / 进程数；服务器卡片显示 OS / 内核 / IP 系统信息。
 - **分组与排序**：添加服务器可填「分组」和「序号」，列表按分组展示、组内按序号排序（未填归入「未分组」）。
 - **登录**：`PANEL_USERS` 多用户（`user:pass,user:pass`）或单管理员（`PANEL_PASSWORD`），登录即管理员。**应用内置失败限流**（同一 IP 在 15 分钟窗口内失败 ≥5 次 → 锁定 15 分钟并返回 `429` + `Retry-After`，登录成功自动清零）；生产部署**必须**再前置 **Cloudflare Access**（登录密码作为第二层），以覆盖跨边缘实例的限流一致性。
@@ -293,7 +294,7 @@ wrangler secret put PANEL_USERS      # 回车后粘贴值，如 alice:pass1,bob:
 | GET | `/ws/terminal/{id}` | 浏览器终端 WebSocket（校验创建者/admin） |
 | GET | `/ws/file/{id}` | 浏览器文件管理 WebSocket（JSON 行协议：list/read/write/zip/rename/delete，校验创建者/admin） |
 | GET | `/ws/agent/file` | agent 文件数据流（key 校验 + stream 归属校验） |
-| GET | `/ws/push` | 面板实时刷新：客户端每 3 秒发 sync，服务端按权限返回服务器列表 |
+| GET | `/ws/push` | 面板实时刷新：首帧 sync 后被动接收上报驱动推送，服务端按权限返回服务器列表 |
 | GET | `/ws/agent/control` | agent 控制通道（key 指纹定位 + 校验，按分片路由；监控上报也走这里） |
 | GET | `/ws/agent/terminal` | agent 终端数据流（key 校验 + stream 归属校验） |
 | POST | `/api/report` | agent 监控上报 HTTP 备用入口（key 指纹定位 + 校验） |
@@ -308,7 +309,7 @@ wrangler secret put PANEL_USERS      # 回车后粘贴值，如 alice:pass1,bob:
 
 ### MCP（AI 接入）
 
-`/mcp` 实现标准 [Model Context Protocol](https://modelcontextprotocol.io) **无状态 Streamable HTTP**（2026-07-28 修订版：单 POST 端点、无会话、每请求独立鉴权）。鉴权复用现有 `Authorization: Bearer <JWT 或 PAT>`。
+`/mcp` 实现标准 [Model Context Protocol](https://modelcontextprotocol.io) **无状态 Streamable HTTP**（2025-11-25 修订版：单 POST 端点、无会话、每请求独立鉴权）。鉴权复用现有 `Authorization: Bearer <JWT 或 PAT>`。
 
 **工具**：
 
@@ -368,7 +369,7 @@ curl -X POST https://<面板域名>/mcp -H "Authorization: Bearer <token>" \
 ## 六、架构要点（多 DO 分片等）
 
 - **多 DO 分片**：终端 DO `SHARDS = 4`，streamId 带 `shard-序号` 前缀，浏览器/agent 的 WS 请求按前缀路由到对应 DO 实例，避免单点瓶颈。
-- **实时刷新 PanelDO**：单实例 DO，前端 `/ws/push` 连接后由**客户端每 3 秒发 sync 触发**；DO 用 Hibernation API，空闲即休眠（不计时长），收到 sync 才唤醒查 D1 并回发，按用户权限过滤（在线状态秒级更新）。
+- **实时刷新 PanelDO**：单实例 DO，前端 `/ws/push` 连接后**首帧 sync 即订阅**，此后由监控上报驱动实时推送（服务器变化/新数据时回发列表）；DO 用 Hibernation API，空闲即休眠（不计时长），按用户权限过滤（在线状态秒级更新）。
 - **会话回收**：终端会话两端都断开超过 10 分钟，DO 惰性清理（每 60s 扫描一次）。
 - **监控时序（MetricsDO，默认开启归档）**：agent 上报先写内存滚动窗口（保留最近 720 分钟/机，前端查询秒回）；alarm 每 10 分钟把超过 1 小时的旧数据批量写入 `metrics_min` 表（写入量 ≈ 60 行/机/小时，免费额度内），并按 **30 天保留期**每日清理过期行（重启不丢历史）。`ARCHIVE_TO_D1=0` 可关闭归档（关闭后仅内存 12 小时）。
 - **已知限制**：

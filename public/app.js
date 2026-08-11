@@ -53,6 +53,13 @@
     // PAT：exec 权限决定终端/文件菜单显隐（admin 恒有 exec）；修改/删除等管理操作仅 admin（PAT 恒隐藏）
     canExec = user.role === 1 || (user.scopes && user.scopes.includes('server:exec'));
     isAdmin = !user.is_pat;
+    // 头部下拉菜单的管理项（添加服务器/站点/告警/自定义指标/服务监控/令牌/审计/用量）按 isAdmin 隐藏，
+    // PAT 用户不再看到点击后 403 的入口（退出保留）
+    const ADMIN_MENUS = new Set(['add-server', 'site', 'alerts', 'custom-setup', 'service-setup', 'tokens', 'audit-logs', 'usage']);
+    document.querySelectorAll('#dropdown .dd-item').forEach((btn) => {
+      const m = btn.dataset.menu;
+      btn.classList.toggle('hidden', !isAdmin && m && ADMIN_MENUS.has(m));
+    });
     loadServers(); // 先拉一次，WS 建立后每 3 秒由服务端推送覆盖
     startPush();
     idleGuard.start(); // 空闲观看保护：登录后开始计时
@@ -107,8 +114,8 @@
     rows.push(['Swap', e.swap != null ? fmtBytes(e.swap) : '-']);
     rows.push(['负载 (1/5/15)', [e.load1, e.load5, e.load15].map((v) => (v != null ? Number(v).toFixed(2) : '-')).join(' / ')]);
     rows.push(['网络', (m.net_in != null ? '↓ ' + fmtBytes(m.net_in) + '/s' : '-') + ' · ' + (m.net_out != null ? '↑ ' + fmtBytes(m.net_out) + '/s' : '-')]);
-    if (e.procs != null) rows.push(['进程数', e.procs]);
-    if (e.tcp != null) rows.push(['TCP / UDP', e.tcp + ' / ' + (e.udp != null ? e.udp : '-')]);
+    if (e.procs != null) rows.push(['进程数', escapeHtml(e.procs)]);
+    if (e.tcp != null) rows.push(['TCP / UDP', escapeHtml(e.tcp) + ' / ' + (e.udp != null ? escapeHtml(e.udp) : '-')]);
     rows.push(['温度', e.temp != null ? Number(e.temp).toFixed(1) + ' °C' : 'N/A']);
     const items = rows.map(([k, v]) => `<div class="mt-row"><span>${k}</span><b>${v}</b></div>`).join('');
     // 系统信息：内核 / IP 等（info 仅在 info_json 变更时更新）
@@ -128,7 +135,7 @@
     let diskHtml = '';
     if (Array.isArray(e.disk) && e.disk.length) {
       diskHtml = `<div class="mt-sub">磁盘（${e.disk.length} 个挂载点）</div><div class="mt-disk">` +
-        e.disk.map((d) => `<div><span title="${escapeHtml(d.m)}">${escapeHtml(d.m)}</span><b>${d.u}%</b></div>`).join('') + '</div>';
+        e.disk.map((d) => `<div><span title="${escapeHtml(d.m)}">${escapeHtml(d.m)}</span><b>${escapeHtml(d.u)}%</b></div>`).join('') + '</div>';
     }
     return `<div class="mt-title">实时指标</div>${items}${sysHtml}${diskHtml}`;
   }
@@ -157,7 +164,7 @@
   function probesBlockHtml(s) {
     if (!Array.isArray(s.probes) || !s.probes.length) return '';
     return `
-        <div class="probes">${s.probes.map((p) => `<span class="probe ${p.ok ? 'ok' : 'down'}" title="${escapeHtml(p.name)}${p.code ? ` · HTTP ${p.code}` : ''}"><i class="dot"></i>${escapeHtml(p.name)}</span>`).join('')}</div>`;
+        <div class="probes">${s.probes.map((p) => `<span class="probe ${p.ok ? 'ok' : 'down'}" title="${escapeHtml(p.name)}${p.code ? ` · HTTP ${escapeHtml(p.code)}` : ''}"><i class="dot"></i>${escapeHtml(p.name)}</span>`).join('')}</div>`;
   }
   function cardHtml(s) {
     const m = s.metric;
@@ -479,6 +486,43 @@
     $('#btn-dialog-cancel').onclick = () => { closeDialog(); onCancel && onCancel(); };
     $('#btn-dialog-ok').onclick = () => { closeDialog(); onOk && onOk(); };
   }
+  // promptDialog —— 替代原生 prompt()（Safari/移动端体验差、样式割裂）；
+  // 复用通用对话框，动态插入输入框，回车=确认，Esc=取消
+  let promptInputEl = null;
+  function promptDialog(title, defaultValue, onOk, onCancel) {
+    $('#dialog-title').textContent = title;
+    $('#dialog-text').textContent = '';
+    $('#dialog-text').classList.remove('mono');
+    if (!promptInputEl) {
+      promptInputEl = document.createElement('input');
+      promptInputEl.type = 'text';
+      promptInputEl.className = 'dlg-input';
+      promptInputEl.maxLength = 200;
+      $('#dialog-text').after(promptInputEl);
+      promptInputEl.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') $('#btn-dialog-ok').click();
+      });
+    }
+    promptInputEl.value = defaultValue || '';
+    promptInputEl.style.display = 'block';
+    $('#btn-dialog-ok').classList.remove('hidden');
+    $('#btn-dialog-cancel').textContent = '取消';
+    $('#btn-dialog-cancel').classList.remove('hidden');
+    $('#dialog').classList.remove('hidden');
+    lockScroll();
+    const finish = () => {
+      if (promptInputEl) promptInputEl.style.display = 'none';
+      closeDialog();
+    };
+    $('#btn-dialog-close').onclick = () => { finish(); onCancel && onCancel(); };
+    $('#btn-dialog-cancel').onclick = () => { finish(); onCancel && onCancel(); };
+    $('#btn-dialog-ok').onclick = () => {
+      const v = promptInputEl.value.trim();
+      finish();
+      if (v) onOk && onOk(v);
+    };
+    setTimeout(() => promptInputEl.focus(), 0);
+  }
 
   // ---------- 终端（断线自动重连） ----------
   function openTerminal(serverId, serverName) {
@@ -517,6 +561,7 @@
   let fileServerId = 0;      // 当前文件会话所属服务器（断线重连用）
   let fileServerName = '';
   let fileFilterTimer = null;          // 过滤输入框 debounce 定时器
+  let fileEntries = [];      // 当前目录条目缓存（上传前同名检测用）
 
   // FileSession：连接/协议/上传下载状态机（api.js，零 DOM），UI 通过回调处理
   const fileSess = new FileSession({
@@ -576,6 +621,7 @@
   }
 
   function renderFileList(entries) {
+    fileEntries = entries || []; // 缓存条目供上传同名检测
     const rows = entries.map((e) => {
       const size = e.type === 'dir' ? '—' : fmtBytes(e.size);
       const time = e.mtime ? new Date(e.mtime * 1000).toLocaleString('zh-CN') : '—';
@@ -597,8 +643,18 @@
     $('#file-list').innerHTML = rows.join('') || '<tr><td colspan="4" class="muted">空目录</td></tr>';
   }
 
-  // 上传/下载入口：状态机在 FileSession（api.js），这里只负责 UI 接线
+  // 上传/下载入口：状态机在 FileSession（api.js），这里只负责 UI 接线。
+  // 上传前检测当前目录同名文件（服务端首块同样强制校验 overwrite，双保险）——同名需二次确认
   function uploadFile(file) {
+    const target = fileJoin(fileSess.cwd, file.name);
+    const existing = fileEntries.some((e) => e.type !== 'dir' && fileJoin(fileSess.cwd, e.name) === target);
+    if (existing) {
+      confirmDialog(`「${file.name}」已存在，是否覆盖？`, () => {
+        $('#btn-file-cancel').classList.remove('hidden');
+        fileSess.upload(file, { overwrite: true });
+      });
+      return;
+    }
     $('#btn-file-cancel').classList.remove('hidden');
     fileSess.upload(file);
   }
@@ -988,7 +1044,7 @@
   }
 
   // ---------- 审计日志（仅管理员，保留 90 天） ----------
-  const AUDIT_ACTION_LABEL = { 'server.create': '添加服务器', 'server.update': '修改服务器', 'server.delete': '删除服务器', 'terminal.open': '打开终端', 'file.open': '文件管理' };
+  const AUDIT_ACTION_LABEL = { 'server.create': '添加服务器', 'server.update': '修改服务器', 'server.delete': '删除服务器', 'terminal.open': '打开终端', 'file.open': '文件管理', 'file.upload': '上传文件', 'exec.command': '执行命令' };
   async function openAuditModal() {
     $('#audit-modal').classList.remove('hidden');
     lockScroll();
@@ -1251,8 +1307,10 @@
     if (ren) {
       closeRowMenus();
       const old = ren.dataset.path.split('/').pop();
-      const name = prompt(`重命名：\n${ren.dataset.path}\n\n新名称（仅改名，不支持跨目录）：`, old);
-      if (name !== null && name.trim()) fileSess.rename(ren.dataset.path, name.trim());
+      // 原生 prompt() → promptDialog（对话框体系一致，回车确认/Esc 取消）
+      promptDialog(`重命名：${ren.dataset.path}（仅改名，不支持跨目录）`, old, (name) => {
+        fileSess.rename(ren.dataset.path, name);
+      });
       return;
     }
     const del = e.target.closest('.f-act-del');

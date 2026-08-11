@@ -176,6 +176,43 @@ test('服务器：管理员添加/列表/删除 + 分组排序', async () => {
   assert.deepEqual(after.map((s) => s.name), ['web-01', 'db-01']);
 });
 
+test('PATCH /api/servers/:id：部分字段更新（不再 500）', async () => {
+  const env = makeEnv();
+  const token = await login(env);
+  await addServer(env, token, { name: 'patch-me', group: 'g1', sort_order: 3 });
+  const list = await (await call(env, { path: '/api/servers', token })).json();
+  const id = list[0].id;
+
+  // 只改名称（不带 group/sort_order）——此前 SELECT 缺列 → undefined 绑定 → 500
+  const r1 = await call(env, { method: 'PATCH', path: `/api/servers/${id}`, token, body: { name: 'renamed' } });
+  assert.equal(r1.status, 200, '只改名称应成功');
+  let row = await env.DB.prepare('SELECT name, "group", display_index FROM servers WHERE id = ?').bind(id).first();
+  assert.equal(row.name, 'renamed');
+  assert.equal(row.group, 'g1'); // 未传字段保持原值
+  assert.equal(row.display_index, 3);
+
+  // 只改分组
+  const r2 = await call(env, { method: 'PATCH', path: `/api/servers/${id}`, token, body: { group: 'prod' } });
+  assert.equal(r2.status, 200);
+  row = await env.DB.prepare('SELECT name, "group", display_index FROM servers WHERE id = ?').bind(id).first();
+  assert.equal(row.name, 'renamed');
+  assert.equal(row.group, 'prod');
+
+  // 只改序号
+  const r3 = await call(env, { method: 'PATCH', path: `/api/servers/${id}`, token, body: { sort_order: 9 } });
+  assert.equal(r3.status, 200);
+  row = await env.DB.prepare('SELECT name, "group", display_index FROM servers WHERE id = ?').bind(id).first();
+  assert.equal(row.display_index, 9);
+
+  // 空 name 拒绝
+  const r4 = await call(env, { method: 'PATCH', path: `/api/servers/${id}`, token, body: { name: '  ' } });
+  assert.equal(r4.status, 400);
+
+  // 每次更新一条审计（server.update）
+  const logs = await env.DB.prepare("SELECT * FROM audit_logs WHERE action = 'server.update'").all();
+  assert.equal(logs.results.length, 3);
+});
+
 test('删除服务器：清理历史数据 + 审计日志 + 通知 DO 断开 agent', async () => {
   const env = makeEnv();
   const token = await login(env);
@@ -476,6 +513,21 @@ test('监控：短区间走内存热区（METRICS /query），非法 range 回�
   await call(env, { path: `/api/monitor?server_id=${id}&range=weird`, token });
   const q2 = env.METRICS.calls.filter((c) => c.path === '/query').pop();
   assert.equal(q2.query.limit, '720');
+});
+
+test('监控：极端 range（99999d）回退 12h，不触发 D1 全表扫', async () => {
+  const env = makeEnv();
+  const token = await login(env);
+  await addServer(env, token, { name: 'm1' });
+  const list = await (await call(env, { path: '/api/servers', token })).json();
+  const id = list[0].id;
+
+  const res = await call(env, { path: `/api/monitor?server_id=${id}&range=99999d`, token });
+  assert.equal(res.status, 200);
+  const q = env.METRICS.calls.filter((c) => c.path === '/query').pop();
+  // 白名单收口：99999d 不在 1h/12h/3d/7d/30d 白名单 → 回退 12h（limit 720），
+  // 而不是按 99999×24h 分钟数请求（会导致 D1 ts % step 抽样全表扫，索引失效）
+  assert.equal(q.query.limit, '720', '99999d 应回退 12h');
 });
 
 test('监控：不存在的服务器 404；长区间 3d 合并 D1 + 热区查询', async () => {
@@ -806,6 +858,31 @@ test('MCP：tools/list 与 tools/call', async () => {
   const goodSigned = await worker.fetch(new Request(cuRes.upload_url, { method: 'POST', body: 'hello signed' }), env);
   assert.equal(goodSigned.status, 200);
 
+  // Bearer 路径（非签名分支）：/api/file_upload 带 token + server_id/path → 审计 + DO /rpc/upload 透传
+  const serverRow = await env.DB.prepare("SELECT id FROM servers WHERE name = 'web-1'").first();
+  const bearerUp = await worker.fetch(
+    new Request(`http://panel.local/api/file_upload?server_id=${serverRow.id}&path=/tmp/t.txt`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${token}` },
+      body: 'raw bytes',
+    }),
+    env
+  );
+  assert.equal(bearerUp.status, 200, 'Bearer 上传分支应成功');
+  assert.ok(env.TERMINAL.calls.some((c) => c.path === '/rpc/upload'), '转发到 TerminalDO /rpc/upload');
+  const upAudit = await env.DB.prepare("SELECT COUNT(*) AS c FROM audit_logs WHERE action = 'file.upload'").all();
+  assert.equal(upAudit.results[0].c, 2, '签名签发 1 次 + Bearer 直传 1 次审计');
+  // 非绝对路径拒绝
+  const badPath = await worker.fetch(
+    new Request(`http://panel.local/api/file_upload?server_id=${serverRow.id}&path=rel.txt`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${token}` },
+      body: 'x',
+    }),
+    env
+  );
+  assert.equal(badPath.status, 400);
+
   // exec_command：DO stub 返回 200（无 agent 语义）→ 结构正确
   const ex = await (await mcp(env, { token, body: { jsonrpc: '2.0', id: 6, method: 'tools/call', params: { name: 'exec_command', arguments: { server_name: 'web-1', command: 'echo hi' } } } })).json();
   assert.equal(ex.result.isError, false);
@@ -872,7 +949,7 @@ test('MCP：tools/list 与 tools/call', async () => {
   assert.equal(asRes.name, 'mcp-new');
   assert.equal(asRes.server_id, 3);
   assert.ok(asRes.agent_key && asRes.agent_key.length === 64, 'agent_key 明文返回');
-  // H1：部署地址动态生成（host = panel.local，非占位符）
+  // 部署地址动态生成（host = panel.local，非占位符）
   assert.equal(asRes.wss_base, 'wss://panel.local/ws/agent');
   assert.equal(asRes.report_url, 'https://panel.local/api/report');
   // add_server：缺 name → isError

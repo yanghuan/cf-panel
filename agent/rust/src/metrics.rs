@@ -155,8 +155,13 @@ fn count_lines(path: &str) -> u64 {
         .map(|f| std::io::BufReader::new(f).lines().count().saturating_sub(1) as u64)
         .unwrap_or(0)
 }
+// IPv4 + IPv6 合计（仅读 tcp/udp 会让 IPv6-only 主机连接数恒为 0；
+// 文件不存在（老内核）时 count_lines 返回 0，天然兼容）
 fn collect_conns() -> (u64, u64) {
-    (count_lines("/proc/net/tcp"), count_lines("/proc/net/udp"))
+    (
+        count_lines("/proc/net/tcp") + count_lines("/proc/net/tcp6"),
+        count_lines("/proc/net/udp") + count_lines("/proc/net/udp6"),
+    )
 }
 
 // 磁盘结果缓存：df 结果 60s 内复用；超时/失败返回上次成功值（熔断降级，不空转重试）
@@ -170,62 +175,117 @@ async fn disk_cache(
         .await
 }
 
-// 磁盘：df -Pkl（-l 仅本地文件系统，不碰 NFS/CIFS 挂死挂载点）；tokio 子进程 +
-// kill_on_drop + 进程组（超时即杀，不留孤儿）；60s 缓存；失败走真熔断——
-// 刷新缓存时间戳使熔断窗口内直接返回旧值不重试（60s 后重试一次）
+// 磁盘：statvfs + /proc/mounts（无外部命令依赖，替代 df -Pkl——busybox 精简版/
+// 最小镜像无 df 或参数缺失）。保留 spawn_blocking + 5s 超时：挂死的 NFS 挂载点上
+// statvfs 同样会阻塞，与 df 行为等价；60s 缓存 + 失败真熔断逻辑不变
 async fn collect_disk() -> Vec<serde_json::Value> {
     let now = std::time::Instant::now();
     if let Some((ts, disk)) = disk_cache().await.as_ref() {
         if now.duration_since(*ts).as_secs() < 60 {
-            return disk.clone(); // 60s 缓存命中（快采 5s → 12 帧只跑一次 df）
+            return disk.clone(); // 60s 缓存命中（快采 5s → 12 帧只跑一次）
         }
     }
-    let mut cmd = tokio::process::Command::new("df");
-    cmd.args(["-Pkl"]).kill_on_drop(true);
-    #[cfg(unix)]
-    cmd.process_group(0); // 超时取消时杀掉整个进程组，防 df 孤儿残留
-    let out = tokio::time::timeout(Duration::from_secs(5), cmd.output()).await;
-    let mut disk = Vec::new();
+    let fut = tokio::task::spawn_blocking(disk_usage_static);
+    let out = tokio::time::timeout(Duration::from_secs(5), fut).await;
     match out {
-        Ok(Ok(out)) if out.status.success() => {
-            let text = String::from_utf8_lossy(&out.stdout);
-            for line in text.lines().skip(1) {
-                let mut it = line.split_whitespace();
-                let _fs = it.next();
-                let _blocks = it.next();
-                let _used = it.next();
-                let _avail = it.next();
-                let cap = it.next().unwrap_or("");
-                let mount = it.next().unwrap_or("");
-                if mount.starts_with('/') {
-                    let pct = cap.trim_end_matches('%').parse::<u64>().unwrap_or(0);
-                    disk.push(json!({ "m": mount, "u": pct }));
-                }
-            }
+        Ok(Ok(Ok(disk))) => {
             *disk_cache().await = Some((now, disk.clone())); // 成功：更新缓存
+            disk
         }
         _ => {
             // 失败/超时：真熔断——刷新时间戳，后续 60s 内直接返回旧值/空值不重试；
-            // 无旧值也写空缓存（开机即挂死 NFS 场景下避免每帧重跑 df 挂 5s）
+            // 无旧值也写空缓存（开机即挂死 NFS 场景下避免每帧重跑挂 5s）
             let mut c = disk_cache().await;
             let old = c.as_ref().map(|(_, v)| v.clone());
             *c = Some((now, old.clone().unwrap_or_default()));
             if let Some(old) = old {
                 return old;
             }
+            Vec::new()
         }
     }
-    disk
+}
+
+// statvfs 读取：遍历 /proc/mounts，伪文件系统过滤（proc/sysfs/cgroup 等），
+// 挂载点去重；与原 df -l 的"仅本地文件系统"语义对齐（overlay 是容器根，保留不过滤）
+fn disk_usage_static() -> Result<Vec<serde_json::Value>, ()> {
+    const FAKE_FSTYPES: &[&str] = &[
+        "proc",
+        "sysfs",
+        "devpts",
+        "devtmpfs",
+        "cgroup",
+        "cgroup2",
+        "pstore",
+        "securityfs",
+        "debugfs",
+        "tracefs",
+        "fusectl",
+        "configfs",
+        "mqueue",
+        "binfmt_misc",
+        "hugetlbfs",
+        "autofs",
+        "rpc_pipefs",
+        "nsfs",
+        "bpf",
+    ];
+    let mounts = std::fs::read_to_string("/proc/mounts").map_err(|_| ())?;
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for line in mounts.lines() {
+        let mut it = line.split_whitespace();
+        let _dev = it.next().unwrap_or("");
+        let mount = it.next().unwrap_or("");
+        let fstype = it.next().unwrap_or("");
+        if !mount.starts_with('/') || !seen.insert(mount.to_string()) {
+            continue; // 非绝对路径或重复挂载（bind mount）跳过
+        }
+        if FAKE_FSTYPES.contains(&fstype) {
+            continue;
+        }
+        let c_path = std::ffi::CString::new(mount.as_bytes()).map_err(|_| ())?;
+        let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+        if unsafe { libc::statvfs(c_path.as_ptr(), &mut st) } != 0 {
+            continue; // statvfs 失败（权限/挂死点异常）跳过该挂载点
+        }
+        let frsize = if st.f_frsize > 0 {
+            st.f_frsize as u64
+        } else {
+            1
+        };
+        let used = st.f_blocks.saturating_sub(st.f_bfree) as u64 * frsize;
+        let avail = st.f_bavail as u64 * frsize;
+        let pct = if used + avail > 0 {
+            used * 100 / (used + avail)
+        } else {
+            0
+        };
+        out.push(json!({ "m": mount, "u": pct }));
+    }
+    Ok(out)
 }
 
 // 网络速率：/proc/net/dev 累计差分（字节/秒）
+// 跳过回环与常见虚拟网卡前缀（lo/docker*/veth*/br-*/virbr*/tun*/tap*/vxlan*/gretap*/ip6tnl*/sit*/
+// ——否则容器宿主/本机回环流量计入速率导致虚高）
+fn is_virtual_iface(name: &str) -> bool {
+    const VIRT_PREFIXES: &[&str] = &[
+        "lo", "docker", "veth", "br-", "virbr", "tun", "tap", "vxlan", "gretap", "ip6tnl", "sit",
+        "dummy", "vnet",
+    ];
+    VIRT_PREFIXES.iter().any(|p| name.starts_with(p))
+}
 async fn collect_net() -> (u64, u64) {
     let mut rx = 0u64;
     let mut tx = 0u64;
     if let Some(text) = read_file("/proc/net/dev") {
         for line in text.lines().skip(2) {
             let mut it = line.split_whitespace();
-            let _iface = it.next();
+            let iface = it.next().unwrap_or("").trim_end_matches(':');
+            if iface.is_empty() || is_virtual_iface(iface) {
+                continue;
+            }
             if let Some(r) = it.next().and_then(|v| v.parse::<u64>().ok()) {
                 rx += r;
             }
@@ -300,12 +360,40 @@ async fn collect_info() -> serde_json::Value {
         .and_then(|r| r.ok())
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .unwrap_or_default();
+    // hostname -I 在 busybox/精简镜像不支持 → 依次回退 `ip -4 -o addr show scope global`
+    // （busybox ip 可用）与裸 `hostname`（单值）；ip 输出解析为 IP 列表（去掉 /prefix）
     let host = run_blocking(5, || {
-        std::process::Command::new("hostname").arg("-I").output()
+        if let Ok(o) = std::process::Command::new("hostname").arg("-I").output() {
+            if o.status.success() {
+                return String::from_utf8_lossy(&o.stdout).trim().to_string();
+            }
+        }
+        if let Ok(o) = std::process::Command::new("ip")
+            .args(["-4", "-o", "addr", "show", "scope", "global"])
+            .output()
+        {
+            if o.status.success() {
+                let ips: Vec<String> = String::from_utf8_lossy(&o.stdout)
+                    .lines()
+                    .filter_map(|l| {
+                        // 格式: "2: eth0    inet 1.2.3.4/24 brd ... scope global eth0"
+                        let mut it = l.split_whitespace();
+                        let _ = it.next(); // "2:"
+                        let _ = it.next(); // "eth0"
+                        let _ = it.next(); // "inet"
+                        it.next()
+                            .map(|addr| addr.split('/').next().unwrap_or("").to_string())
+                    })
+                    .collect();
+                return ips.join(" ");
+            }
+        }
+        std::process::Command::new("hostname")
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_default()
     })
     .await
-    .and_then(|r| r.ok())
-    .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
     .unwrap_or_default();
     let mut ip4 = String::new();
     let mut ip6 = String::new();

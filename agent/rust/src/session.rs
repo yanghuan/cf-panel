@@ -48,10 +48,23 @@ impl TermSession {
             pixel_width: 0,
             pixel_height: 0,
         })?;
-        let mut cmd = CommandBuilder::new("bash");
+        // shell 探测 $SHELL → /bin/bash → /bin/sh（busybox/Alpine/OpenWrt 无 bash 时终端仍可用；
+        // 显式声明 xterm-256color：systemd 环境无 TERM 时 TUI 程序检测不到终端类型会输出一屏立即退出）
+        let shell = std::env::var("SHELL")
+            .ok()
+            .filter(|s| !s.is_empty() && std::path::Path::new(s).exists())
+            .unwrap_or_else(|| {
+                // Alpine/busybox/OpenWrt 无 bash：/bin/sh 即 ash（busybox applet），绝对路径避免 PATH 依赖
+                if std::path::Path::new("/bin/bash").exists() {
+                    "/bin/bash".to_string()
+                } else if std::path::Path::new("/bin/sh").exists() {
+                    "/bin/sh".to_string()
+                } else {
+                    "sh".to_string()
+                }
+            });
+        let mut cmd = CommandBuilder::new(&shell);
         cmd.arg("-i");
-        // systemd 环境无 TERM：TUI 程序（top/htop/vim）检测不到终端类型会输出一屏立即退出；
-        // 显式声明 xterm-256color，保证全屏交互正常
         cmd.env("TERM", "xterm-256color");
         let child = pair.slave.spawn_command(cmd)?;
         let child_pid = child.process_id().unwrap_or(0);
@@ -374,7 +387,13 @@ fn crc32(data: &[u8]) -> u32 {
     !c
 }
 
-// 递归收集目录条目（相对路径，目录带尾 /）
+// EOCD 条目数字段为 u16（最大 65,535），超限必须显式报错而非截断
+const ZIP_MAX_ENTRIES: usize = 65_535;
+
+// 递归收集目录条目（相对路径，目录带尾 /）。
+// 符号链接一律跳过（不跟随、不打包）：否则 walk_dir_size（metadata 不跟随链接）与打包时
+// fs::read（跟随链接）口径不一致——指向大文件的 symlink 可绕过大小预检导致 OOM；
+// 且 symlink→dir 会被 file_type 当作普通文件，fs::read(目录) 报 Is a directory 使整个打包失败。
 fn collect_zip_entries(
     dir: &std::path::Path,
     prefix: &str,
@@ -388,7 +407,13 @@ fn collect_zip_entries(
         } else {
             format!("{prefix}/{name}")
         };
-        let ft = e.file_type()?;
+        let ft = e.file_type()?; // 不跟随符号链接
+        if ft.is_symlink() {
+            continue; // 跳过符号链接
+        }
+        if out.len() >= ZIP_MAX_ENTRIES {
+            return Err(std::io::Error::other("too many entries (zip limit 65535)"));
+        }
         if ft.is_dir() {
             out.push((format!("{rel}/"), true));
             collect_zip_entries(&e.path(), &rel, out)?;
@@ -403,14 +428,24 @@ fn collect_zip_entries(
 fn zip_directory(dir: &std::path::Path, out: &mut Vec<u8>) -> std::io::Result<()> {
     let mut entries: Vec<(String, bool)> = Vec::new();
     collect_zip_entries(dir, "", &mut entries)?;
+    // EOCD 条目数为 u16，超 65,535 明确报错（而非截断产生非法 zip）
+    if entries.len() > ZIP_MAX_ENTRIES {
+        return Err(std::io::Error::other("too many entries (zip limit 65535)"));
+    }
     let mut central: Vec<u8> = Vec::new();
-    let mut offset: u32 = 0;
+    let mut offset: u64 = 0;
     for (rel, is_dir) in &entries {
         let data = if *is_dir {
             Vec::new()
         } else {
             std::fs::read(dir.join(rel))?
         };
+        // 硬上限：按累计实际字节数校验（预检之外的兜底，防任何口径差异导致的 OOM）
+        if offset + data.len() as u64 > FILE_LIMIT {
+            return Err(std::io::Error::other(
+                "directory too large for zip (>500MB)",
+            ));
+        }
         let crc = crc32(&data);
         let name_bytes = rel.as_bytes();
         let mut lh = Vec::new();
@@ -445,10 +480,14 @@ fn zip_directory(dir: &std::path::Path, out: &mut Vec<u8>) -> std::io::Result<()
         ch.extend_from_slice(&0u16.to_le_bytes()); // disk number
         ch.extend_from_slice(&0u16.to_le_bytes()); // internal attrs
         ch.extend_from_slice(&0u32.to_le_bytes()); // external attrs
-        ch.extend_from_slice(&offset.to_le_bytes()); // local header offset
+        ch.extend_from_slice(&(offset as u32).to_le_bytes()); // local header offset
         ch.extend_from_slice(name_bytes);
         central.extend_from_slice(&ch);
-        offset += lh.len() as u32 + data.len() as u32;
+        offset += lh.len() as u64 + data.len() as u64;
+        // offset 超 u32 上限（4GB zip）明确报错（500MB 预检已先挡，双保险）
+        if offset > u32::MAX as u64 {
+            return Err(std::io::Error::other("zip too large (>4GB)"));
+        }
     }
     out.extend_from_slice(&central);
     // EOCD
@@ -458,7 +497,7 @@ fn zip_directory(dir: &std::path::Path, out: &mut Vec<u8>) -> std::io::Result<()
     out.extend_from_slice(&(entries.len() as u16).to_le_bytes());
     out.extend_from_slice(&(entries.len() as u16).to_le_bytes());
     out.extend_from_slice(&(central.len() as u32).to_le_bytes());
-    out.extend_from_slice(&offset.to_le_bytes());
+    out.extend_from_slice(&(offset as u32).to_le_bytes()); // EOCD offset 为 4 字节字段
     out.extend_from_slice(&0u16.to_le_bytes()); // comment len
     Ok(())
 }
@@ -472,16 +511,21 @@ async fn file_zip(path: &str, sid: &str, tmp_dir: &str) -> Result<(String, u64),
     if !meta.is_dir() {
         return Err("not a directory".into());
     }
-    // 目录大小上限使用 FILE_LIMIT（500 MB），防止 OOM
+    // 目录大小上限使用 FILE_LIMIT（500 MB），防止 OOM。
+    // 与 collect_zip_entries 同口径：符号链接跳过（M3——此前 metadata() 不跟随链接，
+    // 预检通过后打包 fs::read 跟随链接读取大文件，可绕过 500MB 上限导致 OOM）
     fn walk_dir_size(path: &std::path::Path) -> Result<u64, std::io::Error> {
         let mut size: u64 = 0;
         for entry in std::fs::read_dir(path)? {
             let entry = entry?;
-            let meta = entry.metadata()?;
-            if meta.is_dir() {
+            let ft = entry.file_type()?; // 不跟随符号链接
+            if ft.is_symlink() {
+                continue;
+            }
+            if ft.is_dir() {
                 size += walk_dir_size(&entry.path())?;
             } else {
-                size += meta.len();
+                size += entry.metadata()?.len();
             }
         }
         Ok(size)
@@ -654,6 +698,15 @@ async fn handle_file_cmd_binary(
             .and_then(|x| x.as_str())
             .unwrap_or("default")
             .to_string();
+        // 与 /api/file_upload 路径（main.rs）语义对齐——首块且目标已存在且未显式
+        // overwrite=true → 拒绝（防文件管理 WS 上传静默覆盖同名文件导致数据丢失）
+        let overwrite = v
+            .get("overwrite")
+            .and_then(|x| x.as_bool())
+            .unwrap_or(false);
+        if offset == 0 && !overwrite && std::path::Path::new(&path).exists() {
+            return err_json("target already exists (use overwrite=1)");
+        }
         write_bytes(
             &path,
             offset,

@@ -120,9 +120,9 @@ export class TerminalDO {
         try {
           const existing = await this.state.storage.getAlarm();
           const next = createdAt + SESSION_TTL_MS + 1000;
-          if (existing == null || next < existing) this.state.storage.setAlarm(next);
+          if (existing == null || next < existing) await this.state.storage.setAlarm(next);
         } catch { /* 无法安排 alarm 时依赖 fetch 时 maybeSweep */ }
-        // 会话指令：确认重发机制（L10 补齐 open_file）——agent 收到并启动后回
+        // 会话指令：确认重发机制（open_file 补齐）——agent 收到并启动后回
         // terminal_ready/file_ready，未确认则定时重发（最多 3 次），避免控制通道重连窗口丢指令
         const openType = isFile ? 'open_file' : 'open_terminal';
         agentWs.send(JSON.stringify({ type: openType, stream_id: body.streamId }));
@@ -364,7 +364,7 @@ export class TerminalDO {
   // 惰性清理：两端都断开且超过 TTL 的僵尸会话 → 删除；并清理对应 pendingOpen。
   // 若有未到期的僵尸会话，则安排 DO alarm 到最早到期时间——Hibernation 下零流量也会
   // 被 alarm 短暂唤醒执行清理，避免"必须等下一次 fetch 才回收"的滞留（alarm 每次 = 1 次请求，僵尸会话罕见，成本可忽略）。
-  maybeSweep() {
+  async maybeSweep() {
     const now = Date.now();
     let next = Infinity;
     for (const [sid, sess] of this.sessions) {
@@ -397,18 +397,18 @@ export class TerminalDO {
       }
     }
     if (next !== Infinity) {
-      try { this.state.storage.setAlarm(next + 1000); } catch { /* ignore */ }
+      try { await this.state.storage.setAlarm(next + 1000); } catch { /* ignore */ }
     }
   }
 
   // Hibernation alarm：零流量时也被唤醒执行清理；无僵尸会话则无需设定 alarm，保持休眠
   async alarm() {
     this.rebuildIndex();
-    this.maybeSweep();
+    await this.maybeSweep();
   }
 
   // open_terminal/open_file 确认重发：下发后 5s 未收到 agent 的 *_ready 则重发，最多 3 次
-  // 解决 agent 控制通道重连窗口内指令丢失导致的终端/文件"打不开"（L10：open_file 补齐）
+  // 解决 agent 控制通道重连窗口内指令丢失导致的终端/文件"打不开"（open_file 补齐）
   // 记录 serverId + agentWs 归属：cleanup 断开时只清理关联项，不影响其他服务器/会话
   scheduleOpenAck(agentWs, streamId, serverId, openType) {
     if (this.pendingOpen.has(streamId)) return;
@@ -538,13 +538,15 @@ export class TerminalDO {
       return;
     }
     // agent 控制通道（不在任何 session）：处理监控上报 {type:"report"} 与终端确认 {type:"terminal_ready"}
-    const sess = [...this.sessions.values()].find((s) => s.userWs === ws || s.agentWs === ws);
+    // 附件已含 sid → O(1) 定位（原来每条消息 O(N) 扫 sessions，终端按键高频路径）
+    const sess = (att && att.sid && this.sessions.get(att.sid)) ||
+      [...this.sessions.values()].find((s) => s.userWs === ws || s.agentWs === ws);
     if (!sess) {
       if (typeof message === 'string') {
         try {
           const j = JSON.parse(message);
           if (j && (j.type === 'terminal_ready' || j.type === 'file_ready')) {
-            // agent 已收到 open_terminal/open_file 并开始启动 → 停止确认重发（L10：file_ready 补齐）
+            // agent 已收到 open_terminal/open_file 并开始启动 → 停止确认重发（file_ready 补齐）
             const r = this.pendingOpen.get(j.stream_id);
             if (r && r.timer) clearTimeout(r.timer);
             this.pendingOpen.delete(j.stream_id);

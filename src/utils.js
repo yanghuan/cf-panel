@@ -82,17 +82,26 @@ export async function sha256Hex(input) {
   const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(String(input)));
   return bytesToHex(new Uint8Array(digest));
 }
-// 解析监控时间范围："1h"/"12h"/"3d"/"7d"/"30d" → 小时数（非法回退 12h）
+// 解析监控时间范围："1h"/"12h"/"3d"/"7d"/"30d" → 小时数（非法/非白名单回退 12h）。
+// 白名单收在函数内：拒绝任意 \d+(h|d)（如 99999d）——超大 range 会让 D1 查询走
+// `ts % step` 抽样（ts 列取模无法用索引）→ 全表扫描行读放大，一个登录用户即可耗尽 D1 免费行读
+const RANGE_HOURS_WHITELIST = new Set([1, 12, 72, 168, 720]); // 1h / 12h / 3d / 7d / 30d
 export function parseRangeHours(range) {
   const m = String(range).match(/^(\d+)(h|d)$/);
   if (!m) return 12;
   const n = Number(m[1]);
-  return m[2] === 'd' ? n * 24 : n;
+  const hours = m[2] === 'd' ? n * 24 : n;
+  return RANGE_HOURS_WHITELIST.has(hours) ? hours : 12;
 }
 // 安全解析 JSON 字符串（extra/info 列），失败回退 null
 export function safeJson(s) {
   if (s == null) return null;
   try { return JSON.parse(s); } catch { return null; }
+}
+// 数值归一化：字符串数字转 number，对象/数组/NaN/Infinity → null（上报数据入口校验用）
+export function numOrNull(v) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
 }
 // 清洗告警配置（PUT /api/settings 用）：只保留合法字段，空 webhook_url 即禁用
 export function sanitizeAlerts(a) {

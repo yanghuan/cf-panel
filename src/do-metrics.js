@@ -1,6 +1,6 @@
 // cf-panel — Durable Object：监控时序内存热区（MetricsDO）
 import { ARCHIVE_AFTER_MIN } from './config.js';
-import { json, err, doPanel, sendWebhook } from './utils.js';
+import { json, err, doPanel, sendWebhook, numOrNull } from './utils.js';
 import { getAlertCfg, SETTINGS_CACHE } from './db.js';
 
 // 本模块专用常量（热区/归档/家政/推送，就近定义便于对照使用代码）
@@ -13,6 +13,7 @@ const ARCHIVE_IDLE_INTERVAL_MS = 60 * 60 * 1000; // 闲置（无数据且告警�
 const LATEST_PUSH_INTERVAL_MS = 5000; // 上报驱动聚合推送间隔（有观看者时 ≥5s 推一次全部 latest 给 PanelDO；
 // 单机时被 REPORT_FWD_THROTTLE_S=5s 钳制（MetricsDO 每 5s 收帧），多机时聚合多台上报防推送风暴）
 const PUSH_PROBE_INTERVAL_MS = 30 * 1000; // pushOn 自愈反查 /viewers 的间隔（MetricsDO evict 丢失 pushOn 时）
+const RETRY_BACKOFF_MS = 60 * 1000; // 告警 webhook 送达失败后的重试退避（失败只退避 1 分钟，而非静默整个冷却期）
 
 // 内存热区（12h 秒回）+ alarm 归档 D1（默认开启，ARCHIVE_TO_D1=0 可关闭）；
 // 归档时按 METRICS_RETENTION_DAYS 保留期每日清理过期历史
@@ -133,9 +134,16 @@ export class MetricsDO {
       this.arcCache.set(serverId, arcTs);
     }
     const archiveCutoff = Math.floor(Date.now() / 1000 / 60) - ARCHIVE_AFTER_MIN;
+    // 数值归一化兜底：storage 历史行可能含修复前的坏数据（对象/字符串），
+    // 归一化后 D1.bind 不抛类型错误 → 归档水位可推进，杜绝"单条坏数据停摆整机归档"
     const mk = (t, row) => this.env.DB.prepare(
       'INSERT OR IGNORE INTO metrics_min (server_id, ts, cpu, mem_used, mem_total, net_in, net_out, extra) VALUES (?,?,?,?,?,?,?,?)'
-    ).bind(serverId, t, row.cpu, row.mem_used, row.mem_total, row.net_in, row.net_out, row.extra ? JSON.stringify(row.extra) : null);
+    ).bind(
+      serverId, t,
+      numOrNull(row.cpu), numOrNull(row.mem_used), numOrNull(row.mem_total),
+      numOrNull(row.net_in), numOrNull(row.net_out),
+      row.extra ? JSON.stringify(row.extra) : null
+    );
     const stmts = [];
     // 水位只推进到本次实际归档的最大 ts（maxArchived），不得无条件推进到 cutoff：
     // 热写路径在实例 evict 后是空 Map，若水位仍推进，storage 中 arcTs+1~cutoff 的未归档行会被
@@ -390,7 +398,7 @@ export class MetricsDO {
     if (this.alarmCached != null && this.alarmCached <= next) return; // 已有不晚于 next 的 alarm，无需查 storage
     const existing = await this.state.storage.getAlarm();
     if (existing == null || next < existing) {
-      this.state.storage.setAlarm(next);
+      try { await this.state.storage.setAlarm(next); } catch (e) { console.error('scheduleArchive setAlarm failed:', e); }
       this.alarmCached = next;
     } else {
       this.alarmCached = existing;
@@ -406,12 +414,14 @@ export class MetricsDO {
     await this.ensureAlertLoaded(); // 恢复持久化冷却状态
     const now = Date.now();
     const cooldown = cfg.cooldown_min * 60 * 1000;
+    const cooledKeys = []; // 本次判定中置冷却的 key（webhook 失败时缩短冷却，见下）
     const cooled = async (key) => {
       const last = this.alertLast.get(key);
       if (last && now - last < cooldown) return false;
       this.alertLast.set(key, now);
       // 冷却触发即持久化，实例 evict/重启后不重复告警
       try { await this.state.storage.put('alert:' + key, String(now)); } catch { /* 持久化失败仅内存 */ }
+      cooledKeys.push(key);
       return true;
     };
     const alerts = [];
@@ -436,7 +446,7 @@ export class MetricsDO {
       alerts.push(`负载 ${b.extra.load1} >= ${cfg.load}`);
     }
     if (alerts.length) {
-      await sendWebhook(cfg, {
+      const ok = await sendWebhook(cfg, {
         event: 'alert',
         title: `[cf-panel] ${b.serverName} 指标告警`,
         server: { id: b.serverId, name: b.serverName },
@@ -444,6 +454,16 @@ export class MetricsDO {
         details: alerts,
         time: new Date().toISOString(),
       });
+      if (!ok && cooledKeys.length) {
+        // webhook 送达失败不得消耗完整冷却（否则指标持续超阈值时告警静默丢失整个冷却期）。
+        // 把冷却起点回拨到 cooldown - RETRY_BACKOFF_MS 前 → 剩余冷却恰为退避间隔（1 分钟），
+        // 之后每帧（≤5s）重新判定触发重发，直至送达。
+        const backoffTs = now - cooldown + RETRY_BACKOFF_MS;
+        for (const key of cooledKeys) {
+          this.alertLast.set(key, backoffTs);
+          try { await this.state.storage.put('alert:' + key, String(backoffTs)); } catch { /* 持久化失败仅内存 */ }
+        }
+      }
     }
   }
 
@@ -460,20 +480,26 @@ export class MetricsDO {
       const st = this.probeState.get(key) || { ok: true, lastFail: 0 };
       if (p.ok) {
         if (!st.ok) {
-          this.probeState.set(key, { ok: true, lastFail: 0 });
-          try { await this.state.storage.put('probe:' + key, JSON.stringify({ ok: true, lastFail: 0 })); } catch { /* 持久化失败仅内存 */ }
-          await sendWebhook(cfg, {
+          // 成功才落 up 状态；失败回滚为原 down 状态，下帧重发（恢复为瞬时事件，无冷却语义，≤5s 重试）
+          const sent = await sendWebhook(cfg, {
             event: 'probe_recovered',
             title: `[cf-panel] ${serverName} 服务恢复：${p.name}`,
             server: { id: serverId, name: serverName },
             message: `服务器 ${serverName} 的服务「${p.name}」已恢复正常。`,
             time: new Date().toISOString(),
           });
+          if (!sent) {
+            this.probeState.set(key, st);
+            try { await this.state.storage.put('probe:' + key, JSON.stringify(st)); } catch { /* 持久化失败仅内存 */ }
+          } else {
+            this.probeState.set(key, { ok: true, lastFail: 0 });
+            try { await this.state.storage.put('probe:' + key, JSON.stringify({ ok: true, lastFail: 0 })); } catch { /* 持久化失败仅内存 */ }
+          }
         }
       } else if (st.ok || now - st.lastFail >= cooldown) {
         this.probeState.set(key, { ok: false, lastFail: now });
         try { await this.state.storage.put('probe:' + key, JSON.stringify({ ok: false, lastFail: now })); } catch { /* 持久化失败仅内存 */ }
-        await sendWebhook(cfg, {
+        const sent = await sendWebhook(cfg, {
           event: 'probe_down',
           title: `[cf-panel] ${serverName} 服务异常：${p.name}`,
           server: { id: serverId, name: serverName },
@@ -481,6 +507,12 @@ export class MetricsDO {
           details: p,
           time: new Date().toISOString(),
         });
+        if (!sent) {
+          // down 通知送达失败 → lastFail 回拨到 cooldown - 退避 前，剩余冷却=1 分钟退避后重发
+          const backoff = now - cooldown + RETRY_BACKOFF_MS;
+          this.probeState.set(key, { ok: false, lastFail: backoff });
+          try { await this.state.storage.put('probe:' + key, JSON.stringify({ ok: false, lastFail: backoff })); } catch { /* 持久化失败仅内存 */ }
+        }
       }
     }
   }
@@ -512,25 +544,30 @@ export class MetricsDO {
       const key = `alert:offline:${s.id}`;
       const last = this.offlineState.get(s.id) || 'on';
       if (!isOnline && last !== 'off') {
-        this.offlineState.set(s.id, 'off');
-        await this.state.storage.put(key, 'off');
-        await sendWebhook(cfg, {
+        // 送达成功才落 off 状态（失败不落状态，下轮 alarm（10min）自动重发）
+        const sent = await sendWebhook(cfg, {
           event: 'offline',
           title: `[cf-panel] ${s.name} 离线`,
           server: { id: s.id, name: s.name },
           message: `服务器 ${s.name}（id=${s.id}）超过 ${offlineAfter}s 未上报，已判定离线。`,
           time: new Date().toISOString(),
         });
+        if (sent) {
+          this.offlineState.set(s.id, 'off');
+          await this.state.storage.put(key, 'off');
+        }
       } else if (isOnline && last === 'off') {
-        this.offlineState.set(s.id, 'on');
-        await this.state.storage.put(key, 'on');
-        await sendWebhook(cfg, {
+        const sent = await sendWebhook(cfg, {
           event: 'recovered',
           title: `[cf-panel] ${s.name} 恢复在线`,
           server: { id: s.id, name: s.name },
           message: `服务器 ${s.name}（id=${s.id}）已恢复上报。`,
           time: new Date().toISOString(),
         });
+        if (sent) {
+          this.offlineState.set(s.id, 'on');
+          await this.state.storage.put(key, 'on');
+        }
       }
     }
   }
@@ -604,7 +641,12 @@ export class MetricsDO {
       // 新上报经 scheduleArchive 提前拉回（alarmCached 失效后 getAlarm 发现更早需求重新设置）
       const idle = this.data.size === 0 && !alertOn;
       this.alarmCached = Date.now() + (idle ? ARCHIVE_IDLE_INTERVAL_MS : ARCHIVE_INTERVAL_MS);
-      this.state.storage.setAlarm(this.alarmCached);
+      try {
+        await this.state.storage.setAlarm(this.alarmCached);
+      } catch (e) {
+        // 续排失败（storage 不可用）记日志——alarm() 的 finally 续排是归档/清理/告警不停摆的唯一保障
+        console.error('alarm reschedule failed:', e);
+      }
     }
   }
 
@@ -634,10 +676,16 @@ export class MetricsDO {
           }
           if (ts > arcTs) {
             const v = JSON.parse(k.value);
+            // 数值归一化：历史坏数据（修复前写入）不得让整批归档失败
             stmts.push(
               this.env.DB.prepare(
                 'INSERT OR IGNORE INTO metrics_min (server_id, ts, cpu, mem_used, mem_total, net_in, net_out, extra) VALUES (?,?,?,?,?,?,?,?)'
-              ).bind(serverId, ts, v.cpu, v.mem_used, v.mem_total, v.net_in, v.net_out, v.extra ? JSON.stringify(v.extra) : null)
+              ).bind(
+                serverId, ts,
+                numOrNull(v.cpu), numOrNull(v.mem_used), numOrNull(v.mem_total),
+                numOrNull(v.net_in), numOrNull(v.net_out),
+                v.extra ? JSON.stringify(v.extra) : null
+              )
             );
             arcMax.set(serverId, Math.max(arcMax.get(serverId) || 0, ts));
           }
@@ -646,9 +694,14 @@ export class MetricsDO {
         if (ts <= keepCutoff) keysToDelete.push(k.name);
       }
     } catch { /* storage 不可用则跳过本次清理（行保留，下次重试） */ }
-    // D1 写入成功后才删除 storage 行（防 D1 失败时两端数据丢失）；分批提交
+    // D1 写入成功后才删除 storage 行（防 D1 失败时两端数据丢失）；分批提交。
+    // 单批失败不得中断后续批次/清理/水位推进（归档失败不再连带跳过 prune 与家政持久化）
     for (let i = 0; i < stmts.length; i += 100) {
-      await this.env.DB.batch(stmts.slice(i, i + 100));
+      try {
+        await this.env.DB.batch(stmts.slice(i, i + 100));
+      } catch (e) {
+        console.error(`fullSweep batch failed (${stmts.length} rows):`, e);
+      }
     }
     await Promise.all(keysToDelete.map((name) => this.state.storage.delete(name)));
     // 同步清理内存缓存中超过热区上限的数据

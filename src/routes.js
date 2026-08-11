@@ -41,7 +41,7 @@ const MCP_TOOLS = [
   },
   {
     name: 'create_upload',
-    description: '创建一次性的文件上传签名 URL（大文件/二进制上传通道，不经过 LLM 上下文）。返回可直接 curl 使用的 POST URL，签名绑定目标服务器、路径与覆盖标志，10 分钟过期。AI 自身无法直接传大文件——把返回的 upload_url 转给用户/程序执行（或指导客户端用 fetch/curl POST 该 URL，body 为原始文件字节，支持任意大小流式分片）。需 exec 权限。',
+    description: '创建一次性的文件上传签名 URL（大文件/二进制上传通道，不经过 LLM 上下文）。返回可直接 curl 使用的 POST URL，签名绑定目标服务器、路径与覆盖标志，10 分钟过期。AI 自身无法直接传大文件——把返回的 upload_url 转给用户/程序执行（或指导客户端用 fetch/curl POST 该 URL，body 为原始文件字节，流式分片；默认上限 100MB，可 UPLOAD_MAX_MB 调高）。需 exec 权限。',
     inputSchema: {
       type: 'object',
       properties: {
@@ -217,8 +217,15 @@ function recordLoginFail(ip) {
 // 用量观测：Worker 侧请求计数（实例级，evict/重启清零，仅趋势参考；
 // MetricsDO 侧计数每 10 分钟 alarm 汇总到 storage，跨 evict 保留近似量级）
 export const apiCounts = new Map(); // `${method} ${path}` -> 次数
+// 路径归一化——动态 id/流 id 段替换为占位符，避免 /api/servers/123、/api/tokens/7 等
+// 每个实体一条计数（服务器/令牌较多时超 200 条 clear() 全量清零，/api/usage 计数失去趋势意义）
+function normalizeApiPath(path) {
+  return path
+    .replace(/^(\/api\/[a-z-]+)\/\d+/, '$1/:id')
+    .replace(/^(\/ws\/[a-z]+)\/\w+/, '$1/:stream');
+}
 function countApi(method, path) {
-  const key = `${method} ${path}`;
+  const key = `${method} ${normalizeApiPath(path)}`;
   apiCounts.set(key, (apiCounts.get(key) || 0) + 1);
   if (apiCounts.size > 200) apiCounts.clear(); // 防 Map 无限增长
 }
@@ -226,6 +233,17 @@ function countApi(method, path) {
 // ---------------- REST API ----------------
 
 export async function handleApi(request, env) {
+  try {
+    return await handleApiInner(request, env);
+  } catch (e) {
+    // 顶层 error boundary：任何未捕获异常（D1 类型错误/约束失败等）返回 JSON 500，
+    // 前端可读，不再暴露 CF 裸 500 白屏
+    console.error('handleApi unhandled error:', e);
+    return err('internal error', 500);
+  }
+}
+
+async function handleApiInner(request, env) {
   const url = new URL(request.url);
   const path = url.pathname;
   const method = request.method;
@@ -348,7 +366,7 @@ export async function handleApi(request, env) {
   if (method === 'PATCH' && path.startsWith('/api/servers/')) {
     if (!isAdmin(user)) return err('forbidden', 403);
     const id = Number(path.split('/')[3]) || 0;
-    const server = await env.DB.prepare('SELECT name FROM servers WHERE id = ?').bind(id).first();
+    const server = await env.DB.prepare('SELECT name, "group", display_index FROM servers WHERE id = ?').bind(id).first();
     if (!server) return err('not found', 404);
     const body = await request.json().catch(() => ({}));
     const name = body.name !== undefined ? String(body.name).trim() : server.name;
@@ -659,7 +677,7 @@ async function mcpListServers(user, env) {
 
 // 工具：在 agent 上执行一次性命令（经 TerminalDO 控制通道，等待 exec_result）
 // 鉴权：管理员或 PAT 带 server:exec scope 且命中 server_ids 白名单（canExec）
-async function mcpExecCommand(user, env, args) {
+async function mcpExecCommand(user, env, args, ip) {
   const serverId = Number(args.server_id) || 0;
   const command = String(args.command || '').trim();
   if (!command) throw new Error('command is required');
@@ -686,6 +704,14 @@ async function mcpExecCommand(user, env, args) {
   });
   const result = await resp.json();
   if (!resp.ok) throw new Error(result.error || `exec failed (${resp.status})`);
+  // exec 是全项目权限最高、最需留痕的写操作（此前是全项目唯一无审计记录的命令执行）。
+  // detail 存截断命令（200 字符）+ exit_code；审计失败不影响命令结果
+  const commandTrunc = command.length > 200 ? command.slice(0, 200) + '…' : command;
+  try {
+    await env.DB.prepare('INSERT INTO audit_logs (user_id, username, client_ip, action, target_server_id, detail) VALUES (?,?,?,?,?,?)')
+      .bind(user.id, user.username, ip, 'exec.command', server.id, `exit=${typeof result.exit_code === 'number' ? result.exit_code : '?'} ${commandTrunc}`)
+      .run();
+  } catch (e) { /* 审计失败不影响命令结果 */ }
   return {
     server_id: server.id,
     server_name: server.name,
@@ -735,7 +761,7 @@ async function mcpCreateUpload(user, env, args, host, ip) {
     expires_at: exp, // unix 秒
     expires_in_seconds: Math.max(0, exp - Math.floor(Date.now() / 1000)),
     upload_url: uploadUrl,
-    usage: `curl -X POST '${uploadUrl}' --data-binary @<本地文件>  # body 为原始文件字节，支持任意大小（服务端自动分片）`,
+    usage: `curl -X POST '${uploadUrl}' --data-binary @<本地文件>  # body 为原始文件字节，流式分片（默认上限 100MB，可 UPLOAD_MAX_MB 调高）`,
   };
 }
 
@@ -963,6 +989,17 @@ async function mcpGetMonitor(user, env, args) {
 
 // /mcp 主入口（无状态 Streamable HTTP）
 export async function handleMcp(request, env) {
+  try {
+    return await handleMcpInner(request, env);
+  } catch (e) {
+    // 顶层 error boundary：工具级 try/catch 之外的异常（鉴权/解析/DB 层）返回 JSON-RPC 内部错误
+    console.error('handleMcp unhandled error:', e);
+    const origin = request.headers.get('origin');
+    return mcpResult(null, null, { code: -32603, message: 'Internal error' }, origin);
+  }
+}
+
+async function handleMcpInner(request, env) {
   const url = new URL(request.url);
   if (request.method !== 'POST') return new Response(null, { status: 405 });
   const configError = requireJwtSecret(env);
@@ -1020,7 +1057,7 @@ export async function handleMcp(request, env) {
         let content;
         if (params.name === 'list_servers') content = await mcpListServers(user, env);
         else if (params.name === 'get_monitor') content = await mcpGetMonitor(user, env, params.arguments || {});
-        else if (params.name === 'exec_command') content = await mcpExecCommand(user, env, params.arguments || {});
+        else if (params.name === 'exec_command') content = await mcpExecCommand(user, env, params.arguments || {}, clientIp(request));
         else if (params.name === 'create_upload') content = await mcpCreateUpload(user, env, params.arguments || {}, url.host, clientIp(request));
         else if (params.name === 'add_server') content = await mcpAddServer(user, env, params.arguments || {}, clientIp(request), url.host);
         else if (params.name === 'delete_server') content = await mcpDeleteServer(user, env, params.arguments || {}, clientIp(request));
@@ -1046,6 +1083,16 @@ export async function handleMcp(request, env) {
 // ---------------- WebSocket 路由（按分片转发 DO） ----------------
 
 export async function handleWs(request, env) {
+  try {
+    return await handleWsInner(request, env);
+  } catch (e) {
+    // 顶层 error boundary：路由/反查阶段异常返回 500（此时尚未 upgrade，可安全返回普通响应）
+    console.error('handleWs unhandled error:', e);
+    return new Response('internal error', { status: 500 });
+  }
+}
+
+async function handleWsInner(request, env) {
   const url = new URL(request.url);
   const path = url.pathname;
   const isPanelSocket = path === '/ws/push' || path.startsWith('/ws/terminal/') || path.startsWith('/ws/file/');

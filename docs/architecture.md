@@ -74,7 +74,7 @@
 
 #### 3.2.1 MCP（AI 接入端点）
 
-`/mcp` 实现标准 MCP **无状态 Streamable HTTP**（2026-07-28 修订版）：单一 POST 端点、无 `Mcp-Session-Id` 会话、每请求独立 `Authorization: Bearer` 鉴权（复用 JWT/PAT），服务端不返回 session-id 即天然无状态且兼容所有版本客户端。工具：
+`/mcp` 实现标准 MCP **无状态 Streamable HTTP**（2025-11-25 修订版）：单一 POST 端点、无 `Mcp-Session-Id` 会话、每请求独立 `Authorization: Bearer` 鉴权（复用 JWT/PAT），服务端不返回 session-id 即天然无状态且兼容所有版本客户端。工具：
 - **只读/操作**：`list_servers`（服务器状态 + 系统信息）、`get_monitor`（监控历史，复用内存热区/D1 归档查询与权限过滤）、`exec_command`（一次性 shell 命令执行，经 TerminalDO 控制通道直达 agent，`canExec` 鉴权：管理员或带 `server:exec` scope 的 PAT，超时 kill 进程组）、`create_upload`（签发一次性文件上传**签名 URL**——HMAC 无状态自验证，绑定 server_id/path/overwrite 并 10 分钟过期，AI 将 URL 转给用户/程序用 curl/fetch POST 原始字节上传，服务端流式分片写 agent；大文件/二进制不经过 LLM 上下文）。
 - **管理类（仅管理员，JWT 登录；PAT 一律拒绝）**：`add_server`（注册新服务器 + 生成 agent key）、`update_server` / `delete_server`（改名/分组/排序 / 删除含历史清理）、`list_tokens` / `create_token` / `revoke_token`（PAT 生命周期，明文只返回一次）、`get_audit_logs`（审计日志）、`get_usage`（用量观测）、`get_settings` / `update_settings`（站点名/公告/IP 归属地开关/告警配置）。
 JSON-RPC 2.0：`initialize` / `tools/list` / `tools/call` / `ping`；通知返回 202；校验 `Origin` 防 DNS rebinding。
@@ -99,9 +99,9 @@ DO 是整个设计的心脏，对应哪吒 Dashboard 里那两个 `io.Copy` 的�
 
 #### 3.3.1 面板实时刷新（PanelDO）
 
-服务器列表不需要用户手动刷新：前端登录后建一条 WebSocket 到 `/ws/push`，**由客户端每 3 秒发一条 `sync` 请求**，单实例 **PanelDO** 收到后才查一次 D1，按该连接的用户权限（admin 全量 / PAT 白名单 / member 归属）过滤后回发服务器列表（在线状态由 `last_seen` 宽限期推导）。
+服务器列表不需要用户手动刷新：前端登录后建一条 WebSocket 到 `/ws/push`，**首帧 `sync` 即订阅，此后被动接收上报驱动推送**，单实例 **PanelDO** 在服务器数据变化（新上报/在线状态变化）时唤醒查 D1，按该连接的用户权限（admin 全量 / PAT 白名单 / member 归属）过滤后回发服务器列表（在线状态由 `last_seen` 宽限期推导）。
 
-- **Hibernation API + 客户端触发**：DO 空闲即休眠（不计时长），收到 sync 才短暂唤醒——避免"服务端定时器"造成的实例常驻费用，开销趋近普通 Worker。
+- **Hibernation API + 事件驱动**：DO 空闲即休眠（不计时长），有数据变化才短暂唤醒回发——避免"服务端定时器"造成的实例常驻费用，开销趋近普通 Worker。
 - token 通过 `serializeAttachment` 随连接持久化，休眠唤醒后在 `webSocketMessage` 里 `deserializeAttachment` 取回，无需额外存储。
 - 单实例 DO（`idFromName('main')`）；D1 临时故障时跳过该周期，下个周期自动恢复。
 
@@ -134,7 +134,7 @@ DO 是整个设计的心脏，对应哪吒 Dashboard 里那两个 `io.Copy` 的�
 **进程拓扑**
 
 ```
-后台上报:  collect_report() ──FIFO──> websocat(上行) ──> 面板 {type:"report",cpu,mem,...} 每 120s（默认；有观看者时服务端下发 3s）
+后台上报:  collect_report() ──FIFO──> websocat(上行) ──> 面板 {type:"report",cpu,mem,...} 每 120s（默认；有观看者时服务端下发 5s）
                                       ▲
 控制循环:  websocat -b $WSS/control   │ bash + jq 循环
              │  open_terminal {sid} → 拉起终端会话
@@ -198,7 +198,7 @@ done
 - resize：控制 WS 收到 `{type:resize,...}` → `stty -F <slave路径>` 改 winsize → 内核发 `SIGWINCH`，`vim`/`top` 跟着变尺寸。
 - 监控上报：后台循环每 `REPORT_INTERVAL`（默认 120s）采集一次，JSON 写入 FIFO；控制通道 websocat 以 FIFO 为 stdin，数据自动经 WS 上行，服务端识别 `{type:"report"}` 落监控热区——**免 crontab、免独立脚本**。
 - 上报内容：固定列（CPU/内存/网络速率）+ `extra` JSON（Swap/磁盘/负载/温度/进程数/TCP-UDP 连接数，紧凑短 key 不压缩）+ `info`（OS/内核/IP，服务端比对变化才更新 `servers.info_json`）。网络速率由 agent 对 `/proc/net/dev` 累计值做差分，避免累计值当速率。
-- **省配额策略**：PanelDO 暴露 `/viewers` RPC（`state.getWebSockets().length` 统计在线前端）；TerminalDO 在 agent 控制通道建立与每次上报后查询它，通过 `{type:"set_report_interval", interval}` 下发间隔（仅变化时）：有观看者 3s 快采、无人 120s 低频采样——配额从"时刻满采"降到"只在有人看时满采"。首位观看者上线时 PanelDO 还会向各分片广播 `/rpc/wakeup`，agent 立即切快采（免等下一次上报）。agent 端把下发的间隔写入 `$TMP_DIR/report-interval`，上报循环每次唤醒后读取。
+- **省配额策略**：PanelDO 暴露 `/viewers` RPC（`state.getWebSockets().length` 统计在线前端）；TerminalDO 在 agent 控制通道建立与每次上报后查询它，通过 `{type:"set_report_interval", interval}` 下发间隔（仅变化时）：有观看者 5s 快采、无人 120s 低频采样——配额从"时刻满采"降到"只在有人看时满采"。首位观看者上线时 PanelDO 还会向各分片广播 `/rpc/wakeup`，agent 立即切快采（免等下一次上报）。agent 端把下发的间隔写入 `$TMP_DIR/report-interval`，上报循环每次唤醒后读取。
 - **文件管理**：与终端同构的独立会话——面板 `POST /api/file/open` 创建会话并下发 `open_file` 指令，agent 连回 `/ws/agent/file` 处理（**Rust 版内置实现，无独立脚本**）。JSON 行协议：`list`（目录列表，支持通配符过滤）/`read`/`write`（**Binary 混合帧 = JSON 头 + `\n` + 原始字节，无 base64 膨胀**；分块 512KB、`write` 按确认推进、临时文件 + 原子 rename）+ `zip`（**目录打包**：agent 手写 STORED ZIP 到临时文件，返回路径/大小，前端分段拉取完成后发 `delete` 清理）/`rename`/`delete`（**系统路径保护**：`/proc` `/sys` `/etc` `/usr` `/var` `/root` 等目录的重命名/删除/打包一律拒绝，防误操作破坏系统）；浏览器经 `/ws/file/{sid}` 透传。服务端复用 TerminalDO 会话注册表/权限/清理，DO 只做双向透传。
 - 权衡：Shell 版零解释器依赖、部署极简；但并发弱、进程多、每终端 +9MB。已实现 **Rust 版（`agent/rust/`）替代**：实测内存 1.9MB（全静态 musl）、单进程、无外部二进制依赖，协议一致可无缝替换；Shell 版废弃保留参考。
 
@@ -424,29 +424,31 @@ CREATE TABLE kv_json (
 
 ## 9. 实现清单（分阶段）
 
+> 状态：全部完成（2026-08 复查）；各能力对应实现见 §3–§8 对应章节。
+
 **阶段 0 — 最小闭环（MVP）**
-- [ ] Pages 部署前端 + `xterm.js` 终端 UI。
-- [ ] DO 实现 `WebSocket Hibernation` 的双向对拷骨架。
-- [ ] 一台机器上跑一个最简 agent：`pty.Start` + 单 WS 对拷。
-- [ ] 浏览器 → DO → agent → PTY 跑通一个 `echo` / `ls`。
+- [x] Pages 部署前端 + `xterm.js` 终端 UI。
+- [x] DO 实现 `WebSocket Hibernation` 的双向对拷骨架。
+- [x] 一台机器上跑一个最简 agent：`pty.Start` + 单 WS 对拷。
+- [x] 浏览器 → DO → agent → PTY 跑通一个 `echo` / `ls`。
 
 **阶段 1 — 鉴权与会话**
-- [ ] Worker 鉴权 + 权限 scope（exec）。
-- [ ] `POST /api/terminal` 生成 `streamId` 并下发指令给 agent。
-- [ ] DO 会话注册表（owner / server / 双 socket）。
+- [x] Worker 鉴权 + 权限 scope（exec）。
+- [x] `POST /api/terminal` 生成 `streamId` 并下发指令给 agent。
+- [x] DO 会话注册表（owner / server / 双 socket）。
 
 **阶段 2 — 安全加固**
-- [ ] `/ws/terminal/{id}` 校验 creator/admin（防 UUID 劫持）。
+- [x] `/ws/terminal/{id}` 校验 creator/admin（防 UUID 劫持）。
 - [x] agent 身份（`X-Agent-Key` header）+ stream 归属校验。
-- [ ] 全局命令执行开关。
-- [ ] resize 帧（窗口自适应）。
-- [ ] 审计日志。
+- [x] 全局命令执行开关。
+- [x] resize 帧（窗口自适应）。
+- [x] 审计日志。
 
 **阶段 3 — 生产化**
-- [ ] 多终端会话按 streamId 分片到不同 DO。
-- [ ] 心跳 / 超时回收（keepalive + `CloseStream`）。
-- [ ] 断线重连、PTY 进程组清理（关终端不残留子进程）。
-- [ ] 监控数据的采集与展示（对齐"面板"主业）。
+- [x] 多终端会话按 streamId 分片到不同 DO。
+- [x] 心跳 / 超时回收（keepalive + `CloseStream`）。
+- [x] 断线重连、PTY 进程组清理（关终端不残留子进程）。
+- [x] 监控数据的采集与展示（对齐"面板"主业）。
 
 ---
 

@@ -107,11 +107,12 @@
     }
 
     // ---------- 上传状态机（stop-and-wait：等 write_result 确认才发下一块） ----------
-    upload(file) {
+    upload(file, opts) {
       if (this.uploadState) { if (this.h.onError) this.h.onError('已有上传进行中，请等待完成'); return; }
       if (file.size > FILE_MAX) { if (this.h.onError) this.h.onError('文件超过 500MB 限制'); return; }
       const uploadId = (window.crypto && crypto.randomUUID) ? crypto.randomUUID() : String(Date.now()) + '-' + Math.random().toString(36).slice(2);
-      this.uploadState = { file, size: file.size, sent: 0, acked: 0, uploadId, path: CfUtils.fileJoin(this.cwd, file.name), reader: new FileReader() };
+      // overwrite：目标已存在时是否覆盖（默认 false，服务端首块强制校验，与签名上传路径语义一致）
+      this.uploadState = { file, size: file.size, sent: 0, acked: 0, uploadId, path: CfUtils.fileJoin(this.cwd, file.name), reader: new FileReader(), overwrite: !!(opts && opts.overwrite) };
       this._sendNextUpload();
     }
     _sendNextUpload() {
@@ -122,7 +123,7 @@
         if (!this.uploadState) return; // 已取消（reader 异步完成）
         const commit = u.sent + chunk.size >= u.size;
         // 混合帧：JSON 头 + '\n' + 原始字节（Binary 帧，无 base64 膨胀）
-        const head = new TextEncoder().encode(JSON.stringify({ type: 'write', path: u.path, offset: u.sent, commit, upload_id: u.uploadId }) + '\n');
+        const head = new TextEncoder().encode(JSON.stringify({ type: 'write', path: u.path, offset: u.sent, commit, upload_id: u.uploadId, overwrite: u.overwrite }) + '\n');
         const data = new Uint8Array(u.reader.result);
         const frame = new Uint8Array(head.length + data.length);
         frame.set(head, 0);

@@ -1054,7 +1054,7 @@ test('TerminalDO: terminal_ready 确认后停止重发', async (t) => {
   }
 });
 
-test('TerminalDO: /rpc open_file 下发确认重发，未确认时 5s 重发最多 3 次（L10）', async (t) => {
+test('TerminalDO: /rpc open_file 下发确认重发，未确认时 5s 重发最多 3 次', async (t) => {
   t.mock.timers.enable({ apis: ['setTimeout'] });
   try {
     const env = makeEnv();
@@ -1083,7 +1083,7 @@ test('TerminalDO: /rpc open_file 下发确认重发，未确认时 5s 重发最�
   }
 });
 
-test('TerminalDO: file_ready 确认后停止 open_file 重发（L10）', async (t) => {
+test('TerminalDO: file_ready 确认后停止 open_file 重发', async (t) => {
   t.mock.timers.enable({ apis: ['setTimeout'] });
   try {
     const env = makeEnv();

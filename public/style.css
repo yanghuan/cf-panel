@@ -454,6 +454,19 @@ button.danger:hover { background: rgba(248, 113, 113, .12); }
 }
 .dialog-text.mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }
 .dialog-actions { display: flex; justify-content: flex-end; gap: 8px; }
+/* promptDialog 输入框（与对话框体系样式一致，替代原生 prompt()） */
+.dlg-input {
+  width: 100%;
+  box-sizing: border-box;
+  margin: 0 0 16px;
+  padding: 10px 12px;
+  background: rgba(20, 25, 40, .55);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  color: var(--text);
+  font: inherit;
+}
+.dlg-input:focus { outline: none; border-color: var(--accent); }
 
 /* ---------- Toast ---------- */
 .toast {

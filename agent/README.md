@@ -58,7 +58,7 @@ AGENT_KEY=<面板添加服务器时生成的 key> \
 | --- | --- | --- |
 | `AGENT_WSS_URL` | 必填 | 面板 agent WebSocket 地址 |
 | `AGENT_KEY` | 必填 | agent 身份 + 凭证 |
-| `REPORT_INTERVAL` | 120 | 默认上报间隔秒（有观看者时服务端动态下发 3s） |
+| `REPORT_INTERVAL` | 120 | 默认上报间隔秒（有观看者时服务端动态下发 5s） |
 | `DISABLE_EXEC` | 0 | =1 禁用终端/文件（仅保留监控） |
 | `PROBES` | 空 | 服务探活 `name:http:URL,name:tcp:host:port,...` |
 | `CUSTOM_METRICS` | 空 | 自定义指标 JSON `[{"name","cmd"}]` |

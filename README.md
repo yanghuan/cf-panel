@@ -289,7 +289,6 @@ wrangler secret put PANEL_USERS      # 回车后粘贴值，如 alice:pass1,bob:
 | DELETE | `/api/servers/:id` | 删除服务器（仅管理员） |
 | POST | `/api/terminal` | 创建终端会话（exec 权限 + 归属校验），返回 session_id |
 | POST | `/api/file/open` | 创建文件管理会话（exec 权限 + 归属校验），返回 session_id |
-| POST | `/mcp/file_upload?server_id=&path=&overwrite=` | 流式上传文件到 agent（body=原始字节，Worker 自动分片；Bearer 鉴权或签名 URL token 均可。位于 `/mcp` 前缀下以绕过 CF Access 拦截，供 curl 直传） |
 | GET | `/api/usage` | 用量观测（近 24h 上报帧 / DO 事件 / D1 写行估算，仅管理员） |
 | GET | `/ws/terminal/{id}` | 浏览器终端 WebSocket（校验创建者/admin） |
 | GET | `/ws/file/{id}` | 浏览器文件管理 WebSocket（JSON 行协议：list/read/write/zip/rename/delete，校验创建者/admin） |
@@ -298,7 +297,6 @@ wrangler secret put PANEL_USERS      # 回车后粘贴值，如 alice:pass1,bob:
 | GET | `/ws/agent/control` | agent 控制通道（key 指纹定位 + 校验，按分片路由；监控上报也走这里） |
 | GET | `/ws/agent/terminal` | agent 终端数据流（key 校验 + stream 归属校验） |
 | GET | `/api/monitor?server_id=&range=` | 监控历史（range: 1h/12h/3d/7d/30d，默认 12h 走内存，更早走 D1） |
-| POST | `/mcp` | MCP 端点（无状态 Streamable HTTP，JSON-RPC 2.0；Bearer 鉴权） |
 | GET | `/api/tokens` | PAT 列表（仅管理员） |
 | POST | `/api/tokens` | 创建 PAT（scopes + server_ids 白名单 + 可选 `expires_in_days` 有效期，缺省永久；明文只返回一次） |
 | DELETE | `/api/tokens/:id` | 删除 PAT（仅管理员） |
@@ -308,6 +306,11 @@ wrangler secret put PANEL_USERS      # 回车后粘贴值，如 alice:pass1,bob:
 | POST | `/api/settings/test_webhook` | 测试 Webhook（仅管理员：传当前表单告警配置，发测试通知并回显 HTTP 状态，不保存） |
 
 ### MCP（AI 接入）
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| POST | `/mcp` | MCP 端点（无状态 Streamable HTTP，JSON-RPC 2.0；Bearer 鉴权） |
+| POST | `/mcp/file_upload?server_id=&path=&overwrite=` | 流式上传文件到 agent（body=原始字节，Worker 自动分片；Bearer 鉴权或签名 URL token 均可。位于 `/mcp` 前缀下以绕过 CF Access 拦截，供 curl 直传） |
 
 `/mcp` 实现标准 [Model Context Protocol](https://modelcontextprotocol.io) **无状态 Streamable HTTP**（2025-11-25 修订版：单 POST 端点、无会话、每请求独立鉴权）。鉴权复用现有 `Authorization: Bearer <JWT 或 PAT>`。
 

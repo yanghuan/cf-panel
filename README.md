@@ -272,7 +272,7 @@ wrangler secret put PANEL_USERS      # 回车后粘贴值，如 alice:pass1,bob:
 - **监控**：点「监控」默认看近 12 小时分钟数据（内存 DO 热区，秒回）；可切 1小时/3天/7天/30天查看 D1 归档历史（分钟粒度，超长区间自动降采样）。指标：CPU / 内存 / Swap / 磁盘（根分区）/ 负载 / 温度 / 进程数；服务器卡片显示 OS / 内核 / IP 系统信息。
 - **分组与排序**：添加服务器可填「分组」和「序号」，列表按分组展示、组内按序号排序（未填归入「未分组」）。
 - **登录**：`PANEL_USERS` 多用户（`user:pass,user:pass`）或单管理员（`PANEL_PASSWORD`），登录即管理员。**应用内置失败限流**（同一 IP 在 15 分钟窗口内失败 ≥5 次 → 锁定 15 分钟并返回 `429` + `Retry-After`，登录成功自动清零）；生产部署**必须**再前置 **Cloudflare Access**（登录密码作为第二层），以覆盖跨边缘实例的限流一致性。
-  > ⚠️ Access 需为 agent 路径放行：`/ws/agent/*` 与 `/api/report` 使用 `X-Agent-Key` 头（非浏览器 SSO），必须配置 Bypass 或 Service Token 策略，否则 agent 无法连接。
+  > ⚠️ Access 需为 agent 路径放行：`/ws/agent/*` 使用 `X-Agent-Key` 头（非浏览器 SSO），必须配置 Bypass 或 Service Token 策略，否则 agent 无法连接。
 - **公告**：设置里可改站点名/公告（存 D1 `kv_json` 表），公告对所有访客可见。
 - **PAT**：设置里可创建访问令牌（scopes + server_ids 白名单），供 API 调用（`Authorization: Bearer cfp_xxx`）。
 - **审计日志**：右上角菜单「审计日志」可查看（添加/删除服务器、打开终端/文件均记录），D1 保留 90 天后自动清理。
@@ -297,7 +297,6 @@ wrangler secret put PANEL_USERS      # 回车后粘贴值，如 alice:pass1,bob:
 | GET | `/ws/push` | 面板实时刷新：首帧 sync 后被动接收上报驱动推送，服务端按权限返回服务器列表 |
 | GET | `/ws/agent/control` | agent 控制通道（key 指纹定位 + 校验，按分片路由；监控上报也走这里） |
 | GET | `/ws/agent/terminal` | agent 终端数据流（key 校验 + stream 归属校验） |
-| POST | `/api/report` | agent 监控上报 HTTP 备用入口（key 指纹定位 + 校验） |
 | GET | `/api/monitor?server_id=&range=` | 监控历史（range: 1h/12h/3d/7d/30d，默认 12h 走内存，更早走 D1） |
 | POST | `/mcp` | MCP 端点（无状态 Streamable HTTP，JSON-RPC 2.0；Bearer 鉴权） |
 | GET | `/api/tokens` | PAT 列表（仅管理员） |

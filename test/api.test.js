@@ -300,34 +300,23 @@ test('服务器：有观看者时用快宽限期（15s）判定在线', async ()
 });
 
 // ---------------- agent 上报 ----------------
-test('agent 上报：key 指纹定位 + 哈希校验 + 落库', async () => {
+test('handleReport 落库：系统信息/探活/custom 写入 + MetricsDO 转发', async () => {
   const env = makeEnv();
   const token = await login(env);
-  const { agent_key } = await addServer(env, token, { name: 'node-1' });
+  await addServer(env, token, { name: 'node-1' });
   const list = await (await call(env, { path: '/api/servers', token })).json();
   const id = list[0].id;
 
-  // 未知 key → 401
-  const unknown = await call(env, { method: 'POST', path: '/api/report', body: { key: '0'.repeat(64) } });
-  assert.equal(unknown.status, 401);
-
-  // 错误 key → 401
-  const bad = await call(env, { method: 'POST', path: '/api/report', body: { key: 'a'.repeat(64) } });
-  assert.equal(bad.status, 401);
-
-  // 正确 key → 200 且落库
-  const ok = await call(env, {
-    method: 'POST', path: '/api/report',
-    body: {
-      key: agent_key, cpu: 12.5, mem_used: 1024, mem_total: 4096,
-      net_in: 1000, net_out: 2000,
-      extra: { load1: 0.5 },
-      info: { os: 'Debian 12', kernel: '6.1' },
-      probes: [{ name: 'web', ok: true, ms: 5 }],
-      custom: [{ name: 'estab', value: 42 }],
-    },
+  // 直接调用 handleReport（上报统一走 WS 控制通道，HTTP /api/report 已删除）
+  await I.handleReport(env, {
+    serverId: id,
+    cpu: 12.5, mem_used: 1024, mem_total: 4096,
+    net_in: 1000, net_out: 2000,
+    extra: { load1: 0.5 },
+    info: { os: 'Debian 12', kernel: '6.1' },
+    probes: [{ name: 'web', ok: true, ms: 5 }],
+    custom: [{ name: 'estab', value: 42 }],
   });
-  assert.equal(ok.status, 200);
 
   const row = await env.DB.prepare('SELECT * FROM servers WHERE id = ?').bind(id).first();
   assert.ok(row.last_seen > 0); // 上报更新 last_seen
@@ -364,19 +353,19 @@ test('agent 上报：key 指纹定位 + 哈希校验 + 落库', async () => {
 test('服务器行缓存 + MetricsDO 转发节流（降额）', async () => {
   const env = makeEnv();
   const token = await login(env);
-  const { agent_key } = await addServer(env, token, { name: 'node-1' });
+  await addServer(env, token, { name: 'node-1' });
   const reportCalls = () => env.METRICS.calls.filter((c) => c.path === '/report').length;
   // 首帧上报：缓存 miss 查 D1，转发 MetricsDO 1 次
-  await call(env, { method: 'POST', path: '/api/report', body: { key: agent_key, cpu: 1 } });
+  await I.handleReport(env, { serverId: 1, cpu: 1 });
   assert.equal(reportCalls(), 1, '首帧转发 MetricsDO');
   assert.ok(I.serverRowCache.has(1), '服务器行已缓存');
   // 5s 窗口内重复上报：入队（覆盖本机帧），不触发 flush → MetricsDO 转发次数不变
-  await call(env, { method: 'POST', path: '/api/report', body: { key: agent_key, cpu: 2 } });
-  await call(env, { method: 'POST', path: '/api/report', body: { key: agent_key, cpu: 3 } });
+  await I.handleReport(env, { serverId: 1, cpu: 2 });
+  await I.handleReport(env, { serverId: 1, cpu: 3 });
   assert.equal(reportCalls(), 1, '5s 窗口内不重复转发（批量）');
   // 超过 5s（flush 时间拨回）→ 重新 flush
   I.setReportFlushAt(Date.now() - 6000);
-  await call(env, { method: 'POST', path: '/api/report', body: { key: agent_key, cpu: 4 } });
+  await I.handleReport(env, { serverId: 1, cpu: 4 });
   assert.equal(reportCalls(), 2, '超过 5s 重新转发');
   // D1 数据仍正常落库（节流只影响 DO 转发）
   const row = await env.DB.prepare('SELECT last_seen FROM servers WHERE id = 1').first();
@@ -951,7 +940,6 @@ test('MCP：tools/list 与 tools/call', async () => {
   assert.ok(asRes.agent_key && asRes.agent_key.length === 64, 'agent_key 明文返回');
   // 部署地址动态生成（host = panel.local，非占位符）
   assert.equal(asRes.wss_base, 'wss://panel.local/ws/agent');
-  assert.equal(asRes.report_url, 'https://panel.local/api/report');
   // add_server：缺 name → isError
   const asBad = await (await mcp(env, { token, body: { jsonrpc: '2.0', id: 21, method: 'tools/call', params: { name: 'add_server', arguments: {} } } })).json();
   assert.equal(asBad.result.isError, true);

@@ -55,7 +55,7 @@ const MCP_TOOLS = [
   },
   {
     name: 'add_server',
-    description: '注册一台新服务器（面板 D1 记录 + 生成一次性 agent key）。仅管理员。返回 agent_key（明文只返回一次，请妥善保存）与 wss_base/report_url 部署信息。',
+    description: '注册一台新服务器（面板 D1 记录 + 生成一次性 agent key）。仅管理员。返回 agent_key（明文只返回一次，请妥善保存）与 wss_base 部署信息。',
     inputSchema: {
       type: 'object',
       properties: {
@@ -162,7 +162,7 @@ import {
 } from './utils.js';
 import { queryMonitorRows, queryCustomMetrics, kvClearCache } from './db.js';
 import { authUser, isAdmin, canAccessServer, canExec, listServersWithState, serverListCache } from './auth.js';
-import { handleReport, serverRowCache, lastSeenWrite, customWritten } from './report.js';
+import { serverRowCache, lastSeenWrite, customWritten } from './report.js';
 
 // ---------------- 登录失败限流 ----------------
 // 登录失败限流（应用层纵深防御）。内存窗口按 IP 计数，缓解单 IP 爆破；
@@ -286,30 +286,6 @@ async function handleApiInner(request, env) {
     return json({ site_name: settings.site_name || 'cf-panel', notice: settings.notice || '', geo_lookup: !!settings.geo_lookup });
   }
 
-  // POST /api/report —— agent 监控上报（key 指纹定位 + hash 校验，无需登录）
-  // 时序数据写入内存 DO（MetricsDO 热区）；last_seen 仍落 D1
-  if (method === 'POST' && path === '/api/report') {
-    const body = await request.json().catch(() => ({}));
-    const keyId = await sha256Hex(String(body.key || ''));
-    const server = await env.DB.prepare('SELECT * FROM servers WHERE agent_key_id = ?').bind(keyId).first();
-    if (!server) return err('unknown agent', 401);
-    const hash = await hashSecret(String(body.key || ''), env);
-    if (hash !== server.agent_key_hash) return err('bad key', 401);
-    await handleReport(env, {
-      serverId: server.id,
-      cpu: body.cpu,
-      mem_used: body.mem_used,
-      mem_total: body.mem_total,
-      net_in: body.net_in,
-      net_out: body.net_out,
-      extra: body.extra,
-      info: body.info,
-      probes: body.probes,
-      custom: body.custom,
-    });
-    return json({ ok: true });
-  }
-
   // POST /api/file_upload?token= —— 签名 URL 直传（MCP create_upload 签发，无状态 HMAC 验签，无需 Bearer）
   // 签名绑定 server_id/path/overwrite/exp；验证失败 403。审计在 create_upload 时已记录，此处不重复。
   // JWT_SECRET 仍是必需安全边界（验签密钥回退依赖它）：缺失时签名上传同样 503，防止绕过配置错误。
@@ -358,7 +334,6 @@ async function handleApiInner(request, env) {
     return json({
       agent_key: key,
       wss_base: `wss://${url.host}/ws/agent`,
-      report_url: `https://${url.host}/api/report`,
     });
   }
 
@@ -816,7 +791,6 @@ async function mcpAddServer(user, env, args, ip, host) {
     name,
     agent_key: key, // 明文只返回一次
     wss_base: `wss://${host}/ws/agent`, // agent 部署地址（与 REST 版一致，动态生成）
-    report_url: `https://${host}/api/report`,
   };
 }
 

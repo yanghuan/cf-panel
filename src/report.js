@@ -33,7 +33,7 @@ export let reportFlushAt = 0; // 上次 flush 时刻（ms；隔离实例内共�
 export function setReportFlushAt(v) { reportFlushAt = v; } // let 原始值无法经属性赋值，测试用 setter 操纵 flush 时刻
 
 // agent 监控上报落库：更新 last_seen（在线判定唯一依据；系统信息变更才写 info_json，探活变更才写 probe_json），
-// 时序写入 MetricsDO 热区（供 /api/report 与控制通道复用）。
+// 时序写入 MetricsDO 热区（供控制通道上报复用；HTTP /api/report 入口已删除，上报统一走 WS）。
 // 告警冷却/探活去重判定在 MetricsDO 内部完成（见 MetricsDO.checkAlerts / checkProbeAlerts）。
 
 // ---- 收口：agent 上报视为不可信输入（agent 运行在被控机，可能被入侵/异常）----

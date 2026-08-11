@@ -216,6 +216,8 @@
       </details>
       <div class="settings-row">
         <button id="btn-save-alerts">保存告警配置</button>
+        <button id="btn-test-webhook" class="ghost">测试 Webhook</button>
+        <span id="webhook-test-result" class="muted" style="font-size:12px"></span>
       </div>
     </div>
   </div>
@@ -304,7 +306,23 @@
       <button id="btn-audit-close" class="ghost">关闭</button>
     </div>
     <div class="settings-body">
+      <div class="settings-row">
+        <select id="audit-filter-action" style="padding:8px 12px;border-radius:10px;background:rgba(20,25,40,.6);border:1px solid var(--border);color:var(--text)">
+          <option value="">全部动作</option>
+        </select>
+        <input id="audit-filter-user" type="text" placeholder="用户名筛选" style="width:110px" />
+        <input id="audit-filter-server" type="number" placeholder="服务器 ID" style="width:100px" />
+        <button id="btn-audit-apply">筛选</button>
+        <button id="btn-audit-csv" class="ghost">导出 CSV</button>
+      </div>
       <ul id="audit-list" class="token-list"></ul>
+      <div class="settings-row" style="justify-content:space-between">
+        <span id="audit-pager-info" class="muted" style="font-size:12px"></span>
+        <span>
+          <button id="btn-audit-prev" class="ghost">上一页</button>
+          <button id="btn-audit-next" class="ghost">下一页</button>
+        </span>
+      </div>
     </div>
   </div>
 

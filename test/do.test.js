@@ -1106,6 +1106,52 @@ test('TerminalDO: file_ready 确认后停止 open_file 重发', async (t) => {
   }
 });
 
+test('TerminalDO: 文件写操作指令写审计（delete/zip/rename + write 首块）', async () => {
+  const env = makeEnv();
+  const inst = new TerminalDO(mockState(), env);
+  const userWs = { send() {}, close() {} };
+  const agentWs = { send() {}, readyState: 1 };
+  // 模拟已鉴权文件会话（首帧鉴权会写入 creatorUser）
+  inst.sessions.set('0-fid', {
+    sid: '0-fid', streamId: '0-fid', serverId: 1, creatorUserId: 7, creatorUser: 'alice',
+    type: 'file', createdAt: Date.now(), userWs, agentWs, userBuf: [], agentBuf: [],
+  });
+  const audits = async (action) => {
+    const rows = await env.DB.prepare('SELECT * FROM audit_logs WHERE action = ?').bind(action).all();
+    return rows.results;
+  };
+
+  // delete / rename / zip 各记一条
+  await inst.webSocketMessage(userWs, JSON.stringify({ type: 'delete', path: '/tmp/a.txt' }));
+  await inst.webSocketMessage(userWs, JSON.stringify({ type: 'rename', path: '/tmp/a.txt', new_name: 'b.txt' }));
+  await inst.webSocketMessage(userWs, JSON.stringify({ type: 'zip', path: '/opt/dir' }));
+  // write 仅首块（offset=0）记一条，后续块不重复
+  await inst.webSocketMessage(userWs, JSON.stringify({ type: 'write', path: '/tmp/up.bin', offset: 0, commit: false }));
+  await inst.webSocketMessage(userWs, JSON.stringify({ type: 'write', path: '/tmp/up.bin', offset: 512, commit: true }));
+
+  const dels = await audits('file.delete');
+  assert.equal(dels.length, 1);
+  assert.equal(dels[0].username, 'alice');
+  assert.equal(dels[0].target_server_id, 1);
+  assert.equal(dels[0].detail, '/tmp/a.txt');
+
+  const rens = await audits('file.rename');
+  assert.equal(rens.length, 1);
+  assert.equal(rens[0].detail, '/tmp/a.txt → b.txt');
+
+  const zips = await audits('file.zip');
+  assert.equal(zips.length, 1);
+  assert.equal(zips[0].detail, '/opt/dir');
+
+  const wrs = await audits('file.write');
+  assert.equal(wrs.length, 1, 'write 仅首块记录一次');
+  assert.equal(wrs[0].detail, '/tmp/up.bin');
+
+  // 非文件指令（终端输入等）不产生审计
+  const all = await env.DB.prepare("SELECT COUNT(*) AS c FROM audit_logs WHERE action LIKE 'file.%'").all();
+  assert.equal(Number(all.results[0].c), 4, '仅 4 条文件审计（delete/rename/zip/write）');
+});
+
 test('TerminalDO: /rpc/exec 下发 exec 指令，收到 exec_result 后返回结果', async () => {
   const env = makeEnv();
   const sent = [];

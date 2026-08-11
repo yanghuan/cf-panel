@@ -660,20 +660,82 @@ test('审计日志：管理员可查（倒序 + limit），非管理员 403', as
   await addServer(env, adminToken, { name: 'a1' }); // 产生 server.create
   await call(env, { method: 'POST', path: '/api/terminal', token: adminToken, body: { server_id: 1 } }); // 产生 terminal.open
 
-  const rows = await (await call(env, { path: '/api/audit-logs', token: adminToken })).json();
+  const body = await (await call(env, { path: '/api/audit-logs', token: adminToken })).json();
+  const rows = body.rows;
   const actions = rows.map((r) => r.action);
   assert.ok(actions.includes('server.create'));
   assert.ok(actions.includes('terminal.open'));
   // 倒序：最新（terminal.open）在前
   assert.equal(rows[0].action, 'terminal.open');
+  assert.ok(body.total >= 2, '返回总数');
 
-  // limit 生效
+  // limit + offset 分页生效
   const one = await (await call(env, { path: '/api/audit-logs?limit=1', token: adminToken })).json();
-  assert.equal(one.length, 1);
+  assert.equal(one.rows.length, 1);
+  assert.equal(one.rows[0].action, 'terminal.open', '第一页第一条为最新');
+  const page2 = await (await call(env, { path: '/api/audit-logs?limit=1&offset=1', token: adminToken })).json();
+  assert.equal(page2.rows[0].action, 'server.create', '第二页为次新');
+
+  // action 筛选
+  const filtered = await (await call(env, { path: '/api/audit-logs?action=server.create', token: adminToken })).json();
+  assert.ok(filtered.rows.length >= 1);
+  assert.ok(filtered.rows.every((r) => r.action === 'server.create'));
+  assert.ok(filtered.total < body.total, '筛选后总数减少');
+
+  // 用户名筛选（login 用户名为 admin）
+  const byUser = await (await call(env, { path: '/api/audit-logs?user=adm', token: adminToken })).json();
+  assert.ok(byUser.rows.every((r) => (r.username || '').includes('adm')));
+
+  // server_id 筛选
+  const byServer = await (await call(env, { path: '/api/audit-logs?server_id=1', token: adminToken })).json();
+  assert.ok(byServer.rows.every((r) => r.target_server_id === 1));
+
+  // CSV 导出（带鉴权，返回 text/csv + Content-Disposition）
+  const csv = await call(env, { path: '/api/audit-logs?format=csv', token: adminToken });
+  assert.equal(csv.status, 200);
+  assert.match(csv.headers.get('content-type'), /text\/csv/);
+  assert.match(csv.headers.get('content-disposition'), /audit-logs\.csv/);
+  const csvText = await csv.text();
+  assert.match(csvText, /^id,user_id,username,client_ip,action,target_server_id,detail,created_at/);
+  assert.match(csvText, /terminal\.open/);
 
   // PAT 不能查看
   const pat = await (await call(env, { method: 'POST', path: '/api/tokens', token: adminToken, body: { name: 'r', scopes: ['server:read'] } })).json();
   assert.equal((await call(env, { path: '/api/audit-logs', token: pat.token })).status, 403);
+});
+
+test('测试 Webhook：发送测试通知并回显 HTTP 状态', async () => {
+  const env = makeEnv();
+  const token = await login(env);
+  const origFetch = globalThis.fetch;
+
+  // 未填地址 → 400
+  const noUrl = await call(env, { method: 'POST', path: '/api/settings/test_webhook', token, body: { alerts: {} } });
+  assert.equal(noUrl.status, 400);
+
+  // 2xx → ok:true + status
+  globalThis.fetch = async () => new Response('ok', { status: 202 });
+  const ok = await (await call(env, { method: 'POST', path: '/api/settings/test_webhook', token, body: { alerts: { webhook_url: 'https://x/hook' } } })).json();
+  assert.equal(ok.ok, true);
+  assert.equal(ok.status, 202);
+
+  // 5xx → ok:false + status
+  globalThis.fetch = async () => new Response('err', { status: 503 });
+  const bad = await (await call(env, { method: 'POST', path: '/api/settings/test_webhook', token, body: { alerts: { webhook_url: 'https://x/hook' } } })).json();
+  assert.equal(bad.ok, false);
+  assert.equal(bad.status, 503);
+
+  // 网络异常 → ok:false + error 消息
+  globalThis.fetch = async () => { throw new Error('net down'); };
+  const net = await (await call(env, { method: 'POST', path: '/api/settings/test_webhook', token, body: { alerts: { webhook_url: 'https://x/hook' } } })).json();
+  assert.equal(net.ok, false);
+  assert.match(net.error, /net down/);
+
+  // 不保存配置：settings 里不应出现 alerts
+  const settings = await (await call(env, { path: '/api/settings', token })).json();
+  assert.equal(settings.alerts, undefined, '测试不落配置');
+
+  globalThis.fetch = origFetch;
 });
 
 test('用量观测：/api/usage 仅管理员可访问，返回用量估算（P2 #15）', async () => {
@@ -964,11 +1026,17 @@ test('MCP：tools/list 与 tools/call', async () => {
   const rk = await (await mcp(env, { token, body: { jsonrpc: '2.0', id: 25, method: 'tools/call', params: { name: 'revoke_token', arguments: { token_id: ltRes[0].id } } } })).json();
   assert.equal(rk.result.isError, false);
 
-  // get_audit_logs：应有 server.create / server.update / server.delete 前的记录
+  // get_audit_logs：分页 + 筛选（返回 {rows,total}）
   const al = await (await mcp(env, { token, body: { jsonrpc: '2.0', id: 26, method: 'tools/call', params: { name: 'get_audit_logs', arguments: { limit: 10 } } } })).json();
   const alRes = JSON.parse(al.result.content[0].text);
-  assert.ok(alRes.length >= 2, '有审计记录');
-  assert.ok(alRes.some((r) => r.action === 'server.create'));
+  assert.ok(alRes.rows.length >= 2, '有审计记录');
+  assert.ok(alRes.total >= 2, '返回总数');
+  assert.ok(alRes.rows.some((r) => r.action === 'server.create'));
+  // action 筛选（本测试中 update_server 已产生 server.update）
+  const alF = await (await mcp(env, { token, body: { jsonrpc: '2.0', id: 27, method: 'tools/call', params: { name: 'get_audit_logs', arguments: { action: 'server.update' } } } })).json();
+  const alFRes = JSON.parse(alF.result.content[0].text);
+  assert.ok(alFRes.rows.length >= 1, 'update_server 已产生 server.update 审计');
+  assert.ok(alFRes.rows.every((r) => r.action === 'server.update'));
 
   // get_settings / update_settings
   const gs = await (await mcp(env, { token, body: { jsonrpc: '2.0', id: 27, method: 'tools/call', params: { name: 'get_settings', arguments: {} } } })).json();

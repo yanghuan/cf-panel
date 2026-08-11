@@ -275,7 +275,7 @@ wrangler secret put PANEL_USERS      # 回车后粘贴值，如 alice:pass1,bob:
   > ⚠️ Access 需为 agent 路径放行：`/ws/agent/*` 使用 `X-Agent-Key` 头（非浏览器 SSO），必须配置 Bypass 或 Service Token 策略，否则 agent 无法连接。
 - **公告**：设置里可改站点名/公告（存 D1 `kv_json` 表），公告对所有访客可见。
 - **PAT**：设置里可创建访问令牌（scopes + server_ids 白名单），供 API 调用（`Authorization: Bearer cfp_xxx`）。
-- **审计日志**：右上角菜单「审计日志」可查看（添加/删除服务器、打开终端/文件均记录），D1 保留 90 天后自动清理。
+- **审计日志**：右上角菜单「审计日志」可查看（添加/删除服务器、终端/文件会话、文件写操作（上传/打包/重命名/删除）、执行命令均记录），支持按动作/用户/服务器筛选、分页与 CSV 导出，D1 保留 90 天后自动清理。
 
 ## 四、API 一览
 
@@ -302,9 +302,10 @@ wrangler secret put PANEL_USERS      # 回车后粘贴值，如 alice:pass1,bob:
 | GET | `/api/tokens` | PAT 列表（仅管理员） |
 | POST | `/api/tokens` | 创建 PAT（scopes + server_ids 白名单，明文只返回一次） |
 | DELETE | `/api/tokens/:id` | 删除 PAT（仅管理员） |
-| GET | `/api/audit-logs` | 审计日志（仅管理员，倒序，`?limit=` 上限 500，保留 90 天） |
+| GET | `/api/audit-logs` | 审计日志（仅管理员，倒序分页：`?limit=&offset=&action=&user=&server_id=`，`?format=csv` 导出，保留 90 天） |
 | GET | `/api/settings` | 读取全部设置（含告警配置，仅管理员） |
 | PUT | `/api/settings` | 更新站点名/公告/告警配置（D1 kv_json，仅管理员） |
+| POST | `/api/settings/test_webhook` | 测试 Webhook（仅管理员：传当前表单告警配置，发测试通知并回显 HTTP 状态，不保存） |
 
 ### MCP（AI 接入）
 
@@ -324,7 +325,7 @@ wrangler secret put PANEL_USERS      # 回车后粘贴值，如 alice:pass1,bob:
 | `list_tokens` | 列出 PAT 概要（仅管理员，不含哈希/明文） |
 | `create_token` | 创建 PAT（仅管理员；`name` + `scopes`/`server_ids`，明文只返回一次） |
 | `revoke_token` | 撤销 PAT（仅管理员，立即失效） |
-| `get_audit_logs` | 审计日志（仅管理员，`limit` 默认 100 最大 500，保留 90 天） |
+| `get_audit_logs` | 审计日志（仅管理员，`limit`/`offset`/`action`/`user`/`server_id` 分页筛选，返回 `{rows,total}`，保留 90 天） |
 | `get_usage` | 用量观测（仅管理员：上报帧/DO 事件/D1 写行估算） |
 | `get_settings` / `update_settings` | 读取/更新面板设置（仅管理员：站点名/公告/IP 归属地开关/告警配置） |
 
@@ -361,7 +362,7 @@ curl -X POST https://<面板域名>/mcp -H "Authorization: Bearer <token>" \
 - `/ws/terminal/{id}` 仅允许会话创建者或管理员连接（防 stream UUID 劫持，GHSA 教训）。
 - agent 建连必须提供 `X-Agent-Key`（或 query key）；服务端先用 key 的 SHA-256 指纹（`servers.agent_key_id`）反查服务器，再与 `servers.agent_key_hash` 比对；`/ws/agent/terminal` 额外校验 stream 归属。
 - 面板登录密码存 CF secret（`PANEL_USERS`/`PANEL_PASSWORD`），不进代码库；agent key 与 PAT 只存哈希（key 指纹用于检索，HMAC 哈希用于校验）。
-- 审计日志：`terminal.open` / `server.create` 写 `audit_logs`。
+- 审计日志：`server.create/update/delete`、`terminal.open`、`file.open/upload/write/zip/rename/delete`、`exec.command` 写 `audit_logs`（WS 文件操作在 DO 拦截指令记录；`exec.command` 含命令与 exit_code）。
 - agent 侧 `DISABLE_EXEC=1` 可全局禁止命令执行（终端任务直接忽略）。
 - 终端/监控接口按权限收敛：JWT 管理员全量；PAT 按 scopes + server_ids 白名单收窄。
 

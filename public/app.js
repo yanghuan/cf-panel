@@ -971,31 +971,51 @@
     }
   }
 
-  async function saveAlerts() {
+  // 组装当前弹窗表单的告警配置（保存/测试共用）
+  function collectAlertForm() {
     const num = (v) => (v.trim() ? Number(v) : 0);
+    return {
+      webhook_url: $('#set-alert-url').value.trim(),
+      webhook_token: $('#set-alert-token').value.trim(),
+      method: $('#set-alert-method').value,
+      body_template: $('#set-alert-body').value.trim(),
+      content_type: $('#set-alert-content-type').value.trim(),
+      headers: $('#set-alert-headers').value.trim(),
+      cpu_pct: num($('#set-alert-cpu').value),
+      mem_pct: num($('#set-alert-mem').value),
+      disk_pct: num($('#set-alert-disk').value),
+      load: num($('#set-alert-load').value),
+      cooldown_min: num($('#set-alert-cooldown').value),
+      offline_after_s: num($('#set-alert-offline').value),
+    };
+  }
+
+  async function saveAlerts() {
     try {
       await api('/api/settings', {
         method: 'PUT',
-        body: JSON.stringify({
-          alerts: {
-            webhook_url: $('#set-alert-url').value.trim(),
-            webhook_token: $('#set-alert-token').value.trim(),
-            method: $('#set-alert-method').value,
-            body_template: $('#set-alert-body').value.trim(),
-            content_type: $('#set-alert-content-type').value.trim(),
-            headers: $('#set-alert-headers').value.trim(),
-            cpu_pct: num($('#set-alert-cpu').value),
-            mem_pct: num($('#set-alert-mem').value),
-            disk_pct: num($('#set-alert-disk').value),
-            load: num($('#set-alert-load').value),
-            cooldown_min: num($('#set-alert-cooldown').value),
-            offline_after_s: num($('#set-alert-offline').value),
-          },
-        }),
+        body: JSON.stringify({ alerts: collectAlertForm() }),
       });
       toast('告警配置已保存');
     } catch (e) {
       toast(e.message);
+    }
+  }
+
+  // 测试 Webhook：用当前表单配置（未保存）发一条测试通知并回显 HTTP 状态
+  async function testWebhook() {
+    const el = $('#webhook-test-result');
+    el.textContent = '发送中…';
+    try {
+      const res = await api('/api/settings/test_webhook', {
+        method: 'POST',
+        body: JSON.stringify({ alerts: collectAlertForm() }),
+      });
+      el.textContent = res.ok
+        ? `✓ 发送成功（HTTP ${res.status}）`
+        : `✗ 发送失败：${res.error || `HTTP ${res.status}`}`;
+    } catch (e) {
+      el.textContent = `✗ ${e.message}`;
     }
   }
 
@@ -1043,16 +1063,36 @@
     });
   }
 
-  // ---------- 审计日志（仅管理员，保留 90 天） ----------
-  const AUDIT_ACTION_LABEL = { 'server.create': '添加服务器', 'server.update': '修改服务器', 'server.delete': '删除服务器', 'terminal.open': '打开终端', 'file.open': '文件管理', 'file.upload': '上传文件', 'exec.command': '执行命令' };
+  // ---------- 审计日志（仅管理员，保留 90 天；筛选/分页/CSV 导出） ----------
+  const AUDIT_ACTION_LABEL = {
+    'server.create': '添加服务器', 'server.update': '修改服务器', 'server.delete': '删除服务器',
+    'terminal.open': '打开终端', 'file.open': '文件管理', 'file.upload': '上传文件',
+    'file.write': '写入文件', 'file.zip': '打包目录', 'file.rename': '重命名', 'file.delete': '删除文件',
+    'exec.command': '执行命令',
+  };
+  const auditState = { limit: 100, offset: 0, action: '', user: '', serverId: '' };
   async function openAuditModal() {
     $('#audit-modal').classList.remove('hidden');
     lockScroll();
+    // 动作筛选下拉（后端按 action 精确匹配）
+    const sel = $('#audit-filter-action');
+    if (sel.options.length <= 1) {
+      for (const [k, v] of Object.entries(AUDIT_ACTION_LABEL)) {
+        const opt = document.createElement('option');
+        opt.value = k; opt.textContent = v;
+        sel.appendChild(opt);
+      }
+    }
     await loadAuditLogs();
   }
   async function loadAuditLogs() {
     try {
-      const rows = await api('/api/audit-logs?limit=200');
+      const q = new URLSearchParams({ limit: auditState.limit, offset: auditState.offset });
+      if (auditState.action) q.set('action', auditState.action);
+      if (auditState.user) q.set('user', auditState.user);
+      if (auditState.serverId) q.set('server_id', auditState.serverId);
+      const body = await api(`/api/audit-logs?${q}`);
+      const rows = body.rows || body; // 兼容：新格式 {rows,total}
       $('#audit-list').innerHTML = rows.length
         ? rows.map((r) => `
             <li><div class="audit-row">
@@ -1061,6 +1101,12 @@
               <span class="audit-time">${escapeHtml(r.created_at || '')}</span>
             </div></li>`).join('')
         : '<li class="muted">暂无审计记录</li>';
+      const total = Number(body.total || rows.length);
+      const from = total ? auditState.offset + 1 : 0;
+      const to = Math.min(auditState.offset + rows.length, total);
+      $('#audit-pager-info').textContent = total ? `第 ${from}-${to} 条 / 共 ${total} 条` : '';
+      $('#btn-audit-prev').disabled = auditState.offset <= 0;
+      $('#btn-audit-next').disabled = auditState.offset + rows.length >= total;
     } catch (e) {
       $('#audit-list').innerHTML = `<li class="muted">${escapeHtml(e.message)}</li>`;
     }
@@ -1180,6 +1226,7 @@
   // 告警弹窗
   $('#btn-alerts-close').onclick = () => { $('#alerts-modal').classList.add('hidden'); unlockScroll(); };
   $('#btn-save-alerts').onclick = saveAlerts;
+  $('#btn-test-webhook').onclick = testWebhook;
 
   // 自定义指标查看弹窗
   $('#btn-custom-close').onclick = () => { $('#custom-modal').classList.add('hidden'); unlockScroll(); };
@@ -1208,6 +1255,35 @@
 
   // 审计日志弹窗
   $('#btn-audit-close').onclick = () => { $('#audit-modal').classList.add('hidden'); unlockScroll(); };
+  // 审计筛选/分页/CSV
+  $('#btn-audit-apply').onclick = () => {
+    auditState.offset = 0;
+    auditState.action = $('#audit-filter-action').value;
+    auditState.user = $('#audit-filter-user').value.trim();
+    auditState.serverId = $('#audit-filter-server').value.trim();
+    loadAuditLogs();
+  };
+  $('#btn-audit-prev').onclick = () => { auditState.offset = Math.max(0, auditState.offset - auditState.limit); loadAuditLogs(); };
+  $('#btn-audit-next').onclick = () => { auditState.offset += auditState.limit; loadAuditLogs(); };
+  $('#btn-audit-csv').onclick = async () => {
+    // CSV 需带 Authorization 头：fetch 拿 Blob 后触发下载
+    const q = new URLSearchParams({ format: 'csv' });
+    if (auditState.action) q.set('action', auditState.action);
+    if (auditState.user) q.set('user', auditState.user);
+    if (auditState.serverId) q.set('server_id', auditState.serverId);
+    try {
+      const res = await fetch(`/api/audit-logs?${q}`, { headers: { authorization: `Bearer ${token}` } });
+      if (!res.ok) throw new Error(`导出失败：HTTP ${res.status}`);
+      const blob = await res.blob();
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = 'audit-logs.csv';
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(a.href);
+    } catch (e) { toast(e.message); }
+  };
   // 用量观测弹窗
   $('#btn-usage-close').onclick = () => { $('#usage-modal').classList.add('hidden'); unlockScroll(); };
   $('#token-list').addEventListener('click', (e) => {

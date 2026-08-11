@@ -232,8 +232,9 @@ export function parseHeaders(s, vars) {
 // 发送告警 Webhook（模板化）：method/url/body/headers 均支持占位符；
 // token 仅作为 {token} 占位符变量，由用户放在 URL/header/body 任意位置。
 // 检查 HTTP 状态，失败/异常记 console.error（Cloudflare 后台 Worker 日志可见，便于排查丢失的告警）。
-export async function sendWebhook(cfg, payload) {
-  if (!cfg.enabled || !cfg.webhook_url) return false;
+// sendWebhookRaw 返回 {ok, status, error}（测试 Webhook 按钮回显状态用）；sendWebhook 转布尔供告警链路复用。
+export async function sendWebhookRaw(cfg, payload) {
+  if (!cfg.enabled || !cfg.webhook_url) return { ok: false, status: 0, error: 'webhook not configured' };
   const vars = {
     event: payload.event,
     title: payload.title,
@@ -254,11 +255,14 @@ export async function sendWebhook(cfg, payload) {
     const resp = await fetch(url, { method, headers, body });
     if (!resp.ok) {
       console.error(`[cf-panel] webhook failed: ${payload.event} → ${url} HTTP ${resp.status}`);
-      return false;
+      return { ok: false, status: resp.status, error: `HTTP ${resp.status}` };
     }
-    return true;
+    return { ok: true, status: resp.status, error: null };
   } catch (e) {
     console.error(`[cf-panel] webhook error: ${payload.event} → ${url} ${e && e.message ? e.message : e}`);
-    return false;
+    return { ok: false, status: 0, error: (e && e.message) || String(e) };
   }
+}
+export async function sendWebhook(cfg, payload) {
+  return (await sendWebhookRaw(cfg, payload)).ok;
 }

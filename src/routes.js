@@ -122,10 +122,16 @@ const MCP_TOOLS = [
   },
   {
     name: 'get_audit_logs',
-    description: '查询审计日志（倒序，保留 90 天）：谁在何时对哪台机器做了什么操作。仅管理员。',
+    description: '查询审计日志（倒序，保留 90 天）：谁在何时对哪台机器做了什么操作。支持按动作/用户/服务器筛选与分页。仅管理员。',
     inputSchema: {
       type: 'object',
-      properties: { limit: { type: 'integer', description: '返回条数，默认 100，最大 500' } },
+      properties: {
+        limit: { type: 'integer', description: '返回条数，默认 100，最大 500' },
+        offset: { type: 'integer', description: '分页偏移，默认 0' },
+        action: { type: 'string', description: '按操作类型精确筛选（如 server.create / exec.command / file.delete）' },
+        user: { type: 'string', description: '按用户名模糊筛选' },
+        server_id: { type: 'integer', description: '按目标服务器 id 筛选' },
+      },
       required: [],
     },
   },
@@ -156,7 +162,7 @@ const MCP_TOOLS = [
 ];
 import {
   json, err, requireJwtSecret, signJwt, randomHex, sha256Hex, hashSecret, safeJson,
-  kvGet, kvPut, sanitizeAlerts, parseRangeHours,
+  kvGet, kvPut, sanitizeAlerts, parseRangeHours, sendWebhookRaw,
   doMetrics, doForShard, doPanel, shardForServerId, makeStreamId, shardFromStreamId,
   signUploadToken, verifyUploadToken,
 } from './utils.js';
@@ -540,12 +546,60 @@ async function handleApiInner(request, env) {
     return json({ ok: true });
   }
 
-  // GET /api/audit-logs —— 审计日志（仅管理员，倒序分页，保留 90 天）
+  // GET /api/audit-logs —— 审计日志（仅管理员，倒序分页 + 筛选 + CSV 导出，保留 90 天）
+  // 参数：limit（默认 100 最大 500）、offset（分页偏移）、action（精确匹配）、user（用户名模糊）、
+  //       server_id（数字）、format=csv（导出，text/csv 附件）
   if (method === 'GET' && path === '/api/audit-logs') {
     if (!isAdmin(user)) return err('forbidden', 403);
     const limit = Math.min(Math.max(Number(url.searchParams.get('limit')) || 100, 1), 500);
-    const rows = await env.DB.prepare('SELECT id, user_id, username, client_ip, action, target_server_id, detail, created_at FROM audit_logs ORDER BY id DESC LIMIT ?').bind(limit).all();
-    return json(rows.results);
+    const offset = Math.max(Number(url.searchParams.get('offset')) || 0, 0);
+    const action = String(url.searchParams.get('action') || '').trim();
+    const userName = String(url.searchParams.get('user') || '').trim();
+    const serverId = Number(url.searchParams.get('server_id')) || 0;
+    // WHERE 条件全部参数化（无用户输入拼进 SQL）
+    const conds = [];
+    const binds = [];
+    if (action) { conds.push('action = ?'); binds.push(action); }
+    if (userName) { conds.push('username LIKE ?'); binds.push(`%${userName}%`); }
+    if (serverId) { conds.push('target_server_id = ?'); binds.push(serverId); }
+    const where = conds.length ? ` WHERE ${conds.join(' AND ')}` : '';
+    if (url.searchParams.get('format') === 'csv') {
+      // CSV 导出：全量（不分页，上限 5000 防响应过大）
+      const csvRows = await env.DB.prepare(
+        `SELECT id, user_id, username, client_ip, action, target_server_id, detail, created_at FROM audit_logs${where} ORDER BY id DESC LIMIT 5000`
+      ).bind(...binds).all();
+      const esc = (v) => `"${String(v == null ? '' : v).replace(/"/g, '""')}"`;
+      const header = 'id,user_id,username,client_ip,action,target_server_id,detail,created_at';
+      const lines = csvRows.results.map((r) => [r.id, r.user_id, r.username, r.client_ip, r.action, r.target_server_id, r.detail, r.created_at].map(esc).join(','));
+      return new Response([header, ...lines].join('\n'), {
+        headers: {
+          'content-type': 'text/csv; charset=utf-8',
+          'content-disposition': 'attachment; filename="audit-logs.csv"',
+        },
+      });
+    }
+    const [rows, totalRow] = await Promise.all([
+      env.DB.prepare(`SELECT id, user_id, username, client_ip, action, target_server_id, detail, created_at FROM audit_logs${where} ORDER BY id DESC LIMIT ? OFFSET ?`).bind(...binds, limit, offset).all(),
+      env.DB.prepare(`SELECT COUNT(*) AS c FROM audit_logs${where}`).bind(...binds).first(),
+    ]);
+    return json({ rows: rows.results, total: Number(totalRow?.c || 0) });
+  }
+
+  // POST /api/settings/test_webhook —— 测试 Webhook（仅管理员；传当前弹窗表单值，不保存配置）
+  // 回显 HTTP 状态码，供用户验证模板化配置（占位符/Headers/Body）是否正确
+  if (method === 'POST' && path === '/api/settings/test_webhook') {
+    if (!isAdmin(user)) return err('forbidden', 403);
+    const body = await request.json().catch(() => ({}));
+    const cfg = sanitizeAlerts(body.alerts || {});
+    if (!cfg.webhook_url) return err('webhook_url required（请先填写 Webhook 地址）', 400);
+    cfg.enabled = true; // sanitizeAlerts 输出无 enabled（空 url 即禁用）；测试入口显式开启
+    const result = await sendWebhookRaw(cfg, {
+      event: 'test',
+      title: '[cf-panel] Webhook 测试通知',
+      message: '这是一条测试通知：告警配置验证成功。',
+      time: new Date().toISOString(),
+    });
+    return json(result);
   }
 
   // ---- 面板设置（D1 kv_json，仅管理员） ----
@@ -887,8 +941,19 @@ async function mcpRevokeToken(user, env, args) {
 async function mcpGetAuditLogs(user, env, args) {
   requireAdmin(user);
   const limit = Math.min(Math.max(Number(args.limit) || 100, 1), 500);
-  const rows = await env.DB.prepare('SELECT id, user_id, username, client_ip, action, target_server_id, detail, created_at FROM audit_logs ORDER BY id DESC LIMIT ?').bind(limit).all();
-  return rows.results;
+  const offset = Math.max(Number(args.offset) || 0, 0);
+  const action = String(args.action || '').trim();
+  const userName = String(args.user || '').trim();
+  const serverId = Number(args.server_id) || 0;
+  const conds = [];
+  const binds = [];
+  if (action) { conds.push('action = ?'); binds.push(action); }
+  if (userName) { conds.push('username LIKE ?'); binds.push(`%${userName}%`); }
+  if (serverId) { conds.push('target_server_id = ?'); binds.push(serverId); }
+  const where = conds.length ? ` WHERE ${conds.join(' AND ')}` : '';
+  const rows = await env.DB.prepare(`SELECT id, user_id, username, client_ip, action, target_server_id, detail, created_at FROM audit_logs${where} ORDER BY id DESC LIMIT ? OFFSET ?`).bind(...binds, limit, offset).all();
+  const totalRow = await env.DB.prepare(`SELECT COUNT(*) AS c FROM audit_logs${where}`).bind(...binds).first();
+  return { rows: rows.results, total: Number(totalRow?.c || 0) };
 }
 
 async function mcpGetUsage(user, env) {

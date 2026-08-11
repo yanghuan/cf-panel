@@ -521,6 +521,7 @@ export class TerminalDO {
       }
       // 鉴权通过 → 挂接为会话用户端；附件升级为 user 角色（供休眠唤醒重建索引）。
       // patToken 随附件持久化：PAT 撤销后每次浏览器消息重校验，撤销即关闭（JWT 不存，保持零 D1 读）
+      sess.creatorUser = user.username || ''; // 文件写操作审计用（休眠唤醒后首帧鉴权会重新设置）
       sess.userWs = ws;
       sess.lastPatCheck = Date.now(); // 首帧已校验，PAT 重校验节流起点
       ws.serializeAttachment({
@@ -636,6 +637,17 @@ export class TerminalDO {
               agentWs.send(JSON.stringify({ type: 'resize', stream_id: sess.streamId, rows: Number(j.rows) || 24, cols: Number(j.cols) || 80 }));
             }
             return;
+          }
+          // 文件写操作审计（zip/rename/delete + write 首块）：记入 audit_logs，失败不影响透传。
+          // 文件会话与终端共用本通道，仅文件指令携带 path 字段，据此区分。
+          if (j && j.path && (j.type === 'zip' || j.type === 'rename' || j.type === 'delete' || (j.type === 'write' && Number(j.offset) === 0))) {
+            let detail = String(j.path).slice(0, 200);
+            if (j.type === 'rename') detail += ` → ${String(j.new_name || '').slice(0, 100)}`;
+            try {
+              await this.env.DB.prepare('INSERT INTO audit_logs (user_id, username, action, target_server_id, detail) VALUES (?,?,?,?,?)')
+                .bind(sess.creatorUserId, sess.creatorUser || '', `file.${j.type}`, sess.serverId, detail)
+                .run();
+            } catch (e) { console.error('file audit failed:', e); }
           }
         } catch {
           /* 不是 JSON，当普通输入透传 */

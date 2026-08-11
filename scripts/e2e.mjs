@@ -534,11 +534,15 @@ async function step8_mcp() {
     else bad(`MCP revoke_token 失败：${JSON.stringify(rvData)}`);
   } else bad('MCP revoke_token：跳过（list_tokens 未返回 e2e-mcp-pat 的 ID）');
 
-  // ---- 8.10) get_audit_logs ----
+  // ---- 8.10) get_audit_logs（返回 {rows,total}，支持筛选） ----
   const al = await mcpTool(16, 'get_audit_logs', { limit: 5 });
   const alData = mcpContent(al);
-  if (Array.isArray(alData) && alData.length >= 1) ok('MCP get_audit_logs：有审计记录（≥1 条）');
-  else bad('MCP get_audit_logs：无审计记录');
+  if (alData?.rows?.length >= 1 && alData.total >= 1) ok('MCP get_audit_logs：有审计记录（≥1 条）');
+  else bad(`MCP get_audit_logs：无审计记录：${JSON.stringify(alData)}`);
+  const alF = await mcpTool(21, 'get_audit_logs', { action: 'server.update' });
+  const alFData = mcpContent(alF);
+  if (alFData?.rows?.length >= 1 && alFData.rows.every((r) => r.action === 'server.update')) ok('MCP get_audit_logs：action 筛选生效');
+  else bad(`MCP get_audit_logs：筛选异常：${JSON.stringify(alFData)}`);
 
   // ---- 8.11) get_usage ----
   const gu = await mcpTool(17, 'get_usage');
@@ -562,6 +566,17 @@ async function step8_mcp() {
       await mcpTool(20, 'update_settings', { site_name: gsName });
     }
   } else bad(`MCP update_settings 失败：${JSON.stringify(upsData)}`);
+
+  // ---- 8.13) 测试 Webhook（指向面板自身 → 非 2xx，验证端点可达并回显状态） ----
+  const tw = await fetch(`${BASE}/api/settings/test_webhook`, {
+    method: 'POST',
+    headers: { 'authorization': `Bearer ${token}`, 'content-type': 'application/json' },
+    body: JSON.stringify({ alerts: { webhook_url: `${BASE}/api/public/settings` } }),
+  });
+  const twData = await tw.json();
+  if (tw.status === 200 && twData.ok === false && twData.status >= 400)
+    ok(`测试 Webhook：端点可达并回显 HTTP 状态（${twData.status}）`);
+  else bad(`测试 Webhook 异常：HTTP ${tw.status} ${JSON.stringify(twData)}`);
 }
 
 // ============================================================

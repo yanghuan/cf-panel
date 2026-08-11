@@ -309,10 +309,10 @@ wrangler secret put PANEL_USERS      # 回车后粘贴值，如 alice:pass1,bob:
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| POST | `/mcp` | MCP 端点（无状态 Streamable HTTP，JSON-RPC 2.0；Bearer 鉴权） |
+| POST | `/mcp` | MCP 端点（Streamable HTTP，兼容协议版本 2025-11-25；单 POST 端点、无会话、每请求独立鉴权） |
 | POST | `/mcp/file_upload?server_id=&path=&overwrite=` | 流式上传文件到 agent（body=原始字节，Worker 自动分片；Bearer 鉴权或签名 URL token 均可。位于 `/mcp` 前缀下以绕过 CF Access 拦截，供 curl 直传） |
 
-`/mcp` 实现标准 [Model Context Protocol](https://modelcontextprotocol.io) **无状态 Streamable HTTP**（2025-11-25 修订版：单 POST 端点、无会话、每请求独立鉴权）。鉴权复用现有 `Authorization: Bearer <JWT 或 PAT>`。
+`/mcp` 实现标准 [Model Context Protocol](https://modelcontextprotocol.io) **Streamable HTTP**（兼容协议版本 `2025-11-25`）：单 POST 端点、无 `Mcp-Session-Id` 会话、每请求独立鉴权——采用**无状态简化实现**（与 2026-07-28 规范正式确立的无状态模型方向一致，但保留旧版 initialize 握手以兼容 2025-11-25 客户端）。鉴权复用现有 `Authorization: Bearer <JWT 或 PAT>`。
 
 **工具**：
 

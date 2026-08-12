@@ -663,7 +663,20 @@ button.danger:hover { background: rgba(248, 113, 113, .12); }
 .monitor-modal .modal-head,
 .monitor-modal .range-btns,
 .monitor-modal .chart-wrap { width: 100%; max-width: 960px; margin-left: auto; margin-right: auto; }
-.monitor-modal .chart-wrap { flex: 1; min-height: 0; }
+.monitor-modal .chart-wrap { flex: 1; min-height: 0; overflow-y: auto; height: auto; }
+/* 每指标一张图：标题 + canvas 块，纵向排列 */
+.m-chart { margin-bottom: 14px; }
+.m-chart-title { font-size: 13px; color: var(--muted); margin: 0 0 6px; font-weight: 600; }
+.m-chart-body {
+  position: relative;
+  height: 180px;
+  background: var(--panel);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 10px;
+}
 .custom-select {
   padding: 6px 12px;
   border-radius: 10px;

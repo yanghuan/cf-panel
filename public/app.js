@@ -13,7 +13,7 @@
   let serversCache = [];
   let pushTimer = null;    // 每 3 秒发一次 sync 请求的定时器（老化）
   let monitorState = null; // { serverId, serverName, range } 当前监控视图
-  let monitorChart = null; // Chart.js 实例（切换范围时销毁重建）
+  let monitorCharts = []; // Chart.js 实例数组（每指标一张图，切换范围时全部销毁重建）
 
   // ---------- 基础 ----------
   function toast(msg, ms = 2500) {
@@ -717,12 +717,13 @@
     }
   }
 
+  // 监控图表：每个指标独立一张图（CPU / 内存 / 网络 / 自定义指标），纵向排列，
+  // 各自独立刻度轴——量纲不同不再挤在一张图（原双轴方案可读性差）
   function renderMonitorChart(rows, custom) {
     const wrap = $('#monitor-modal .chart-wrap');
-    if (monitorChart) { monitorChart.destroy(); monitorChart = null; }
-    // 重建 canvas（用固定容器定位，canvas 可能被上次提示文本覆盖导致元素为空）
-    const canvas = wrap.querySelector('#monitor-chart');
-    if (!canvas || canvas.tagName !== 'CANVAS') wrap.innerHTML = '<canvas id="monitor-chart"></canvas>';
+    monitorCharts.forEach((c) => { try { c.destroy(); } catch { /* ignore */ } });
+    monitorCharts = [];
+    wrap.innerHTML = '';
     if (!window.Chart) {
       wrap.innerHTML = '<p class="muted" style="padding:24px">图表库（Chart.js）加载失败，请检查网络。</p>';
       return;
@@ -732,46 +733,50 @@
       return;
     }
     const labels = rows.map((r) => new Date(r.ts * 60000).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }));
-    const cpus = rows.map((r) => r.cpu);
-    const mems = rows.map((r) => (r.mem_used == null ? null : +(r.mem_used / 1048576).toFixed(1)));
-    const netIns = rows.map((r) => (r.net_in == null ? null : +(r.net_in / 1024).toFixed(1)));
-    const netOuts = rows.map((r) => (r.net_out == null ? null : +(r.net_out / 1024).toFixed(1)));
-    const datasets = [
-      { label: 'CPU %', data: cpus, borderColor: '#3b82f6', backgroundColor: 'rgba(59,130,246,.12)', fill: true, tension: 0.3, pointRadius: 0, borderWidth: 2 },
-      { label: '内存 MB', data: mems, borderColor: '#f59e0b', backgroundColor: 'rgba(245,158,11,.08)', fill: true, tension: 0.3, pointRadius: 0, borderWidth: 2, yAxisID: 'y1' },
-      { label: '网络↓ KB/s', data: netIns, borderColor: '#22d3ee', backgroundColor: 'transparent', tension: 0.3, pointRadius: 0, borderWidth: 1.5, yAxisID: 'y1', spanGaps: true },
-      { label: '网络↑ KB/s', data: netOuts, borderColor: '#f472b6', backgroundColor: 'transparent', tension: 0.3, pointRadius: 0, borderWidth: 1.5, yAxisID: 'y1', spanGaps: true },
-    ];
-    // 自定义指标（按 ts 对齐系统时间轴，共用右轴；量纲差异仅看趋势）
-    Object.entries(custom || {}).forEach(([name, points]) => {
-      if (!Array.isArray(points) || !points.length) return;
-      const cMap = new Map(points.map((p) => [p.ts, p.value]));
-      datasets.push({
-        label: name,
-        data: rows.map((r) => (cMap.has(r.ts) ? cMap.get(r.ts) : null)),
-        borderColor: MONITOR_COLORS[datasets.length % MONITOR_COLORS.length],
-        backgroundColor: 'transparent',
-        tension: 0.3, pointRadius: 0, borderWidth: 1.5, yAxisID: 'y1',
-      });
-    });
-    monitorChart = new Chart($('#monitor-chart'), {
-      type: 'line',
-      data: { labels, datasets },
-      options: {
-        responsive: true,
-        maintainAspectRatio: false,
-        interaction: { mode: 'index', intersect: false },
-        plugins: {
-          legend: { labels: { color: '#8b949e', boxWidth: 12 } },
-          tooltip: { backgroundColor: '#1c2230', borderColor: '#2d333b', borderWidth: 1, titleColor: '#e6edf3', bodyColor: '#8b949e' },
-        },
-        scales: {
-          x: { ticks: { color: '#8b949e', maxTicksLimit: 8, maxRotation: 0 }, grid: { color: 'rgba(255,255,255,.04)' } },
-          y: { position: 'left', ticks: { color: '#8b949e' }, grid: { color: 'rgba(255,255,255,.04)' } },
-          y1: { position: 'right', grid: { drawOnChartArea: false }, ticks: { color: '#8b949e' } },
-        },
+    const lineCfg = (color, fill) => ({ borderColor: color, backgroundColor: fill, tension: 0.3, pointRadius: 0, borderWidth: 1.8, spanGaps: true });
+    // 公共刻度样式
+    const axisStyle = () => ({ ticks: { color: '#8b949e', maxTicksLimit: 8, maxRotation: 0 }, grid: { color: 'rgba(255,255,255,.04)' } });
+    const chartOpts = () => ({
+      responsive: true,
+      maintainAspectRatio: false,
+      interaction: { mode: 'index', intersect: false },
+      plugins: {
+        legend: { labels: { color: '#8b949e', boxWidth: 12 } },
+        tooltip: { backgroundColor: '#1c2230', borderColor: '#2d333b', borderWidth: 1, titleColor: '#e6edf3', bodyColor: '#8b949e' },
       },
+      scales: { x: axisStyle(), y: axisStyle() },
     });
+    // 生成一块"标题 + canvas"的图块并创建 Chart 实例
+    const mkChart = (title, datasets) => {
+      const id = `mc-${monitorCharts.length + 1}`;
+      const div = document.createElement('div');
+      div.className = 'm-chart';
+      div.innerHTML = `<h4 class="m-chart-title">${title}</h4><div class="m-chart-body"><canvas id="${id}"></canvas></div>`;
+      wrap.appendChild(div);
+      monitorCharts.push(new Chart(document.getElementById(id), {
+        type: 'line',
+        data: { labels, datasets },
+        options: chartOpts(),
+      }));
+    };
+
+    // CPU：独立图（%）
+    mkChart('CPU（%）', [{ label: 'CPU', data: rows.map((r) => r.cpu), ...lineCfg('#3b82f6', 'rgba(59,130,246,.12)'), fill: true }]);
+    // 内存：独立图（MB）
+    mkChart('内存（MB）', [{ label: '内存', data: rows.map((r) => (r.mem_used == null ? null : +(r.mem_used / 1048576).toFixed(1))), ...lineCfg('#f59e0b', 'rgba(245,158,11,.08)'), fill: true }]);
+    // 网络：上下行同量纲（KB/s）放一张，便于对比
+    mkChart('网络（KB/s）', [
+      { label: '下行', data: rows.map((r) => (r.net_in == null ? null : +(r.net_in / 1024).toFixed(1))), ...lineCfg('#22d3ee', 'transparent') },
+      { label: '上行', data: rows.map((r) => (r.net_out == null ? null : +(r.net_out / 1024).toFixed(1))), ...lineCfg('#f472b6', 'transparent') },
+    ]);
+    // 自定义指标：按 ts 对齐系统时间轴，独立一张（量纲差异仅看趋势）
+    const cNames = Object.keys(custom || {}).filter((n) => Array.isArray(custom[n]) && custom[n].length);
+    if (cNames.length) {
+      mkChart('自定义指标', cNames.map((n, i) => {
+        const cMap = new Map(custom[n].map((p) => [p.ts, p.value]));
+        return { label: n, data: rows.map((r) => (cMap.has(r.ts) ? cMap.get(r.ts) : null)), ...lineCfg(MONITOR_COLORS[i % MONITOR_COLORS.length], 'transparent') };
+      }));
+    }
   }
 
   // ---------- 自定义指标面板（agent CUSTOM_METRICS 采集，存 D1 metrics_custom） ----------
@@ -1364,7 +1369,13 @@
     const btn = e.target.closest('.range-btn');
     if (btn && monitorState) showMonitor(monitorState.serverId, monitorState.serverName, btn.dataset.range);
   });
-  $('#btn-monitor-close').onclick = () => { $('#monitor-modal').classList.add('hidden'); unlockScroll(); };
+  $('#btn-monitor-close').onclick = () => {
+    $('#monitor-modal').classList.add('hidden');
+    unlockScroll();
+    // 关闭时销毁图表实例（释放内存；下次打开 renderMonitorChart 会重建）
+    monitorCharts.forEach((c) => { try { c.destroy(); } catch { /* ignore */ } });
+    monitorCharts = [];
+  };
 
   // 告警渠道预设：点击「使用」填入表单模板
   $('#alert-preset-list').addEventListener('click', (e) => {

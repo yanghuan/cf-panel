@@ -236,6 +236,8 @@ button.danger:hover { background: rgba(248, 113, 113, .12); }
 .card:has(.card-menu:not(.hidden)) { z-index: 2; }
 .card-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 10px; }
 .card .name { font-size: 15px; font-weight: 600; }
+/* 服务器国家旗帜（emoji，服务器名前；geo 开启且有国家代码时显示） */
+.card .name .flag { margin-right: 5px; font-size: 14px; line-height: 1; vertical-align: -1px; }
 .card .meta { font-size: 12px; color: var(--muted); margin-bottom: 10px; word-break: break-all; }
 .card .meta .cid { color: var(--accent, #8b5cf6); font-weight: 600; font-variant-numeric: tabular-nums; }
 

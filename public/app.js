@@ -4,7 +4,7 @@
   // 工具函数与 <cf-ip> 组件从 utils.js 解构；api 层从 api.js 解构（index.html 中均须先加载）
   const { $, escapeHtml, fmtBytes, fileJoin, fileParent, downsample, lockScroll, unlockScroll,
           MONITOR_STEP_MAX, MONITOR_RANGE_LABEL, MONITOR_COLORS,
-          GEO_PRIVATE, setGeoEnabled, IdleGuard } = CfUtils;
+          GEO_PRIVATE, setGeoEnabled, flagEmoji, geoLookup, IdleGuard } = CfUtils;
   const { api, setTokenGetter, FileSession, TermSession, PushSession } = CfApi;
   let token = localStorage.getItem('cfpanel_token') || '';
   setTokenGetter(() => token); // api 层通过 getter 读取当前 token
@@ -191,7 +191,7 @@
       <div class="card" data-id="${s.id}">
         <div class="card-head">
           <div class="card-title">
-            <span class="name">${escapeHtml(s.name)}</span>
+            <span class="name"><span class="flag" data-flag="${escapeHtml(ip)}"></span>${escapeHtml(s.name)}</span>
             <button class="more-btn" title="节点操作">⋯</button>
             <div class="card-menu hidden">
               ${canExec ? `<button data-act="term" data-id="${s.id}" data-name="${escapeHtml(s.name)}">终端</button>
@@ -273,6 +273,21 @@
     box.innerHTML = groups.map((g) => `
       <h3 class="group-title">${escapeHtml(g)}（${byGroup(g).length}）</h3>
       <div class="grid">${byGroup(g).map(cardHtml).join('')}</div>`).join('');
+    updateFlags(); // 卡片旗帜异步补全（geo 查询受 geoEnabled 开关控制）
+  }
+  // 旗帜补全：对卡片名前的 [data-flag] 占位查国家代码 → 渲染 emoji 旗帜；
+  // geo 关闭/私网/查询失败 → 移除占位（不显示空位）
+  function updateFlags() {
+    document.querySelectorAll('#servers .flag[data-flag]').forEach((el) => {
+      const ip = el.dataset.flag || '';
+      if (!ip) { el.remove(); return; }
+      geoLookup(ip).then((res) => {
+        if (!el.isConnected) return;
+        const cc = res && res.cc;
+        if (cc && flagEmoji(cc)) el.textContent = flagEmoji(cc);
+        else el.remove();
+      });
+    });
   }
   // 推送到达：增量更新已有卡片（指标/探活/徽章），不重建卡片 DOM——
   // 防每秒/每推送全量重建导致 hover 高亮抖动、打开的节点菜单被销毁

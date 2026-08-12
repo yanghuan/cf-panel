@@ -257,11 +257,8 @@ fn disk_usage_static() -> Result<Vec<serde_json::Value>, ()> {
         };
         let used = st.f_blocks.saturating_sub(st.f_bfree) as u64 * frsize;
         let avail = st.f_bavail as u64 * frsize;
-        let pct = used
-            .checked_mul(100)
-            .and_then(|u| u.checked_div(used + avail))
-            .unwrap_or(0); // 除数为 0（异常挂载点）回退 0
-        out.push(json!({ "m": mount, "u": pct }));
+        // 上报 used/total（字节），百分比由前端计算——信息无损的完备表示（u 为派生值不再传输）
+        out.push(json!({ "m": mount, "used": used, "total": used + avail }));
     }
     Ok(out)
 }

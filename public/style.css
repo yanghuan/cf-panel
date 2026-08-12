@@ -315,6 +315,9 @@ button.danger:hover { background: rgba(248, 113, 113, .12); }
 .mt-row span { color: var(--muted); white-space: nowrap; }
 .mt-row b { color: var(--text); font-weight: 600; }
 .mt-sub { margin-top: 8px; padding-top: 6px; border-top: 1px solid var(--border); font-size: 11px; color: var(--muted); }
+/* 磁盘标题栏：左侧标题 + 右侧累计值（当前值 / 最大值 (百分比)） */
+.mt-disk-head { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+.mt-disk-head b { color: var(--text); font-weight: 600; white-space: nowrap; }
 /* 磁盘挂载点独立滚动区：鼠标移到列表上滚轮即可滚动，避免整个 tooltip 超高 */
 .mt-disk {
   max-height: 160px;

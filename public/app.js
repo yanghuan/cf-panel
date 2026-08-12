@@ -136,8 +136,22 @@
     }
     let diskHtml = '';
     if (Array.isArray(e.disk) && e.disk.length) {
-      diskHtml = `<div class="mt-sub">磁盘（${e.disk.length} 个挂载点）</div><div class="mt-disk">` +
-        e.disk.map((d) => `<div><span title="${escapeHtml(d.m)}">${escapeHtml(d.m)}</span><b>${escapeHtml(d.u)}%</b></div>`).join('') + '</div>';
+      // 磁盘项：新格式 {m, used, total}（百分比由前端算）；旧格式 {m, u} 回退
+      const diskRow = (d) => {
+        if (d.used != null && d.total > 0) {
+          const pct = (d.used / d.total * 100).toFixed(0);
+          return `${fmtBytes(d.used)} / ${fmtBytes(d.total)} (${pct}%)`;
+        }
+        return `${escapeHtml(d.u)}%`;
+      };
+      // 累计：仅统计新格式项（旧格式无字节值无法求和）
+      let sumUsed = 0, sumTotal = 0;
+      for (const d of e.disk) if (d.used != null && d.total > 0) { sumUsed += d.used; sumTotal += d.total; }
+      const sumHtml = sumTotal > 0
+        ? `<b title="累计">${fmtBytes(sumUsed)} / ${fmtBytes(sumTotal)} (${(sumUsed / sumTotal * 100).toFixed(0)}%)</b>`
+        : '';
+      diskHtml = `<div class="mt-sub mt-disk-head"><span>磁盘（${e.disk.length} 个挂载点）</span>${sumHtml}</div><div class="mt-disk">` +
+        e.disk.map((d) => `<div><span title="${escapeHtml(d.m)}">${escapeHtml(d.m)}</span><b>${diskRow(d)}</b></div>`).join('') + '</div>';
     }
     return `<div class="mt-title">实时指标</div>${items}${sysHtml}${diskHtml}`;
   }
@@ -148,10 +162,11 @@
     const m = s.metric;
     if (!m) return '';
     // 磁盘使用率：取所有挂载点中最大
+    // 磁盘使用率（%）：新格式 used/total 计算，旧格式 u 回退；取所有挂载点中最大
     function diskPct() {
       const arr = m.extra && m.extra.disk;
       if (!Array.isArray(arr) || !arr.length) return null;
-      return Math.max(...arr.map((d) => Number(d.u) || 0));
+      return Math.max(...arr.map((d) => (d.used != null && d.total > 0 ? d.used / d.total * 100 : Number(d.u) || 0)));
     }
     const barColor = (p) => (p >= 90 ? '#f85149' : p >= 70 ? '#d29922' : 'var(--accent)');
     // pct 为百分比数值（0-100）：null（无数据/无总量）→ data-nobar 标记，CSS 隐藏填充与波浪；

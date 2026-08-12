@@ -68,8 +68,12 @@ export function sanitizeReportPayload(p) {
       for (const d of p.extra.disk.slice(0, EXTRA_DISK_MAX)) {
         if (!d || typeof d !== 'object') continue;
         const m = String(d.m == null ? '' : d.m).slice(0, DISK_PATH_MAX);
+        // used/total（字节）：百分比由前端计算；兼容旧 agent 上报的 u（百分比）
+        const used = numOrNull(d.used);
+        const total = numOrNull(d.total);
         const u = numOrNull(d.u);
-        if (m && u != null) disk.push({ m, u });
+        if (m && used != null && total != null && total > 0) disk.push({ m, used, total });
+        else if (m && u != null) disk.push({ m, u }); // 旧格式回退
       }
       if (disk.length) e.disk = disk;
     }

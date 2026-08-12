@@ -746,12 +746,15 @@
       },
       scales: { x: axisStyle(), y: axisStyle() },
     });
-    // 生成一块"标题 + canvas"的图块并创建 Chart 实例；tooltipLabel 可选（自定义 tooltip 内容）
-    const mkChart = (title, datasets, tooltipLabel) => {
+    // 取最后一个非 null 数据点（标题右侧最新值用）
+    const lastVal = (arr) => { for (let i = arr.length - 1; i >= 0; i--) if (arr[i] != null) return arr[i]; return null; };
+    // 生成一块"标题 + 最新值 + canvas"的图块并创建 Chart 实例；
+    // tooltipLabel 可选（自定义 tooltip 内容）；latestText 为标题右侧最新数据文本
+    const mkChart = (title, datasets, tooltipLabel, latestText) => {
       const id = `mc-${monitorCharts.length + 1}`;
       const div = document.createElement('div');
       div.className = 'm-chart';
-      div.innerHTML = `<h4 class="m-chart-title">${title}</h4><div class="m-chart-body"><canvas id="${id}"></canvas></div>`;
+      div.innerHTML = `<h4 class="m-chart-title">${title}<span class="m-chart-latest">${latestText || ''}</span></h4><div class="m-chart-body"><canvas id="${id}"></canvas></div>`;
       wrap.appendChild(div);
       const opts = chartOpts();
       if (tooltipLabel) opts.plugins.tooltip.callbacks = { label: tooltipLabel };
@@ -761,34 +764,57 @@
         options: opts,
       }));
     };
+    const memPctOf = (r) => (r && r.mem_total > 0 ? +(r.mem_used / r.mem_total * 100).toFixed(1) : null);
+    const swapPctOf = (r) => { const s = r && r.extra && r.extra.swap, t = r && r.extra && r.extra.swap_total; return s != null && t > 0 ? +(s / t * 100).toFixed(1) : null; };
 
     // CPU：独立图（%）
-    mkChart('CPU（%）', [{ label: 'CPU', data: rows.map((r) => r.cpu), ...lineCfg('#3b82f6', 'rgba(59,130,246,.12)'), fill: true }]);
-    // 内存：单图（MB 曲线），tooltip 同时显示 当前值 / 总量 / 百分比（曲线形状与 % 相同，合并免双轴混淆）
-    mkChart('内存', [{ label: '内存', data: rows.map((r) => (r.mem_used == null ? null : +(r.mem_used / 1048576).toFixed(1))), ...lineCfg('#f59e0b', 'rgba(245,158,11,.08)'), fill: true }],
+    const cpuData = rows.map((r) => r.cpu);
+    mkChart('CPU（%）', [{ label: 'CPU', data: cpuData, ...lineCfg('#3b82f6', 'rgba(59,130,246,.12)'), fill: true }], null,
+      lastVal(cpuData) != null ? `${lastVal(cpuData).toFixed(1)}%` : '');
+    // 内存 + Swap：同为 % 量纲合并一张图；tooltip 显示各自 当前值/总量/百分比
+    const memPctData = rows.map(memPctOf);
+    const swapPctData = rows.map(swapPctOf);
+    mkChart('内存 / Swap（%）', [
+      { label: '内存', data: memPctData, ...lineCfg('#f59e0b', 'rgba(245,158,11,.08)'), fill: true },
+      { label: 'Swap', data: swapPctData, ...lineCfg('#22d3ee', 'transparent') },
+    ],
       (ctx) => {
         const r = rows[ctx.dataIndex];
-        if (!r || r.mem_used == null) return '';
-        const mb = +(r.mem_used / 1048576).toFixed(1);
-        if (r.mem_total > 0) {
-          const tot = +(r.mem_total / 1048576).toFixed(1);
-          const pct = +(r.mem_used / r.mem_total * 100).toFixed(1);
-          return `内存：${mb} MB / ${tot} MB（${pct}%）`;
+        if (!r) return '';
+        if (ctx.datasetIndex === 1) {
+          const s = r.extra && r.extra.swap;
+          if (s == null) return '';
+          const mb = +(s / 1048576).toFixed(1);
+          const t = r.extra && r.extra.swap_total;
+          if (t > 0) return `Swap：${mb} MB / ${+(t / 1048576).toFixed(1)} MB（${swapPctOf(r)}%）`;
+          return `Swap：${mb} MB`;
         }
-        return `内存：${mb} MB`;
-      });
+        if (r.mem_used == null) return '';
+        const mmb = +(r.mem_used / 1048576).toFixed(1);
+        if (r.mem_total > 0) return `内存：${mmb} MB / ${+(r.mem_total / 1048576).toFixed(1)} MB（${memPctOf(r)}%）`;
+        return `内存：${mmb} MB`;
+      },
+      [lastVal(memPctData), lastVal(swapPctData)].filter((v) => v != null).map((v) => `${v}%`).join(' · '));
     // 网络：上下行同量纲（KB/s）放一张，便于对比
+    const netInData = rows.map((r) => (r.net_in == null ? null : +(r.net_in / 1024).toFixed(1)));
+    const netOutData = rows.map((r) => (r.net_out == null ? null : +(r.net_out / 1024).toFixed(1)));
     mkChart('网络（KB/s）', [
-      { label: '下行', data: rows.map((r) => (r.net_in == null ? null : +(r.net_in / 1024).toFixed(1))), ...lineCfg('#22d3ee', 'transparent') },
-      { label: '上行', data: rows.map((r) => (r.net_out == null ? null : +(r.net_out / 1024).toFixed(1))), ...lineCfg('#f472b6', 'transparent') },
-    ]);
+      { label: '下行', data: netInData, ...lineCfg('#22d3ee', 'transparent') },
+      { label: '上行', data: netOutData, ...lineCfg('#f472b6', 'transparent') },
+    ], null,
+      [['↓', lastVal(netInData)], ['↑', lastVal(netOutData)]].filter(([, v]) => v != null).map(([d, v]) => `${d} ${v} KB/s`).join(' · '));
     // 自定义指标：按 ts 对齐系统时间轴，独立一张（量纲差异仅看趋势）
     const cNames = Object.keys(custom || {}).filter((n) => Array.isArray(custom[n]) && custom[n].length);
     if (cNames.length) {
       mkChart('自定义指标', cNames.map((n, i) => {
         const cMap = new Map(custom[n].map((p) => [p.ts, p.value]));
         return { label: n, data: rows.map((r) => (cMap.has(r.ts) ? cMap.get(r.ts) : null)), ...lineCfg(MONITOR_COLORS[i % MONITOR_COLORS.length], 'transparent') };
-      }));
+      }), null,
+        cNames.map((n) => {
+          const pts = custom[n].filter((p) => p.value != null);
+          const v = pts.length ? pts[pts.length - 1].value : null;
+          return v != null ? `${escapeHtml(n)}: ${v}` : '';
+        }).filter(Boolean).join(' · '));
     }
   }
 

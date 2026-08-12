@@ -178,15 +178,17 @@ async fn disk_cache(
 
 // 磁盘：statvfs + /proc/mounts（无外部命令依赖，替代 df -Pkl——busybox 精简版/
 // 最小镜像无 df 或参数缺失）。保留 spawn_blocking + 5s 超时：挂死的 NFS 挂载点上
-// statvfs 同样会阻塞，与 df 行为等价；60s 缓存 + 失败真熔断逻辑不变
-async fn collect_disk() -> Vec<serde_json::Value> {
+// statvfs 同样会阻塞，与 df 行为等价；60s 缓存 + 失败真熔断逻辑不变。
+// include：DISK_FSTYPE_INCLUDE 强制保留的 fstype 列表（默认排除的网络盘可借此计入统计）
+async fn collect_disk(include: &[String]) -> Vec<serde_json::Value> {
     let now = std::time::Instant::now();
     if let Some((ts, disk)) = disk_cache().await.as_ref() {
         if now.duration_since(*ts).as_secs() < 60 {
             return disk.clone(); // 60s 缓存命中（快采 5s → 12 帧只跑一次）
         }
     }
-    let fut = tokio::task::spawn_blocking(disk_usage_static);
+    let include = include.to_vec(); // spawn_blocking 需 'static
+    let fut = tokio::task::spawn_blocking(move || disk_usage_static(&include));
     let out = tokio::time::timeout(Duration::from_secs(5), fut).await;
     match out {
         Ok(Ok(Ok(disk))) => {
@@ -208,41 +210,37 @@ async fn collect_disk() -> Vec<serde_json::Value> {
 }
 
 // statvfs 读取：遍历 /proc/mounts，伪文件系统过滤（proc/sysfs/cgroup 等），
-// 挂载点去重；与原 df -l 的"仅本地文件系统"语义对齐（overlay 是容器根，保留不过滤）
-fn disk_usage_static() -> Result<Vec<serde_json::Value>, ()> {
-    const FAKE_FSTYPES: &[&str] = &[
-        "proc",
-        "sysfs",
-        "devpts",
-        "devtmpfs",
-        "cgroup",
-        "cgroup2",
-        "pstore",
-        "securityfs",
-        "debugfs",
-        "tracefs",
-        "fusectl",
-        "configfs",
-        "mqueue",
-        "binfmt_misc",
-        "hugetlbfs",
-        "autofs",
-        "rpc_pipefs",
-        "nsfs",
-        "bpf",
-    ];
+// 设备去重（同一设备 bind mount 不重复计数，dev 为空/无意义时退回按挂载点去重）。
+// 统计口径向"真实磁盘分区"看齐——默认排除：
+//   1) 虚拟/内存文件系统：tmpfs/ramfs/rootfs 容量是内存比例、overlay 是宿主盘容量、squashfs 只读镜像、
+//      drvfs/9p 是跨系统共享盘——计入会把内存/远程容量混进磁盘 total，稀释使用率
+//   2) 网络文件系统：nfs*/fuse.*（rclone/sshfs 等）统计的是远程配额，不是本机磁盘
+//      （fuseblk 即 NTFS 外接数据盘是真实分区，保留）
+// DISK_FSTYPE_INCLUDE（include 参数）可强制保留上述默认排除的类型（如 fuse.rclone 的 OneDrive）
+fn disk_usage_static(include: &[String]) -> Result<Vec<serde_json::Value>, ()> {
     let mounts = std::fs::read_to_string("/proc/mounts").map_err(|_| ())?;
     let mut out = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for line in mounts.lines() {
         let mut it = line.split_whitespace();
-        let _dev = it.next().unwrap_or("");
+        let dev = it.next().unwrap_or("");
         let mount = it.next().unwrap_or("");
         let fstype = it.next().unwrap_or("");
-        if !mount.starts_with('/') || !seen.insert(mount.to_string()) {
-            continue; // 非绝对路径或重复挂载（bind mount）跳过
+        if !mount.starts_with('/') {
+            continue; // 非绝对路径跳过
         }
-        if FAKE_FSTYPES.contains(&fstype) {
+        // 设备去重：同一设备多挂载（bind/子目录挂载）只保留首个，避免容量重复统计；
+        // dev 为空或 "none" 时无设备语义，退回按挂载点去重
+        let key = if dev.is_empty() || dev == "none" {
+            mount.to_string()
+        } else {
+            dev.to_string()
+        };
+        if !seen.insert(key) {
+            continue;
+        }
+        // 伪文件系统 / 虚拟内存盘 / 网络盘默认跳过；DISK_FSTYPE_INCLUDE 显式保留优先
+        if disk_excluded(fstype, include) {
             continue;
         }
         let c_path = std::ffi::CString::new(mount.as_bytes()).map_err(|_| ())?;
@@ -321,6 +319,112 @@ async fn collect_net() -> (u64, u64) {
     };
     *guard = Some(NetState { rx, tx, ts: now });
     (in_rate, out_rate)
+}
+
+// ---- 磁盘 IO：/sys/block/<dev>/stat 累计计数器差分（与网络速率同模式）----
+// stat 字段（无 major/minor/name 前 3 列，索引 0 起）：
+//   0 reads  2 sectors_read  3 time_reading(ms)  4 writes  6 sectors_written
+//   7 time_writing(ms)  9 time_doing_io(ms)
+// /sys/block 只列整盘（分区在子目录），天然避开分区重复计数；
+// 虚拟设备（ram/loop/dm 等）跳过，仅真实磁盘求和
+struct DiskIoState {
+    reads: u64,
+    writes: u64,
+    r_sectors: u64,
+    w_sectors: u64,
+    t_io_ms: u64,
+    ts: u64,
+}
+static DISK_IO: std::sync::OnceLock<tokio::sync::Mutex<Option<DiskIoState>>> =
+    std::sync::OnceLock::new();
+async fn disk_io_state() -> tokio::sync::MutexGuard<'static, Option<DiskIoState>> {
+    DISK_IO
+        .get_or_init(|| tokio::sync::Mutex::new(None))
+        .lock()
+        .await
+}
+
+fn is_virtual_disk(name: &str) -> bool {
+    const VIRT_PREFIXES: &[&str] = &[
+        "ram", "loop", "fd", "dm-", "md", "sr", "nbd", "zram", "drbd",
+    ];
+    VIRT_PREFIXES.iter().any(|p| name.starts_with(p))
+}
+
+// 汇总全部真实整盘累计值（无真实盘时全 0）
+fn read_disk_io_totals() -> (u64, u64, u64, u64, u64) {
+    let mut reads = 0u64;
+    let mut writes = 0u64;
+    let mut r_sectors = 0u64;
+    let mut w_sectors = 0u64;
+    let mut t_io_ms = 0u64;
+    if let Ok(entries) = std::fs::read_dir("/sys/block") {
+        for ent in entries.flatten() {
+            let name = ent.file_name().to_string_lossy().to_string();
+            if is_virtual_disk(&name) {
+                continue;
+            }
+            if let Some(text) = read_file(&format!("/sys/block/{}/stat", name)) {
+                let f: Vec<u64> = text
+                    .split_whitespace()
+                    .filter_map(|v| v.parse().ok())
+                    .collect();
+                if f.len() >= 10 {
+                    reads += f[0];
+                    r_sectors += f[2];
+                    writes += f[4];
+                    w_sectors += f[6];
+                    t_io_ms += f[9];
+                }
+            }
+        }
+    }
+    (reads, writes, r_sectors, w_sectors, t_io_ms)
+}
+
+// 差分计算（纯函数便于测试）：dt=0 或无数据时返回空对象（首帧无历史，返回 {} 由白名单丢弃）
+fn disk_io_diff(prev: &DiskIoState, cur: &DiskIoState) -> serde_json::Value {
+    let dt = cur.ts.saturating_sub(prev.ts);
+    if dt == 0 {
+        return json!({});
+    }
+    let kb = |sectors: u64, base: u64| {
+        ((sectors.saturating_sub(base)) as f64 * 512.0 / dt as f64 / 1024.0 * 10.0).round() / 10.0
+    };
+    let iops = |cnt: u64, base: u64| ((cnt.saturating_sub(base)) as f64 / dt as f64).round();
+    // util%：Δtime_doing_io / Δt × 100；多盘并行求和可能超 100%，clamp
+    let util = ((cur.t_io_ms.saturating_sub(prev.t_io_ms)) as f64 / (dt as f64 * 1000.0) * 100.0)
+        .clamp(0.0, 100.0);
+    json!({
+        "read_kbs": kb(cur.r_sectors, prev.r_sectors),
+        "write_kbs": kb(cur.w_sectors, prev.w_sectors),
+        "r_iops": iops(cur.reads, prev.reads),
+        "w_iops": iops(cur.writes, prev.writes),
+        "util_pct": (util * 10.0).round() / 10.0,
+    })
+}
+
+async fn collect_disk_io() -> serde_json::Value {
+    let (reads, writes, r_sectors, w_sectors, t_io_ms) = read_disk_io_totals();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let cur = DiskIoState {
+        reads,
+        writes,
+        r_sectors,
+        w_sectors,
+        t_io_ms,
+        ts: now,
+    };
+    let mut guard = disk_io_state().await;
+    let out = match guard.as_ref() {
+        Some(prev) => disk_io_diff(prev, &cur),
+        None => json!({}),
+    };
+    *guard = Some(cur);
+    out
 }
 
 // 系统信息缓存：OS/内核/IP 基本不变，10min 内复用（快采不再每帧 fork uname/hostname）
@@ -584,11 +688,59 @@ async fn collect_custom(cfg: &Config) -> Vec<serde_json::Value> {
     out
 }
 
+// DISK_FSTYPE_INCLUDE 解析：逗号分隔、去空白、去空项
+pub fn disk_include(cfg: &Config) -> Vec<String> {
+    cfg.disk_fstype_include
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+// 磁盘统计过滤判断：伪文件系统 / 虚拟内存盘（tmpfs/ramfs/overlay/squashfs/drvfs/9p）/
+// 网络盘（nfs*/cifs/smbfs/fuse.*）默认排除；include 中显式列出的 fstype 强制保留。
+// fuseblk（NTFS 外接数据盘，走 fuse 驱动）是真实分区，不排除
+fn disk_excluded(fstype: &str, include: &[String]) -> bool {
+    if include.iter().any(|s| s == fstype) {
+        return false;
+    }
+    const FAKE: &[&str] = &[
+        "proc",
+        "sysfs",
+        "devpts",
+        "devtmpfs",
+        "cgroup",
+        "cgroup2",
+        "pstore",
+        "securityfs",
+        "debugfs",
+        "tracefs",
+        "fusectl",
+        "configfs",
+        "mqueue",
+        "binfmt_misc",
+        "hugetlbfs",
+        "autofs",
+        "rpc_pipefs",
+        "nsfs",
+        "bpf",
+    ];
+    const VIRT: &[&str] = &[
+        "tmpfs", "ramfs", "overlay", "squashfs", "drvfs", "9p", "rootfs",
+    ];
+    const NET: &[&str] = &["nfs", "nfs4", "cifs", "smbfs", "fuse"];
+    FAKE.contains(&fstype)
+        || VIRT.contains(&fstype)
+        || NET.contains(&fstype)
+        || fstype.starts_with("fuse.")
+}
+
 // ---- 汇总上报 ----
 pub async fn collect_report(cfg: &Config) -> Option<String> {
     // 无依赖采集项并行（join!），消除串行累积（cpu 200ms + df/uname/hostname 5s 上限 +
     // probes/custom 5s/个）对快采帧率的稀释；blocking 峰值 = info(1) + disk(1) = 2 < Semaphore 4
-    let (cpu, mem, load, conns, net, info, probes, custom, disk) = tokio::join!(
+    let disk_inc = disk_include(cfg);
+    let (cpu, mem, load, conns, net, info, probes, custom, disk, disk_io) = tokio::join!(
         collect_cpu(),
         async { collect_mem() },
         async { collect_load() },
@@ -597,7 +749,8 @@ pub async fn collect_report(cfg: &Config) -> Option<String> {
         collect_info(),
         collect_probes(cfg),
         collect_custom(cfg),
-        collect_disk(),
+        collect_disk(&disk_inc),
+        collect_disk_io(),
     );
     let (mem_used, mem_total, swap, swap_total) = mem;
     let (l1, l5, l15, procs, uptime) = load;
@@ -614,6 +767,7 @@ pub async fn collect_report(cfg: &Config) -> Option<String> {
             "swap": swap,
             "swap_total": swap_total,
             "disk": disk,
+            "disk_io": disk_io,
             "load1": l1, "load5": l5, "load15": l15,
             "temp": collect_temp(),
             "procs": procs, "tcp": tcp, "udp": udp,
@@ -651,5 +805,108 @@ mod tests {
         let (tcp, udp) = collect_conns();
         assert!(tcp > 0, "/proc/net/tcp 应可读");
         assert!(udp > 0);
+    }
+
+    #[test]
+    fn is_virtual_disk_filters_ram_loop() {
+        assert!(is_virtual_disk("ram0"));
+        assert!(is_virtual_disk("loop7"));
+        assert!(is_virtual_disk("dm-0"));
+        assert!(is_virtual_disk("md0"));
+        assert!(is_virtual_disk("sr0"));
+        assert!(is_virtual_disk("zram0"));
+        // 真实盘保留
+        assert!(!is_virtual_disk("sda"));
+        assert!(!is_virtual_disk("nvme0n1"));
+        assert!(!is_virtual_disk("vda"));
+        assert!(!is_virtual_disk("mmcblk0"));
+    }
+
+    #[test]
+    fn disk_io_diff_computes_rates() {
+        let prev = DiskIoState {
+            reads: 100,
+            writes: 50,
+            r_sectors: 1000, // 1000 扇区 × 512 = 500KB
+            w_sectors: 500,  // 250KB
+            t_io_ms: 0,
+            ts: 1000,
+        };
+        let cur = DiskIoState {
+            reads: 130,      // 30 次 / 10s = 3 IOPS
+            writes: 70,      // 20 次 / 10s = 2 IOPS
+            r_sectors: 2000, // 500KB / 10s = 50 KB/s
+            w_sectors: 1000, // 250KB / 10s = 25 KB/s
+            t_io_ms: 5000,   // 5s / 10s = 50%
+            ts: 1010,
+        };
+        let v = disk_io_diff(&prev, &cur);
+        assert_eq!(v["read_kbs"], 50.0);
+        assert_eq!(v["write_kbs"], 25.0);
+        assert_eq!(v["r_iops"], 3.0);
+        assert_eq!(v["w_iops"], 2.0);
+        assert_eq!(v["util_pct"], 50.0);
+        // dt=0 空对象（首帧语义）
+        assert_eq!(
+            disk_io_diff(&cur, &DiskIoState { ts: 1010, ..cur }),
+            json!({})
+        );
+    }
+
+    #[test]
+    fn disk_excluded_filters_virtual_and_network() {
+        let empty: Vec<String> = vec![];
+        // 真实磁盘分区保留
+        assert!(!disk_excluded("ext4", &empty));
+        assert!(!disk_excluded("xfs", &empty));
+        assert!(!disk_excluded("btrfs", &empty));
+        assert!(!disk_excluded("vfat", &empty));
+        assert!(!disk_excluded("fuseblk", &empty)); // NTFS 外接盘是真实分区
+                                                    // 伪文件系统 / 虚拟内存盘 / 网络盘排除
+        assert!(disk_excluded("proc", &empty));
+        assert!(disk_excluded("tmpfs", &empty));
+        assert!(disk_excluded("ramfs", &empty));
+        assert!(disk_excluded("overlay", &empty));
+        assert!(disk_excluded("rootfs", &empty)); // WSL /init 是内核内存 FS
+        assert!(disk_excluded("squashfs", &empty));
+        assert!(disk_excluded("drvfs", &empty));
+        assert!(disk_excluded("9p", &empty));
+        assert!(disk_excluded("nfs", &empty));
+        assert!(disk_excluded("nfs4", &empty));
+        assert!(disk_excluded("cifs", &empty));
+        assert!(disk_excluded("fuse", &empty));
+        assert!(disk_excluded("fuse.rclone", &empty));
+        assert!(disk_excluded("fuse.sshfs", &empty));
+    }
+
+    #[test]
+    fn disk_excluded_include_overrides() {
+        // DISK_FSTYPE_INCLUDE 显式保留优先于默认排除
+        let inc = vec!["fuse.rclone".to_string(), "tmpfs".to_string()];
+        assert!(!disk_excluded("fuse.rclone", &inc)); // OneDrive 挂载点计入统计
+        assert!(!disk_excluded("tmpfs", &inc));
+        assert!(disk_excluded("nfs", &inc)); // 未列出的网络盘仍排除
+                                             // include 是精确匹配：fuse.sshfs 不会被 fuse.rclone 放行
+        assert!(disk_excluded("fuse.sshfs", &inc));
+    }
+
+    #[test]
+    fn disk_include_parses_csv() {
+        let cfg = crate::Config {
+            wss: String::new(),
+            key: String::new(),
+            report_interval: 120,
+            disable_exec: false,
+            probes: String::new(),
+            custom_metrics: String::new(),
+            disk_fstype_include: " fuse.rclone, tmpfs ,,".to_string(),
+            tmp_dir: String::new(),
+            log_file: String::new(),
+            log_max: 0,
+        };
+        assert_eq!(
+            disk_include(&cfg),
+            vec!["fuse.rclone".to_string(), "tmpfs".to_string()]
+        );
     }
 }

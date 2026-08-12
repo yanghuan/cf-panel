@@ -5,6 +5,7 @@
 //           report（上报落库）、routes（REST/MCP/WS 路由）、do-*（三个 DO 类）
 // ============================================================
 import { handleApi, handleMcp, handleWs, loginFails, apiCounts } from './routes.js';
+import { sanitizeReportPayload } from './report.js';
 import { TerminalDO } from './do-terminal.js';
 import { MetricsDO } from './do-metrics.js';
 import { PanelDO } from './do-panel.js';
@@ -44,7 +45,7 @@ export const __internals = {
   b64u, b64uDecode, bytesToHex, hmacSha256,
   signJwt, verifyJwt, randomHex, sha256Hex,
   parseRangeHours, safeJson, sanitizeAlerts, hashSecret,
-  renderTemplate, parseHeaders, sendWebhook,
+  renderTemplate, parseHeaders, sendWebhook, sanitizeReportPayload,
   shardForServerId, makeStreamId, shardFromStreamId,
   isAdmin, canAccessServer, canExec, handleReport,
   lastSeenWrite, LAST_SEEN_THROTTLE_S, customWritten, serverListCache, apiCounts, serverRowCache, reportBatch,

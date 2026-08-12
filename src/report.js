@@ -40,6 +40,7 @@ export function setReportFlushAt(v) { reportFlushAt = v; } // let 原始值无�
 // 入口处归一化 + 白名单 + 条数/体积上限，一处收口消除四类后果：
 // 注入（extra 键白名单）、告警丢失/归档停摆（数值归一化，杜绝对象/数组混入）、容量放大（条数与体积上限）。
 const EXTRA_NUM_KEYS = ['swap', 'swap_total', 'load1', 'load5', 'load15', 'procs', 'tcp', 'udp', 'uptime', 'temp'];
+const DISK_IO_NUM_KEYS = ['read_kbs', 'write_kbs', 'r_iops', 'w_iops', 'util_pct']; // 磁盘 IO 嵌套对象白名单
 const EXTRA_DISK_MAX = 20;    // 挂载点条数上限（agent 正常 <10）
 const DISK_PATH_MAX = 128;    // 挂载点路径长度上限
 const CUSTOM_MAX = 50;        // 自定义指标条数上限
@@ -76,6 +77,15 @@ export function sanitizeReportPayload(p) {
         else if (m && u != null) disk.push({ m, u }); // 旧格式回退
       }
       if (disk.length) e.disk = disk;
+    }
+    // 磁盘 IO：嵌套对象白名单 + 数值归一化（无有效键时丢弃）
+    if (p.extra.disk_io && typeof p.extra.disk_io === 'object' && !Array.isArray(p.extra.disk_io)) {
+      const io = {};
+      for (const k of DISK_IO_NUM_KEYS) {
+        const v = numOrNull(p.extra.disk_io[k]);
+        if (v != null) io[k] = v;
+      }
+      if (Object.keys(io).length) e.disk_io = io;
     }
     try {
       out.extra = JSON.stringify(e).length <= EXTRA_JSON_MAX ? e : null;

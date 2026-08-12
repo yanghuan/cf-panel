@@ -171,6 +171,38 @@ test('sanitizeAlerts', () => {
   assert.equal(I.sanitizeAlerts({ method: 'put' }).method, 'PUT'); // 大小写归一 + PUT 允许
 });
 
+// ---------------- 上报 sanitize：磁盘 IO 白名单 ----------------
+test('sanitizeReportPayload 磁盘 IO 嵌套对象白名单归一化', () => {
+  // 合法上报：字符串数字归一化，未知键剔除
+  const out = I.sanitizeReportPayload({
+    serverId: 1,
+    extra: {
+      disk_io: { read_kbs: '12.4', write_kbs: 3.1, r_iops: '12', w_iops: 33, util_pct: 2.3, evil: 'x' },
+    },
+  });
+  assert.deepEqual(out.extra.disk_io, {
+    read_kbs: 12.4, write_kbs: 3.1, r_iops: 12, w_iops: 33, util_pct: 2.3,
+  });
+  // 恶意/坏数据：对象/多元素数组/'abc'/NaN → null；全无效时整个 disk_io 丢弃
+  // （与既有 numOrNull 语义一致：单元素数组 [1]→1、null→0 会保留）
+  const bad = I.sanitizeReportPayload({
+    serverId: 1,
+    extra: {
+      disk_io: { read_kbs: {}, write_kbs: 'abc', r_iops: [1, 2], w_iops: NaN, util_pct: 'x' },
+    },
+  });
+  assert.equal(bad.extra.disk_io, undefined);
+  // 单元素数组按既有语义归一化为数字
+  const arr = I.sanitizeReportPayload({
+    serverId: 1,
+    extra: { disk_io: { r_iops: [7], util_pct: null } },
+  });
+  assert.deepEqual(arr.extra.disk_io, { r_iops: 7, util_pct: 0 });
+  // 非对象类型（数组/字符串）直接丢弃
+  assert.equal(I.sanitizeReportPayload({ serverId: 1, extra: { disk_io: [1, 2] } }).extra.disk_io, undefined);
+  assert.equal(I.sanitizeReportPayload({ serverId: 1, extra: { disk_io: 'x' } }).extra.disk_io, undefined);
+});
+
 // ---------------- 模板渲染 / Headers ----------------
 test('renderTemplate 占位符替换，缺失键替换为空', () => {
   const vars = { event: 'alert', title: 'T', token: 'tok' };

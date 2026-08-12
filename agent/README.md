@@ -62,6 +62,7 @@ AGENT_KEY=<面板添加服务器时生成的 key> \
 | `DISABLE_EXEC` | 0 | =1 禁用终端/文件（仅保留监控） |
 | `PROBES` | 空 | 服务探活 `name:http:URL,name:tcp:host:port,...` |
 | `CUSTOM_METRICS` | 空 | 自定义指标 JSON `[{"name","cmd"}]` |
+| `DISK_FSTYPE_INCLUDE` | 空 | 磁盘统计强制保留的 fstype（逗号分隔）。默认只统计真实磁盘分区（排除 tmpfs/overlay/squashfs/rootfs/drvfs/9p 等虚拟盘与 nfs/cifs/fuse.* 网络盘）；如需统计网络盘（如 rclone 挂载的 OneDrive）配置如 `fuse.rclone` |
 | `AGENT_TMPDIR` | `/tmp/cfpanel-<key前8位>` | 临时目录 |
 | `AGENT_LOG` | `/tmp/cfpanel-<key前8位>-agent.log` | 日志文件 |
 | `AGENT_LOG_MAX` | 262144 | 日志轮转上限字节 |

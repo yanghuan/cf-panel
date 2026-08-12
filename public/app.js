@@ -130,6 +130,15 @@
       : '-']);
     rows.push(['负载 (1/5/15)', [e.load1, e.load5, e.load15].map((v) => (v != null ? Number(v).toFixed(2) : '-')).join(' / ')]);
     rows.push(['网络', (m.net_in != null ? '↓ ' + fmtBytes(m.net_in) + '/s' : '-') + ' · ' + (m.net_out != null ? '↑ ' + fmtBytes(m.net_out) + '/s' : '-')]);
+    if (e.disk_io && (e.disk_io.read_kbs != null || e.disk_io.write_kbs != null || e.disk_io.util_pct != null)) {
+      const io = e.disk_io;
+      rows.push(['磁盘 IO', [
+        io.read_kbs != null ? `↓ ${io.read_kbs}KB/s` : null,
+        io.write_kbs != null ? `↑ ${io.write_kbs}KB/s` : null,
+        io.r_iops != null && io.w_iops != null ? `IOPS ${io.r_iops}/${io.w_iops}` : null,
+        io.util_pct != null ? `util ${io.util_pct}%` : null,
+      ].filter(Boolean).join(' · ') || '-']);
+    }
     if (e.procs != null) rows.push(['进程数', escapeHtml(e.procs)]);
     if (e.tcp != null) rows.push(['TCP / UDP', escapeHtml(e.tcp) + ' / ' + (e.udp != null ? escapeHtml(e.udp) : '-')]);
     rows.push(['温度', e.temp != null ? Number(e.temp).toFixed(1) + ' °C' : 'N/A']);
@@ -790,14 +799,20 @@
     const liveCharts = [];
     // 生成一块"标题 + 最新值 + canvas"的图块并创建 Chart 实例；
     // tooltipLabel 可选（自定义 tooltip 内容）；latestText 为标题右侧最新数据文本；yUnit 为 Y 轴刻度单位；
-    // fmt 可选（实时更新时自定义标题右侧最新值文本，默认数值用 ' · ' 连接）
-    const mkChart = (title, datasets, tooltipLabel, latestText, liveGet, yUnit, fmt) => {
+    // fmt 可选（实时更新时自定义标题右侧最新值文本，默认数值用 ' · ' 连接）；
+    // y2Unit 可选（右侧 Y 轴单位，dataset 用 yAxisID: 'y2' 挂右轴，如 %util）
+    const mkChart = (title, datasets, tooltipLabel, latestText, liveGet, yUnit, fmt, y2Unit) => {
       const id = `mc-${monitorCharts.length + 1}`;
       const div = document.createElement('div');
       div.className = 'm-chart';
       div.innerHTML = `<h4 class="m-chart-title">${title}<span class="m-chart-latest">${latestText || ''}</span></h4><div class="m-chart-body"><canvas id="${id}"></canvas></div>`;
       wrap.appendChild(div);
       const opts = chartOpts(yUnit);
+      if (y2Unit) {
+        opts.scales.y2 = axisStyle(y2Unit);
+        opts.scales.y2.position = 'right'; // 右轴移到最右侧（Chart.js 默认与左轴堆叠）
+        opts.scales.y2.grid = { drawOnChartArea: false }; // 双轴网格不叠加
+      }
       if (tooltipLabel) opts.plugins.tooltip.callbacks = { label: tooltipLabel };
       const chart = new Chart(document.getElementById(id), {
         type: 'line',
@@ -817,10 +832,17 @@
     };
     const memPctOf = (r) => (r && r.mem_total > 0 ? +(r.mem_used / r.mem_total * 100).toFixed(1) : null);
     const swapPctOf = (r) => { const s = r && r.extra && r.extra.swap, t = r && r.extra && r.extra.swap_total; return s != null && t > 0 ? +(s / t * 100).toFixed(1) : null; };
+    // tooltip 格式化：按 dataset label 追加单位或函数格式化（如 {CPU:(v)=>v.toFixed(1)+'%'}）；未配置的不追加
+    const tipWith = (units) => (ctx) => {
+      const v = ctx.raw;
+      if (v == null) return '';
+      const u = units[ctx.dataset.label];
+      return `${ctx.dataset.label}：${typeof u === 'function' ? u(v) : v}${typeof u === 'string' ? u : ''}`;
+    };
 
     // CPU：独立图（%）
     const cpuData = rows.map((r) => r.cpu);
-    mkChart('CPU（%）', [{ label: 'CPU', data: cpuData, ...lineCfg('#3b82f6', 'rgba(59,130,246,.12)'), fill: true }], null,
+    mkChart('CPU（%）', [{ label: 'CPU', data: cpuData, ...lineCfg('#3b82f6', 'rgba(59,130,246,.12)'), fill: true }], tipWith({ CPU: (v) => v.toFixed(1) + '%' }),
       lastVal(cpuData) != null ? `${lastVal(cpuData).toFixed(1)}%` : '',
       (m) => (m.cpu == null ? null : m.cpu.toFixed(1) + '%'),
       '%');
@@ -871,7 +893,7 @@
     mkChart('网络（KB/s）', [
       { label: '下行', data: netInData, ...lineCfg('#22d3ee', 'transparent') },
       { label: '上行', data: netOutData, ...lineCfg('#f472b6', 'transparent') },
-    ], null,
+    ], tipWith({ 下行: ' KB/s', 上行: ' KB/s' }),
       [['↓', lastVal(netInData)], ['↑', lastVal(netOutData)]].filter(([, v]) => v != null).map(([d, v]) => `${d} ${v} KB/s`).join(' · '),
       (m) => {
         const vals = [m.net_in, m.net_out].map((v) => (v == null ? null : +(v / 1024).toFixed(1)));
@@ -900,6 +922,41 @@
       },
       '',
       ([tcp, udp]) => [['TCP', tcp], ['UDP', udp]].filter(([, v]) => v != null).map(([d, v]) => `${d}：${v}`).join(' · '));
+    // 磁盘 IO：读写速率（KB/s，左轴）+ %util（右轴 %）双轴一图——吞吐与忙占比同看；
+    // IOPS 量纲独立（次/秒）单独一张
+    const ioOf = (r) => (r && r.extra && r.extra.disk_io) || null;
+    const ioReadData = rows.map((r) => { const io = ioOf(r); return io && io.read_kbs != null ? io.read_kbs : null; });
+    const ioWriteData = rows.map((r) => { const io = ioOf(r); return io && io.write_kbs != null ? io.write_kbs : null; });
+    const ioUtilData = rows.map((r) => { const io = ioOf(r); return io && io.util_pct != null ? io.util_pct : null; });
+    const ioLast = (io) => (io && io.read_kbs != null ? `↓ ${io.read_kbs} KB/s` : '') +
+      (io && io.write_kbs != null ? ` · ↑ ${io.write_kbs} KB/s` : '') +
+      (io && io.util_pct != null ? ` · util ${io.util_pct}%` : '');
+    mkChart('磁盘 IO（KB/s · %）', [
+      { label: '读', data: ioReadData, ...lineCfg('#22d3ee', 'transparent') },
+      { label: '写', data: ioWriteData, ...lineCfg('#f472b6', 'transparent') },
+      { label: 'util', data: ioUtilData, ...lineCfg('#34d399', 'transparent'), yAxisID: 'y2' },
+    ], tipWith({ 读: ' KB/s', 写: ' KB/s', util: '%' }),
+      ioLast({ read_kbs: lastVal(ioReadData), write_kbs: lastVal(ioWriteData), util_pct: lastVal(ioUtilData) }),
+      (m) => {
+        const io = ioOf(m);
+        return [io && io.read_kbs, io && io.write_kbs, io && io.util_pct].map((v) => (v == null ? null : v));
+      },
+      'KB/s',
+      ([r, w, u]) => [r != null ? `↓ ${r} KB/s` : null, w != null ? `↑ ${w} KB/s` : null, u != null ? `util ${u}%` : null].filter(Boolean).join(' · '),
+      '%');
+    const ioRData = rows.map((r) => { const io = ioOf(r); return io && io.r_iops != null ? io.r_iops : null; });
+    const ioWData = rows.map((r) => { const io = ioOf(r); return io && io.w_iops != null ? io.w_iops : null; });
+    mkChart('磁盘 IOPS', [
+      { label: '读', data: ioRData, ...lineCfg('#22d3ee', 'transparent') },
+      { label: '写', data: ioWData, ...lineCfg('#f472b6', 'transparent') },
+    ], tipWith({ 读: ' 次/秒', 写: ' 次/秒' }),
+      [['读', lastVal(ioRData)], ['写', lastVal(ioWData)]].filter(([, v]) => v != null).map(([d, v]) => `${d} ${v}`).join(' · '),
+      (m) => {
+        const io = ioOf(m);
+        return [io && io.r_iops, io && io.w_iops].map((v) => (v == null ? null : v));
+      },
+      '次/秒',
+      ([r, w]) => [['读', r], ['写', w]].filter(([, v]) => v != null).map(([d, v]) => `${d} ${v}`).join(' · '));
     // 自定义指标：按 ts 对齐系统时间轴，独立一张（量纲差异仅看趋势）
     const cNames = Object.keys(custom || {}).filter((n) => Array.isArray(custom[n]) && custom[n].length);
     if (cNames.length) {

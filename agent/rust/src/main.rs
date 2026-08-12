@@ -28,6 +28,7 @@ pub struct Config {
     pub disable_exec: bool,
     pub probes: String,
     pub custom_metrics: String,
+    pub disk_fstype_include: String,
     pub tmp_dir: String,
     pub log_file: String,
     pub log_max: u64,
@@ -46,6 +47,9 @@ fn read_config() -> Config {
         disable_exec: std::env::var("DISABLE_EXEC").unwrap_or_default() == "1",
         probes: std::env::var("PROBES").unwrap_or_default(),
         custom_metrics: std::env::var("CUSTOM_METRICS").unwrap_or_default(),
+        // 磁盘统计强制保留的 fstype（逗号分隔）：默认排除虚拟/内存与网络文件系统，
+        // 如挂载 OneDrive 的 fuse.rclone 想计入统计则配置 DISK_FSTYPE_INCLUDE=fuse.rclone
+        disk_fstype_include: std::env::var("DISK_FSTYPE_INCLUDE").unwrap_or_default(),
         tmp_dir: std::env::var("AGENT_TMPDIR").unwrap_or_else(|_| format!("/tmp/cfpanel-{slug}")),
         log_file: std::env::var("AGENT_LOG")
             .unwrap_or_else(|_| format!("/tmp/cfpanel-{slug}-agent.log")),
@@ -760,6 +764,9 @@ fn print_help() {
     println!("  PROBES            默认 空    服务探活：\"name:http:URL,name:tcp:host:port,...\"");
     println!(
         "  CUSTOM_METRICS    默认 空    自定义指标 JSON：[{{\"name\":\"x\",\"cmd\":\"命令\"}}]"
+    );
+    println!(
+        "  DISK_FSTYPE_INCLUDE 默认 空  磁盘统计强制保留的 fstype（逗号分隔），如 fuse.rclone"
     );
     println!("  AGENT_TMPDIR      默认 /tmp/cfpanel-<key前8位>   临时目录");
     println!("  AGENT_LOG         默认 /tmp/cfpanel-<key前8位>-agent.log   日志文件");

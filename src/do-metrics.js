@@ -436,10 +436,15 @@ export class MetricsDO {
         alerts.push(`内存 ${memPct.toFixed(1)}% >= ${cfg.mem_pct}%`);
       }
     }
-    // 磁盘（根分区）
+    // 磁盘（根分区）：新格式 used/total 计算百分比，旧格式 u 回退
     const rootDisk = b.extra && b.extra.disk && b.extra.disk.find((d) => d.m === '/');
-    if (rootDisk && rootDisk.u != null && rootDisk.u >= cfg.disk_pct && await cooled(`${b.serverId}:disk`)) {
-      alerts.push(`磁盘 / ${rootDisk.u}% >= ${cfg.disk_pct}%`);
+    if (rootDisk) {
+      const rootPct = rootDisk.used != null && rootDisk.total > 0
+        ? (rootDisk.used / rootDisk.total) * 100
+        : rootDisk.u;
+      if (rootPct != null && rootPct >= cfg.disk_pct && await cooled(`${b.serverId}:disk`)) {
+        alerts.push(`磁盘 / ${rootPct.toFixed(1)}% >= ${cfg.disk_pct}%`);
+      }
     }
     // 负载（可选，未设置则不启用）
     if (cfg.load > 0 && b.extra && b.extra.load1 != null && b.extra.load1 >= cfg.load && await cooled(`${b.serverId}:load`)) {

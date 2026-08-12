@@ -664,12 +664,12 @@ test('MetricsDO: /report 内存/磁盘/负载阈值告警', async () => {
       body: JSON.stringify({
         serverId: 2, serverName: 'srv2', minTs: nowMin,
         cpu: 10, mem_used: 900, mem_total: 1000, // mem 90%
-        extra: { disk: [{ m: '/', u: 95 }], load1: 8 },
+        extra: { disk: [{ m: '/', used: 95, total: 100 }], load1: 8 }, // 磁盘新格式 used/total 95%
       }),
     });
     assert.equal(cap.calls.length, 1);
     const details = JSON.parse(cap.calls[0].init.body).details;
-    assert.deepEqual(details, ['内存 90.0% >= 90%', '磁盘 / 95% >= 80%', '负载 8 >= 5']);
+    assert.deepEqual(details, ['内存 90.0% >= 90%', '磁盘 / 95.0% >= 80%', '负载 8 >= 5']);
   } finally {
     cap.restore();
   }

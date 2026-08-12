@@ -103,6 +103,20 @@
     }
   }
 
+  // 磁盘整体使用率：新格式 {m,used,total} 累计求和（与 tooltip 标题栏累计一致）；
+  // 全为旧格式 {m,u}（无字节值无法累计）时回退最大值。返回 {used,total,pct} 或 null
+  function diskSumOf(m) {
+    const arr = m && m.extra && m.extra.disk;
+    if (!Array.isArray(arr) || !arr.length) return null;
+    let used = 0, total = 0, maxU = 0;
+    for (const d of arr) {
+      if (d.used != null && d.total > 0) { used += d.used; total += d.total; }
+      else maxU = Math.max(maxU, Number(d.u) || 0);
+    }
+    if (total > 0) return { used, total, pct: +(used / total * 100).toFixed(1) };
+    return maxU > 0 ? { pct: +maxU.toFixed(1) } : null;
+  }
+
   // 悬浮指标详情：展示 agent 上报的全部监控条目 + 系统信息
   function metricTipHtml(m, info) {
     const e = m.extra || {};
@@ -161,13 +175,6 @@
   function metricBlockHtml(s) {
     const m = s.metric;
     if (!m) return '';
-    // 磁盘使用率：取所有挂载点中最大
-    // 磁盘使用率（%）：新格式 used/total 计算，旧格式 u 回退；取所有挂载点中最大
-    function diskPct() {
-      const arr = m.extra && m.extra.disk;
-      if (!Array.isArray(arr) || !arr.length) return null;
-      return Math.max(...arr.map((d) => (d.used != null && d.total > 0 ? d.used / d.total * 100 : Number(d.u) || 0)));
-    }
     const barColor = (p) => (p >= 90 ? '#f85149' : p >= 70 ? '#d29922' : 'var(--accent)');
     // pct 为百分比数值（0-100）：null（无数据/无总量）→ data-nobar 标记，CSS 隐藏填充与波浪；
     // 有值 → --p 比例 + --bar-c 分级色
@@ -178,7 +185,9 @@
     const swap = m.extra && m.extra.swap;
     const swapTotal = m.extra && m.extra.swap_total;
     const swapPct = swap != null && swapTotal > 0 ? swap / swapTotal * 100 : null;
-    const dPct = diskPct();
+    // 磁盘整体使用率（累计，与 tooltip 标题栏一致）
+    const dSum = diskSumOf(m);
+    const dPct = dSum ? dSum.pct : null;
     return `
         <div class="metric" data-metric="${escapeHtml(JSON.stringify({ metric: m, info: s.info || null }))}">
           <span class="m-cell"${barAttr(m.cpu)}><b>${m.cpu == null ? '-' : m.cpu.toFixed(1) + '%'}</b><i>CPU</i></span>
@@ -186,7 +195,7 @@
           <span class="m-cell" data-nobar><b>${m.extra && m.extra.load1 != null ? Number(m.extra.load1).toFixed(2) : '-'}</b><i>负载</i></span>
           <span class="m-cell" data-nobar><b>${m.net_in != null ? fmtBytes(m.net_in) + '/s' : '-'}</b><i>网络↓</i></span>
           <span class="m-cell"${barAttr(swapPct)}><b>${swap != null ? fmtBytes(swap) : '-'}</b><i>Swap</i></span>
-          <span class="m-cell"${barAttr(dPct)}><b>${dPct == null ? '-' : dPct + '%'}</b><i>磁盘</i></span>
+          <span class="m-cell"${barAttr(dPct)}><b>${dPct == null ? '-' : dPct.toFixed(1) + '%'}</b><i>磁盘</i></span>
         </div>`;
   }
   // 探活行 HTML
@@ -839,6 +848,20 @@
       },
       [lastVal(memPctData), lastVal(swapPctData)].filter((v) => v != null).map((v) => `${v}%`).join(' · '),
       (m) => [memPctOf(m), swapPctOf(m)].map((v) => (v == null ? null : v + '%')),
+      '%');
+    // 磁盘：整体使用率（累计，与卡片/tooltip 标题栏一致），% 量纲独立图；tooltip 显示累计当前值/最大值
+    const diskSumData = rows.map(diskSumOf);
+    const diskPctData = diskSumData.map((d) => (d ? d.pct : null));
+    mkChart('磁盘（%）', [
+      { label: '磁盘', data: diskPctData, ...lineCfg('#34d399', 'rgba(52,211,153,.08)'), fill: true },
+    ],
+      (ctx) => {
+        const d = diskSumData[ctx.dataIndex];
+        if (!d) return '';
+        return d.used != null ? `磁盘：${fmtBytes(d.used)} / ${fmtBytes(d.total)}（${d.pct}%）` : `磁盘：${d.pct}%`;
+      },
+      lastVal(diskPctData) != null ? `${lastVal(diskPctData)}%` : '',
+      (m) => { const d = diskSumOf(m); return d ? d.pct + '%' : null; },
       '%');
     // 网络：上下行同量纲（KB/s）放一张，便于对比
     const netInData = rows.map((r) => (r.net_in == null ? null : +(r.net_in / 1024).toFixed(1)));

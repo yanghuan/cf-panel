@@ -61,7 +61,7 @@
 
   const geoCache = new Map(); // ip -> {label, cc}（内存缓存：同页会话命中）
   const GEO_CACHE_KEY = 'cfpanel_geo_cache';
-  const GEO_CACHE_TTL = 7 * 24 * 3600 * 1000; // 持久化缓存 7 天（IP 变化少，避免跨刷新/跨会话重复查询）
+  const GEO_CACHE_TTL = 45 * 24 * 3600 * 1000; // 持久化缓存 45 天（服务器 IP 归属地几乎不变，吸收第三方数据库修正即可，避免频繁重查）
   const GEO_CACHE_MAX = 500;
   // 启动时从 localStorage 恢复持久化缓存（仅未过期条目）。
   // 只恢复新格式（含 cc 字段）：旧格式（仅 label 字符串，无国家代码）直接丢弃——

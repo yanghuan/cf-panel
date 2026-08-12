@@ -742,9 +742,15 @@
     const tsArr = rows.map((r) => r.ts);
     const labels = rows.map((r) => new Date(r.ts * 60000).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }));
     const lineCfg = (color, fill) => ({ borderColor: color, backgroundColor: fill, tension: 0.3, pointRadius: 0, borderWidth: 1.8, spanGaps: true });
-    // 公共刻度样式
-    const axisStyle = () => ({ ticks: { color: '#8b949e', maxTicksLimit: 8, maxRotation: 0 }, grid: { color: 'rgba(255,255,255,.04)' } });
-    const chartOpts = () => ({
+    // 公共刻度样式；unit 可选（如 '%'/'KB/s'）→ Y 轴刻度值后追加单位
+    const axisStyle = (unit) => ({
+      ticks: {
+        color: '#8b949e', maxTicksLimit: 8, maxRotation: 0,
+        callback: unit ? (v) => `${v}${unit}` : undefined,
+      },
+      grid: { color: 'rgba(255,255,255,.04)' },
+    });
+    const chartOpts = (yUnit) => ({
       responsive: true,
       maintainAspectRatio: false,
       interaction: { mode: 'index', intersect: false },
@@ -752,21 +758,21 @@
         legend: { labels: { color: '#8b949e', boxWidth: 12 } },
         tooltip: { backgroundColor: '#1c2230', borderColor: '#2d333b', borderWidth: 1, titleColor: '#e6edf3', bodyColor: '#8b949e' },
       },
-      scales: { x: axisStyle(), y: axisStyle() },
+      scales: { x: axisStyle(), y: axisStyle(yUnit) },
     });
     // 取最后一个非 null 数据点（标题右侧最新值用）
     const lastVal = (arr) => { for (let i = arr.length - 1; i >= 0; i--) if (arr[i] != null) return arr[i]; return null; };
     // 实时更新注册表：每张图的 chart 实例、涉及的 dataset 索引、从最新 metric 取值与格式化的函数
     const liveCharts = [];
     // 生成一块"标题 + 最新值 + canvas"的图块并创建 Chart 实例；
-    // tooltipLabel 可选（自定义 tooltip 内容）；latestText 为标题右侧最新数据文本
-    const mkChart = (title, datasets, tooltipLabel, latestText, liveGet) => {
+    // tooltipLabel 可选（自定义 tooltip 内容）；latestText 为标题右侧最新数据文本；yUnit 为 Y 轴刻度单位
+    const mkChart = (title, datasets, tooltipLabel, latestText, liveGet, yUnit) => {
       const id = `mc-${monitorCharts.length + 1}`;
       const div = document.createElement('div');
       div.className = 'm-chart';
       div.innerHTML = `<h4 class="m-chart-title">${title}<span class="m-chart-latest">${latestText || ''}</span></h4><div class="m-chart-body"><canvas id="${id}"></canvas></div>`;
       wrap.appendChild(div);
-      const opts = chartOpts();
+      const opts = chartOpts(yUnit);
       if (tooltipLabel) opts.plugins.tooltip.callbacks = { label: tooltipLabel };
       const chart = new Chart(document.getElementById(id), {
         type: 'line',
@@ -791,7 +797,8 @@
     const cpuData = rows.map((r) => r.cpu);
     mkChart('CPU（%）', [{ label: 'CPU', data: cpuData, ...lineCfg('#3b82f6', 'rgba(59,130,246,.12)'), fill: true }], null,
       lastVal(cpuData) != null ? `${lastVal(cpuData).toFixed(1)}%` : '',
-      (m) => (m.cpu == null ? null : m.cpu.toFixed(1) + '%'));
+      (m) => (m.cpu == null ? null : m.cpu.toFixed(1) + '%'),
+      '%');
     // 内存 + Swap：同为 % 量纲合并一张图；tooltip 显示各自 当前值/总量/百分比
     const memPctData = rows.map(memPctOf);
     const swapPctData = rows.map(swapPctOf);
@@ -816,7 +823,8 @@
         return `内存：${mmb} MB`;
       },
       [lastVal(memPctData), lastVal(swapPctData)].filter((v) => v != null).map((v) => `${v}%`).join(' · '),
-      (m) => [memPctOf(m), swapPctOf(m)].map((v) => (v == null ? null : v + '%')));
+      (m) => [memPctOf(m), swapPctOf(m)].map((v) => (v == null ? null : v + '%')),
+      '%');
     // 网络：上下行同量纲（KB/s）放一张，便于对比
     const netInData = rows.map((r) => (r.net_in == null ? null : +(r.net_in / 1024).toFixed(1)));
     const netOutData = rows.map((r) => (r.net_out == null ? null : +(r.net_out / 1024).toFixed(1)));
@@ -828,7 +836,8 @@
       (m) => {
         const vals = [m.net_in, m.net_out].map((v) => (v == null ? null : +(v / 1024).toFixed(1)));
         return [['↓', vals[0]], ['↑', vals[1]]].filter(([, v]) => v != null).map(([d, v]) => `${d} ${v} KB/s`).join(' · ');
-      });
+      },
+      'KB/s');
     // 自定义指标：按 ts 对齐系统时间轴，独立一张（量纲差异仅看趋势）
     const cNames = Object.keys(custom || {}).filter((n) => Array.isArray(custom[n]) && custom[n].length);
     if (cNames.length) {

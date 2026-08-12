@@ -63,12 +63,14 @@
   const GEO_CACHE_KEY = 'cfpanel_geo_cache';
   const GEO_CACHE_TTL = 7 * 24 * 3600 * 1000; // 持久化缓存 7 天（IP 变化少，避免跨刷新/跨会话重复查询）
   const GEO_CACHE_MAX = 500;
-  // 启动时从 localStorage 恢复持久化缓存（仅未过期条目；兼容旧格式 label 为字符串）
+  // 启动时从 localStorage 恢复持久化缓存（仅未过期条目）。
+  // 只恢复新格式（含 cc 字段）：旧格式（仅 label 字符串，无国家代码）直接丢弃——
+  // 若保留则 geoLookup 命中缓存永远不重查，旗帜将无法补全（丢弃后下次自动重查拿 cc）
   try {
     const raw = JSON.parse(localStorage.getItem(GEO_CACHE_KEY) || '{}');
     for (const [k, v] of Object.entries(raw)) {
-      if (Date.now() - v.ts < GEO_CACHE_TTL) {
-        geoCache.set(k, typeof v.label === 'string' ? { label: v.label, cc: '' } : v.label);
+      if (Date.now() - v.ts < GEO_CACHE_TTL && v.cc) {
+        geoCache.set(k, { label: v.label, cc: v.cc });
       }
     }
   } catch { /* localStorage 不可用则仅内存缓存 */ }

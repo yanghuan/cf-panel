@@ -764,6 +764,8 @@
     mkChart('CPU（%）', [{ label: 'CPU', data: rows.map((r) => r.cpu), ...lineCfg('#3b82f6', 'rgba(59,130,246,.12)'), fill: true }]);
     // 内存：独立图（MB）
     mkChart('内存（MB）', [{ label: '内存', data: rows.map((r) => (r.mem_used == null ? null : +(r.mem_used / 1048576).toFixed(1))), ...lineCfg('#f59e0b', 'rgba(245,158,11,.08)'), fill: true }]);
+    // 内存：独立图（%）
+    mkChart('内存（%）', [{ label: '内存', data: rows.map((r) => (r.mem_total > 0 ? +(r.mem_used / r.mem_total * 100).toFixed(1) : null)), ...lineCfg('#b45309', 'rgba(180,83,9,.08)'), fill: true }]);
     // 网络：上下行同量纲（KB/s）放一张，便于对比
     mkChart('网络（KB/s）', [
       { label: '下行', data: rows.map((r) => (r.net_in == null ? null : +(r.net_in / 1024).toFixed(1))), ...lineCfg('#22d3ee', 'transparent') },

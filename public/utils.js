@@ -133,11 +133,15 @@
     geoCache.set(ip, { label: '', cc: '' }); // 失败：仅内存缓存（避免同批重复查，不持久化坏数据）
     return null;
   }
-  // 旗帜 emoji：ISO 3166-1 alpha-2 代码 → 区域指示符（如 CN → 🇨🇳；零资源，随系统字体渲染）
-  function flagEmoji(cc) {
+  // 旗帜渲染：ISO 3166-1 alpha-2 代码 → 旗帜。
+  // 非 Windows（macOS/Linux/Android/iOS）：区域指示符 emoji（零请求、随系统字体渲染）；
+  // Windows：系统 emoji 字体无旗帜字形（显示为 CN 字母），改用 flagcdn SVG 图片（跨平台统一）。
+  const FLAG_IMG_ONLY = /Windows/i.test(navigator.userAgent);
+  function flagHtml(cc) {
     if (!cc || !/^[A-Za-z]{2}$/.test(cc)) return '';
-    const a = cc.toUpperCase();
-    return String.fromCodePoint(0x1F1E6 + a.charCodeAt(0) - 65, 0x1F1E6 + a.charCodeAt(1) - 65);
+    const c = cc.toLowerCase();
+    if (FLAG_IMG_ONLY) return `<img src="https://flagcdn.com/${c}.svg" alt="${escapeHtml(cc)}" loading="lazy" class="flag-img">`;
+    return String.fromCodePoint(0x1F1E6 + cc.charCodeAt(0) - 65, 0x1F1E6 + cc.charCodeAt(1) - 65);
   }
 
   // ---------- 空闲观看保护（IdleGuard）：无操作计时 + 提示 + 自动暂停，动作经回调注入 ----------
@@ -220,6 +224,6 @@
     $, escapeHtml, fmtBytes, fileJoin, fileParent, downsample,
     lockScroll, unlockScroll,
     MONITOR_STEP_MAX, MONITOR_RANGE_LABEL, MONITOR_COLORS,
-    GEO_PRIVATE, geoLookup, flagEmoji, setGeoEnabled, IdleGuard,
+    GEO_PRIVATE, geoLookup, flagHtml, setGeoEnabled, IdleGuard,
   };
 })();

@@ -262,7 +262,10 @@ button.danger:hover { background: rgba(248, 113, 113, .12); }
   border-radius: 7px;
   overflow: hidden;
 }
-/* 竖直背景进度条：自下而上按 --p（0~1）填充，--bar-c 分级色（半透明保证数值可读） */
+/* 竖直背景进度条：自下而上按 --p（0~1）填充，--bar-c 分级色（半透明保证数值可读）。
+   mask 一体式水位：填充块本身的上边缘即波浪形（SVG 遮罩上缘波浪、下缘平直，
+   横向 24px 平铺、纵向拉伸），填充顶端就是波浪轮廓——无直线截断、无单独画线，
+   任何百分比（含 100%）波形都完整不裁切 */
 .m-cell::before {
   content: '';
   position: absolute;
@@ -271,22 +274,16 @@ button.danger:hover { background: rgba(248, 113, 113, .12); }
   opacity: .3;
   transform: scaleY(var(--p, 0));
   transform-origin: bottom;
+  -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' preserveAspectRatio='none'%3E%3Cpath d='M0 4 Q6 0 12 4 T24 4 V24 H0 Z' fill='black'/%3E%3C/svg%3E");
+  mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' preserveAspectRatio='none'%3E%3Cpath d='M0 4 Q6 0 12 4 T24 4 V24 H0 Z' fill='black'/%3E%3C/svg%3E");
+  -webkit-mask-repeat: repeat-x;
+  mask-repeat: repeat-x;
+  -webkit-mask-size: 24px 100%;
+  mask-size: 24px 100%;
   pointer-events: none;
 }
-/* 进度条顶端波浪线（水位效果，随填充高度浮动）：SVG 波浪重复横向平铺，
-   bottom 与填充条顶端对齐（calc 百分比乘 --p），不透明度略高于色块使其清晰 */
-.m-cell::after {
-  content: '';
-  position: absolute;
-  left: 0;
-  right: 0;
-  bottom: calc((100% - 6px) * var(--p, 0));
-  height: 7px;
-  background: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 7' preserveAspectRatio='none'%3E%3Cpath d='M0 3.5 Q6 0 12 3.5 T24 3.5' fill='none' stroke='white' stroke-width='2.2'/%3E%3C/svg%3E") repeat-x left bottom / 24px 7px;
-  opacity: .55;
-  transform: translateY(50%); /* 波浪骑在填充条顶端边界上 */
-  pointer-events: none;
-}
+/* 无百分比数据的格（负载/网络）：不渲染填充 */
+.m-cell[data-nobar]::before { display: none; }
 .m-cell b, .m-cell i { position: relative; z-index: 1; }
 
 /* 指标悬浮详情（鼠标在 6 格区域时跟随指针弹出，fixed 视口定位由 JS 控制） */

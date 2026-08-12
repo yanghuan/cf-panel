@@ -154,8 +154,11 @@
       return Math.max(...arr.map((d) => Number(d.u) || 0));
     }
     const barColor = (p) => (p >= 90 ? '#f85149' : p >= 70 ? '#d29922' : 'var(--accent)');
-    // pct 为百分比数值（0-100），null 表示无数据/无总量 → 不渲染进度条
-    const barAttr = (pct) => (pct == null ? '' : ` style="--p:${(Math.max(0, Math.min(pct, 100)) / 100).toFixed(3)};--bar-c:${barColor(pct)}"`);
+    // pct 为百分比数值（0-100）：null（无数据/无总量）→ data-nobar 标记，CSS 隐藏填充与波浪；
+    // 有值 → --p 比例 + --bar-c 分级色
+    const barAttr = (pct) => (pct == null
+      ? ' data-nobar'
+      : ` style="--p:${(Math.max(0, Math.min(pct, 100)) / 100).toFixed(3)};--bar-c:${barColor(pct)}"`);
     const memPct = m.mem_total > 0 ? m.mem_used / m.mem_total * 100 : null;
     const swap = m.extra && m.extra.swap;
     const swapTotal = m.extra && m.extra.swap_total;
@@ -165,8 +168,8 @@
         <div class="metric" data-metric="${escapeHtml(JSON.stringify({ metric: m, info: s.info || null }))}">
           <span class="m-cell"${barAttr(m.cpu)}><b>${m.cpu == null ? '-' : m.cpu.toFixed(1) + '%'}</b><i>CPU</i></span>
           <span class="m-cell"${barAttr(memPct)}><b>${fmtBytes(m.mem_used)}</b><i>内存</i></span>
-          <span class="m-cell"><b>${m.extra && m.extra.load1 != null ? Number(m.extra.load1).toFixed(2) : '-'}</b><i>负载</i></span>
-          <span class="m-cell"><b>${m.net_in != null ? fmtBytes(m.net_in) + '/s' : '-'}</b><i>网络↓</i></span>
+          <span class="m-cell" data-nobar><b>${m.extra && m.extra.load1 != null ? Number(m.extra.load1).toFixed(2) : '-'}</b><i>负载</i></span>
+          <span class="m-cell" data-nobar><b>${m.net_in != null ? fmtBytes(m.net_in) + '/s' : '-'}</b><i>网络↓</i></span>
           <span class="m-cell"${barAttr(swapPct)}><b>${swap != null ? fmtBytes(swap) : '-'}</b><i>Swap</i></span>
           <span class="m-cell"${barAttr(dPct)}><b>${dPct == null ? '-' : dPct + '%'}</b><i>磁盘</i></span>
         </div>`;

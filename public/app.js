@@ -342,6 +342,8 @@
       } else if (probesEl) {
         probesEl.remove();
       }
+      // 监控弹窗打开且为该服务器：实时更新图表末点（同分钟替换 / 跨分钟追加滚动）
+      updateMonitorLive(s);
     }
     renderOverview();
   }
@@ -696,6 +698,9 @@
 
   // ---------- 监控（简易文本图，支持时间范围） ----------
   let monitorReqSeq = 0; // 监控 range 请求序号（快速切换时丢弃过期响应）
+  // 实时更新状态：打开监控时记录（serverId + 图表分钟戳窗口 + 是否降采样）。
+  // 推送到达时按时间戳更新末点：同分钟→替换末点，跨分钟→追加滚动（保持窗口长度）
+  let monitorLive = null; // { serverId, tsArr, downsampled, charts: [{chart, getVal, latestEl}] }
   async function showMonitor(serverId, serverName, range) {
     range = range || '12h';
     monitorState = { serverId, serverName, range };
@@ -708,10 +713,11 @@
       const custom = data.custom || {};
       const label = MONITOR_RANGE_LABEL[range] || range;
       const cCount = Object.keys(custom).length;
-      $('#monitor-title').textContent = `监控 · ${serverName}（${label}，${rows.length} 点${rows.length > MONITOR_STEP_MAX ? '，降采样' : ''}${cCount ? ` +${cCount} 自定义` : ''}）`;
+      const downsampled = rows.length > MONITOR_STEP_MAX;
+      $('#monitor-title').textContent = `监控 · ${serverName}（${label}，${rows.length} 点${downsampled ? '，降采样' : ''}${cCount ? ` +${cCount} 自定义` : ''}）`;
       $('#monitor-modal').classList.remove('hidden'); // 先显示，保证 canvas 有尺寸
       lockScroll();
-      renderMonitorChart(downsample(rows), custom);
+      renderMonitorChart(downsample(rows), custom, downsampled);
     } catch (e) {
       toast(e.message);
     }
@@ -719,10 +725,11 @@
 
   // 监控图表：每个指标独立一张图（CPU / 内存 / 网络 / 自定义指标），纵向排列，
   // 各自独立刻度轴——量纲不同不再挤在一张图（原双轴方案可读性差）
-  function renderMonitorChart(rows, custom) {
+  function renderMonitorChart(rows, custom, downsampled) {
     const wrap = $('#monitor-modal .chart-wrap');
     monitorCharts.forEach((c) => { try { c.destroy(); } catch { /* ignore */ } });
     monitorCharts = [];
+    monitorLive = null;
     wrap.innerHTML = '';
     if (!window.Chart) {
       wrap.innerHTML = '<p class="muted" style="padding:24px">图表库（Chart.js）加载失败，请检查网络。</p>';
@@ -732,6 +739,7 @@
       wrap.innerHTML = '<p class="muted" style="padding:24px">该时间范围暂无数据。</p>';
       return;
     }
+    const tsArr = rows.map((r) => r.ts);
     const labels = rows.map((r) => new Date(r.ts * 60000).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }));
     const lineCfg = (color, fill) => ({ borderColor: color, backgroundColor: fill, tension: 0.3, pointRadius: 0, borderWidth: 1.8, spanGaps: true });
     // 公共刻度样式
@@ -748,9 +756,11 @@
     });
     // 取最后一个非 null 数据点（标题右侧最新值用）
     const lastVal = (arr) => { for (let i = arr.length - 1; i >= 0; i--) if (arr[i] != null) return arr[i]; return null; };
+    // 实时更新注册表：每张图的 chart 实例、涉及的 dataset 索引、从最新 metric 取值与格式化的函数
+    const liveCharts = [];
     // 生成一块"标题 + 最新值 + canvas"的图块并创建 Chart 实例；
     // tooltipLabel 可选（自定义 tooltip 内容）；latestText 为标题右侧最新数据文本
-    const mkChart = (title, datasets, tooltipLabel, latestText) => {
+    const mkChart = (title, datasets, tooltipLabel, latestText, liveGet) => {
       const id = `mc-${monitorCharts.length + 1}`;
       const div = document.createElement('div');
       div.className = 'm-chart';
@@ -758,11 +768,21 @@
       wrap.appendChild(div);
       const opts = chartOpts();
       if (tooltipLabel) opts.plugins.tooltip.callbacks = { label: tooltipLabel };
-      monitorCharts.push(new Chart(document.getElementById(id), {
+      const chart = new Chart(document.getElementById(id), {
         type: 'line',
         data: { labels, datasets },
         options: opts,
-      }));
+      });
+      monitorCharts.push(chart);
+      if (liveGet) {
+        liveCharts.push({
+          chart,
+          latestEl: div.querySelector('.m-chart-latest'),
+          datasetCount: datasets.length,
+          get: liveGet, // (metric) => Array<value|null>（每 dataset 一个值）
+          fmt: (values) => values.filter((v) => v != null).join(' · '), // 覆盖时可自定义
+        });
+      }
     };
     const memPctOf = (r) => (r && r.mem_total > 0 ? +(r.mem_used / r.mem_total * 100).toFixed(1) : null);
     const swapPctOf = (r) => { const s = r && r.extra && r.extra.swap, t = r && r.extra && r.extra.swap_total; return s != null && t > 0 ? +(s / t * 100).toFixed(1) : null; };
@@ -770,7 +790,8 @@
     // CPU：独立图（%）
     const cpuData = rows.map((r) => r.cpu);
     mkChart('CPU（%）', [{ label: 'CPU', data: cpuData, ...lineCfg('#3b82f6', 'rgba(59,130,246,.12)'), fill: true }], null,
-      lastVal(cpuData) != null ? `${lastVal(cpuData).toFixed(1)}%` : '');
+      lastVal(cpuData) != null ? `${lastVal(cpuData).toFixed(1)}%` : '',
+      (m) => (m.cpu == null ? null : m.cpu.toFixed(1) + '%'));
     // 内存 + Swap：同为 % 量纲合并一张图；tooltip 显示各自 当前值/总量/百分比
     const memPctData = rows.map(memPctOf);
     const swapPctData = rows.map(swapPctOf);
@@ -794,7 +815,8 @@
         if (r.mem_total > 0) return `内存：${mmb} MB / ${+(r.mem_total / 1048576).toFixed(1)} MB（${memPctOf(r)}%）`;
         return `内存：${mmb} MB`;
       },
-      [lastVal(memPctData), lastVal(swapPctData)].filter((v) => v != null).map((v) => `${v}%`).join(' · '));
+      [lastVal(memPctData), lastVal(swapPctData)].filter((v) => v != null).map((v) => `${v}%`).join(' · '),
+      (m) => [memPctOf(m), swapPctOf(m)].map((v) => (v == null ? null : v + '%')));
     // 网络：上下行同量纲（KB/s）放一张，便于对比
     const netInData = rows.map((r) => (r.net_in == null ? null : +(r.net_in / 1024).toFixed(1)));
     const netOutData = rows.map((r) => (r.net_out == null ? null : +(r.net_out / 1024).toFixed(1)));
@@ -802,7 +824,11 @@
       { label: '下行', data: netInData, ...lineCfg('#22d3ee', 'transparent') },
       { label: '上行', data: netOutData, ...lineCfg('#f472b6', 'transparent') },
     ], null,
-      [['↓', lastVal(netInData)], ['↑', lastVal(netOutData)]].filter(([, v]) => v != null).map(([d, v]) => `${d} ${v} KB/s`).join(' · '));
+      [['↓', lastVal(netInData)], ['↑', lastVal(netOutData)]].filter(([, v]) => v != null).map(([d, v]) => `${d} ${v} KB/s`).join(' · '),
+      (m) => {
+        const vals = [m.net_in, m.net_out].map((v) => (v == null ? null : +(v / 1024).toFixed(1)));
+        return [['↓', vals[0]], ['↑', vals[1]]].filter(([, v]) => v != null).map(([d, v]) => `${d} ${v} KB/s`).join(' · ');
+      });
     // 自定义指标：按 ts 对齐系统时间轴，独立一张（量纲差异仅看趋势）
     const cNames = Object.keys(custom || {}).filter((n) => Array.isArray(custom[n]) && custom[n].length);
     if (cNames.length) {
@@ -815,6 +841,49 @@
           const v = pts.length ? pts[pts.length - 1].value : null;
           return v != null ? `${escapeHtml(n)}: ${v}` : '';
         }).filter(Boolean).join(' · '));
+    }
+    // 实时更新注册：推送到达时按分钟戳更新各图末点（同分钟替换、跨分钟追加滚动）。
+    // 自定义指标走分钟级 D1 直写、推送不含，不注册（保持快照）
+    monitorLive = {
+      serverId: monitorState.serverId,
+      tsArr,
+      maxLen: tsArr.length,
+      downsampled: !!downsampled, // 降采样窗口：只替换末点不追加（避免破坏采样窗口语义）
+      charts: liveCharts,
+    };
+  }
+
+  // 推送到达 → 更新监控图末点（若监控弹窗打开且为该服务器）
+  // 时间语义：推送的最新 metric 对应当前分钟；与图表末点分钟戳比较——
+  // 同分钟 → 替换末点；跨分钟 → 追加滚动（移出最旧点，保持窗口长度）
+  function updateMonitorLive(s) {
+    if (!monitorLive || !s || s.id !== monitorLive.serverId) return;
+    const m = s.metric;
+    if (!m || !monitorLive.charts.length) return;
+    const minTs = Math.floor(Date.now() / 1000 / 60);
+    const lastTs = monitorLive.tsArr[monitorLive.tsArr.length - 1];
+    const append = minTs > lastTs && !monitorLive.downsampled;
+    const label = new Date(minTs * 60000).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' });
+    for (const lc of monitorLive.charts) {
+      const values = lc.get(m);
+      if (!values || !values.length) continue;
+      lc.chart.data.datasets.forEach((ds, i) => {
+        const v = values[i] == null ? null : values[i];
+        if (append) {
+          ds.data.push(v);
+          ds.data.shift(); // 保持窗口长度（时间轴右移）
+        } else {
+          ds.data[ds.data.length - 1] = v; // 同分钟：替换末点
+        }
+      });
+      if (append) {
+        lc.chart.data.labels.push(label);
+        lc.chart.data.labels.shift();
+        monitorLive.tsArr.push(minTs);
+        monitorLive.tsArr.shift();
+      }
+      lc.chart.update('none'); // 无动画，避免 5s 推送抖动
+      if (lc.latestEl) lc.latestEl.textContent = lc.fmt(values);
     }
   }
 
@@ -1414,6 +1483,7 @@
     // 关闭时销毁图表实例（释放内存；下次打开 renderMonitorChart 会重建）
     monitorCharts.forEach((c) => { try { c.destroy(); } catch { /* ignore */ } });
     monitorCharts = [];
+    monitorLive = null;
   };
 
   // 告警渠道预设：点击「使用」填入表单模板

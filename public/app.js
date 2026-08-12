@@ -152,20 +152,13 @@
       if (!Array.isArray(arr) || !arr.length) return '-';
       return Math.max(...arr.map((d) => Number(d.u) || 0)) + '%';
     }
-    // Swap 使用率：有总量显示百分比，无总量（旧 agent）回退当前值
-    function swapPct() {
-      const sw = m.extra && m.extra.swap;
-      const st = m.extra && m.extra.swap_total;
-      if (sw == null) return '-';
-      return st > 0 ? (sw / st * 100).toFixed(0) + '%' : fmtBytes(sw);
-    }
     return `
         <div class="metric" data-metric="${escapeHtml(JSON.stringify({ metric: m, info: s.info || null }))}">
           <span class="m-cell"><b>${m.cpu == null ? '-' : m.cpu.toFixed(1) + '%'}</b><i>CPU</i></span>
           <span class="m-cell"><b>${fmtBytes(m.mem_used)}</b><i>内存</i></span>
           <span class="m-cell"><b>${m.extra && m.extra.load1 != null ? Number(m.extra.load1).toFixed(2) : '-'}</b><i>负载</i></span>
           <span class="m-cell"><b>${m.net_in != null ? fmtBytes(m.net_in) + '/s' : '-'}</b><i>网络↓</i></span>
-          <span class="m-cell"><b>${swapPct()}</b><i>Swap</i></span>
+          <span class="m-cell"><b>${m.extra && m.extra.swap != null ? fmtBytes(m.extra.swap) : '-'}</b><i>Swap</i></span>
           <span class="m-cell"><b>${diskPct()}</b><i>磁盘</i></span>
         </div>`;
   }

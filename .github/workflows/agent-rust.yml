@@ -44,8 +44,10 @@ jobs:
         with:
           targets: x86_64-unknown-linux-musl, aarch64-unknown-linux-musl
 
-      - name: 安装 musl 工具链与交叉编译工具（ring 等 build script 与静态链接需要）
-        run: sudo apt-get update && sudo apt-get install -y musl-tools clang llvm
+      - name: 安装 musl 工具链与交叉编译工具（ring 等 build script 与静态链接需要；
+          binutils-aarch64-linux-gnu 提供 aarch64 的 GNU ld——clang 交叉链接时缺它会报
+          "unrecognised emulation mode: aarch64linux"）
+        run: sudo apt-get update && sudo apt-get install -y musl-tools clang llvm binutils-aarch64-linux-gnu
 
       - name: 编译 x86_64 全静态二进制（musl）
         working-directory: agent/rust
@@ -56,14 +58,15 @@ jobs:
         run: |
           AGENT_BUILD_TS=$(date -u +'%Y.%m.%d-%H%M') cargo build --release --target x86_64-unknown-linux-musl
 
-      # M8：aarch64（树莓派/ARM 小主机）——clang 交叉链接（ring 汇编交叉编译需要 clang）
+      # M8：aarch64（树莓派/ARM 小主机）——clang 交叉链接（ring 汇编交叉编译需要 clang；
+      # -fuse-ld=aarch64-linux-gnu-ld：clang 默认调 x86 的 ld，不支持 aarch64 仿真）
       - name: 编译 aarch64 全静态二进制（musl）
         working-directory: agent/rust
         env:
           CC_aarch64_unknown_linux_musl: clang
           AR_aarch64_unknown_linux_musl: llvm-ar
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: clang
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_RUSTFLAGS: -C link-arg=--target=aarch64-unknown-linux-musl -C strip=symbols
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_RUSTFLAGS: -C link-arg=--target=aarch64-unknown-linux-musl -C link-arg=-fuse-ld=/usr/bin/aarch64-linux-gnu-ld -C strip=symbols
         run: |
           AGENT_BUILD_TS=$(date -u +'%Y.%m.%d-%H%M') cargo build --release --target aarch64-unknown-linux-musl
           cd target/aarch64-unknown-linux-musl/release

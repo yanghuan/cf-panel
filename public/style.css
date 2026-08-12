@@ -252,7 +252,26 @@ button.danger:hover { background: rgba(248, 113, 113, .12); }
   border-radius: 10px;
   cursor: pointer; /* 点击弹出指标详情 */
 }
-.m-cell { display: flex; flex-direction: column; gap: 2px; text-align: center; }
+.m-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  text-align: center;
+  position: relative; /* 背景进度条定位锚点 */
+}
+/* 每格背景进度条：自下而上按 --p（0~1）填充，--bar-c 分级色（半透明保证数值可读） */
+.m-cell::before {
+  content: '';
+  position: absolute;
+  inset: 3px;
+  border-radius: 7px;
+  background: var(--bar-c, var(--accent));
+  opacity: .16;
+  transform: scaleY(var(--p, 0));
+  transform-origin: bottom;
+  pointer-events: none;
+}
+.m-cell b, .m-cell i { position: relative; z-index: 1; }
 
 /* 指标悬浮详情（鼠标在 6 格区域时跟随指针弹出，fixed 视口定位由 JS 控制） */
 .m-tip {

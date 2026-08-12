@@ -44,9 +44,7 @@ jobs:
         with:
           targets: x86_64-unknown-linux-musl, aarch64-unknown-linux-musl
 
-      - name: 安装 musl 工具链与交叉编译工具（ring 等 build script 与静态链接需要；
-          binutils-aarch64-linux-gnu 提供 aarch64 的 GNU ld——clang 交叉链接时缺它会报
-          "unrecognised emulation mode: aarch64linux"）
+      - name: 安装 musl 工具链与交叉编译工具（ring 等 build script 与静态链接需要；binutils-aarch64-linux-gnu 提供 aarch64 的 GNU ld，clang 交叉链接缺它时报 unrecognised emulation mode）
         run: sudo apt-get update && sudo apt-get install -y musl-tools clang llvm binutils-aarch64-linux-gnu
 
       - name: 编译 x86_64 全静态二进制（musl）

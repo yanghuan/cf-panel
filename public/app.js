@@ -746,26 +746,37 @@
       },
       scales: { x: axisStyle(), y: axisStyle() },
     });
-    // 生成一块"标题 + canvas"的图块并创建 Chart 实例
-    const mkChart = (title, datasets) => {
+    // 生成一块"标题 + canvas"的图块并创建 Chart 实例；tooltipLabel 可选（自定义 tooltip 内容）
+    const mkChart = (title, datasets, tooltipLabel) => {
       const id = `mc-${monitorCharts.length + 1}`;
       const div = document.createElement('div');
       div.className = 'm-chart';
       div.innerHTML = `<h4 class="m-chart-title">${title}</h4><div class="m-chart-body"><canvas id="${id}"></canvas></div>`;
       wrap.appendChild(div);
+      const opts = chartOpts();
+      if (tooltipLabel) opts.plugins.tooltip.callbacks = { label: tooltipLabel };
       monitorCharts.push(new Chart(document.getElementById(id), {
         type: 'line',
         data: { labels, datasets },
-        options: chartOpts(),
+        options: opts,
       }));
     };
 
     // CPU：独立图（%）
     mkChart('CPU（%）', [{ label: 'CPU', data: rows.map((r) => r.cpu), ...lineCfg('#3b82f6', 'rgba(59,130,246,.12)'), fill: true }]);
-    // 内存：独立图（MB）
-    mkChart('内存（MB）', [{ label: '内存', data: rows.map((r) => (r.mem_used == null ? null : +(r.mem_used / 1048576).toFixed(1))), ...lineCfg('#f59e0b', 'rgba(245,158,11,.08)'), fill: true }]);
-    // 内存：独立图（%）
-    mkChart('内存（%）', [{ label: '内存', data: rows.map((r) => (r.mem_total > 0 ? +(r.mem_used / r.mem_total * 100).toFixed(1) : null)), ...lineCfg('#b45309', 'rgba(180,83,9,.08)'), fill: true }]);
+    // 内存：单图（MB 曲线），tooltip 同时显示 当前值 / 总量 / 百分比（曲线形状与 % 相同，合并免双轴混淆）
+    mkChart('内存', [{ label: '内存', data: rows.map((r) => (r.mem_used == null ? null : +(r.mem_used / 1048576).toFixed(1))), ...lineCfg('#f59e0b', 'rgba(245,158,11,.08)'), fill: true }],
+      (ctx) => {
+        const r = rows[ctx.dataIndex];
+        if (!r || r.mem_used == null) return '';
+        const mb = +(r.mem_used / 1048576).toFixed(1);
+        if (r.mem_total > 0) {
+          const tot = +(r.mem_total / 1048576).toFixed(1);
+          const pct = +(r.mem_used / r.mem_total * 100).toFixed(1);
+          return `内存：${mb} MB / ${tot} MB（${pct}%）`;
+        }
+        return `内存：${mb} MB`;
+      });
     // 网络：上下行同量纲（KB/s）放一张，便于对比
     mkChart('网络（KB/s）', [
       { label: '下行', data: rows.map((r) => (r.net_in == null ? null : +(r.net_in / 1024).toFixed(1))), ...lineCfg('#22d3ee', 'transparent') },

@@ -38,6 +38,8 @@
   const MONITOR_COLORS = ['#8b5cf6', '#22d3ee', '#f472b6', '#34d399', '#fbbf24', '#a78bfa'];
 
   // 长区间数据太多时按区间平均降采样，保证可读性
+  // 字段完整性：数值主字段（含 mem_total）平均；extra（swap/磁盘/进程/连接等）取区间内最后一条非空——
+  // 否则内存/Swap/磁盘/进程/连接图在长区间全部无数据（mem_total 与 extra 丢失）
   function downsample(rows, max = MONITOR_STEP_MAX) {
     if (rows.length <= max) return rows;
     const step = rows.length / max;
@@ -46,9 +48,12 @@
       const start = Math.floor(i * step);
       const slice = rows.slice(start, Math.max(start + 1, Math.floor((i + 1) * step)));
       const agg = { ts: slice[0].ts };
-      for (const k of ['cpu', 'mem_used', 'net_in', 'net_out']) {
+      for (const k of ['cpu', 'mem_used', 'mem_total', 'net_in', 'net_out']) {
         const vals = slice.map((r) => r[k]).filter((v) => v != null);
         agg[k] = vals.length ? vals.reduce((a, b) => a + b, 0) / vals.length : null;
+      }
+      for (let j = slice.length - 1; j >= 0; j--) {
+        if (slice[j].extra) { agg.extra = slice[j].extra; break; }
       }
       out.push(agg);
     }

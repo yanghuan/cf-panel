@@ -789,8 +789,9 @@
     // 实时更新注册表：每张图的 chart 实例、涉及的 dataset 索引、从最新 metric 取值与格式化的函数
     const liveCharts = [];
     // 生成一块"标题 + 最新值 + canvas"的图块并创建 Chart 实例；
-    // tooltipLabel 可选（自定义 tooltip 内容）；latestText 为标题右侧最新数据文本；yUnit 为 Y 轴刻度单位
-    const mkChart = (title, datasets, tooltipLabel, latestText, liveGet, yUnit) => {
+    // tooltipLabel 可选（自定义 tooltip 内容）；latestText 为标题右侧最新数据文本；yUnit 为 Y 轴刻度单位；
+    // fmt 可选（实时更新时自定义标题右侧最新值文本，默认数值用 ' · ' 连接）
+    const mkChart = (title, datasets, tooltipLabel, latestText, liveGet, yUnit, fmt) => {
       const id = `mc-${monitorCharts.length + 1}`;
       const div = document.createElement('div');
       div.className = 'm-chart';
@@ -810,7 +811,7 @@
           latestEl: div.querySelector('.m-chart-latest'),
           datasetCount: datasets.length,
           get: liveGet, // (metric) => Array<value|null>（每 dataset 一个值）
-          fmt: (values) => values.filter((v) => v != null).join(' · '), // 覆盖时可自定义
+          fmt: fmt || ((values) => values.filter((v) => v != null).join(' · ')),
         });
       }
     };
@@ -846,9 +847,10 @@
         if (r.mem_total > 0) return `内存：${mmb} MB / ${+(r.mem_total / 1048576).toFixed(1)} MB（${memPctOf(r)}%）`;
         return `内存：${mmb} MB`;
       },
-      [lastVal(memPctData), lastVal(swapPctData)].filter((v) => v != null).map((v) => `${v}%`).join(' · '),
+      [['内存', lastVal(memPctData)], ['Swap', lastVal(swapPctData)]].filter(([, v]) => v != null).map(([d, v]) => `${d}：${v}%`).join(' · '),
       (m) => [memPctOf(m), swapPctOf(m)].map((v) => (v == null ? null : v + '%')),
-      '%');
+      '%',
+      ([mem, swap]) => [['内存', mem], ['Swap', swap]].filter(([, v]) => v != null).map(([d, v]) => `${d}：${v}`).join(' · '));
     // 磁盘：整体使用率（累计，与卡片/tooltip 标题栏一致），% 量纲独立图；tooltip 显示累计当前值/最大值
     const diskSumData = rows.map(diskSumOf);
     const diskPctData = diskSumData.map((d) => (d ? d.pct : null));
@@ -876,6 +878,28 @@
         return [['↓', vals[0]], ['↑', vals[1]]].filter(([, v]) => v != null).map(([d, v]) => `${d} ${v} KB/s`).join(' · ');
       },
       'KB/s');
+    // 进程数：extra.procs（整数），独立图
+    const procsData = rows.map((r) => (r && r.extra && r.extra.procs != null ? r.extra.procs : null));
+    mkChart('进程数', [
+      { label: '进程', data: procsData, ...lineCfg('#a78bfa', 'rgba(167,139,250,.08)'), fill: true },
+    ], null,
+      lastVal(procsData) != null ? String(lastVal(procsData)) : '',
+      (m) => (m && m.extra && m.extra.procs != null ? m.extra.procs : null),
+      '');
+    // 连接数：TCP + UDP（与网络图风格一致，双线便于对比）
+    const tcpData = rows.map((r) => (r && r.extra && r.extra.tcp != null ? r.extra.tcp : null));
+    const udpData = rows.map((r) => (r && r.extra && r.extra.udp != null ? r.extra.udp : null));
+    mkChart('连接数（TCP/UDP）', [
+      { label: 'TCP', data: tcpData, ...lineCfg('#22d3ee', 'transparent') },
+      { label: 'UDP', data: udpData, ...lineCfg('#f472b6', 'transparent') },
+    ], null,
+      [['TCP', lastVal(tcpData)], ['UDP', lastVal(udpData)]].filter(([, v]) => v != null).map(([d, v]) => `${d}：${v}`).join(' · '),
+      (m) => {
+        const e = (m && m.extra) || {};
+        return [e.tcp, e.udp].map((v) => (v == null ? null : v));
+      },
+      '',
+      ([tcp, udp]) => [['TCP', tcp], ['UDP', udp]].filter(([, v]) => v != null).map(([d, v]) => `${d}：${v}`).join(' · '));
     // 自定义指标：按 ts 对齐系统时间轴，独立一张（量纲差异仅看趋势）
     const cNames = Object.keys(custom || {}).filter((n) => Array.isArray(custom[n]) && custom[n].length);
     if (cNames.length) {

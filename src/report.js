@@ -39,7 +39,7 @@ export function setReportFlushAt(v) { reportFlushAt = v; } // let 原始值无�
 // ---- 收口：agent 上报视为不可信输入（agent 运行在被控机，可能被入侵/异常）----
 // 入口处归一化 + 白名单 + 条数/体积上限，一处收口消除四类后果：
 // 注入（extra 键白名单）、告警丢失/归档停摆（数值归一化，杜绝对象/数组混入）、容量放大（条数与体积上限）。
-const EXTRA_NUM_KEYS = ['swap', 'load1', 'load5', 'load15', 'procs', 'tcp', 'udp', 'uptime', 'temp'];
+const EXTRA_NUM_KEYS = ['swap', 'swap_total', 'load1', 'load5', 'load15', 'procs', 'tcp', 'udp', 'uptime', 'temp'];
 const EXTRA_DISK_MAX = 20;    // 挂载点条数上限（agent 正常 <10）
 const DISK_PATH_MAX = 128;    // 挂载点路径长度上限
 const CUSTOM_MAX = 50;        // 自定义指标条数上限

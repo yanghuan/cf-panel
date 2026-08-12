@@ -675,6 +675,7 @@ async function mcpListServers(user, env) {
       net_out_rate_bps: s.metric.net_out,
       load1: s.metric.extra && s.metric.extra.load1,
       swap_bytes: s.metric.extra && s.metric.extra.swap,
+      swap_total_bytes: s.metric.extra && s.metric.extra.swap_total,
       temp_c: s.metric.extra && s.metric.extra.temp,
       procs: s.metric.extra && s.metric.extra.procs,
       tcp_conns: s.metric.extra && s.metric.extra.tcp,

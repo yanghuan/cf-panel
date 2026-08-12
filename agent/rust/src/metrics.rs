@@ -84,8 +84,8 @@ async fn collect_cpu() -> f64 {
     }
 }
 
-// 内存/swap：/proc/meminfo
-fn collect_mem() -> (u64, u64, u64) {
+// 内存/swap：/proc/meminfo（返回 used, total, swap_used, swap_total）
+fn collect_mem() -> (u64, u64, u64, u64) {
     let text = read_file("/proc/meminfo").unwrap_or_default();
     let mut t = 0u64;
     let mut a = 0u64;
@@ -107,7 +107,8 @@ fn collect_mem() -> (u64, u64, u64) {
         t.saturating_sub(a) * 1024,
         t * 1024,
         st.saturating_sub(sf) * 1024,
-    ) // used, total, swap
+        st * 1024,
+    ) // used, total, swap_used, swap_total
 }
 
 // 负载 / 进程数 / 开机时间
@@ -602,7 +603,7 @@ pub async fn collect_report(cfg: &Config) -> Option<String> {
         collect_custom(cfg),
         collect_disk(),
     );
-    let (mem_used, mem_total, swap) = mem;
+    let (mem_used, mem_total, swap, swap_total) = mem;
     let (l1, l5, l15, procs, uptime) = load;
     let (tcp, udp) = conns;
     let (net_in, net_out) = net;
@@ -615,6 +616,7 @@ pub async fn collect_report(cfg: &Config) -> Option<String> {
         "net_out": net_out,
         "extra": {
             "swap": swap,
+            "swap_total": swap_total,
             "disk": disk,
             "load1": l1, "load5": l5, "load15": l15,
             "temp": collect_temp(),
@@ -634,9 +636,10 @@ mod tests {
 
     #[test]
     fn collect_mem_parses() {
-        let (used, total, _swap) = collect_mem();
+        let (used, total, swap_used, swap_total) = collect_mem();
         assert!(total > 0, "MemTotal 应可读");
         assert!(used <= total, "已用不超过总量");
+        assert!(swap_used <= swap_total, "swap 已用不超过总量");
     }
 
     #[test]

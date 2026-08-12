@@ -111,7 +111,9 @@
     rows.push(['内存', m.mem_used != null
       ? fmtBytes(m.mem_used) + (m.mem_total ? ' / ' + fmtBytes(m.mem_total) + ' (' + (m.mem_used / m.mem_total * 100).toFixed(0) + '%)' : '')
       : '-']);
-    rows.push(['Swap', e.swap != null ? fmtBytes(e.swap) : '-']);
+    rows.push(['Swap', e.swap != null
+      ? fmtBytes(e.swap) + (e.swap_total ? ' / ' + fmtBytes(e.swap_total) + ' (' + (e.swap / e.swap_total * 100).toFixed(0) + '%)' : '')
+      : '-']);
     rows.push(['负载 (1/5/15)', [e.load1, e.load5, e.load15].map((v) => (v != null ? Number(v).toFixed(2) : '-')).join(' / ')]);
     rows.push(['网络', (m.net_in != null ? '↓ ' + fmtBytes(m.net_in) + '/s' : '-') + ' · ' + (m.net_out != null ? '↑ ' + fmtBytes(m.net_out) + '/s' : '-')]);
     if (e.procs != null) rows.push(['进程数', escapeHtml(e.procs)]);
@@ -150,13 +152,20 @@
       if (!Array.isArray(arr) || !arr.length) return '-';
       return Math.max(...arr.map((d) => Number(d.u) || 0)) + '%';
     }
+    // Swap 使用率：有总量显示百分比，无总量（旧 agent）回退当前值
+    function swapPct() {
+      const sw = m.extra && m.extra.swap;
+      const st = m.extra && m.extra.swap_total;
+      if (sw == null) return '-';
+      return st > 0 ? (sw / st * 100).toFixed(0) + '%' : fmtBytes(sw);
+    }
     return `
         <div class="metric" data-metric="${escapeHtml(JSON.stringify({ metric: m, info: s.info || null }))}">
           <span class="m-cell"><b>${m.cpu == null ? '-' : m.cpu.toFixed(1) + '%'}</b><i>CPU</i></span>
           <span class="m-cell"><b>${fmtBytes(m.mem_used)}</b><i>内存</i></span>
           <span class="m-cell"><b>${m.extra && m.extra.load1 != null ? Number(m.extra.load1).toFixed(2) : '-'}</b><i>负载</i></span>
           <span class="m-cell"><b>${m.net_in != null ? fmtBytes(m.net_in) + '/s' : '-'}</b><i>网络↓</i></span>
-          <span class="m-cell"><b>${m.extra && m.extra.swap != null ? fmtBytes(m.extra.swap) : '-'}</b><i>Swap</i></span>
+          <span class="m-cell"><b>${swapPct()}</b><i>Swap</i></span>
           <span class="m-cell"><b>${diskPct()}</b><i>磁盘</i></span>
         </div>`;
   }

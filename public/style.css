@@ -252,7 +252,42 @@ button.danger:hover { background: rgba(248, 113, 113, .12); }
   border-radius: 10px;
   cursor: pointer; /* 点击弹出指标详情 */
 }
-.m-cell { display: flex; flex-direction: column; gap: 2px; text-align: center; }
+.m-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  text-align: center;
+  position: relative; /* 背景进度条定位锚点 */
+  background: rgba(255, 255, 255, .045); /* 底槽：始终可见的浅色轨道（低百分比也有视觉锚点） */
+  border-radius: 7px;
+  overflow: hidden;
+}
+/* 竖直背景进度条：自下而上按 --p（0~1）填充，--bar-c 分级色（半透明保证数值可读） */
+.m-cell::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: var(--bar-c, var(--accent));
+  opacity: .3;
+  transform: scaleY(var(--p, 0));
+  transform-origin: bottom;
+  pointer-events: none;
+}
+/* 进度条顶端波浪线（水位效果，随填充高度浮动）：SVG 波浪重复横向平铺，
+   bottom 与填充条顶端对齐（calc 百分比乘 --p），不透明度略高于色块使其清晰 */
+.m-cell::after {
+  content: '';
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: calc((100% - 6px) * var(--p, 0));
+  height: 7px;
+  background: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 7' preserveAspectRatio='none'%3E%3Cpath d='M0 3.5 Q6 0 12 3.5 T24 3.5' fill='none' stroke='white' stroke-width='2.2'/%3E%3C/svg%3E") repeat-x left bottom / 24px 7px;
+  opacity: .55;
+  transform: translateY(50%); /* 波浪骑在填充条顶端边界上 */
+  pointer-events: none;
+}
+.m-cell b, .m-cell i { position: relative; z-index: 1; }
 
 /* 指标悬浮详情（鼠标在 6 格区域时跟随指针弹出，fixed 视口定位由 JS 控制） */
 .m-tip {

@@ -143,23 +143,32 @@
   }
 
   // 指标行 HTML（数值随推送变化；tooltip 数据内嵌 data-metric，事件委托绑定不受重建影响）
+  // 有百分比来源的格（CPU/内存/Swap/磁盘）以背景进度条呈现：--p 比例 + --bar-c 分级色（CSS 伪元素渲染）
   function metricBlockHtml(s) {
     const m = s.metric;
     if (!m) return '';
     // 磁盘使用率：取所有挂载点中最大
     function diskPct() {
       const arr = m.extra && m.extra.disk;
-      if (!Array.isArray(arr) || !arr.length) return '-';
-      return Math.max(...arr.map((d) => Number(d.u) || 0)) + '%';
+      if (!Array.isArray(arr) || !arr.length) return null;
+      return Math.max(...arr.map((d) => Number(d.u) || 0));
     }
+    const barColor = (p) => (p >= 90 ? '#f85149' : p >= 70 ? '#d29922' : 'var(--accent)');
+    // pct 为百分比数值（0-100），null 表示无数据/无总量 → 不渲染进度条
+    const barAttr = (pct) => (pct == null ? '' : ` style="--p:${(Math.max(0, Math.min(pct, 100)) / 100).toFixed(3)};--bar-c:${barColor(pct)}"`);
+    const memPct = m.mem_total > 0 ? m.mem_used / m.mem_total * 100 : null;
+    const swap = m.extra && m.extra.swap;
+    const swapTotal = m.extra && m.extra.swap_total;
+    const swapPct = swap != null && swapTotal > 0 ? swap / swapTotal * 100 : null;
+    const dPct = diskPct();
     return `
         <div class="metric" data-metric="${escapeHtml(JSON.stringify({ metric: m, info: s.info || null }))}">
-          <span class="m-cell"><b>${m.cpu == null ? '-' : m.cpu.toFixed(1) + '%'}</b><i>CPU</i></span>
-          <span class="m-cell"><b>${fmtBytes(m.mem_used)}</b><i>内存</i></span>
+          <span class="m-cell"${barAttr(m.cpu)}><b>${m.cpu == null ? '-' : m.cpu.toFixed(1) + '%'}</b><i>CPU</i></span>
+          <span class="m-cell"${barAttr(memPct)}><b>${fmtBytes(m.mem_used)}</b><i>内存</i></span>
           <span class="m-cell"><b>${m.extra && m.extra.load1 != null ? Number(m.extra.load1).toFixed(2) : '-'}</b><i>负载</i></span>
           <span class="m-cell"><b>${m.net_in != null ? fmtBytes(m.net_in) + '/s' : '-'}</b><i>网络↓</i></span>
-          <span class="m-cell"><b>${m.extra && m.extra.swap != null ? fmtBytes(m.extra.swap) : '-'}</b><i>Swap</i></span>
-          <span class="m-cell"><b>${diskPct()}</b><i>磁盘</i></span>
+          <span class="m-cell"${barAttr(swapPct)}><b>${swap != null ? fmtBytes(swap) : '-'}</b><i>Swap</i></span>
+          <span class="m-cell"${barAttr(dPct)}><b>${dPct == null ? '-' : dPct + '%'}</b><i>磁盘</i></span>
         </div>`;
   }
   // 探活行 HTML

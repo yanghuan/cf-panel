@@ -665,10 +665,21 @@ button.danger:hover { background: rgba(248, 113, 113, .12); }
 }
 .monitor-modal .modal-head,
 .monitor-modal .range-btns,
-.monitor-modal .chart-wrap { width: 100%; max-width: 960px; margin-left: auto; margin-right: auto; }
-.monitor-modal .chart-wrap { flex: 1; min-height: 0; overflow-y: auto; height: auto; }
-/* 每指标一张图：标题 + canvas 块，纵向排列 */
-.m-chart { margin-bottom: 14px; }
+.monitor-modal .chart-wrap { width: 100%; margin-left: auto; margin-right: auto; }
+/* 监控图表：全屏宽度 + 3 列网格（第一行 CPU/内存-Swap，第二行磁盘三图，第三行网络/连接/进程） */
+.monitor-modal .chart-wrap {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  height: auto;
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 14px;
+  align-items: start;
+}
+/* 自定义指标图占整行 */
+.m-chart.m-chart-full { grid-column: 1 / -1; }
+.m-chart { margin-bottom: 0; }
 .m-chart-title {
   font-size: 13px;
   color: var(--muted);
@@ -690,15 +701,6 @@ button.danger:hover { background: rgba(248, 113, 113, .12); }
   border-radius: 10px;
   padding: 10px;
 }
-.custom-select {
-  padding: 6px 12px;
-  border-radius: 10px;
-  background: rgba(20, 25, 40, .6);
-  border: 1px solid var(--border);
-  color: var(--text);
-  font-size: 13px;
-}
-.custom-select:focus { outline: none; border-color: var(--accent); }
 .custom-editor {
   flex: 1;
   min-width: 0;
@@ -727,6 +729,11 @@ button.danger:hover { background: rgba(248, 113, 113, .12); }
   padding: 12px;
 }
 #monitor-chart { width: 100% !important; height: 100% !important; }
+
+/* ---------- 中等屏幕：监控图表改 2 列（3 列过挤） ---------- */
+@media (max-width: 900px) {
+  .monitor-modal .chart-wrap { grid-template-columns: repeat(2, 1fr); }
+}
 
 /* ---------- 移动端适配（≤640px） ---------- */
 @media (max-width: 640px) {
@@ -772,6 +779,7 @@ button.danger:hover { background: rgba(248, 113, 113, .12); }
 
 /* ---------- 手机窄屏（≤420px）：卡片单列 ---------- */
 @media (max-width: 420px) {
+  .monitor-modal .chart-wrap { grid-template-columns: 1fr; }
   .grid { grid-template-columns: 1fr; }
   .overview { grid-template-columns: repeat(2, 1fr); }
 }

@@ -167,10 +167,10 @@
         }
         return `${escapeHtml(d.u)}%`;
       };
-      // 累计：仅统计新格式项（旧格式无字节值无法求和）
+      // 累计：仅统计新格式项（旧格式无字节值无法求和）；单挂载点时与明细行重复，不显示
       let sumUsed = 0, sumTotal = 0;
       for (const d of e.disk) if (d.used != null && d.total > 0) { sumUsed += d.used; sumTotal += d.total; }
-      const sumHtml = sumTotal > 0
+      const sumHtml = e.disk.length > 1 && sumTotal > 0
         ? `<b title="累计">${fmtBytes(sumUsed)} / ${fmtBytes(sumTotal)} (${(sumUsed / sumTotal * 100).toFixed(0)}%)</b>`
         : '';
       diskHtml = `<div class="mt-sub mt-disk-head"><span>磁盘（${e.disk.length} 个挂载点）</span>${sumHtml}</div><div class="mt-disk">` +
@@ -230,7 +230,6 @@
               ${canExec ? `<button data-act="term" data-id="${s.id}" data-name="${escapeHtml(s.name)}">终端</button>
               <button data-act="file" data-id="${s.id}" data-name="${escapeHtml(s.name)}">文件</button>` : ''}
               <button data-act="mon" data-id="${s.id}" data-name="${escapeHtml(s.name)}">监控</button>
-              <button data-act="custom" data-id="${s.id}" data-name="${escapeHtml(s.name)}">自定义指标</button>
               ${isAdmin ? `<button data-act="edit" data-id="${s.id}" data-name="${escapeHtml(s.name)}" data-group="${escapeHtml(s.group || '')}" data-order="${s.display_index || 0}">修改</button>
               <button data-act="del" data-id="${s.id}" data-name="${escapeHtml(s.name)}" class="dd-danger">删除</button>` : ''}
             </div>
@@ -800,11 +799,13 @@
     // 生成一块"标题 + 最新值 + canvas"的图块并创建 Chart 实例；
     // tooltipLabel 可选（自定义 tooltip 内容）；latestText 为标题右侧最新数据文本；yUnit 为 Y 轴刻度单位；
     // fmt 可选（实时更新时自定义标题右侧最新值文本，默认数值用 ' · ' 连接）；
-    // y2Unit 可选（右侧 Y 轴单位，dataset 用 yAxisID: 'y2' 挂右轴，如 %util）
-    const mkChart = (title, datasets, tooltipLabel, latestText, liveGet, yUnit, fmt, y2Unit) => {
+    // y2Unit 可选（右侧 Y 轴单位，dataset 用 yAxisID: 'y2' 挂右轴，如 %util）；
+    // gridCol 可选（1-3 显式指定 3 列网格中的列，控制换行位置）；spanFull 整行占满（自定义指标）
+    const mkChart = (title, datasets, tooltipLabel, latestText, liveGet, yUnit, fmt, y2Unit, gridCol, spanFull) => {
       const id = `mc-${monitorCharts.length + 1}`;
       const div = document.createElement('div');
-      div.className = 'm-chart';
+      div.className = 'm-chart' + (spanFull ? ' m-chart-full' : '');
+      if (gridCol) div.style.gridColumn = String(gridCol);
       div.innerHTML = `<h4 class="m-chart-title">${title}<span class="m-chart-latest">${latestText || ''}</span></h4><div class="m-chart-body"><canvas id="${id}"></canvas></div>`;
       wrap.appendChild(div);
       const opts = chartOpts(yUnit);
@@ -845,7 +846,7 @@
     mkChart('CPU（%）', [{ label: 'CPU', data: cpuData, ...lineCfg('#3b82f6', 'rgba(59,130,246,.12)'), fill: true }], tipWith({ CPU: (v) => v.toFixed(1) + '%' }),
       lastVal(cpuData) != null ? `${lastVal(cpuData).toFixed(1)}%` : '',
       (m) => (m.cpu == null ? null : m.cpu.toFixed(1) + '%'),
-      '%');
+      '%', undefined, undefined, 1);
     // 内存 + Swap：同为 % 量纲合并一张图；tooltip 显示各自 当前值/总量/百分比
     const memPctData = rows.map(memPctOf);
     const swapPctData = rows.map(swapPctOf);
@@ -872,7 +873,25 @@
       [['内存', lastVal(memPctData)], ['Swap', lastVal(swapPctData)]].filter(([, v]) => v != null).map(([d, v]) => `${d}：${v}%`).join(' · '),
       (m) => [memPctOf(m), swapPctOf(m)].map((v) => (v == null ? null : v + '%')),
       '%',
-      ([mem, swap]) => [['内存', mem], ['Swap', swap]].filter(([, v]) => v != null).map(([d, v]) => `${d}：${v}`).join(' · '));
+      ([mem, swap]) => [['内存', mem], ['Swap', swap]].filter(([, v]) => v != null).map(([d, v]) => `${d}：${v}`).join(' · '),
+      undefined, 2);
+    // 负载：1/5/15 分钟三条线（无单位），独立图
+    const load1Data = rows.map((r) => (r && r.extra && r.extra.load1 != null ? Number(r.extra.load1) : null));
+    const load5Data = rows.map((r) => (r && r.extra && r.extra.load5 != null ? Number(r.extra.load5) : null));
+    const load15Data = rows.map((r) => (r && r.extra && r.extra.load15 != null ? Number(r.extra.load15) : null));
+    mkChart('负载 (1/5/15)', [
+      { label: '1m', data: load1Data, ...lineCfg('#3b82f6', 'transparent') },
+      { label: '5m', data: load5Data, ...lineCfg('#f59e0b', 'transparent') },
+      { label: '15m', data: load15Data, ...lineCfg('#34d399', 'transparent') },
+    ], tipWith({ '1m': (v) => v.toFixed(2), '5m': (v) => v.toFixed(2), '15m': (v) => v.toFixed(2) }),
+      [lastVal(load1Data), lastVal(load5Data), lastVal(load15Data)].filter((v) => v != null).map((v) => v.toFixed(2)).join(' / '),
+      (m) => {
+        const e = (m && m.extra) || {};
+        return [e.load1, e.load5, e.load15].map((v) => (v == null ? null : Number(v).toFixed(2)));
+      },
+      '',
+      (vals) => vals.filter((v) => v != null).join(' / '),
+      undefined, 3);
     // 磁盘：整体使用率（累计，与卡片/tooltip 标题栏一致），% 量纲独立图；tooltip 显示累计当前值/最大值
     const diskSumData = rows.map(diskSumOf);
     const diskPctData = diskSumData.map((d) => (d ? d.pct : null));
@@ -886,42 +905,7 @@
       },
       lastVal(diskPctData) != null ? `${lastVal(diskPctData)}%` : '',
       (m) => { const d = diskSumOf(m); return d ? d.pct + '%' : null; },
-      '%');
-    // 网络：上下行同量纲（KB/s）放一张，便于对比
-    const netInData = rows.map((r) => (r.net_in == null ? null : +(r.net_in / 1024).toFixed(1)));
-    const netOutData = rows.map((r) => (r.net_out == null ? null : +(r.net_out / 1024).toFixed(1)));
-    mkChart('网络（KB/s）', [
-      { label: '下行', data: netInData, ...lineCfg('#22d3ee', 'transparent') },
-      { label: '上行', data: netOutData, ...lineCfg('#f472b6', 'transparent') },
-    ], tipWith({ 下行: ' KB/s', 上行: ' KB/s' }),
-      [['↓', lastVal(netInData)], ['↑', lastVal(netOutData)]].filter(([, v]) => v != null).map(([d, v]) => `${d} ${v} KB/s`).join(' · '),
-      (m) => {
-        const vals = [m.net_in, m.net_out].map((v) => (v == null ? null : +(v / 1024).toFixed(1)));
-        return [['↓', vals[0]], ['↑', vals[1]]].filter(([, v]) => v != null).map(([d, v]) => `${d} ${v} KB/s`).join(' · ');
-      },
-      'KB/s');
-    // 进程数：extra.procs（整数），独立图
-    const procsData = rows.map((r) => (r && r.extra && r.extra.procs != null ? r.extra.procs : null));
-    mkChart('进程数', [
-      { label: '进程', data: procsData, ...lineCfg('#a78bfa', 'rgba(167,139,250,.08)'), fill: true },
-    ], null,
-      lastVal(procsData) != null ? String(lastVal(procsData)) : '',
-      (m) => (m && m.extra && m.extra.procs != null ? m.extra.procs : null),
-      '');
-    // 连接数：TCP + UDP（与网络图风格一致，双线便于对比）
-    const tcpData = rows.map((r) => (r && r.extra && r.extra.tcp != null ? r.extra.tcp : null));
-    const udpData = rows.map((r) => (r && r.extra && r.extra.udp != null ? r.extra.udp : null));
-    mkChart('连接数（TCP/UDP）', [
-      { label: 'TCP', data: tcpData, ...lineCfg('#22d3ee', 'transparent') },
-      { label: 'UDP', data: udpData, ...lineCfg('#f472b6', 'transparent') },
-    ], null,
-      [['TCP', lastVal(tcpData)], ['UDP', lastVal(udpData)]].filter(([, v]) => v != null).map(([d, v]) => `${d}：${v}`).join(' · '),
-      (m) => {
-        const e = (m && m.extra) || {};
-        return [e.tcp, e.udp].map((v) => (v == null ? null : v));
-      },
-      '',
-      ([tcp, udp]) => [['TCP', tcp], ['UDP', udp]].filter(([, v]) => v != null).map(([d, v]) => `${d}：${v}`).join(' · '));
+      '%', undefined, undefined, 1);
     // 磁盘 IO：读写速率（KB/s，左轴）+ %util（右轴 %）双轴一图——吞吐与忙占比同看；
     // IOPS 量纲独立（次/秒）单独一张
     const ioOf = (r) => (r && r.extra && r.extra.disk_io) || null;
@@ -943,7 +927,7 @@
       },
       'KB/s',
       ([r, w, u]) => [r != null ? `↓ ${r} KB/s` : null, w != null ? `↑ ${w} KB/s` : null, u != null ? `util ${u}%` : null].filter(Boolean).join(' · '),
-      '%');
+      '%', 2);
     const ioRData = rows.map((r) => { const io = ioOf(r); return io && io.r_iops != null ? io.r_iops : null; });
     const ioWData = rows.map((r) => { const io = ioOf(r); return io && io.w_iops != null ? io.w_iops : null; });
     mkChart('磁盘 IOPS', [
@@ -956,7 +940,44 @@
         return [io && io.r_iops, io && io.w_iops].map((v) => (v == null ? null : v));
       },
       '次/秒',
-      ([r, w]) => [['读', r], ['写', w]].filter(([, v]) => v != null).map(([d, v]) => `${d} ${v}`).join(' · '));
+      ([r, w]) => [['读', r], ['写', w]].filter(([, v]) => v != null).map(([d, v]) => `${d} ${v}`).join(' · '),
+      undefined, 3);
+    // 网络：上下行同量纲（KB/s）放一张，便于对比
+    const netInData = rows.map((r) => (r.net_in == null ? null : +(r.net_in / 1024).toFixed(1)));
+    const netOutData = rows.map((r) => (r.net_out == null ? null : +(r.net_out / 1024).toFixed(1)));
+    mkChart('网络（KB/s）', [
+      { label: '下行', data: netInData, ...lineCfg('#22d3ee', 'transparent') },
+      { label: '上行', data: netOutData, ...lineCfg('#f472b6', 'transparent') },
+    ], tipWith({ 下行: ' KB/s', 上行: ' KB/s' }),
+      [['↓', lastVal(netInData)], ['↑', lastVal(netOutData)]].filter(([, v]) => v != null).map(([d, v]) => `${d} ${v} KB/s`).join(' · '),
+      (m) => {
+        const vals = [m.net_in, m.net_out].map((v) => (v == null ? null : +(v / 1024).toFixed(1)));
+        return [['↓', vals[0]], ['↑', vals[1]]].filter(([, v]) => v != null).map(([d, v]) => `${d} ${v} KB/s`).join(' · ');
+      },
+      'KB/s', undefined, undefined, 1);
+    // 连接数：TCP + UDP（与网络图风格一致，双线便于对比）
+    const tcpData = rows.map((r) => (r && r.extra && r.extra.tcp != null ? r.extra.tcp : null));
+    const udpData = rows.map((r) => (r && r.extra && r.extra.udp != null ? r.extra.udp : null));
+    mkChart('连接数（TCP/UDP）', [
+      { label: 'TCP', data: tcpData, ...lineCfg('#22d3ee', 'transparent') },
+      { label: 'UDP', data: udpData, ...lineCfg('#f472b6', 'transparent') },
+    ], null,
+      [['TCP', lastVal(tcpData)], ['UDP', lastVal(udpData)]].filter(([, v]) => v != null).map(([d, v]) => `${d}：${v}`).join(' · '),
+      (m) => {
+        const e = (m && m.extra) || {};
+        return [e.tcp, e.udp].map((v) => (v == null ? null : v));
+      },
+      '',
+      ([tcp, udp]) => [['TCP', tcp], ['UDP', udp]].filter(([, v]) => v != null).map(([d, v]) => `${d}：${v}`).join(' · '),
+      undefined, 2);
+    // 进程数：extra.procs（整数），独立图
+    const procsData = rows.map((r) => (r && r.extra && r.extra.procs != null ? r.extra.procs : null));
+    mkChart('进程数', [
+      { label: '进程', data: procsData, ...lineCfg('#a78bfa', 'rgba(167,139,250,.08)'), fill: true },
+    ], null,
+      lastVal(procsData) != null ? String(lastVal(procsData)) : '',
+      (m) => (m && m.extra && m.extra.procs != null ? m.extra.procs : null),
+      '', undefined, undefined, 3);
     // 自定义指标：按 ts 对齐系统时间轴，独立一张（量纲差异仅看趋势）
     const cNames = Object.keys(custom || {}).filter((n) => Array.isArray(custom[n]) && custom[n].length);
     if (cNames.length) {
@@ -968,7 +989,8 @@
           const pts = custom[n].filter((p) => p.value != null);
           const v = pts.length ? pts[pts.length - 1].value : null;
           return v != null ? `${escapeHtml(n)}: ${v}` : '';
-        }).filter(Boolean).join(' · '));
+        }).filter(Boolean).join(' · '),
+        null, null, null, null, null, true);
     }
     // 实时更新注册：推送到达时按分钟戳更新各图末点（同分钟替换、跨分钟追加滚动）。
     // 自定义指标走分钟级 D1 直写、推送不含，不注册（保持快照）
@@ -1013,87 +1035,6 @@
       lc.chart.update('none'); // 无动画，避免 5s 推送抖动
       if (lc.latestEl) lc.latestEl.textContent = lc.fmt(values);
     }
-  }
-
-  // ---------- 自定义指标面板（agent CUSTOM_METRICS 采集，存 D1 metrics_custom） ----------
-  let customChart = null;
-  let customState = { serverId: 0, range: '12h' };
-
-  function openCustomModal(serverId, serverName) {
-    customState = { serverId: serverId || 0, range: '12h' };
-    $('#custom-title').textContent = serverName ? `自定义指标 · ${serverName}` : '自定义指标';
-    $('#custom-modal').classList.remove('hidden');
-    lockScroll();
-    document.querySelectorAll('#custom-modal .range-btn').forEach((b) => b.classList.toggle('active', b.dataset.range === customState.range));
-    api('/api/servers').then((list) => {
-      $('#custom-server').innerHTML = '<option value="">选择服务器</option>' +
-        list.map((s) => `<option value="${s.id}">${escapeHtml(s.name)}</option>`).join('');
-      if (customState.serverId) {
-        $('#custom-server').value = String(customState.serverId);
-        loadCustomMetrics();
-      }
-    }).catch((e) => toast(e.message));
-  }
-
-  async function loadCustomMetrics() {
-    const id = Number($('#custom-server').value) || 0;
-    customState.serverId = id;
-    if (!id) { renderCustomChart({}); return; }
-    try {
-      const data = await api(`/api/monitor?server_id=${id}&range=${customState.range}`);
-      renderCustomChart(data.custom || {});
-    } catch (e) {
-      toast(e.message);
-    }
-  }
-
-  function renderCustomChart(custom) {
-    const wrap = $('#custom-modal .chart-wrap');
-    if (customChart) { customChart.destroy(); customChart = null; }
-    // 若 canvas 被上次提示文本覆盖则重建（用固定容器定位，防重复打开时 #custom-chart 为空）
-    const canvas = wrap.querySelector('#custom-chart');
-    if (!canvas || canvas.tagName !== 'CANVAS') wrap.innerHTML = '<canvas id="custom-chart"></canvas>';
-    if (!window.Chart) {
-      wrap.innerHTML = '<p class="muted" style="padding:24px">图表库（Chart.js）加载失败，请检查网络。</p>';
-      return;
-    }
-    const names = Object.keys(custom || {});
-    if (!names.length) {
-      wrap.innerHTML = '<p class="muted" style="padding:24px">该服务器暂无自定义指标。请在 agent 配置 CUSTOM_METRICS（JSON：name+cmd）后自动上报。</p>';
-      return;
-    }
-    const tsSet = new Set();
-    names.forEach((n) => (custom[n] || []).forEach((p) => tsSet.add(p.ts)));
-    const tsArr = [...tsSet].sort((a, b) => a - b);
-    const labels = tsArr.map((t) => new Date(t * 60000).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }));
-    const datasets = names.map((n, i) => {
-      // Map 索引：O(n) 建索引 + O(1) 查询，避免逐点 find 的 O(n²)（对齐监控图）
-      const pMap = new Map((custom[n] || []).map((p) => [p.ts, p.value]));
-      return {
-        label: n,
-        data: tsArr.map((t) => (pMap.has(t) ? pMap.get(t) : null)),
-        borderColor: MONITOR_COLORS[i % MONITOR_COLORS.length],
-        backgroundColor: 'transparent',
-        tension: 0.3, pointRadius: 0, borderWidth: 1.5, spanGaps: true,
-      };
-    });
-    customChart = new Chart($('#custom-chart'), {
-      type: 'line',
-      data: { labels, datasets },
-      options: {
-        responsive: true,
-        maintainAspectRatio: false,
-        interaction: { mode: 'index', intersect: false },
-        plugins: {
-          legend: { labels: { color: '#8b949e', boxWidth: 12 } },
-          tooltip: { backgroundColor: '#1c2230', borderColor: '#2d333b', borderWidth: 1, titleColor: '#e6edf3', bodyColor: '#8b949e' },
-        },
-        scales: {
-          x: { ticks: { color: '#8b949e', maxTicksLimit: 8, maxRotation: 0 }, grid: { color: 'rgba(255,255,255,.04)' } },
-          y: { position: 'left', ticks: { color: '#8b949e' }, grid: { color: 'rgba(255,255,255,.04)' } },
-        },
-      },
-    });
   }
 
   // ---------- 自定义指标设置（生成 agent env 配置片段） ----------
@@ -1510,17 +1451,6 @@
   $('#btn-save-alerts').onclick = saveAlerts;
   $('#btn-test-webhook').onclick = testWebhook;
 
-  // 自定义指标查看弹窗
-  $('#btn-custom-close').onclick = () => { $('#custom-modal').classList.add('hidden'); unlockScroll(); };
-  $('#custom-server').addEventListener('change', loadCustomMetrics);
-  $('#custom-modal').addEventListener('click', (e) => {
-    const btn = e.target.closest('.range-btn');
-    if (!btn || !customState.serverId) return;
-    customState.range = btn.dataset.range;
-    document.querySelectorAll('#custom-modal .range-btn').forEach((b) => b.classList.toggle('active', b.dataset.range === customState.range));
-    loadCustomMetrics();
-  });
-
   // 自定义指标设置弹窗
   $('#btn-custom-setup-close').onclick = () => { $('#custom-setup-modal').classList.add('hidden'); unlockScroll(); };
   $('#btn-custom-gen').onclick = genCustomCfg;
@@ -1591,7 +1521,6 @@
     if (act === 'term') openTerminal(Number(id), name);
     else if (act === 'file') openFileManager(Number(id), name);
     else if (act === 'mon') showMonitor(Number(id), name);
-    else if (act === 'custom') openCustomModal(Number(id), name);
     else if (act === 'edit') openEditModal(Number(id), name, btn.dataset.group, btn.dataset.order);
     else if (act === 'del') {
       confirmDialog(`确认删除服务器「${name}」？`, () => {

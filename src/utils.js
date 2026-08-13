@@ -248,6 +248,15 @@ export async function sendWebhookRaw(cfg, payload) {
   // 统一允许的 HTTP 方法（GET/POST/PUT），不再把 PUT 静默当 POST
   const method = ['GET', 'POST', 'PUT'].includes(cfg.method) ? cfg.method : 'POST';
   const url = renderTemplate(cfg.webhook_url, vars);
+  // 协议白名单：仅允许 http/https（拒绝 file://、gopher:// 等奇形 scheme，防 SSRF 类误配）
+  try {
+    const pu = new URL(url);
+    if (pu.protocol !== 'http:' && pu.protocol !== 'https:') {
+      return { ok: false, status: 0, error: `unsupported protocol: ${pu.protocol}` };
+    }
+  } catch {
+    return { ok: false, status: 0, error: 'invalid webhook url' };
+  }
   const headers = parseHeaders(cfg.headers, vars);
   if (!headers['content-type']) headers['content-type'] = cfg.content_type || 'application/json';
   const body = method === 'GET' ? undefined : (cfg.body_template ? renderTemplate(cfg.body_template, vars) : JSON.stringify(payload));

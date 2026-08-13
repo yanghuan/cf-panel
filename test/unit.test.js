@@ -68,9 +68,12 @@ test('parsePanelUsers', () => {
   ]);
   // 空项被过滤
   assert.deepEqual(I.parsePanelUsers({ PANEL_USERS: 'a:p,,' }), [{ username: 'a', password: 'p' }]);
-  // 边界：无冒号条目（旧实现会截断末字符成 "ba"/"bad"）、空用户名条目均被丢弃
-  assert.deepEqual(I.parsePanelUsers({ PANEL_USERS: 'a:p,bad,:' }), [{ username: 'a', password: 'p' }]);
+  // 有冒号但用户名为空（":pass"）→ 丢弃（旧行为）
   assert.deepEqual(I.parsePanelUsers({ PANEL_USERS: ':pass,ok:go' }), [{ username: 'ok', password: 'go' }]);
+  // fail closed：无冒号的非空条目（密码/用户名含逗号的典型症状）→ 抛错暴露配置错误，
+  // 不再静默截断（如 alice:pass,1 旧实现会把密码截成 pass 且真实密码永远登录失败）
+  assert.throws(() => I.parsePanelUsers({ PANEL_USERS: 'a:p,bad' }), /无冒号/);
+  assert.throws(() => I.parsePanelUsers({ PANEL_USERS: 'alice:pass,1' }), /无冒号/);
 });
 
 // ---------------- 哈希 ----------------
@@ -259,6 +262,13 @@ test('sendWebhook：非 2xx / 网络异常记错误日志并返回 false', async
     // 未启用/无 URL → false
     assert.equal(await I.sendWebhook({ enabled: false }, { event: 'alert' }), false);
     assert.equal(await I.sendWebhook({ enabled: true }, { event: 'alert' }), false);
+
+    // 协议白名单：非 http/https（file://、畸形 URL）不发请求直接失败
+    globalThis.fetch = async () => { throw new Error('should not fetch'); };
+    const badProto = await I.sendWebhook({ webhook_url: 'file:///etc/passwd', enabled: true }, { event: 'alert' });
+    assert.equal(badProto, false, 'file:// 拒绝');
+    const badUrl = await I.sendWebhook({ webhook_url: 'not a url', enabled: true }, { event: 'alert' });
+    assert.equal(badUrl, false, '畸形 URL 拒绝');
   } finally {
     globalThis.fetch = origFetch;
     console.error = origErr;

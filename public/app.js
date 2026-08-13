@@ -1029,11 +1029,14 @@
       if (append) {
         lc.chart.data.labels.push(label);
         lc.chart.data.labels.shift();
-        monitorLive.tsArr.push(minTs);
-        monitorLive.tsArr.shift();
       }
       lc.chart.update('none'); // 无动画，避免 5s 推送抖动
       if (lc.latestEl) lc.latestEl.textContent = lc.fmt(values);
+    }
+    // tsArr 为共享窗口，只推进一次（在图表循环外——否则 N 张图窗口被移 N 位、尾部出现重复 minTs）
+    if (append) {
+      monitorLive.tsArr.push(minTs);
+      monitorLive.tsArr.shift();
     }
   }
 

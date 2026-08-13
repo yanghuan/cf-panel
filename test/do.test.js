@@ -770,14 +770,15 @@ test('MetricsDO: /drop 清理 storage 告警/探活状态', async () => {
 });
 
 // ---------------- PanelDO ----------------
-test('PanelDO: /viewers 只统计已鉴权观看者；其他路径 404', async () => {
+test('PanelDO: /viewers 只统计已鉴权观看者，返回 fastSince 过渡标记；其他路径 404', async () => {
   const env = makeEnv();
   const ws1 = { deserializeAttachment: () => 'tok1' };
   const ws2 = { deserializeAttachment: () => 'tok2' };
   const ws3 = { deserializeAttachment: () => null }; // 未鉴权
   const inst = new PanelDO({ getWebSockets: () => [ws1, ws2, ws3] }, env);
+  inst.fastSince = 12345;
   const res = await inst.fetch(new Request('https://do.internal/viewers'));
-  assert.deepEqual(await res.json(), { count: 2 });
+  assert.deepEqual(await res.json(), { count: 2, fastSince: 12345 });
   assert.equal((await inst.fetch(new Request('https://do.internal/other'))).status, 404);
 });
 
@@ -1106,33 +1107,42 @@ test('TerminalDO: file_ready 确认后停止 open_file 重发', async (t) => {
   }
 });
 
-test('TerminalDO: 文件写操作指令写审计（delete/zip/rename + write 首块）', async () => {
+test('TerminalDO: 文件写操作指令写审计（delete/zip/rename Text 帧 + write 首块 Binary 混合帧）', async () => {
   const env = makeEnv();
   const inst = new TerminalDO(mockState(), env);
   const userWs = { send() {}, close() {} };
   const agentWs = { send() {}, readyState: 1 };
-  // 模拟已鉴权文件会话（首帧鉴权会写入 creatorUser）
+  // 模拟已鉴权文件会话（首帧鉴权会写入 creatorUser；clientIp 随 /rpc 创建时传入）
   inst.sessions.set('0-fid', {
     sid: '0-fid', streamId: '0-fid', serverId: 1, creatorUserId: 7, creatorUser: 'alice',
+    clientIp: '203.0.113.7',
     type: 'file', createdAt: Date.now(), userWs, agentWs, userBuf: [], agentBuf: [],
   });
   const audits = async (action) => {
     const rows = await env.DB.prepare('SELECT * FROM audit_logs WHERE action = ?').bind(action).all();
     return rows.results;
   };
+  // Binary 混合帧：JSON 头 + '\n' + 原始字节（生产上传路径，api.js _sendNextUpload 同构）
+  const mixFrame = (obj, bytes = 0) => {
+    const head = new TextEncoder().encode(JSON.stringify(obj) + '\n');
+    const buf = new Uint8Array(head.length + bytes);
+    buf.set(head, 0);
+    return buf.buffer;
+  };
 
-  // delete / rename / zip 各记一条
+  // delete / rename / zip 各记一条（Text JSON 帧）
   await inst.webSocketMessage(userWs, JSON.stringify({ type: 'delete', path: '/tmp/a.txt' }));
   await inst.webSocketMessage(userWs, JSON.stringify({ type: 'rename', path: '/tmp/a.txt', new_name: 'b.txt' }));
   await inst.webSocketMessage(userWs, JSON.stringify({ type: 'zip', path: '/opt/dir' }));
-  // write 仅首块（offset=0）记一条，后续块不重复
-  await inst.webSocketMessage(userWs, JSON.stringify({ type: 'write', path: '/tmp/up.bin', offset: 0, commit: false }));
-  await inst.webSocketMessage(userWs, JSON.stringify({ type: 'write', path: '/tmp/up.bin', offset: 512, commit: true }));
+  // write 走 Binary 混合帧：仅首块（offset=0）记一条，后续块不重复
+  await inst.webSocketMessage(userWs, mixFrame({ type: 'write', path: '/tmp/up.bin', offset: 0, commit: false }));
+  await inst.webSocketMessage(userWs, mixFrame({ type: 'write', path: '/tmp/up.bin', offset: 512, commit: true }, 512));
 
   const dels = await audits('file.delete');
   assert.equal(dels.length, 1);
   assert.equal(dels[0].username, 'alice');
   assert.equal(dels[0].target_server_id, 1);
+  assert.equal(dels[0].client_ip, '203.0.113.7');
   assert.equal(dels[0].detail, '/tmp/a.txt');
 
   const rens = await audits('file.rename');
@@ -1144,8 +1154,9 @@ test('TerminalDO: 文件写操作指令写审计（delete/zip/rename + write 首
   assert.equal(zips[0].detail, '/opt/dir');
 
   const wrs = await audits('file.write');
-  assert.equal(wrs.length, 1, 'write 仅首块记录一次');
+  assert.equal(wrs.length, 1, 'write 仅首块记录一次（Binary 混合帧审计生效）');
   assert.equal(wrs[0].detail, '/tmp/up.bin');
+  assert.equal(wrs[0].client_ip, '203.0.113.7');
 
   // 非文件指令（终端输入等）不产生审计
   const all = await env.DB.prepare("SELECT COUNT(*) AS c FROM audit_logs WHERE action LIKE 'file.%'").all();

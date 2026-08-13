@@ -77,13 +77,23 @@ export async function queryServersForUser(env, user) {
   return env.DB.prepare('SELECT * FROM servers WHERE user_id = ? ORDER BY "group", display_index, id').bind(user.id).all();
 }
 
-// 当前是否有面板观看者（决定在线判定用快/慢宽限期；查询失败按无观看者处理）
-export async function hasPanelViewers(env) {
+// 在线判定宽限期（秒）：与 PanelDO buildList 的过渡期语义对齐——有观看者且距 0→1 切快采
+// 已超 30s 过渡期才用快宽限 15s；过渡期内（agent 尚未切快采完成首帧上报）用慢宽限 180s，
+// 避免首观者上线后 REST/MCP 列表短暂误判离线。查询失败按无观看者（慢宽限）处理。
+const PANEL_SWITCH_GRACE_MS = 30 * 1000;
+export async function panelGraceSeconds(env) {
   try {
     const resp = await doPanel(env).fetch('https://do.internal/viewers');
-    return Number((await resp.json()).count || 0) > 0;
+    const v = await resp.json();
+    const count = Number(v.count || 0);
+    const fastSince = Number(v.fastSince || 0);
+    const now = Date.now();
+    if (count > 0 && (!fastSince || now - fastSince >= PANEL_SWITCH_GRACE_MS)) {
+      return ONLINE_GRACE_FAST_S;
+    }
+    return ONLINE_GRACE_SLOW_S;
   } catch {
-    return false;
+    return ONLINE_GRACE_SLOW_S;
   }
 }
 
@@ -111,7 +121,7 @@ export async function listServersWithState(env, user) {
     latest = await lResp.json();
   } catch { /* 无最新指标 */ }
   const nowSec = Math.floor(now / 1000);
-  const grace = (await hasPanelViewers(env)) ? ONLINE_GRACE_FAST_S : ONLINE_GRACE_SLOW_S;
+  const grace = await panelGraceSeconds(env);
   const list = rows.results.map((s) => ({
     id: s.id,
     name: s.name,

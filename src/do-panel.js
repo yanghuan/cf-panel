@@ -62,10 +62,12 @@ export class PanelDO {
 
   async fetch(request) {
     const url = new URL(request.url);
-    // 内部 RPC：供 TerminalDO 查询当前已鉴权在线观看者数（省配额上报策略用）
+    // 内部 RPC：供 TerminalDO 查询当前已鉴权在线观看者数（省配额上报策略用）；
+    // 同时返回 fastSince（0→1 切快采时刻），Worker 侧 REST/MCP 列表据此复用 30s 过渡期
+    // 语义——否则首观者上线后 30s 内慢采 agent 会被 15s 快宽限误判离线
     if (url.pathname === '/viewers') {
       const count = (this.state.getWebSockets?.() || []).filter((w) => w.deserializeAttachment?.()).length;
-      return json({ count });
+      return json({ count, fastSince: count > 0 ? this.fastSince : 0 });
     }
     // 内部 RPC：PAT 撤销后清鉴权缓存（已建观看者连接下个推送即失效关闭；清失败由 5s TTL 兜底）
     if (url.pathname === '/rpc/clear_auth_cache' && request.method === 'POST') {

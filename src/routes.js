@@ -179,12 +179,12 @@ const LOGIN_FAIL_WINDOW_MS = 15 * 60 * 1000;
 const LOGIN_LOCK_MS = 15 * 60 * 1000; // 超限锁定时长
 export const loginFails = new Map(); // ip -> { count, firstAt, lockedUntil }
 
+// 客户端 IP：仅信任 Cloudflare 注入的 cf-connecting-ip。
+// 不回退 X-Forwarded-For——本地 wrangler dev/E2E 无 CF 前置时该头可被任意伪造，
+// 每请求换 XFF 即绕过登录限流（登录限流/审计 IP 与 do-terminal 的 wan_ip 记录不同，
+// 后者仅做展示不影响安全判定，保留 XFF 回退）
 function clientIp(request) {
-  return (
-    request.headers.get('cf-connecting-ip') ||
-    (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() ||
-    'unknown'
-  );
+  return request.headers.get('cf-connecting-ip') || 'unknown';
 }
 
 // 返回剩余锁定秒数；未锁定返回 null（并惰性清理过期窗口）
@@ -435,7 +435,7 @@ async function handleApiInner(request, env) {
     const resp = await stub.fetch('https://do.internal/rpc', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ op: 'create', streamId, serverId: server.id, creatorUserId: user.id }),
+      body: JSON.stringify({ op: 'create', streamId, serverId: server.id, creatorUserId: user.id, clientIp: clientIp(request) }),
     });
     if (!resp.ok) return err(`agent not reachable: ${await resp.text()}`, 502);
     await env.DB.prepare('INSERT INTO audit_logs (user_id, username, client_ip, action, target_server_id) VALUES (?,?,?,?,?)')
@@ -455,7 +455,7 @@ async function handleApiInner(request, env) {
     const resp = await stub.fetch('https://do.internal/rpc', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ op: 'open_file', streamId, serverId: server.id, creatorUserId: user.id }),
+      body: JSON.stringify({ op: 'open_file', streamId, serverId: server.id, creatorUserId: user.id, clientIp: clientIp(request) }),
     });
     if (!resp.ok) return err(`agent not reachable: ${await resp.text()}`, 502);
     await env.DB.prepare('INSERT INTO audit_logs (user_id, username, client_ip, action, target_server_id) VALUES (?,?,?,?,?)')
@@ -547,7 +547,13 @@ async function handleApiInner(request, env) {
       const csvRows = await env.DB.prepare(
         `SELECT id, user_id, username, client_ip, action, target_server_id, detail, created_at FROM audit_logs${where} ORDER BY id DESC LIMIT 5000`
       ).bind(...binds).all();
-      const esc = (v) => `"${String(v == null ? '' : v).replace(/"/g, '""')}"`;
+      // CSV 公式注入防护：detail（exec 命令/文件路径/服务器名）等用户可控字段以 = + - @ \t \r
+      // 开头时，Excel/WPS 打开会当公式执行——前缀单引号强制按文本解析（RFC 4180 双引号转义仍保留）
+      const esc = (v) => {
+        let s = String(v == null ? '' : v);
+        if (/^[=+\-@\t\r]/.test(s)) s = "'" + s;
+        return `"${s.replace(/"/g, '""')}"`;
+      };
       const header = 'id,user_id,username,client_ip,action,target_server_id,detail,created_at';
       const lines = csvRows.results.map((r) => [r.id, r.user_id, r.username, r.client_ip, r.action, r.target_server_id, r.detail, r.created_at].map(esc).join(','));
       return new Response([header, ...lines].join('\n'), {

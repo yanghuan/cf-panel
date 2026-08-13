@@ -20,6 +20,9 @@ export const ONLINE_GRACE_FAST_S = 15;
 
 // 解析面板用户：PANEL_USERS="alice:pass1,bob:pass2"；未设置时回退 PANEL_PASSWORD 单管理员
 //（routes 登录用；__internals 测试导出用）
+// 硬约束：逗号是用户分隔符，密码/用户名均不得含逗号；含逗号会静默拆成多个条目
+// （如 alice:pass,1 → 密码被截成 pass、凭空多出无效条目 1），故对无冒号的非空分段
+// fail closed 抛错（登录 500 暴露配置错误），优于静默截断。
 export function parsePanelUsers(env) {
   const raw = String(env.PANEL_USERS || '').trim();
   if (!raw) {
@@ -27,7 +30,10 @@ export function parsePanelUsers(env) {
   }
   return raw.split(',').map((pair) => {
     const idx = pair.indexOf(':');
-    if (idx <= 0) return null; // 无冒号或用户名缺失（idx=-1/0）→ 丢弃，避免截断末字符
+    if (idx < 0) {
+      if (pair.trim()) throw new Error('PANEL_USERS 配置错误：存在无冒号的条目（用户名/密码不得含逗号）');
+      return null; // 空分段（连续逗号/尾逗号）容忍
+    }
     return { username: pair.slice(0, idx).trim(), password: pair.slice(idx + 1).trim() };
-  }).filter((u) => u && u.username && u.password);
+  }).filter((u) => u && u.username && u.password); // 空用户名/空密码（如 ":pass"）仍按旧行为丢弃
 }

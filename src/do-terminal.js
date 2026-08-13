@@ -98,6 +98,7 @@ export class TerminalDO {
           streamId: body.streamId,
           serverId: body.serverId,
           creatorUserId: body.creatorUserId,
+          clientIp: String(body.clientIp || ''), // 文件写审计用（WS 消息路径无请求头，随会话存储）
           createdAt,
           type: isFile ? 'file' : 'terminal',
           userWs: null,
@@ -112,6 +113,7 @@ export class TerminalDO {
             streamId: body.streamId,
             serverId: body.serverId,
             creatorUserId: body.creatorUserId,
+            clientIp: String(body.clientIp || ''),
             createdAt,
             type: isFile ? 'file' : 'terminal',
           });
@@ -628,6 +630,19 @@ export class TerminalDO {
         }
       }
       // 浏览器 → DO
+      // 文件写操作审计（zip/rename/delete + write 首块）：记入 audit_logs，失败不影响透传。
+      // 文件会话与终端共用本通道，仅文件指令携带 path 字段，据此区分。
+      const fileAudit = async (j) => {
+        if (!j || !j.path) return;
+        if (!(j.type === 'zip' || j.type === 'rename' || j.type === 'delete' || (j.type === 'write' && Number(j.offset) === 0))) return;
+        let detail = String(j.path).slice(0, 200);
+        if (j.type === 'rename') detail += ` → ${String(j.new_name || '').slice(0, 100)}`;
+        try {
+          await this.env.DB.prepare('INSERT INTO audit_logs (user_id, username, client_ip, action, target_server_id, detail) VALUES (?,?,?,?,?,?)')
+            .bind(sess.creatorUserId, sess.creatorUser || '', sess.clientIp || '', `file.${j.type}`, sess.serverId, detail)
+            .run();
+        } catch (e) { console.error('file audit failed:', e); }
+      };
       if (typeof message === 'string') {
         try {
           const j = JSON.parse(message);
@@ -638,19 +653,28 @@ export class TerminalDO {
             }
             return;
           }
-          // 文件写操作审计（zip/rename/delete + write 首块）：记入 audit_logs，失败不影响透传。
-          // 文件会话与终端共用本通道，仅文件指令携带 path 字段，据此区分。
-          if (j && j.path && (j.type === 'zip' || j.type === 'rename' || j.type === 'delete' || (j.type === 'write' && Number(j.offset) === 0))) {
-            let detail = String(j.path).slice(0, 200);
-            if (j.type === 'rename') detail += ` → ${String(j.new_name || '').slice(0, 100)}`;
-            try {
-              await this.env.DB.prepare('INSERT INTO audit_logs (user_id, username, action, target_server_id, detail) VALUES (?,?,?,?,?)')
-                .bind(sess.creatorUserId, sess.creatorUser || '', `file.${j.type}`, sess.serverId, detail)
-                .run();
-            } catch (e) { console.error('file audit failed:', e); }
-          }
+          await fileAudit(j);
         } catch {
           /* 不是 JSON，当普通输入透传 */
+        }
+      } else {
+        // Binary 混合帧（生产上传路径）：JSON 头 + '\n' + 原始字节——审计须在此覆盖，
+        // 否则面板文件管理器上传（api.js 混合帧）无 file.write 审计（Text JSON 分支覆盖不到）
+        try {
+          const bytes = message instanceof ArrayBuffer
+            ? new Uint8Array(message)
+            : new Uint8Array(message.buffer || message, message.byteOffset || 0, message.byteLength || 0);
+          let nl = -1;
+          const headMax = Math.min(bytes.length, 512); // JSON 头很短，只扫前 512 字节
+          for (let i = 0; i < headMax; i++) {
+            if (bytes[i] === 10) { nl = i; break; }
+          }
+          if (nl > 0) {
+            const j = JSON.parse(new TextDecoder().decode(bytes.slice(0, nl)));
+            await fileAudit(j);
+          }
+        } catch {
+          /* 纯二进制（非混合帧）不审计 */
         }
       }
       if (sess.agentWs) sess.agentWs.send(message);

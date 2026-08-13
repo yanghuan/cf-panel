@@ -734,6 +734,11 @@ test('审计日志：管理员可查（倒序 + limit），非管理员 403', as
   assert.match(csvText, /^id,user_id,username,client_ip,action,target_server_id,detail,created_at/);
   assert.match(csvText, /terminal\.open/);
 
+  // 公式注入防护：以 = + - @ 开头的 detail 前缀单引号，防 Excel/WPS 当公式执行
+  await env.DB.prepare("INSERT INTO audit_logs (user_id, username, client_ip, action, target_server_id, detail) VALUES (1, 'admin', '1.1.1.1', 'exec.command', 1, '=cmd|/bin/sh')").run();
+  const csv2 = await (await call(env, { path: '/api/audit-logs?format=csv', token: adminToken })).text();
+  assert.match(csv2, /"'=cmd\|\/bin\/sh"/, '= 前缀被单引号转义');
+
   // PAT 不能查看
   const pat = await (await call(env, { method: 'POST', path: '/api/tokens', token: adminToken, body: { name: 'r', scopes: ['server:read'] } })).json();
   assert.equal((await call(env, { path: '/api/audit-logs', token: pat.token })).status, 403);

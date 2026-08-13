@@ -40,7 +40,7 @@ export class MetricsDO {
     this.latestByServer = new Map(); // serverId -> 最新指标 {ts, ..., last_seen_s}（/report 热写 O(1) 维护，/latest 直接 O(S) 返回）
     this.offlineLoaded = false; // 离线告警状态是否已从 storage 一次性加载（惰性）
     this.offlineState = new Map(); // serverId -> 'on'|'off'（内存副本，避免每机逐个 getAlarm）
-    this.usage = { report: 0, latest: 0, query: 0, alarm: 0 }; // 用量观测：本周期（10min）计数，alarm 时累计到 storage
+    this.usage = { report: 0, latest: 0, query: 0 }; // 用量观测：本周期（10min）计数，周期末累计到 storage
     this.hotLoaded = new Set(); // serverId 已从 storage 完整加载热区的标记（见 ensureHot）
     this.pushOn = false; // 是否有观看者（PanelDO 0→1/1→0 通知），开启时才推送 latest
     this.lastPushAt = 0; // 上次推送 latest 给 PanelDO 的时刻（ms）；上报驱动节流，不引入定时器
@@ -595,7 +595,7 @@ export class MetricsDO {
         await this.state.storage.put('usage:total', JSON.stringify({ report, latest, query }));
       }
     } catch { /* 用量汇总失败不影响主流程 */ }
-    this.usage = { report: 0, latest: 0, query: 0, alarm: 0 };
+    this.usage = { report: 0, latest: 0, query: 0 };
     await this.ensureHousekeepLoaded();
     const archiveOn = this.env.ARCHIVE_TO_D1 !== '0';
     try {

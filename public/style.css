@@ -240,6 +240,8 @@ button.danger:hover { background: rgba(248, 113, 113, .12); }
 /* flex 居中对齐：emoji 与 SVG 图片在两种平台下与服务器名保持同一水平线 */
 .card .name .flag { margin-right: 5px; font-size: 14px; line-height: 1; display: inline-flex; align-items: center; }
 .card .name .flag .flag-img { width: 18px; height: auto; border-radius: 2px; }
+/* 操作系统图标（simple-icons SVG）：旗帜后、服务器名前，与旗帜同一水平线 */
+.card .name .os-ico { width: 16px; height: 16px; margin-right: 5px; vertical-align: middle; display: inline-block; }
 .card .meta { font-size: 12px; color: var(--muted); margin-bottom: 10px; word-break: break-all; }
 .card .meta .cid { color: var(--accent, #8b5cf6); font-weight: 600; font-variant-numeric: tabular-nums; }
 

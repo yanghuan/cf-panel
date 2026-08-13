@@ -4,7 +4,7 @@
   // 工具函数与 <cf-ip> 组件从 utils.js 解构；api 层从 api.js 解构（index.html 中均须先加载）
   const { $, escapeHtml, fmtBytes, fileJoin, fileParent, downsample, lockScroll, unlockScroll,
           MONITOR_STEP_MAX, MONITOR_RANGE_LABEL, MONITOR_COLORS,
-          GEO_PRIVATE, setGeoEnabled, flagHtml, geoLookup, IdleGuard } = CfUtils;
+          GEO_PRIVATE, setGeoEnabled, flagHtml, osIconHtml, geoLookup, IdleGuard } = CfUtils;
   const { api, setTokenGetter, FileSession, TermSession, PushSession } = CfApi;
   let token = localStorage.getItem('cfpanel_token') || '';
   setTokenGetter(() => token); // api 层通过 getter 读取当前 token
@@ -224,7 +224,7 @@
       <div class="card" data-id="${s.id}">
         <div class="card-head">
           <div class="card-title">
-            <span class="name"><span class="flag" data-flag="${escapeHtml(ip)}"></span>${escapeHtml(s.name)}</span>
+            <span class="name"><span class="flag" data-flag="${escapeHtml(ip)}"></span>${osIconHtml(s.info && s.info.os)}${escapeHtml(s.name)}</span>
             <button class="more-btn" title="节点操作">⋯</button>
             <div class="card-menu hidden">
               ${canExec ? `<button data-act="term" data-id="${s.id}" data-name="${escapeHtml(s.name)}">终端</button>

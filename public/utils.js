@@ -139,14 +139,83 @@
     return null;
   }
   // 旗帜渲染：ISO 3166-1 alpha-2 代码 → 旗帜。
-  // 非 Windows（macOS/Linux/Android/iOS）：区域指示符 emoji（零请求、随系统字体渲染）；
-  // Windows：系统 emoji 字体无旗帜字形（显示为 CN 字母），改用 flagcdn SVG 图片（跨平台统一）。
-  const FLAG_IMG_ONLY = /Windows/i.test(navigator.userAgent);
+  // 运行时检测系统能否渲染彩色旗帜 emoji（覆盖全部平台）：
+  //   Windows 默认 Segoe UI Emoji 无旗帜字形（渲染成 CN 字母）→ 图片；
+  //   Linux 无 emoji 字体（渲染成豆腐块）→ 图片；装了含旗帜字形的字体 → emoji；
+  //   macOS / 带彩色 emoji 字体的 Linux → emoji（零请求）。
+  // 检测原理：canvas 绘制 🇨🇳 统计彩色像素占比——旗帜是多色图案，fallback（字母/豆腐块）是单色。
+  // 黑白旗帜字体（Symbola 等）会判"不支持"→ 退回图片（无害方向，最坏不过多一次图片请求）。
+  // 一次检测缓存全局复用；getImageData 异常时保守返回 false（走图片，无显示错误）。
+  function detectFlagEmoji() {
+    try {
+      const c = document.createElement('canvas');
+      c.width = c.height = 64;
+      const ctx = c.getContext('2d');
+      if (!ctx) return false;
+      ctx.font = '48px sans-serif';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText('\u{1F1E8}\u{1F1F3}', 32, 32); // 🇨🇳
+      const d = ctx.getImageData(0, 0, 64, 64).data;
+      let colored = 0, total = 0;
+      for (let i = 0; i < d.length; i += 4) {
+        if (d[i + 3] <= 128) continue; // 透明像素不计
+        total++;
+        const max = Math.max(d[i], d[i + 1], d[i + 2]);
+        const min = Math.min(d[i], d[i + 1], d[i + 2]);
+        if (max - min > 32) colored++; // RGB 通道差大 → 彩色像素
+      }
+      return total > 100 && colored / total > 0.02; // 有少量彩色像素即判定支持
+    } catch { return false; }
+  }
+  const FLAG_EMOJI_SUPPORTED = detectFlagEmoji();
   function flagHtml(cc) {
     if (!cc || !/^[A-Za-z]{2}$/.test(cc)) return '';
+    if (FLAG_EMOJI_SUPPORTED) return String.fromCodePoint(0x1F1E6 + cc.charCodeAt(0) - 65, 0x1F1E6 + cc.charCodeAt(1) - 65);
     const c = cc.toLowerCase();
-    if (FLAG_IMG_ONLY) return `<img src="https://flagcdn.com/${c}.svg" alt="${escapeHtml(cc)}" loading="lazy" class="flag-img">`;
-    return String.fromCodePoint(0x1F1E6 + cc.charCodeAt(0) - 65, 0x1F1E6 + cc.charCodeAt(1) - 65);
+    return `<img src="https://flagcdn.com/${c}.svg" alt="${escapeHtml(cc)}" loading="lazy" class="flag-img">`;
+  }
+
+  // 操作系统图标：simple-icons CDN SVG（白色，适配深色主题）。
+  // 匹配 info.os 字符串（agent 上报的 PRETTY_NAME / 平台名）：Windows/macOS 走平台分支，
+  // Linux 按发行版关键字映射 slug，未知 Linux 兜底 linux 图标，无法识别返回 ''（不显示）。
+  // Windows 图标：simple-icons 已于 2024 年下架全部微软品牌图标（含 windows 各变体），
+  // 改用 bootstrap-icons 的 Windows 窗格图标路径（MIT），data URI 内联（CSP img-src 已放行 data:）
+  const WINDOWS_SVG = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="#fff"><path d="M0 3.449 9.75 2.1v9.451H0Zm10.949-1.602L24 .137v11.35H10.949ZM0 12.6h9.75v9.451L0 20.699Zm10.949 0H24V24l-13.051-1.8Z"/></svg>';
+  const OS_ICON_MAP = [
+    ['apple', ['mac os', 'macos', 'darwin', 'os x']],
+    ['ubuntu', ['ubuntu']],
+    ['debian', ['debian']],
+    ['centos', ['centos']],
+    ['alpine', ['alpine']],
+    ['fedora', ['fedora']],
+    ['archlinux', ['arch']],
+    ['rockylinux', ['rocky']],
+    ['almalinux', ['alma']],
+    ['opensuse', ['opensuse', 'suse']],
+    ['raspberrypi', ['raspbian', 'raspberry']],
+    ['linuxmint', ['mint']],
+    ['manjaro', ['manjaro']],
+    ['kali', ['kali']],
+    ['oracle', ['oracle']],
+    ['popos', ['pop os', 'popos', 'pop!_os']],
+    ['elementaryos', ['elementary']],
+    ['gentoo', ['gentoo']],
+    ['nixos', ['nixos']],
+    ['linux', ['linux']], // 未知发行版兜底
+  ];
+  function osIconHtml(os) {
+    if (!os) return '';
+    const s = String(os).toLowerCase();
+    if (s.includes('windows') || s.includes('microsoft')) {
+      return `<img src="data:image/svg+xml,${encodeURIComponent(WINDOWS_SVG)}" alt="" title="${escapeHtml(String(os))}" loading="lazy" class="os-ico">`;
+    }
+    for (const [slug, keys] of OS_ICON_MAP) {
+      if (keys.some((k) => s.includes(k))) {
+        return `<img src="https://cdn.simpleicons.org/${slug}/fff" alt="" title="${escapeHtml(String(os))}" loading="lazy" class="os-ico">`;
+      }
+    }
+    return '';
   }
 
   // ---------- 空闲观看保护（IdleGuard）：无操作计时 + 提示 + 自动暂停，动作经回调注入 ----------
@@ -229,6 +298,6 @@
     $, escapeHtml, fmtBytes, fileJoin, fileParent, downsample,
     lockScroll, unlockScroll,
     MONITOR_STEP_MAX, MONITOR_RANGE_LABEL, MONITOR_COLORS,
-    GEO_PRIVATE, geoLookup, flagHtml, setGeoEnabled, IdleGuard,
+    GEO_PRIVATE, geoLookup, flagHtml, osIconHtml, setGeoEnabled, IdleGuard,
   };
 })();

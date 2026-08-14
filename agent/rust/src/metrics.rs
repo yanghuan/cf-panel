@@ -243,6 +243,13 @@ fn disk_usage_static(include: &[String]) -> Result<Vec<serde_json::Value>, ()> {
         if disk_excluded(fstype, include) {
             continue;
         }
+        // 目录检查：容器会把 /etc/hosts、/etc/hostname、/etc/resolv.conf 等文件做成 bind mount，
+        // 与根盘同 dev 同 fstype——设备去重拦不住，statvfs 对文件也成功（返回绑定源 FS 统计），
+        // 会把它误当"数据盘挂载点"显示根盘容量。文件型 bind mount 直接跳过。
+        let md = std::fs::metadata(mount).map_err(|_| ())?;
+        if !md.is_dir() {
+            continue;
+        }
         let c_path = std::ffi::CString::new(mount.as_bytes()).map_err(|_| ())?;
         let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
         if unsafe { libc::statvfs(c_path.as_ptr(), &mut st) } != 0 {
@@ -253,10 +260,12 @@ fn disk_usage_static(include: &[String]) -> Result<Vec<serde_json::Value>, ()> {
         } else {
             1
         };
+        // total 直接用 f_blocks（与 df 的 Size 列一致）：used = f_blocks - f_bfree（含 root 保留块的
+        // 已用口径）；f_bavail 不含保留块，若 total = used + avail 会少算保留块（ext4 默认 5%）
+        let total = st.f_blocks as u64 * frsize;
         let used = st.f_blocks.saturating_sub(st.f_bfree) as u64 * frsize;
-        let avail = st.f_bavail as u64 * frsize;
         // 上报 used/total（字节），百分比由前端计算——信息无损的完备表示（u 为派生值不再传输）
-        out.push(json!({ "m": mount, "used": used, "total": used + avail }));
+        out.push(json!({ "m": mount, "used": used, "total": total }));
     }
     Ok(out)
 }

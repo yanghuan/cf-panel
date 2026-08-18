@@ -90,7 +90,7 @@
       }
       let j; try { j = JSON.parse(ev.data); } catch { return; }
       if (j.type === 'list_result' && j.ok) {
-        if (this.h.onList) this.h.onList(j.entries, !!j.truncated);
+        if (this.h.onList) this.h.onList(j.entries, !!j.truncated, j.path);
       } else if (j.type === 'write_result' && j.ok) {
         this._onWriteResult(j);
       } else if (j.type === 'zip_result' && j.ok) {
@@ -108,6 +108,8 @@
         if (this._zipCleanup) this._zipCleanup = false;
         else if (this.h.onDeleteDone) this.h.onDeleteDone();
       } else if (j.type === 'error') {
+        // 读取失败时复位编辑器状态——否则 editState 残留导致"已有编辑读取进行中"永久卡死
+        if (this.editState) this.editState = null;
         if (this.h.onError) this.h.onError(j.message);
       }
     }
@@ -198,9 +200,15 @@
     touch(path) { this.send({ type: 'touch', path }); }
     // 移动（跨目录，同分区原子 rename；跨分区仅文件回退 copy+delete；目标已存在拒绝）
     move(path, dest) { this.send({ type: 'move', path, dest }); }
-    // 在线编辑：分段拉取全文（≤1MB 由调用方限制），onEditLoaded(path, text) 回调
+    // 在线编辑：分段拉取全文（≤1MB 由调用方限制），onEditLoaded(path, text) 回调。
+    // 已有读取进行中：同文件视为重复点击静默忽略；不同文件顶替重开（旧读取的迟到响应
+    // 会因 editState.path 不匹配而落到下载分支被丢弃，无副作用）
     editText(path, size) {
-      if (this.editState) { if (this.h.onError) this.h.onError('已有编辑读取进行中'); return; }
+      if (this.editState) {
+        // 同文件且连接正常 → 重复点击忽略；否则（读取失败残留/断线残留/换文件）顶替重开
+        if (this.editState.path === path && this.connected) return;
+        this.editState = null;
+      }
       this.editState = { path, size, parts: [], received: 0 };
       this.send({ type: 'read', path, offset: 0, limit: FILE_CHUNK });
     }
@@ -210,6 +218,12 @@
       // 编辑器全文读取（优先于下载状态机：editState 独立，完成即回调文本）
       const ed = this.editState;
       if (ed && j.path === ed.path) {
+        // 空文件（size=0，agent 首读即 got=0）直接当空文本打开，不算失败
+        if (j.got === 0 && ed.size === 0) {
+          this.editState = null;
+          if (this.h.onEditLoaded) this.h.onEditLoaded(ed.path, '');
+          return;
+        }
         if (j.got === 0 || !data) {
           this.editState = null;
           if (this.h.onError) this.h.onError('读取文件失败（为空或已变化）');
@@ -218,12 +232,20 @@
         ed.parts.push(data);
         ed.received += j.got;
         if (ed.received >= ed.size) {
-          // 逐段拷贝合并（parts 是 Uint8Array 数组）后整体解码
-          const all = new Uint8Array(ed.parts.reduce((n, p) => n + p.length, 0));
+          // 解码校验：UTF-8 替换字符占比 >1% 判定二进制（扩展名黑名单外的漏网：无扩展名/罕见类型）——
+          // 编辑保存会因替换字符永久损坏二进制，宁可不打开
+          let all = new Uint8Array(ed.parts.reduce((n, p) => n + p.length, 0));
           let o = 0;
           for (const p of ed.parts) { all.set(p, o); o += p.length; }
+          const text = new TextDecoder().decode(all);
+          const fffd = (text.match(/\uFFFD/g) || []).length;
+          if (fffd > 0 && fffd / Math.max(all.length, 1) > 0.01) {
+            this.editState = null;
+            if (this.h.onError) this.h.onError('检测到二进制文件，不支持在线编辑（保存会损坏内容）');
+            return;
+          }
           this.editState = null;
-          if (this.h.onEditLoaded) this.h.onEditLoaded(ed.path, new TextDecoder().decode(all));
+          if (this.h.onEditLoaded) this.h.onEditLoaded(ed.path, text);
         } else {
           this.send({ type: 'read', path: ed.path, offset: ed.received, limit: FILE_CHUNK });
         }

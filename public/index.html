@@ -136,6 +136,33 @@
     </div>
   </div>
 
+  <!-- 移动路径选择器 -->
+  <div id="file-selector-modal" class="modal hidden">
+    <div class="modal-head">
+      <span id="sel-title">移动</span>
+      <div>
+        <button id="btn-sel-ok" class="ghost">移动到此处</button>
+        <button id="btn-sel-close" class="ghost">取消</button>
+      </div>
+    </div>
+    <div class="file-body">
+      <div class="file-toolbar">
+        <button id="btn-sel-up" class="ghost">上级</button>
+        <input id="sel-path" type="text" placeholder="路径" />
+        <button id="sel-go" class="ghost">跳转</button>
+      </div>
+      <p class="muted" style="margin:4px 0;font-size:12px">当前目录：<span id="sel-cwd"></span></p>
+      <div class="sel-list-wrap">
+        <table class="file-table"><tbody id="sel-list"></tbody></table>
+      </div>
+      <div class="file-toolbar" style="margin-top:8px">
+        <span class="muted" style="font-size:12px;align-self:center">目标名称：</span>
+        <input id="sel-name" type="text" />
+      </div>
+      <p id="sel-msg" class="msg"></p>
+    </div>
+  </div>
+
   <!-- 添加/修改服务器弹窗（修改复用同一表单，标题与按钮文案动态切换） -->
   <div id="add-modal" class="modal hidden">
     <div class="modal-head">
@@ -358,8 +385,8 @@
 
   <script src="/vendor/xterm.min.js"></script>
   <script src="/vendor/addon-fit.min.js"></script>
-  <script src="/utils.js?v=3"></script>
-  <script src="/api.js?v=2"></script>
-  <script src="/app.js?v=38"></script>
+  <script src="/utils.js?v=4"></script>
+  <script src="/api.js?v=5"></script>
+  <script src="/app.js?v=40"></script>
 </body>
 </html>

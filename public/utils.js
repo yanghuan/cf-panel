@@ -239,6 +239,20 @@
     return SYSTEM_PATH_PREFIXES.some((s) => norm === s || norm.startsWith(s + '/'));
   }
 
+  // 二进制扩展名黑名单：这些类型的"编辑"必然损坏文件（UTF-8 解码替换字符写回），
+  // 直接不显示编辑入口。名单外的仍可能误判（无扩展名二进制），由 api.js 解码校验兜底。
+  // 集合元素带点（.jpg），比较时补点——两侧口径不一致会全量漏判
+  const BINARY_EXTS = new Set(('.jpg .jpeg .png .gif .webp .bmp .ico .svgz .tif .tiff .heic .avif '
+    + '.zip .gz .bz2 .xz .7z .rar .zst .tar .tgz .tbz2 .txz .jar .war '
+    + '.exe .dll .so .dylib .bin .o .a .class .pyc .wasm '
+    + '.mp3 .mp4 .avi .mkv .mov .flv .wmv .webm .m4a .flac .wav .ogg '
+    + '.pdf .doc .docx .xls .xlsx .ppt .pptx .odt .ods .sqlite .db .mdb '
+    + '.woff .woff2 .ttf .otf .eot .deb .rpm .apk .ipa .img .iso').split(/\s+/));
+  function isBinaryExt(name) {
+    const i = String(name || '').lastIndexOf('.');
+    return i > 0 && BINARY_EXTS.has('.' + name.slice(i + 1).toLowerCase());
+  }
+
   // ---------- 空闲观看保护（IdleGuard）：无操作计时 + 提示 + 自动暂停，动作经回调注入 ----------
   // 类似视频网站"继续观看？"：长时间无浏览器操作 → 提示 → 60s 无响应自动暂停；
   // 任何活动恢复。暂停/恢复/提示等 UI 动作由 handlers 提供（app.js 注入 stopPush/startPush/confirmDialog）
@@ -319,6 +333,6 @@
     $, escapeHtml, fmtBytes, fileJoin, fileParent, downsample,
     lockScroll, unlockScroll,
     MONITOR_STEP_MAX, MONITOR_RANGE_LABEL, MONITOR_COLORS,
-    GEO_PRIVATE, geoLookup, flagHtml, osIconHtml, isSystemPath, setGeoEnabled, IdleGuard,
+    GEO_PRIVATE, geoLookup, flagHtml, osIconHtml, isSystemPath, isBinaryExt, setGeoEnabled, IdleGuard,
   };
 })();

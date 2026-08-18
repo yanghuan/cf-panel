@@ -703,6 +703,18 @@ button.danger:hover { background: rgba(248, 113, 113, .12); }
   border-radius: 10px;
   padding: 10px;
 }
+/* 移动路径选择器：目录列表独立滚动 */
+.sel-list-wrap {
+  max-height: 260px;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 4px 8px;
+  background: rgba(20, 25, 40, .4);
+}
+.sel-list-wrap .file-table { margin: 0; }
+a.f-dir.f-prot { opacity: .55; }
+
 /* 在线文件编辑器：等宽全高 textarea */
 .file-editor-area {
   width: 100%;

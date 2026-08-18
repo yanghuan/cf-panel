@@ -4,6 +4,9 @@
 // ============================================================
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import nodeFs from 'node:fs';
+import nodePath from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { __internals as I } from '../src/index.js';
 
 const env = { JWT_SECRET: 'unit-secret' };
@@ -204,6 +207,48 @@ test('sanitizeReportPayload 磁盘 IO 嵌套对象白名单归一化', () => {
   // 非对象类型（数组/字符串）直接丢弃
   assert.equal(I.sanitizeReportPayload({ serverId: 1, extra: { disk_io: [1, 2] } }).extra.disk_io, undefined);
   assert.equal(I.sanitizeReportPayload({ serverId: 1, extra: { disk_io: 'x' } }).extra.disk_io, undefined);
+});
+
+// ---------------- 前端工具：系统路径 / 二进制扩展名 ----------------
+// utils.js 是浏览器全局脚本（window.CfUtils，无 ES export），mock 最小 DOM 环境后 eval 加载
+function loadCfUtils() {
+  globalThis.window = globalThis;
+  // navigator 用 Node 内置只读全局即可（detectFlagEmoji 不依赖 UA，canvas ctx 为 null 走 catch）
+  globalThis.document = { createElement: () => ({ getContext: () => null, width: 0, height: 0 }) };
+  globalThis.HTMLElement = class HTMLElement { }; // utils.js IdleGuard 的 instanceof 引用
+  globalThis.customElements = { define() { } }; // utils.js 顶部 customElements.define 调用
+  const src = nodeFs.readFileSync(nodePath.join(nodePath.dirname(fileURLToPath(import.meta.url)), '../public/utils.js'), 'utf8');
+  (0, eval)(src); // 间接 eval：全局作用域执行，挂载 window.CfUtils
+  return globalThis.CfUtils;
+}
+const CfUtils = loadCfUtils();
+
+test('isSystemPath 词法归一化与黑名单（与 agent 同规则）', () => {
+  assert.equal(CfUtils.isSystemPath('/etc/passwd'), true);
+  assert.equal(CfUtils.isSystemPath('//etc/passwd'), true);
+  assert.equal(CfUtils.isSystemPath('/home/../etc/x'), true);
+  assert.equal(CfUtils.isSystemPath('etc/passwd'), true); // 相对路径 fail closed
+  assert.equal(CfUtils.isSystemPath('/opt/app/bin'), false); // 部署目录放行
+  assert.equal(CfUtils.isSystemPath('/srv/www'), false);
+  assert.equal(CfUtils.isSystemPath('/home/u/dir'), false);
+});
+
+test('isBinaryExt 扩展名黑名单判定（集合带点，比较补点）', () => {
+  // 命中黑名单：不显示编辑入口
+  assert.equal(CfUtils.isBinaryExt('a.jpg'), true);
+  assert.equal(CfUtils.isBinaryExt('photo.jpeg'), true);
+  assert.equal(CfUtils.isBinaryExt('backup.tar.gz'), true); // 取最后扩展名 gz
+  assert.equal(CfUtils.isBinaryExt('A.JPG'), true); // 大小写不敏感
+  assert.equal(CfUtils.isBinaryExt('lib.so'), true);
+  assert.equal(CfUtils.isBinaryExt('data.sqlite'), true);
+  assert.equal(CfUtils.isBinaryExt('font.woff2'), true);
+  // 文本/无扩展名：可编辑
+  assert.equal(CfUtils.isBinaryExt('nginx.conf'), false);
+  assert.equal(CfUtils.isBinaryExt('run.sh'), false);
+  assert.equal(CfUtils.isBinaryExt('Makefile'), false);
+  assert.equal(CfUtils.isBinaryExt('app.js'), false);
+  assert.equal(CfUtils.isBinaryExt('README'), false);
+  assert.equal(CfUtils.isBinaryExt(''), false);
 });
 
 // ---------------- 模板渲染 / Headers ----------------

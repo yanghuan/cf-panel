@@ -4,7 +4,7 @@
   // 工具函数与 <cf-ip> 组件从 utils.js 解构；api 层从 api.js 解构（index.html 中均须先加载）
   const { $, escapeHtml, fmtBytes, fileJoin, fileParent, downsample, lockScroll, unlockScroll,
           MONITOR_STEP_MAX, MONITOR_RANGE_LABEL, MONITOR_COLORS,
-          GEO_PRIVATE, setGeoEnabled, flagHtml, osIconHtml, isSystemPath, geoLookup, IdleGuard } = CfUtils;
+          GEO_PRIVATE, setGeoEnabled, flagHtml, osIconHtml, isSystemPath, isBinaryExt, geoLookup, IdleGuard } = CfUtils;
   const { api, setTokenGetter, FileSession, TermSession, PushSession } = CfApi;
   let token = localStorage.getItem('cfpanel_token') || '';
   setTokenGetter(() => token); // api 层通过 getter 读取当前 token
@@ -627,10 +627,18 @@
   let fileEntries = [];      // 当前目录条目缓存（上传前同名检测用）
 
   // FileSession：连接/协议/上传下载状态机（api.js，零 DOM），UI 通过回调处理
+  // 移动路径选择器状态（null=关闭）：复用主 WS 会话的 list 指令，onList 按 path 分流渲染
+  let fileSelector = null; // { cwd, srcPath, srcName, srcIsDir, entries }
   const fileSess = new FileSession({
-    onList: (entries, truncated) => {
-      renderFileList(entries);
-      $('#file-msg').textContent = truncated ? '目录条目过多，仅显示前 1000 项' : '';
+    onList: (entries, truncated, path) => {
+      // 选择器打开且本次 list 目标为选择器目录 → 渲染选择器；否则渲染主列表
+      if (fileSelector && path === fileSelector.cwd) {
+        fileSelector.entries = entries || [];
+        renderSelectorList();
+      } else {
+        renderFileList(entries);
+        $('#file-msg').textContent = truncated ? '目录条目过多，仅显示前 1000 项' : '';
+      }
     },
     onUploadProgress: (pct) => { $('#file-msg').textContent = `上传中：${pct}%`; },
     onUploadDone: (path) => { $('#btn-file-cancel').classList.add('hidden'); reloadFileList(); },
@@ -700,8 +708,8 @@
       // 受保护系统路径（与 agent 黑名单同规则）：仅保留下载（读操作），隐藏全部写操作——
       // 系统目录的写操作请走终端 Shell；agent 端仍有最终防线，此处是 UX 层
       const prot = isSystemPath(path);
-      // 在线编辑：普通文件 + ≤1MB + 非系统路径（写回会被 agent 拦）
-      const editable = !prot && e.type !== 'dir' && e.size > 0 && e.size <= 1024 * 1024;
+      // 在线编辑：非目录 + ≤1MB + 非系统路径 + 非二进制扩展名（空文件也放行，编辑器当空文本）
+      const editable = !prot && e.type !== 'dir' && e.size <= 1024 * 1024 && !isBinaryExt(e.name);
       const menu = `<div class="row-menu-wrap">
         <button class="row-menu" type="button" title="操作" aria-label="操作">⋯</button>
         <div class="row-menu-pop hidden">
@@ -762,6 +770,69 @@
     fileSess.cancelEditText();
     $('#file-editor-modal').classList.add('hidden');
     unlockScroll();
+  }
+
+  // ---------- 移动路径选择器（浏览目录选目标 + 文件名输入；复用主 WS 的 list 指令） ----------
+  function openFileSelector(srcPath, srcName, srcIsDir) {
+    fileSelector = { cwd: fileParent(srcPath), srcPath, srcName, srcIsDir, entries: [] };
+    $('#sel-title').textContent = `移动：${srcPath}`;
+    $('#sel-name').value = srcName;
+    $('#file-selector-modal').classList.remove('hidden');
+    lockScroll();
+    fileSess.list(fileSelector.cwd, ''); // 拉取起始目录（onList 按 path 分流）
+  }
+  function closeFileSelector() {
+    fileSelector = null;
+    $('#file-selector-modal').classList.add('hidden');
+    unlockScroll();
+  }
+  // 选择器目录列表：仅显示子目录（点进入）；底部即时同名提示
+  function renderSelectorList() {
+    if (!fileSelector) return;
+    const dirs = fileSelector.entries.filter((e) => e.type === 'dir');
+    const rows = dirs.map((e) => {
+      const p = fileJoin(fileSelector.cwd, e.name);
+      const prot = isSystemPath(p);
+      return `<tr><td><a class="f-dir${prot ? ' f-prot' : ''}" data-path="${escapeHtml(p)}">📁 ${escapeHtml(e.name)}${prot ? ' 🔒' : ''}</a></td></tr>`;
+    });
+    $('#sel-list').innerHTML = rows.join('') || '<tr><td class="muted">（无子目录）</td></tr>';
+    $('#sel-cwd').textContent = fileSelector.cwd;
+    // 目标目录为系统目录 → 禁止确认（agent 也会拦，此处提前提示）
+    const protCwd = isSystemPath(fileSelector.cwd);
+    $('#btn-sel-ok').disabled = protCwd;
+    $('#sel-msg').textContent = protCwd ? '系统目录受保护，不可作为目标；如需操作请使用终端 Shell' : '';
+    checkSelectorConflict();
+  }
+  // 即时同名冲突提示（最终以 agent 拒绝为准——列表可能过期）
+  function checkSelectorConflict() {
+    if (!fileSelector) return;
+    const name = $('#sel-name').value.trim();
+    const conflict = name && fileSelector.entries.some((e) => e.name === name);
+    const sameSrc = name === fileSelector.srcName && fileSelector.cwd === fileParent(fileSelector.srcPath);
+    $('#btn-sel-ok').disabled = isSystemPath(fileSelector.cwd) || !name || sameSrc;
+    if (sameSrc) $('#sel-msg').textContent = '与源位置相同，无需移动';
+    else if (conflict) $('#sel-msg').textContent = `目标已存在同名「${name}」，将被拒绝（不覆盖）`;
+    else if (!isSystemPath(fileSelector.cwd)) $('#sel-msg').textContent = '';
+  }
+  function selEnter(path) {
+    if (!fileSelector) return;
+    fileSelector.cwd = path;
+    fileSess.list(path, '');
+  }
+  function selUp() {
+    if (!fileSelector) return;
+    const up = fileParent(fileSelector.cwd);
+    if (up !== fileSelector.cwd) selEnter(up);
+  }
+  function confirmSelectorMove() {
+    if (!fileSelector) return;
+    const name = $('#sel-name').value.trim();
+    if (!name || name.includes('/')) return toast('文件名不能为空且不含 /');
+    const dest = fileJoin(fileSelector.cwd, name);
+    if (dest === fileSelector.srcPath) return toast('与源位置相同');
+    fileSess.move(fileSelector.srcPath, dest);
+    closeFileSelector();
+    $('#file-msg').textContent = `移动中：${dest}`;
   }
 
   // 上传/下载入口：状态机在 FileSession（api.js），这里只负责 UI 接线。
@@ -1636,11 +1707,22 @@
   $('#file-go').onclick = () => { const p = $('#file-path').value.trim(); if (!p) return; fileSess.cwd = p; reloadFileList(); };
   $('#file-path').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('#file-go').click(); });
   $('#file-input').addEventListener('change', (e) => { const f = e.target.files[0]; if (f) uploadFile(f); e.target.value = ''; });
-  // 新建目录 / 新建文件 / 在线编辑器
+  // 新建目录 / 新建文件 / 在线编辑器 / 移动选择器
   $('#btn-file-mkdir').onclick = mkDir;
   $('#btn-file-touch').onclick = touchFile;
   $('#btn-editor-save').onclick = saveFileEditor;
   $('#btn-editor-close').onclick = closeFileEditor;
+  $('#btn-sel-close').onclick = closeFileSelector;
+  $('#btn-sel-ok').onclick = confirmSelectorMove;
+  $('#btn-sel-up').onclick = selUp;
+  $('#sel-go').onclick = () => { const p = $('#sel-path').value.trim(); if (p) selEnter(p); };
+  $('#sel-path').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('#sel-go').click(); });
+  $('#sel-name').addEventListener('input', checkSelectorConflict);
+  // 选择器目录点击进入（事件委托）
+  $('#sel-list').addEventListener('click', (e) => {
+    const a = e.target.closest('a.f-dir');
+    if (a) selEnter(a.dataset.path);
+  });
   // 文件名通配符过滤：debounce 后发 list（pattern 由 agent 端匹配，先过滤再截断）
   $('#file-filter').addEventListener('input', () => {
     clearTimeout(fileFilterTimer);
@@ -1680,10 +1762,7 @@
     const mv = e.target.closest('.f-act-mv');
     if (mv) {
       closeRowMenus();
-      promptDialog(`移动到（绝对路径，含目标文件名）：${mv.dataset.path}`, mv.dataset.path, (dest) => {
-        if (!dest || !dest.startsWith('/') || dest === mv.dataset.path) return;
-        fileSess.move(mv.dataset.path, dest);
-      });
+      openFileSelector(mv.dataset.path, mv.dataset.path.split('/').pop(), mv.dataset.type === 'dir');
       return;
     }
     const ed = e.target.closest('.f-act-edit');

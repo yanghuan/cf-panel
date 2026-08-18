@@ -654,6 +654,10 @@
     // 重命名/删除成功后刷新列表（zip 下载完成的 delete 清理不回执，不会误触 onDeleteDone）
     onRenameDone: (path) => { reloadFileList(); toast(`已重命名为：${path}`); },
     onDeleteDone: () => { reloadFileList(); toast('已删除'); },
+    onMkdirDone: () => { reloadFileList(); toast('目录已创建'); },
+    onTouchDone: () => { reloadFileList(); toast('文件已创建'); },
+    onMoveDone: (path) => { reloadFileList(); toast(`已移动到：${path}`); },
+    onEditLoaded: (path, text) => openFileEditor(path, text),
     onError: (msg) => { $('#file-msg').textContent = `错误：${msg}`; },
     onDisconnected: () => { if (!$('#file-modal').classList.contains('hidden')) $('#file-msg').textContent = '连接断开，点击「刷新」重连'; },
   });
@@ -692,22 +696,26 @@
       const nameCell = e.type === 'dir'
         ? `<a class="f-dir" data-path="${escapeHtml(path)}">📁 ${escapeHtml(e.name)}</a>`
         : `<span class="f-file">📄 ${escapeHtml(e.name)}</span>`;
-      // 行操作：⋯ 下拉菜单（下载/重命名/删除）。目录下载 = 打包 zip。
-      // 受保护系统路径（与 agent 黑名单同规则）：仅保留下载（读操作），隐藏重命名/删除——
+      // 行操作：⋯ 下拉菜单（下载/编辑/移动/重命名/删除）。目录下载 = 打包 zip。
+      // 受保护系统路径（与 agent 黑名单同规则）：仅保留下载（读操作），隐藏全部写操作——
       // 系统目录的写操作请走终端 Shell；agent 端仍有最终防线，此处是 UX 层
       const prot = isSystemPath(path);
+      // 在线编辑：普通文件 + ≤1MB + 非系统路径（写回会被 agent 拦）
+      const editable = !prot && e.type !== 'dir' && e.size > 0 && e.size <= 1024 * 1024;
       const menu = `<div class="row-menu-wrap">
         <button class="row-menu" type="button" title="操作" aria-label="操作">⋯</button>
         <div class="row-menu-pop hidden">
           <button class="f-act-dl" type="button" data-path="${escapeHtml(path)}" data-type="${e.type}" data-size="${e.size}">下载</button>
-          ${prot ? '' : `<button class="f-act-ren" type="button" data-path="${escapeHtml(path)}">重命名</button>
+          ${editable ? `<button class="f-act-edit" type="button" data-path="${escapeHtml(path)}" data-size="${e.size}">编辑</button>` : ''}
+          ${prot ? '' : `<button class="f-act-mv" type="button" data-path="${escapeHtml(path)}">移动</button>
+          <button class="f-act-ren" type="button" data-path="${escapeHtml(path)}">重命名</button>
           <button class="f-act-del danger" type="button" data-path="${escapeHtml(path)}" data-type="${e.type}">删除</button>`}
         </div>
       </div>`;
       return `<tr><td>${nameCell}</td><td>${size}</td><td>${escapeHtml(time)}</td><td class="f-ops">${menu}</td></tr>`;
     });
     $('#file-list').innerHTML = rows.join('') || '<tr><td colspan="4" class="muted">空目录</td></tr>';
-    // cwd 为受保护系统目录时禁用上传（写操作会被 agent 拒；特殊需求走终端 Shell）
+    // cwd 为受保护系统目录时禁用上传与新建（写操作会被 agent 拒；特殊需求走终端 Shell）
     const cwdProt = isSystemPath(fileSess.cwd);
     const upBtn = document.querySelector('label.file-upload');
     if (upBtn) {
@@ -715,6 +723,45 @@
       upBtn.title = cwdProt ? '系统目录受保护，禁止上传；如需操作请使用终端 Shell' : '';
     }
     $('#file-input').disabled = cwdProt;
+    $('#btn-file-mkdir').classList.toggle('hidden', cwdProt);
+    $('#btn-file-touch').classList.toggle('hidden', cwdProt);
+  }
+
+  // 新建目录 / 新建文件（当前 cwd 下；名字不带 /，agent mkdir -p 语义 + touch create_new）
+  function mkDir() {
+    promptDialog(`新建目录（路径：${escapeHtml(fileSess.cwd)}）`, 'new-dir', (name) => {
+      if (!name || name.includes('/')) return toast('目录名不能包含 /');
+      fileSess.mkdir(fileJoin(fileSess.cwd, name));
+    });
+  }
+  function touchFile() {
+    promptDialog(`新建文件（路径：${escapeHtml(fileSess.cwd)}）`, 'new-file.txt', (name) => {
+      if (!name || name.includes('/')) return toast('文件名不能包含 /');
+      fileSess.touch(fileJoin(fileSess.cwd, name));
+    });
+  }
+
+  // 在线编辑器：editText 全文拉取 → textarea → 保存走 upload（overwrite）原路写回
+  let editorPath = '';
+  function openFileEditor(path, text) {
+    editorPath = path;
+    $('#file-editor-title').textContent = `编辑：${path}`;
+    $('#file-editor-text').value = text;
+    $('#file-editor-modal').classList.remove('hidden');
+    lockScroll();
+  }
+  function saveFileEditor() {
+    const text = $('#file-editor-text').value;
+    const name = editorPath.split('/').pop() || 'edit.tmp';
+    // File 构造（Blob + name）：复用上传状态机分块写回；显式 path（编辑期间 cwd 可能已变化）
+    fileSess.upload(new File([text], name, { type: 'text/plain' }), { overwrite: true, path: editorPath });
+    closeFileEditor();
+    $('#file-msg').textContent = '保存中...';
+  }
+  function closeFileEditor() {
+    fileSess.cancelEditText();
+    $('#file-editor-modal').classList.add('hidden');
+    unlockScroll();
   }
 
   // 上传/下载入口：状态机在 FileSession（api.js），这里只负责 UI 接线。
@@ -1589,6 +1636,11 @@
   $('#file-go').onclick = () => { const p = $('#file-path').value.trim(); if (!p) return; fileSess.cwd = p; reloadFileList(); };
   $('#file-path').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('#file-go').click(); });
   $('#file-input').addEventListener('change', (e) => { const f = e.target.files[0]; if (f) uploadFile(f); e.target.value = ''; });
+  // 新建目录 / 新建文件 / 在线编辑器
+  $('#btn-file-mkdir').onclick = mkDir;
+  $('#btn-file-touch').onclick = touchFile;
+  $('#btn-editor-save').onclick = saveFileEditor;
+  $('#btn-editor-close').onclick = closeFileEditor;
   // 文件名通配符过滤：debounce 后发 list（pattern 由 agent 端匹配，先过滤再截断）
   $('#file-filter').addEventListener('input', () => {
     clearTimeout(fileFilterTimer);
@@ -1623,6 +1675,21 @@
       promptDialog(`重命名：${ren.dataset.path}（仅改名，不支持跨目录）`, old, (name) => {
         fileSess.rename(ren.dataset.path, name);
       });
+      return;
+    }
+    const mv = e.target.closest('.f-act-mv');
+    if (mv) {
+      closeRowMenus();
+      promptDialog(`移动到（绝对路径，含目标文件名）：${mv.dataset.path}`, mv.dataset.path, (dest) => {
+        if (!dest || !dest.startsWith('/') || dest === mv.dataset.path) return;
+        fileSess.move(mv.dataset.path, dest);
+      });
+      return;
+    }
+    const ed = e.target.closest('.f-act-edit');
+    if (ed) {
+      closeRowMenus();
+      fileSess.editText(ed.dataset.path, Number(ed.dataset.size) || 0);
       return;
     }
     const del = e.target.closest('.f-act-del');

@@ -108,6 +108,8 @@
         <input id="file-path" type="text" placeholder="路径，如 /home/user" />
         <button id="file-go" class="ghost">跳转</button>
         <label class="file-upload"><input id="file-input" type="file" hidden />上传</label>
+        <button id="btn-file-mkdir" class="ghost">新建目录</button>
+        <button id="btn-file-touch" class="ghost">新建文件</button>
         <button id="btn-file-cancel" class="ghost hidden">取消上传</button>
         <button id="btn-dl-cancel" class="ghost hidden">取消下载</button>
       </div>
@@ -117,6 +119,20 @@
         <thead><tr><th>名称</th><th>大小</th><th>修改时间</th><th></th></tr></thead>
         <tbody id="file-list"></tbody>
       </table>
+    </div>
+  </div>
+
+  <!-- 在线文件编辑器 -->
+  <div id="file-editor-modal" class="modal hidden">
+    <div class="modal-head">
+      <span id="file-editor-title">编辑</span>
+      <div>
+        <button id="btn-editor-save" class="ghost">保存</button>
+        <button id="btn-editor-close" class="ghost">取消</button>
+      </div>
+    </div>
+    <div class="file-body">
+      <textarea id="file-editor-text" class="file-editor-area" spellcheck="false"></textarea>
     </div>
   </div>
 
@@ -343,7 +359,7 @@
   <script src="/vendor/xterm.min.js"></script>
   <script src="/vendor/addon-fit.min.js"></script>
   <script src="/utils.js?v=3"></script>
-  <script src="/api.js?v=1"></script>
-  <script src="/app.js?v=37"></script>
+  <script src="/api.js?v=2"></script>
+  <script src="/app.js?v=38"></script>
 </body>
 </html>

@@ -703,6 +703,22 @@ button.danger:hover { background: rgba(248, 113, 113, .12); }
   border-radius: 10px;
   padding: 10px;
 }
+/* 在线文件编辑器：等宽全高 textarea */
+.file-editor-area {
+  width: 100%;
+  min-height: 320px;
+  flex: 1;
+  resize: vertical;
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: rgba(20, 25, 40, .6);
+  border: 1px solid var(--border);
+  color: var(--text);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 13px;
+  line-height: 1.5;
+}
+.file-editor-area:focus { outline: none; border-color: var(--accent); }
 .custom-editor {
   flex: 1;
   min-width: 0;

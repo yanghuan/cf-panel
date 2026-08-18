@@ -692,6 +692,113 @@ async fn file_delete(path: &str) -> String {
     }
 }
 
+// 新建目录（mkdir -p 语义：父目录不存在则一并创建）；已存在报错
+async fn file_mkdir(path: &str) -> String {
+    if is_system_path(path) {
+        return err_json(SYSTEM_PATH_ERR);
+    }
+    let path = path.to_string();
+    let r = blocking_with_timeout(10, move || -> Result<(), String> {
+        if is_system_path_resolved(&path) {
+            return Err(SYSTEM_PATH_ERR.into());
+        }
+        if std::path::Path::new(&path).exists() {
+            return Err("already exists".into());
+        }
+        std::fs::create_dir_all(&path).map_err(|e| e.to_string())
+    })
+    .await;
+    match r {
+        Some(Ok(())) => serde_json::json!({ "type": "mkdir_result", "ok": true }).to_string(),
+        Some(Err(e)) => err_json(&e),
+        None => err_json("mkdir timeout"),
+    }
+}
+
+// 新建空文件（create_new：已存在报错，绝不覆盖）
+async fn file_touch(path: &str) -> String {
+    if is_system_path(path) {
+        return err_json(SYSTEM_PATH_ERR);
+    }
+    let path = path.to_string();
+    let r = blocking_with_timeout(10, move || -> Result<(), String> {
+        if is_system_path_resolved(&path) {
+            return Err(SYSTEM_PATH_ERR.into());
+        }
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .map(|_| ())
+            .map_err(|e| {
+                if e.kind() == std::io::ErrorKind::AlreadyExists {
+                    "already exists".to_string()
+                } else {
+                    e.to_string()
+                }
+            })
+    })
+    .await;
+    match r {
+        Some(Ok(())) => serde_json::json!({ "type": "touch_result", "ok": true }).to_string(),
+        Some(Err(e)) => err_json(&e),
+        None => err_json("touch timeout"),
+    }
+}
+
+// 移动（跨目录）：源与目标都必须在允许区域。同分区 fs::rename 原子完成；
+// 跨分区（EXDEV）仅文件回退 copy + delete（目录跨分区需递归复制，提示走终端）；
+// 目标已存在拒绝（防覆盖，与 rename 语义一致）
+async fn file_move(path: &str, dest: &str) -> String {
+    if is_system_path(path) || is_system_path(dest) {
+        return err_json(SYSTEM_PATH_ERR);
+    }
+    let path = path.to_string();
+    let dest = dest.to_string();
+    let r = blocking_with_timeout(60, move || -> Result<String, String> {
+        if is_system_path_resolved(&path) || is_system_path_resolved(&dest) {
+            return Err(SYSTEM_PATH_ERR.into());
+        }
+        let meta = std::fs::metadata(&path).map_err(|_| "path not found")?;
+        if std::path::Path::new(&dest).exists() {
+            return Err("target already exists".into());
+        }
+        if let Some(parent) = std::path::Path::new(&dest).parent() {
+            std::fs::create_dir_all(parent).map_err(|e| format!("create target parent: {e}"))?;
+        }
+        match std::fs::rename(&path, &dest) {
+            Ok(()) => Ok(dest.clone()),
+            Err(e) if e.raw_os_error() == Some(libc::EXDEV) => {
+                // 跨分区：仅文件回退 copy+delete（大小上限同 zip/upload）
+                if meta.is_dir() {
+                    return Err(
+                        "cross-device move of directory not supported (use terminal)".into(),
+                    );
+                }
+                if meta.len() > FILE_LIMIT {
+                    return Err(format!(
+                        "file too large ({:.1} MB > {:.1} MB limit)",
+                        meta.len() as f64 / 1_048_576.0,
+                        FILE_LIMIT as f64 / 1_048_576.0
+                    ));
+                }
+                std::fs::copy(&path, &dest).map_err(|e| format!("copy: {e}"))?;
+                std::fs::remove_file(&path).map_err(|e| format!("remove src: {e}"))?;
+                Ok(dest.clone())
+            }
+            Err(e) => Err(format!("rename failed: {e}")),
+        }
+    })
+    .await;
+    match r {
+        Some(Ok(t)) => {
+            serde_json::json!({ "type": "move_result", "ok": true, "path": t }).to_string()
+        }
+        Some(Err(e)) => err_json(&e),
+        None => err_json("move timeout"),
+    }
+}
+
 // 文件命令响应：Text（list_result/write_result/error 等无数据）或 Binary（read_result 混合帧）
 enum FileReply {
     Text(String),
@@ -745,6 +852,12 @@ async fn handle_file_cmd(line: &str, sid: &str, tmp_dir: &str) -> FileReply {
             FileReply::Text(file_rename(&path, new_name).await)
         }
         "delete" => FileReply::Text(file_delete(&path).await),
+        "mkdir" => FileReply::Text(file_mkdir(&path).await),
+        "touch" => FileReply::Text(file_touch(&path).await),
+        "move" => {
+            let dest = v.get("dest").and_then(|x| x.as_str()).unwrap_or("");
+            FileReply::Text(file_move(&path, dest).await)
+        }
         _ => FileReply::Text(err_json("unknown cmd")),
     }
 }
@@ -1242,6 +1355,55 @@ mod tests {
             .await
             .contains("system path is protected"));
         assert!(file_delete("/").await.contains("system path is protected"));
+        // mkdir/touch/move 同样拦截系统路径（词法 + resolved 双层在函数内）
+        assert!(file_mkdir("/etc/newdir")
+            .await
+            .contains("system path is protected"));
+        assert!(file_touch("/etc/newfile")
+            .await
+            .contains("system path is protected"));
+        assert!(file_move("/home/a", "/etc/b")
+            .await
+            .contains("system path is protected"));
+        assert!(file_move("/etc/a", "/home/b")
+            .await
+            .contains("system path is protected"));
+    }
+
+    #[tokio::test]
+    async fn mkdir_touch_move_workflows() {
+        let base = std::env::temp_dir().join(format!("cfp-mtf-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        // mkdir：父目录不存在时一并创建；重复创建报错
+        let d1 = base.join("a/b/c");
+        assert!(file_mkdir(d1.to_str().unwrap())
+            .await
+            .contains("\"ok\":true"));
+        assert!(file_mkdir(d1.to_str().unwrap())
+            .await
+            .contains("already exists"));
+        // touch：新建空文件；已存在拒绝且不覆盖（内容保持）
+        let f1 = base.join("a/f.txt");
+        assert!(file_touch(f1.to_str().unwrap())
+            .await
+            .contains("\"ok\":true"));
+        std::fs::write(&f1, b"data").unwrap();
+        assert!(file_touch(f1.to_str().unwrap())
+            .await
+            .contains("already exists"));
+        assert_eq!(std::fs::read(&f1).unwrap(), b"data", "已存在时内容不被清空");
+        // move（同分区）：目标已存在拒绝；成功后源消失
+        let d2 = base.join("a/b2");
+        let f2 = d2.join("f.txt");
+        assert!(file_move(f1.to_str().unwrap(), f2.to_str().unwrap())
+            .await
+            .contains("\"ok\":true"));
+        assert!(!f1.exists(), "源已移走");
+        assert_eq!(std::fs::read(&f2).unwrap(), b"data");
+        assert!(file_move(f2.to_str().unwrap(), f2.to_str().unwrap())
+            .await
+            .contains("already exists"));
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

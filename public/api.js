@@ -97,6 +97,12 @@
         this._startZipDownload(j.path, j.size);
       } else if (j.type === 'rename_result' && j.ok) {
         if (this.h.onRenameDone) this.h.onRenameDone(j.path);
+      } else if (j.type === 'mkdir_result' && j.ok) {
+        if (this.h.onMkdirDone) this.h.onMkdirDone();
+      } else if (j.type === 'touch_result' && j.ok) {
+        if (this.h.onTouchDone) this.h.onTouchDone();
+      } else if (j.type === 'move_result' && j.ok) {
+        if (this.h.onMoveDone) this.h.onMoveDone(j.path);
       } else if (j.type === 'delete_result' && j.ok) {
         // zip 下载完成的临时文件清理（silent 标志，不触发 UI 刷新）
         if (this._zipCleanup) this._zipCleanup = false;
@@ -107,12 +113,14 @@
     }
 
     // ---------- 上传状态机（stop-and-wait：等 write_result 确认才发下一块） ----------
+    // opts.path：显式目标绝对路径（在线编辑器保存用，避免编辑期间 cwd 变化写错位置）
     upload(file, opts) {
       if (this.uploadState) { if (this.h.onError) this.h.onError('已有上传进行中，请等待完成'); return; }
       if (file.size > FILE_MAX) { if (this.h.onError) this.h.onError('文件超过 500MB 限制'); return; }
       const uploadId = (window.crypto && crypto.randomUUID) ? crypto.randomUUID() : String(Date.now()) + '-' + Math.random().toString(36).slice(2);
       // overwrite：目标已存在时是否覆盖（默认 false，服务端首块强制校验，与签名上传路径语义一致）
-      this.uploadState = { file, size: file.size, sent: 0, acked: 0, uploadId, path: CfUtils.fileJoin(this.cwd, file.name), reader: new FileReader(), overwrite: !!(opts && opts.overwrite) };
+      const path = (opts && opts.path) || CfUtils.fileJoin(this.cwd, file.name);
+      this.uploadState = { file, size: file.size, sent: 0, acked: 0, uploadId, path, reader: new FileReader(), overwrite: !!(opts && opts.overwrite) };
       this._sendNextUpload();
     }
     _sendNextUpload() {
@@ -184,8 +192,43 @@
     rename(path, newName) { this.send({ type: 'rename', path, new_name: newName }); }
     // 删除（文件或目录递归；系统路径 agent 端拒绝）
     delete(path) { this._zipCleanup = false; this.send({ type: 'delete', path }); }
+    // 新建目录（mkdir -p 语义，父目录一并创建；已存在报错）
+    mkdir(path) { this.send({ type: 'mkdir', path }); }
+    // 新建空文件（已存在拒绝且不覆盖）
+    touch(path) { this.send({ type: 'touch', path }); }
+    // 移动（跨目录，同分区原子 rename；跨分区仅文件回退 copy+delete；目标已存在拒绝）
+    move(path, dest) { this.send({ type: 'move', path, dest }); }
+    // 在线编辑：分段拉取全文（≤1MB 由调用方限制），onEditLoaded(path, text) 回调
+    editText(path, size) {
+      if (this.editState) { if (this.h.onError) this.h.onError('已有编辑读取进行中'); return; }
+      this.editState = { path, size, parts: [], received: 0 };
+      this.send({ type: 'read', path, offset: 0, limit: FILE_CHUNK });
+    }
+    cancelEditText() { this.editState = null; }
 
     _onReadResult(j, data) {
+      // 编辑器全文读取（优先于下载状态机：editState 独立，完成即回调文本）
+      const ed = this.editState;
+      if (ed && j.path === ed.path) {
+        if (j.got === 0 || !data) {
+          this.editState = null;
+          if (this.h.onError) this.h.onError('读取文件失败（为空或已变化）');
+          return;
+        }
+        ed.parts.push(data);
+        ed.received += j.got;
+        if (ed.received >= ed.size) {
+          // 逐段拷贝合并（parts 是 Uint8Array 数组）后整体解码
+          const all = new Uint8Array(ed.parts.reduce((n, p) => n + p.length, 0));
+          let o = 0;
+          for (const p of ed.parts) { all.set(p, o); o += p.length; }
+          this.editState = null;
+          if (this.h.onEditLoaded) this.h.onEditLoaded(ed.path, new TextDecoder().decode(all));
+        } else {
+          this.send({ type: 'read', path: ed.path, offset: ed.received, limit: FILE_CHUNK });
+        }
+        return;
+      }
       const d = this.downloadState;
       if (!d || j.path !== d.path) return; // 取消后的迟到响应：静默丢弃
       if (j.got === 0) {

@@ -306,16 +306,24 @@
     return monacoPromise;
   }
 
-  // Markdown 渲染器 CDN 懒加载（预览功能低频使用，不进 vendor）。
-  // marked 渲染 + DOMPurify 消毒（文件内容来自服务器，HTML 必须过滤防 XSS）
+  // Markdown 渲染器本地 vendor 懒加载（预览低频使用不进首屏；本地化避免 CDN 不可达，与 xterm/Chart.js 同策略）。
+  // marked 渲染 + DOMPurify 消毒（文件内容来自服务器，HTML 必须过滤防 XSS）。
+  // 必须走动态 import 的 ESM 通道：Monaco 的 AMD loader 会定义 window.define（带 amd 标记），
+  // UMD 构建检测到 AMD 后注册为匿名模块、不设 window 全局 → marked/DOMPurify 取不到
   let markdownPromise = null;
   function loadMarkdown() {
     if (!markdownPromise) {
       markdownPromise = (async () => {
-        await loadScript('https://cdnjs.cloudflare.com/ajax/libs/marked/15.0.7/marked.min.js');
-        await loadScript('https://cdnjs.cloudflare.com/ajax/libs/dompurify/3.2.4/purify.min.js');
-        if (!window.marked || !window.DOMPurify) throw new Error('Markdown 组件加载异常');
-        return { marked: window.marked, purify: window.DOMPurify };
+        const [markedMod, purifyMod] = await Promise.all([
+          import('/vendor/marked.esm.js'),
+          import('/vendor/purify.es.mjs'),
+        ]);
+        const m = markedMod.marked || markedMod.default;
+        const p = purifyMod.default || purifyMod;
+        if (!m || typeof m.parse !== 'function' || !p || typeof p.sanitize !== 'function') {
+          throw new Error('Markdown 组件加载异常');
+        }
+        return { marked: m, purify: p };
       })().catch((e) => {
         markdownPromise = null; // 失败清缓存：下次点预览重试
         throw e;

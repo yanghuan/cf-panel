@@ -8,7 +8,7 @@
   <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2032%2032'%3E%3Crect%20width='32'%20height='32'%20rx='7'%20fill='%238b5cf6'/%3E%3Cpath%20d='M9%2011h14M9%2016h14M9%2021h8'%20stroke='white'%20stroke-width='2.5'%20stroke-linecap='round'/%3E%3C/svg%3E">
   <!-- 内容安全策略（防注入/点击劫持；本地 JS/CSS + WebSocket + IP 地理查询放行；
        Monaco 编辑器走 cdnjs（体量 ~3MB 不进 vendor），worker 经 blob proxy 加载 → worker-src blob:） -->
-  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' https://cdnjs.cloudflare.com; style-src 'self' 'unsafe-inline' https://cdnjs.cloudflare.com; img-src 'self' data: https://flagcdn.com https://cdn.simpleicons.org; connect-src 'self' https://ipapi.co https://ipwho.is; worker-src blob:; frame-ancestors 'none'">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' https://cdnjs.cloudflare.com; style-src 'self' 'unsafe-inline' https://cdnjs.cloudflare.com; img-src 'self' data: https://flagcdn.com https://cdn.simpleicons.org; font-src 'self' https://cdnjs.cloudflare.com; connect-src 'self' https://ipapi.co https://ipwho.is https://cdnjs.cloudflare.com; worker-src blob:; frame-ancestors 'none'">
   <!-- 依赖本地化（public/vendor，避免外部 CDN 不可达/供应链风险）；xterm/Chart.js 首次使用时由 JS 懒加载 -->
   <link rel="stylesheet" href="/style.css?v=28" />
 </head>
@@ -386,7 +386,7 @@
 
   <div id="toast" class="toast hidden"></div>
 
-  <script src="/utils.js?v=7"></script>
+  <script src="/utils.js?v=9"></script>
   <script src="/api.js?v=5"></script>
   <script src="/app.js?v=44"></script>
 </body>

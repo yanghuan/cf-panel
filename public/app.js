@@ -909,7 +909,7 @@
     }
     let md;
     try { md = await loadMarkdown(); }
-    catch { toast('预览组件加载失败（CDN 不可达），请稍后重试'); return; }
+    catch { toast('预览组件加载失败，请稍后重试'); return; }
     $('#editor-md-preview').innerHTML = md.purify.sanitize(md.marked.parse(editorGetValue()));
     $('#editor-md-preview').classList.remove('hidden');
     $('#file-editor-text').classList.add('hidden');

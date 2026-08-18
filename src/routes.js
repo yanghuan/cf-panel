@@ -587,6 +587,34 @@ async function handleApiInner(request, env) {
     return json(result);
   }
 
+  // ---- 分组排序（kv_json group_order = 组名数组，下标即顺序） ----
+  // 读：所有登录用户（排序影响所有观看者的展示）；写：仅管理员。
+  // 未在数组中的组追加在尾部按名称排；「未分组」固定最后（前端 groupList 处理）。
+  if (method === 'GET' && path === '/api/group-order') {
+    const order = await kvGet(env, 'group_order', []);
+    return json({ order: Array.isArray(order) ? order : [] });
+  }
+  if (method === 'PUT' && path === '/api/group-order') {
+    if (!isAdmin(user)) return err('forbidden', 403);
+    const body = await request.json().catch(() => ({}));
+    if (!Array.isArray(body.order)) return err('order array required');
+    const seen = new Set();
+    const cleaned = [];
+    for (const g of body.order) {
+      const name = String(g || '').trim();
+      if (!name || name === '未分组' || seen.has(name)) continue; // 去空/去重/未分组固定最后不入表
+      seen.add(name);
+      cleaned.push(name);
+    }
+    if (cleaned.length > 200) return err('too many groups');
+    // 与现存分组求交（保持提交顺序）：孤儿组名（已改名/组内已空）自动清理
+    const rows = await env.DB.prepare('SELECT DISTINCT "group" FROM servers').all();
+    const live = new Set((rows.results || []).map((r) => r.group).filter(Boolean));
+    const order = cleaned.filter((g) => live.has(g));
+    await kvPut(env, 'group_order', order);
+    return json({ ok: true, order });
+  }
+
   // ---- 面板设置（D1 kv_json，仅管理员） ----
   if (method === 'GET' && path === '/api/settings') {
     if (!isAdmin(user)) return err('forbidden', 403);

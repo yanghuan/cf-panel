@@ -11,6 +11,7 @@
   let canExec = true; // 当前用户是否有 exec 权限（PAT 按 scopes，admin 恒有；控制终端/文件菜单显隐）
   let isAdmin = true; // 当前用户是否面板管理员（JWT 登录；PAT 恒 false；控制修改/删除等管理菜单显隐）
   let serversCache = [];
+  let groupOrder = []; // 分组显示顺序（组名数组，下标即顺序；管理员经 ↑↓ 调整，PUT /api/group-order 持久化）
   let pushTimer = null;    // 每 3 秒发一次 sync 请求的定时器（老化）
   let monitorState = null; // { serverId, serverName, range } 当前监控视图
   let monitorCharts = []; // Chart.js 实例数组（每指标一张图，切换范围时全部销毁重建）
@@ -93,7 +94,12 @@
   // ---------- 服务器 ----------
   async function loadServers() {
     try {
-      serversCache = await api('/api/servers');
+      const [list, ord] = await Promise.all([
+        api('/api/servers'),
+        api('/api/group-order').catch(() => ({ order: [] })), // 读取失败不阻塞列表（按名称兜底排序）
+      ]);
+      serversCache = Array.isArray(list) ? list : [];
+      groupOrder = Array.isArray(ord && ord.order) ? ord.order : [];
       renderServers();
     } catch (e) {
       if (String(e.message).includes('401') || String(e.message).includes('unauthorized')) {
@@ -276,15 +282,16 @@
   }
   // 分组标题序列（用于判断分组结构是否变化）
   function groupList() {
-    const sorted = [...serversCache].sort((a, b) => (a.display_index || 0) - (b.display_index || 0));
     const groups = {};
-    for (const s of sorted) {
+    for (const s of serversCache) {
       const g = s.group || '未分组';
       (groups[g] = groups[g] || []).push(s);
     }
-    // 组内按 display_index（序号）排序，分组按名称排序，「未分组」始终排最后
+    // 组内按 display_index（序号）排序；分组按 groupOrder 数组下标排序，
+    // 未配置的组追加尾部按名称排，「未分组」始终最后
+    const idx = (g) => { const i = groupOrder.indexOf(g); return i < 0 ? groupOrder.length : i; };
     return Object.keys(groups).sort(
-      (a, b) => (a === '未分组') - (b === '未分组') || a.localeCompare(b, 'zh')
+      (a, b) => (a === '未分组') - (b === '未分组') || idx(a) - idx(b) || a.localeCompare(b, 'zh')
     );
   }
   function renderServers() {
@@ -302,8 +309,19 @@
     const byGroup = (g) => serversCache
       .filter((s) => (s.group || '未分组') === g)
       .sort((a, b) => (a.display_index || 0) - (b.display_index || 0));
+    // 组标题：名称 + 计数 + 管理员可见的 ↑↓ 排序按钮（未分组固定最后，不给按钮；
+    // 边界禁用以「可排序组」序列计算——与 groupSort handler 的交换逻辑一致）
+    const sortable = groups.filter((g) => g !== '未分组');
+    const gTitle = (g, count) => {
+      const pos = sortable.indexOf(g);
+      // 边界方向不可用时直接隐藏（首组无 ↑、末组无 ↓），比禁用态更干净
+      const sortBtns = isAdmin && pos >= 0
+        ? `<span class="g-sort">${pos > 0 ? `<button data-gact="up" data-group="${escapeHtml(g)}" title="上移">↑</button>` : ''}${pos < sortable.length - 1 ? `<button data-gact="down" data-group="${escapeHtml(g)}" title="下移">↓</button>` : ''}</span>`
+        : '';
+      return `<h3 class="group-title"><span class="g-name">${escapeHtml(g)}（${count}）</span>${sortBtns}</h3>`;
+    };
     box.innerHTML = groups.map((g) => `
-      <h3 class="group-title">${escapeHtml(g)}（${byGroup(g).length}）</h3>
+      ${gTitle(g, byGroup(g).length)}
       <div class="grid">${byGroup(g).map(cardHtml).join('')}</div>`).join('');
     updateFlags(); // 卡片旗帜异步补全（geo 查询受 geoEnabled 开关控制）
   }
@@ -336,7 +354,7 @@
       renderServers();
       return;
     }
-    const domGroups = [...box.querySelectorAll('.group-title')].map((h) => h.textContent.replace(/[（(]\d+[）)]\s*$/, ''));
+    const domGroups = [...box.querySelectorAll('.group-title')].map((h) => (h.querySelector('.g-name') || h).textContent.replace(/[（(]\d+[）)]\s*$/, ''));
     const wantGroups = groupList();
     if (domGroups.join('|') !== wantGroups.join('|')) {
       renderServers();
@@ -1837,6 +1855,30 @@
         api(`/api/servers/${id}`, { method: 'DELETE' }).then(loadServers).catch((e2) => toast(e2.message));
       });
     }
+  });
+
+  // 分组排序：↑↓ 与相邻组交换位置（以当前视觉顺序为准重建全量数组，
+  // 未入表的组顺带纳入、孤儿条目顺带清理），乐观渲染 + 失败回滚
+  $('#servers').addEventListener('click', async (e) => {
+    const btn = e.target.closest('button[data-gact]');
+    if (!btn || btn.disabled) return;
+    const g = btn.dataset.group;
+    const visual = groupList().filter((x) => x !== '未分组'); // 未分组固定最后，不参与
+    const i = visual.indexOf(g);
+    const j = btn.dataset.gact === 'up' ? i - 1 : i + 1;
+    if (i < 0 || j < 0 || j >= visual.length) return;
+    [visual[i], visual[j]] = [visual[j], visual[i]];
+    const prev = groupOrder;
+    groupOrder = visual;
+    renderServers(); // 乐观：立即呈现新顺序
+    try {
+      const r = await api('/api/group-order', { method: 'PUT', body: JSON.stringify({ order: visual }) });
+      groupOrder = (r && Array.isArray(r.order)) ? r.order : visual; // 后端裁剪后的权威顺序
+    } catch (e2) {
+      groupOrder = prev;
+      toast(e2.message);
+    }
+    renderServers();
   });
 
   // 监控时间范围切换 + 关闭

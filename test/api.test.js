@@ -602,6 +602,42 @@ test('PAT：创建/使用/删除，scopes + 白名单生效', async () => {
   assert.ok(env.PANEL.calls.some((u) => String(u).includes('/rpc/clear_auth_cache')), 'PAT 删除触发 PanelDO 缓存清除');
 });
 
+// ---------------- 分组排序 ----------------
+test('分组排序：PUT 仅管理员；去空/去重/过滤未分组/孤儿清理；GET 回读；PAT 只读不可写', async () => {
+  const env = makeEnv();
+  const adminToken = await login(env);
+  await addServer(env, adminToken, { name: 'a', group: 'g1' });
+  await addServer(env, adminToken, { name: 'b', group: 'g2' });
+
+  // 未登录 → 401；非数组 body → 400
+  assert.equal((await call(env, { method: 'PUT', path: '/api/group-order', body: { order: ['g1'] } })).status, 401);
+  assert.equal((await call(env, { method: 'PUT', path: '/api/group-order', token: adminToken, body: { order: 'x' } })).status, 400);
+
+  // 保存：含重复/空串/未分组/不存在孤儿 → 清理为 ['g2','g1']
+  const put = await call(env, {
+    method: 'PUT', path: '/api/group-order', token: adminToken,
+    body: { order: ['g2', 'g1', 'g2', '  ', '未分组', 'ghost'] },
+  });
+  assert.equal(put.status, 200);
+  assert.deepEqual((await put.json()).order, ['g2', 'g1']);
+
+  // GET 回读（登录即可）
+  const got = await (await call(env, { path: '/api/group-order', token: adminToken })).json();
+  assert.deepEqual(got.order, ['g2', 'g1']);
+
+  // kv_json 落库可查
+  const row = await env.DB.prepare("SELECT value FROM kv_json WHERE key = 'group_order'").first();
+  assert.deepEqual(JSON.parse(row.value), ['g2', 'g1']);
+
+  // PAT（非管理员）→ 读 200 / 写 403
+  const pat = await (await call(env, {
+    method: 'POST', path: '/api/tokens', token: adminToken,
+    body: { name: 'ro', scopes: ['server:read'] },
+  })).json();
+  assert.equal((await call(env, { path: '/api/group-order', token: pat.token })).status, 200);
+  assert.equal((await call(env, { method: 'PUT', path: '/api/group-order', token: pat.token, body: { order: ['g1'] } })).status, 403);
+});
+
 test('PAT：scopes 白名单校验（非法值 400，混合值只留合法项）', async () => {
   const env = makeEnv();
   const adminToken = await login(env);

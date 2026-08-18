@@ -230,7 +230,15 @@ button.danger:hover { background: rgba(248, 113, 113, .12); }
 .usage-label { font-size: 11px; color: var(--muted); }
 
 /* ---------- 服务器卡片 ---------- */
-.group-title { font-size: 14px; font-weight: 700; margin: 20px 0 8px; color: var(--muted); letter-spacing: .5px; }
+.group-title { display: flex; align-items: center; gap: 8px; font-size: 14px; font-weight: 700; margin: 20px 0 8px; color: var(--muted); letter-spacing: .5px; }
+/* 分组排序按钮（管理员）：平时弱化，悬停组标题时浮现 */
+.g-sort { margin-left: auto; display: inline-flex; gap: 4px; opacity: .35; transition: opacity .15s ease; }
+.group-title:hover .g-sort { opacity: 1; }
+.g-sort button {
+  background: transparent; border: 1px solid var(--border); color: var(--muted);
+  border-radius: 6px; padding: 1px 8px; font-size: 12px; line-height: 1.4; cursor: pointer;
+}
+.g-sort button:hover { color: var(--text); border-color: rgba(99, 102, 241, .5); }
 .grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));

@@ -1873,13 +1873,15 @@
   $('#btn-file-cancel').onclick = cancelUpload;
   $('#btn-dl-cancel').onclick = cancelDownload;
   $('#file-refresh').onclick = () => {
-    // WS 断开时重建会话（旧会话已失效）；在线则正常刷新列表
+    // 刷新兼跳转（原独立「跳转」按钮已并入）：路径输入框即目标目录，与 cwd 相同则等效刷新
+    const p = $('#file-path').value.trim();
+    if (p) fileSess.cwd = p;
+    // WS 断开时重建会话（旧会话已失效，cwd 已更新，重连后按新路径列表）；在线则刷新列表
     if (fileSess.connected) reloadFileList();
     else if (fileServerId) fileSess.reconnect();
   };
+  $('#file-path').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('#file-refresh').click(); });
   $('#file-up').onclick = () => { fileSess.cwd = fileParent(fileSess.cwd); $('#file-path').value = fileSess.cwd; reloadFileList(); };
-  $('#file-go').onclick = () => { const p = $('#file-path').value.trim(); if (!p) return; fileSess.cwd = p; reloadFileList(); };
-  $('#file-path').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('#file-go').click(); });
   $('#file-input').addEventListener('change', (e) => { const f = e.target.files[0]; if (f) uploadFile(f); e.target.value = ''; });
   // 新建目录 / 新建文件 / 在线编辑器 / 移动选择器
   $('#btn-file-mkdir').onclick = mkDir;

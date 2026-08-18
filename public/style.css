@@ -18,6 +18,25 @@
 
 * { box-sizing: border-box; }
 
+/* ---------- 全局滚动条（贴合深色 UI） ---------- */
+/* Firefox 等标准属性浏览器：细滚动条 + 冷灰蓝 thumb */
+* { scrollbar-width: thin; scrollbar-color: rgba(124, 138, 175, .3) transparent; }
+/* Chrome/Edge/Safari：伪元素精细样式（圆角 + 悬停 accent 变色）。
+   Chrome 121+ 同时支持两者且标准属性优先，故在此重置回伪元素方案 */
+@supports selector(::-webkit-scrollbar) {
+  * { scrollbar-width: auto; scrollbar-color: auto; }
+  ::-webkit-scrollbar { width: 10px; height: 10px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb {
+    background: rgba(124, 138, 175, .3);
+    border-radius: 99px;
+    border: 2px solid transparent; /* 两侧留隙，悬浮感 */
+    background-clip: padding-box;
+  }
+  ::-webkit-scrollbar-thumb:hover { background-color: rgba(99, 102, 241, .55); }
+  ::-webkit-scrollbar-corner { background: transparent; }
+}
+
 body {
   margin: 0;
   min-height: 100vh;
@@ -181,6 +200,8 @@ button.ghost {
   box-shadow: none;
 }
 button.ghost:hover { background: rgba(124, 138, 175, .12); border-color: rgba(124, 138, 175, .35); }
+/* 纯符号按钮（弹窗关闭 ✕）：紧凑方形、垂直居中 */
+button.ghost.icon { padding: 7px 11px; line-height: 1; font-size: 13px; }
 button.danger { background: transparent; border: 1px solid rgba(248, 113, 113, .4); color: var(--bad); box-shadow: none; }
 button.danger:hover { background: rgba(248, 113, 113, .12); }
 

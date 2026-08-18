@@ -10,7 +10,7 @@
        Monaco 编辑器走 cdnjs（体量 ~3MB 不进 vendor），worker 经 blob proxy 加载 → worker-src blob:） -->
   <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' https://cdnjs.cloudflare.com; style-src 'self' 'unsafe-inline' https://cdnjs.cloudflare.com; img-src 'self' data: https://flagcdn.com https://cdn.simpleicons.org; font-src 'self' https://cdnjs.cloudflare.com; connect-src 'self' https://ipapi.co https://ipwho.is https://cdnjs.cloudflare.com; worker-src blob:; frame-ancestors 'none'">
   <!-- 依赖本地化（public/vendor，避免外部 CDN 不可达/供应链风险）；xterm/Chart.js 首次使用时由 JS 懒加载 -->
-  <link rel="stylesheet" href="/style.css?v=28" />
+  <link rel="stylesheet" href="/style.css?v=30" />
 </head>
 <body>
   <div id="app" class="hidden">
@@ -61,7 +61,7 @@
   <div id="monitor-modal" class="monitor-modal hidden">
     <div class="modal-head">
       <span id="monitor-title"></span>
-      <button id="btn-monitor-close" class="ghost">关闭</button>
+      <button id="btn-monitor-close" class="ghost icon" aria-label="关闭" title="关闭">✕</button>
     </div>
     <div class="range-btns">
       <button class="ghost range-btn" data-range="1h">1小时</button>
@@ -89,7 +89,7 @@
   <div id="term-modal" class="modal hidden">
     <div class="modal-head">
       <span id="term-title">终端</span>
-      <button id="btn-term-close" class="ghost">关闭</button>
+      <button id="btn-term-close" class="ghost icon" aria-label="关闭" title="关闭">✕</button>
     </div>
     <div id="term" class="term"></div>
   </div>
@@ -98,14 +98,13 @@
   <div id="file-modal" class="modal hidden">
     <div class="modal-head">
       <span id="file-title">文件管理</span>
-      <button id="btn-file-close" class="ghost">关闭</button>
+      <button id="btn-file-close" class="ghost icon" aria-label="关闭" title="关闭">✕</button>
     </div>
     <div class="file-body">
       <div class="file-toolbar">
         <button id="file-up" class="ghost">上级</button>
-        <button id="file-refresh" class="ghost">刷新</button>
         <input id="file-path" type="text" placeholder="路径，如 /home/user" />
-        <button id="file-go" class="ghost">跳转</button>
+        <button id="file-refresh" class="ghost">刷新</button>
         <label class="file-upload"><input id="file-input" type="file" hidden />上传</label>
         <button id="btn-file-mkdir" class="ghost">新建目录</button>
         <button id="btn-file-touch" class="ghost">新建文件</button>
@@ -170,7 +169,7 @@
   <div id="add-modal" class="modal hidden">
     <div class="modal-head">
       <span id="add-modal-title">添加服务器</span>
-      <button id="btn-add-close" class="ghost">关闭</button>
+      <button id="btn-add-close" class="ghost icon" aria-label="关闭" title="关闭">✕</button>
     </div>
     <div class="settings-body">
       <div class="settings-row">
@@ -201,7 +200,7 @@
   <div id="site-modal" class="modal hidden">
     <div class="modal-head">
       <span>站点信息（公告对所有访客可见）</span>
-      <button id="btn-site-close" class="ghost">关闭</button>
+      <button id="btn-site-close" class="ghost icon" aria-label="关闭" title="关闭">✕</button>
     </div>
     <div class="settings-body">
       <div class="settings-row">
@@ -225,7 +224,7 @@
   <div id="alerts-modal" class="modal hidden">
     <div class="modal-head">
       <span>告警（Webhook，模板化）</span>
-      <button id="btn-alerts-close" class="ghost">关闭</button>
+      <button id="btn-alerts-close" class="ghost icon" aria-label="关闭" title="关闭">✕</button>
     </div>
     <div class="settings-body">
       <div class="settings-row">
@@ -272,7 +271,7 @@
   <div id="tokens-modal" class="modal hidden">
     <div class="modal-head">
       <span>访问令牌（PAT）</span>
-      <button id="btn-tokens-close" class="ghost">关闭</button>
+      <button id="btn-tokens-close" class="ghost icon" aria-label="关闭" title="关闭">✕</button>
     </div>
     <div class="settings-body">
       <div class="settings-row">
@@ -295,7 +294,7 @@
   <div id="custom-setup-modal" class="modal hidden">
     <div class="modal-head">
       <span>自定义指标设置</span>
-      <button id="btn-custom-setup-close" class="ghost">关闭</button>
+      <button id="btn-custom-setup-close" class="ghost icon" aria-label="关闭" title="关闭">✕</button>
     </div>
     <div class="settings-body">
       <p class="muted" style="font-size:13px">在目标机器的 <code>/etc/cf-panel-agent.env</code> 中配置 <code>CUSTOM_METRICS</code>（JSON 数组：<code>name</code> 指标名、<code>cmd</code> 采集命令），agent 会按上报周期执行命令采集数值指标；配置完成后可在该服务器卡片的「⋯ → 监控」中查看曲线。<br><strong>容量提示</strong>：每机每 1 个自定义指标约新增 1,440 行/天（30 天保留约 43,200 行）；建议每机 ≤20 个，避免 D1 免费 5GB 触顶（总占用 ≈ 43,200 × 服务器数 × 指标数 行）。</p>
@@ -314,7 +313,7 @@
   <div id="service-setup-modal" class="modal hidden">
     <div class="modal-head">
       <span>服务监控设置</span>
-      <button id="btn-service-setup-close" class="ghost">关闭</button>
+      <button id="btn-service-setup-close" class="ghost icon" aria-label="关闭" title="关闭">✕</button>
     </div>
     <div class="settings-body">
       <p class="muted" style="font-size:13px">配置 agent 的 <code>PROBES</code> 后可探测本机 HTTP/TCP 服务：探测结果会展示在服务器卡片的徽章上（绿=正常 / 红=异常），持续异常会触发 Webhook 告警。格式：<code>名称:类型:目标,...</code>，类型 <code>http</code>（URL，检查 2xx/3xx）或 <code>tcp</code>（host:port 测连通）。</p>
@@ -333,7 +332,7 @@
   <div id="audit-modal" class="modal hidden">
     <div class="modal-head">
       <span>审计日志（保留 90 天）</span>
-      <button id="btn-audit-close" class="ghost">关闭</button>
+      <button id="btn-audit-close" class="ghost icon" aria-label="关闭" title="关闭">✕</button>
     </div>
     <div class="settings-body">
       <div class="settings-row">
@@ -360,7 +359,7 @@
   <div id="usage-modal" class="modal hidden">
     <div class="modal-head">
       <span>用量观测（额度估算）</span>
-      <button id="btn-usage-close" class="ghost">关闭</button>
+      <button id="btn-usage-close" class="ghost icon" aria-label="关闭" title="关闭">✕</button>
     </div>
     <div class="settings-body">
       <div id="usage-est" class="usage-grid"></div>
@@ -373,7 +372,7 @@
   <div id="dialog" class="modal hidden">
     <div class="modal-head">
       <span id="dialog-title"></span>
-      <button id="btn-dialog-close" class="ghost">关闭</button>
+      <button id="btn-dialog-close" class="ghost icon" aria-label="关闭" title="关闭">✕</button>
     </div>
     <div class="settings-body dialog-body">
       <pre id="dialog-text" class="dialog-text"></pre>
@@ -388,6 +387,6 @@
 
   <script src="/utils.js?v=9"></script>
   <script src="/api.js?v=5"></script>
-  <script src="/app.js?v=44"></script>
+  <script src="/app.js?v=45"></script>
 </body>
 </html>

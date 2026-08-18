@@ -4,7 +4,7 @@
   // 工具函数与 <cf-ip> 组件从 utils.js 解构；api 层从 api.js 解构（index.html 中均须先加载）
   const { $, escapeHtml, fmtBytes, fileJoin, fileParent, downsample, lockScroll, unlockScroll,
           MONITOR_STEP_MAX, MONITOR_RANGE_LABEL, MONITOR_COLORS,
-          GEO_PRIVATE, setGeoEnabled, flagHtml, osIconHtml, isSystemPath, isBinaryExt, geoLookup, IdleGuard } = CfUtils;
+          GEO_PRIVATE, setGeoEnabled, flagHtml, osIconHtml, isSystemPath, isBinaryExt, loadScript, loadCss, geoLookup, IdleGuard } = CfUtils;
   const { api, setTokenGetter, FileSession, TermSession, PushSession } = CfApi;
   let token = localStorage.getItem('cfpanel_token') || '';
   setTokenGetter(() => token); // api 层通过 getter 读取当前 token
@@ -588,10 +588,25 @@
   }
 
   // ---------- 终端（断线自动重连） ----------
-  function openTerminal(serverId, serverName) {
+  async function openTerminal(serverId, serverName) {
     $('#term-title').textContent = `终端 · ${serverName}`;
     $('#term-modal').classList.remove('hidden');
     lockScroll();
+    $('#term').innerHTML = '<p class="muted" style="padding:24px">终端组件加载中...</p>';
+    // xterm + fit 首次使用才加载（缓存后零开销）；失败提示并关闭弹窗
+    try {
+      await Promise.all([
+        loadCss('/vendor/xterm.min.css'),
+        loadScript('/vendor/xterm.min.js'),
+        loadScript('/vendor/addon-fit.min.js'),
+      ]);
+    } catch (e) {
+      toast(e.message || '终端组件加载失败');
+      $('#term-modal').classList.add('hidden'); // 此时尚未建会话/挂事件，直接收起弹窗即可
+      unlockScroll();
+      return;
+    }
+    if ($('#term-modal').classList.contains('hidden')) return; // 加载期间已关闭
     $('#term').innerHTML = '';
 
     const Term = window.Terminal;
@@ -870,6 +885,12 @@
     range = range || '12h';
     monitorState = { serverId, serverName, range };
     const seq = ++monitorReqSeq;
+    // Chart.js 首次使用才加载（200KB，缓存后零开销）；与数据请求并行
+    const chartReady = loadScript('/vendor/chart.umd.min.js').catch((e) => {
+      if (seq !== monitorReqSeq) return; // 已切换其他 range，无需提示
+      toast(e.message || '图表库加载失败');
+      return null;
+    });
     document.querySelectorAll('.range-btn').forEach((b) => b.classList.toggle('active', b.dataset.range === range));
     try {
       const data = await api(`/api/monitor?server_id=${serverId}&range=${range}`);
@@ -882,6 +903,8 @@
       $('#monitor-title').textContent = `监控 · ${serverName}（${label}，${rows.length} 点${downsampled ? '，降采样' : ''}${cCount ? ` +${cCount} 自定义` : ''}）`;
       $('#monitor-modal').classList.remove('hidden'); // 先显示，保证 canvas 有尺寸
       lockScroll();
+      if (null === await chartReady) return; // 图表库加载失败（toast 已提示），数据请求不再渲染
+      if (seq !== monitorReqSeq) return; // 等待期间已切换 range
       renderMonitorChart(downsample(rows), custom, downsampled);
     } catch (e) {
       toast(e.message);

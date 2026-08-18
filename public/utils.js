@@ -239,6 +239,43 @@
     return SYSTEM_PATH_PREFIXES.some((s) => norm === s || norm.startsWith(s + '/'));
   }
 
+  // 脚本/CSS 懒加载（首屏不拉 vendor 大文件：xterm 283KB 仅终端用、Chart.js 200KB 仅监控用）。
+  // Promise 缓存去重（并发调用同 src 共享一次加载）；失败清理标签并删除缓存允许重试
+  const loadedAssets = new Map(); // src -> Promise<void>
+  function loadScript(src) {
+    if (!loadedAssets.has(src)) {
+      loadedAssets.set(src, new Promise((resolve, reject) => {
+        const s = document.createElement('script');
+        s.src = src;
+        s.onload = () => resolve();
+        s.onerror = () => {
+          s.remove();
+          loadedAssets.delete(src); // 失败清缓存：下次调用重试，不永久卡死
+          reject(new Error('加载失败：' + src));
+        };
+        document.head.appendChild(s);
+      }));
+    }
+    return loadedAssets.get(src);
+  }
+  function loadCss(href) {
+    if (!loadedAssets.has(href)) {
+      loadedAssets.set(href, new Promise((resolve, reject) => {
+        const l = document.createElement('link');
+        l.rel = 'stylesheet';
+        l.href = href;
+        l.onload = () => resolve();
+        l.onerror = () => {
+          l.remove();
+          loadedAssets.delete(href);
+          reject(new Error('加载失败：' + href));
+        };
+        document.head.appendChild(l);
+      }));
+    }
+    return loadedAssets.get(href);
+  }
+
   // 二进制扩展名黑名单：这些类型的"编辑"必然损坏文件（UTF-8 解码替换字符写回），
   // 直接不显示编辑入口。名单外的仍可能误判（无扩展名二进制），由 api.js 解码校验兜底。
   // 集合元素带点（.jpg），比较时补点——两侧口径不一致会全量漏判
@@ -333,6 +370,6 @@
     $, escapeHtml, fmtBytes, fileJoin, fileParent, downsample,
     lockScroll, unlockScroll,
     MONITOR_STEP_MAX, MONITOR_RANGE_LABEL, MONITOR_COLORS,
-    GEO_PRIVATE, geoLookup, flagHtml, osIconHtml, isSystemPath, isBinaryExt, setGeoEnabled, IdleGuard,
+    GEO_PRIVATE, geoLookup, flagHtml, osIconHtml, isSystemPath, isBinaryExt, loadScript, loadCss, setGeoEnabled, IdleGuard,
   };
 })();

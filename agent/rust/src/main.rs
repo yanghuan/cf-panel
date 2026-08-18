@@ -341,7 +341,7 @@ async fn handle_upload_frame(
     // 系统路径保护：写操作拒绝系统目录（/proc /sys /etc /usr /var /root 等，与文件会话一致）
     if session::is_system_path(&path) {
         failed.lock().unwrap().insert(upload_id.clone());
-        reject(write, "system path not allowed");
+        reject(write, session::SYSTEM_PATH_ERR);
         return Ok(());
     }
     // 首帧（offset==0）：overwrite=false 且目标已存在 → 拒绝（防误覆盖）

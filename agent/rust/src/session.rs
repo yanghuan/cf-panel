@@ -333,7 +333,10 @@ pub async fn run_file_session(cfg: Config, sid: String) {
     log(format!("file session {sid} ended"));
 }
 
-// ---- 系统路径安全检查：重命名/删除/打包拒绝系统目录（防误操作破坏系统） ----
+// ---- 系统路径安全检查：写/删/改名/打包拒绝系统目录（防误操作破坏系统）----
+// 定位：文件管理器从严屏蔽；操作系统目录的特殊需求走终端 shell 完成。
+// 分两层：词法层（is_system_path，纯内存零 IO，async 上下文安全）与真实路径层
+//（is_system_path_resolved，防符号链接写穿，含文件系统调用，仅限 blocking 上下文）。
 const SYSTEM_PATHS: &[&str] = &[
     "/proc",
     "/sys",
@@ -346,20 +349,90 @@ const SYSTEM_PATHS: &[&str] = &[
     "/sbin",
     "/lib",
     "/lib64",
+    "/efi",  // Arch/openSUSE 惯例：EFI 独立挂载（/boot/efi 已被 /boot 前缀覆盖）
+    "/snap", // Ubuntu snap 系统
     "/opt",
     "/root",
     "/run",
     "/srv",
     "/lost+found",
 ];
-pub fn is_system_path(path: &str) -> bool {
-    let p = path.trim_end_matches('/');
-    if p.is_empty() || p == "/" {
-        return true;
+
+// 词法归一化：要求绝对路径；折叠重复 /；解析 . 与 .. 组件。
+// 返回 None 表示无法归一（相对路径、.. 越过根）——调用方一律 fail closed 拒绝，
+// 否则 "//etc/x"、"/home/../etc/x"、"etc/x"（agent cwd=/ 时）均可词法绕过黑名单
+fn normalize_abs(path: &str) -> Option<String> {
+    if !path.starts_with('/') {
+        return None;
+    }
+    let mut parts: Vec<&str> = Vec::new();
+    for seg in path.split('/') {
+        match seg {
+            "" | "." => {} // 折叠 // 与当前目录组件
+            ".." => {
+                parts.pop()?; // 越过根（.. 回到 / 之上）→ None 拒绝
+            }
+            _ => parts.push(seg),
+        }
+    }
+    if parts.is_empty() {
+        return Some(String::new()); // 根 /
+    }
+    Some(format!("/{}", parts.join("/")))
+}
+
+// 系统路径拦截统一提示（前端 toast 直接展示该文本）
+pub const SYSTEM_PATH_ERR: &str =
+    "system path is protected (安全拦截：系统目录受保护，如需操作请使用终端 Shell)";
+
+fn lexical_system_hit(norm: &str) -> bool {
+    if norm.is_empty() {
+        return true; // 根目录
     }
     SYSTEM_PATHS
         .iter()
-        .any(|s| p == *s || p.starts_with(&format!("{s}/")))
+        .any(|s| norm == *s || norm.starts_with(&format!("{s}/")))
+}
+
+pub fn is_system_path(path: &str) -> bool {
+    match normalize_abs(path) {
+        Some(n) => lexical_system_hit(&n),
+        None => true, // 相对路径 / 越根 → fail closed
+    }
+}
+
+// 真实路径解析后的系统目录判定（防静态符号链接写穿：用户目录内 ln -s /etc link 后，
+// 经 link/x 的写/删等价操作 /etc/x）。从目标向上找最近可 canonicalize 的祖先
+//（新建多级路径时父级可能尚不存在），拼上剩余组件做词法判定；全链无法解析 → 拒绝。
+// 含文件系统调用（挂死 NFS 上可能阻塞），仅限 blocking 上下文使用
+pub fn is_system_path_resolved(path: &str) -> bool {
+    let Some(norm) = normalize_abs(path) else {
+        return true;
+    };
+    if lexical_system_hit(&norm) {
+        return true;
+    }
+    let mut cur = std::path::PathBuf::from(&norm);
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    loop {
+        if let Ok(real) = std::fs::canonicalize(&cur) {
+            let mut full = real;
+            for t in tail.iter().rev() {
+                full.push(t);
+            }
+            return is_system_path(&full.to_string_lossy());
+        }
+        match cur.file_name() {
+            Some(f) => {
+                tail.push(f.to_os_string());
+                match cur.parent() {
+                    Some(p) => cur = p.to_path_buf(),
+                    None => return true, // 走到根仍无法解析 → fail closed
+                }
+            }
+            None => return true,
+        }
+    }
 }
 
 // ---- CRC32（zip STORED 条目校验和） ----
@@ -505,7 +578,7 @@ fn zip_directory(dir: &std::path::Path, out: &mut Vec<u8>) -> std::io::Result<()
 // 目录打包 zip（STORED）到临时文件，返回 (zip 路径, 字节数)；前端分段下载后发 delete 清理
 async fn file_zip(path: &str, sid: &str, tmp_dir: &str) -> Result<(String, u64), String> {
     if is_system_path(path) {
-        return Err("system path not allowed".into());
+        return Err(SYSTEM_PATH_ERR.into());
     }
     let meta = std::fs::metadata(path).map_err(|_| "path not found")?;
     if !meta.is_dir() {
@@ -542,6 +615,9 @@ async fn file_zip(path: &str, sid: &str, tmp_dir: &str) -> Result<(String, u64),
     let zip_path = format!("{}/dl-{sid}.zip", tmp_dir.trim_end_matches('/'));
     let path = path.to_string();
     let r = blocking_with_timeout(120, move || -> Result<(String, u64), String> {
+        if is_system_path_resolved(&path) {
+            return Err(SYSTEM_PATH_ERR.into());
+        }
         let mut buf: Vec<u8> = Vec::new();
         zip_directory(std::path::Path::new(&path), &mut buf).map_err(|e| e.to_string())?;
         let size = buf.len() as u64;
@@ -555,7 +631,7 @@ async fn file_zip(path: &str, sid: &str, tmp_dir: &str) -> Result<(String, u64),
 // 重命名（仅改名，不允许跨目录移动）；new_name 不含路径分隔符
 async fn file_rename(path: &str, new_name: &str) -> String {
     if is_system_path(path) {
-        return err_json("system path not allowed");
+        return err_json(SYSTEM_PATH_ERR);
     }
     let new_name = new_name.trim();
     if new_name.is_empty() || new_name.contains('/') || new_name == "." || new_name == ".." {
@@ -564,6 +640,9 @@ async fn file_rename(path: &str, new_name: &str) -> String {
     let path = path.to_string();
     let new_name = new_name.to_string();
     let r = blocking_with_timeout(10, move || -> Result<String, String> {
+        if is_system_path_resolved(&path) {
+            return Err(SYSTEM_PATH_ERR.into());
+        }
         if !std::path::Path::new(&path).exists() {
             return Err("path not found".into());
         }
@@ -590,10 +669,13 @@ async fn file_rename(path: &str, new_name: &str) -> String {
 // 删除（文件或目录递归）；系统路径拒绝
 async fn file_delete(path: &str) -> String {
     if is_system_path(path) {
-        return err_json("system path not allowed");
+        return err_json(SYSTEM_PATH_ERR);
     }
     let path = path.to_string();
     let r = blocking_with_timeout(60, move || -> Result<(), String> {
+        if is_system_path_resolved(&path) {
+            return Err(SYSTEM_PATH_ERR.into());
+        }
         let meta = std::fs::metadata(&path).map_err(|_| "path not found")?;
         if meta.is_dir() {
             std::fs::remove_dir_all(&path).map_err(|e| e.to_string())
@@ -915,6 +997,12 @@ pub fn write_bytes(
     {
         return err_json("bad upload_id");
     }
+    // 系统路径最终防线（真实路径解析，防符号链接写穿）：WS write 与 REST 上传（main.rs）
+    // 两条写入路径都汇聚到 write_bytes，在此统一拦截；调用方各自还有词法层快速预检。
+    // 本函数在 blocking 闭包内执行，canonicalize 阻塞由外层超时兜底
+    if is_system_path_resolved(path) {
+        return err_json(SYSTEM_PATH_ERR);
+    }
     let tmp = format!("{}.upload.{}", path, upload_id);
     if let Some(parent) = std::path::Path::new(path).parent() {
         let _ = std::fs::create_dir_all(parent);
@@ -1031,11 +1119,80 @@ mod tests {
         assert!(is_system_path("/usr/local/bin"));
         assert!(is_system_path("/var/log"));
         assert!(is_system_path("/root"));
-        // 用户目录/挂载点允许
+        assert!(is_system_path("/efi/loader")); // EFI 独立挂载
+        assert!(is_system_path("/snap/bin")); // Ubuntu snap
+                                              // 用户目录/挂载点允许
         assert!(!is_system_path("/home/user"));
         assert!(!is_system_path("/tmp"));
         assert!(!is_system_path("/mnt/data"));
         assert!(!is_system_path("/home/user/dir"));
+        // 词法绕过全部拒绝（fail closed）：重复斜杠 / .. 回溯 / 相对路径 / 尾斜杠
+        assert!(is_system_path("//etc/passwd"));
+        assert!(is_system_path("/home/../etc/passwd"));
+        assert!(is_system_path("/var/../etc/x"));
+        assert!(is_system_path("etc/passwd")); // 相对路径（agent cwd=/ 时等价 /etc/passwd）
+        assert!(is_system_path("/etc/")); // 尾斜杠
+        assert!(is_system_path("/..")); // 越根
+        assert!(is_system_path("/a/../../etc"));
+        // 归一化后非系统路径仍放行
+        assert!(!is_system_path("/home//a/../b"));
+        assert!(!is_system_path("/mnt/data/./x"));
+    }
+
+    #[test]
+    fn system_path_resolved_blocks_symlink_traversal() {
+        // 静态符号链接写穿：用户目录内 link -> /etc，经 link/x 操作等价 /etc/x → 拒绝
+        let tmp = std::env::temp_dir().join(format!("cfp-symtest-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let link = tmp.join("link");
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink("/etc", &link).unwrap();
+        assert!(is_system_path_resolved(
+            link.join("passwd").to_str().unwrap()
+        ));
+        assert!(is_system_path_resolved(
+            link.join("notexist").to_str().unwrap()
+        )); // 新建也拦
+        assert!(!is_system_path_resolved(
+            tmp.join("normal").to_str().unwrap()
+        )); // 正常用户路径放行
+            // 词法层用例对 resolved 同样成立
+        assert!(is_system_path_resolved("//etc/passwd"));
+        assert!(is_system_path_resolved("etc/passwd"));
+        assert!(is_system_path_resolved("/home/../etc/x"));
+        let _ = std::fs::remove_file(&link);
+        let _ = std::fs::remove_dir(&tmp);
+    }
+
+    #[test]
+    fn write_bytes_rejects_system_path() {
+        let created = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        // 词法层：直接系统路径
+        let r = write_bytes("/etc/cfp-test", 0, b"x", true, "id1", &created);
+        assert!(
+            r.contains("system path is protected"),
+            "直接系统路径拒绝: {r}"
+        );
+        // 词法层：绕过形态
+        let r = write_bytes("//etc/cfp-test", 0, b"x", true, "id2", &created);
+        assert!(
+            r.contains("system path is protected"),
+            "重复斜杠绕过拒绝: {r}"
+        );
+        // 真实路径层：symlink 写穿（tmp/link -> /etc）
+        let tmp = std::env::temp_dir().join(format!("cfp-wtest-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let link = tmp.join("lnk");
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink("/etc", &link).unwrap();
+        let via = link.join("cfp-test");
+        let r = write_bytes(via.to_str().unwrap(), 0, b"x", true, "id3", &created);
+        assert!(
+            r.contains("system path is protected"),
+            "symlink 写穿拒绝: {r}"
+        );
+        let _ = std::fs::remove_file(&link);
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
@@ -1075,11 +1232,11 @@ mod tests {
     async fn rename_delete_rejects_system_path() {
         assert!(file_rename("/etc/passwd", "x")
             .await
-            .contains("system path not allowed"));
+            .contains("system path is protected"));
         assert!(file_delete("/usr")
             .await
-            .contains("system path not allowed"));
-        assert!(file_delete("/").await.contains("system path not allowed"));
+            .contains("system path is protected"));
+        assert!(file_delete("/").await.contains("system path is protected"));
     }
 
     #[test]

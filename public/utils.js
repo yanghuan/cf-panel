@@ -276,6 +276,54 @@
     return loadedAssets.get(href);
   }
 
+  // Monaco Editor CDN 懒加载（编辑器体量大 ~3MB，不进 vendor；cdnjs 固定版本避免供应链漂移）。
+  // AMD loader 流程：loader.js → require.config({paths:{vs}}) → require editor.main。
+  // worker 用 blob proxy（CSP worker-src blob:）承载 CDN workerMain，importScripts 回源加载。
+  // 失败（无网/CDN 不可达）reject，调用方回退 textarea
+  const MONACO_BASE = 'https://cdnjs.cloudflare.com/ajax/libs/monaco-editor/0.52.2/min';
+  let monacoPromise = null;
+  function loadMonaco() {
+    if (!monacoPromise) {
+      monacoPromise = (async () => {
+        await loadScript(`${MONACO_BASE}/vs/loader.min.js`);
+        if (!window.require) throw new Error('Monaco loader 未初始化');
+        window.require.config({ paths: { vs: `${MONACO_BASE}/vs` } });
+        await new Promise((resolve, reject) => {
+          window.require(['vs/editor/editor.main'], resolve, reject);
+        });
+        if (!window.monaco) throw new Error('Monaco 加载异常');
+        // blob proxy worker：跨域 CDN 无法直接 new Worker(cdn url)，经 blob importScripts 中转
+        const src = `self.MonacoEnvironment={baseUrl:'${MONACO_BASE}/'};importScripts('${MONACO_BASE}/vs/base/worker/workerMain.js');`;
+        window.MonacoEnvironment = {
+          getWorkerUrl: () => URL.createObjectURL(new Blob([src], { type: 'text/javascript' })),
+        };
+        return window.monaco;
+      })().catch((e) => {
+        monacoPromise = null; // 失败清缓存：下次打开编辑器重试
+        throw e;
+      });
+    }
+    return monacoPromise;
+  }
+
+  // Markdown 渲染器 CDN 懒加载（预览功能低频使用，不进 vendor）。
+  // marked 渲染 + DOMPurify 消毒（文件内容来自服务器，HTML 必须过滤防 XSS）
+  let markdownPromise = null;
+  function loadMarkdown() {
+    if (!markdownPromise) {
+      markdownPromise = (async () => {
+        await loadScript('https://cdnjs.cloudflare.com/ajax/libs/marked/15.0.7/marked.min.js');
+        await loadScript('https://cdnjs.cloudflare.com/ajax/libs/dompurify/3.2.4/purify.min.js');
+        if (!window.marked || !window.DOMPurify) throw new Error('Markdown 组件加载异常');
+        return { marked: window.marked, purify: window.DOMPurify };
+      })().catch((e) => {
+        markdownPromise = null; // 失败清缓存：下次点预览重试
+        throw e;
+      });
+    }
+    return markdownPromise;
+  }
+
   // 二进制扩展名黑名单：这些类型的"编辑"必然损坏文件（UTF-8 解码替换字符写回），
   // 直接不显示编辑入口。名单外的仍可能误判（无扩展名二进制），由 api.js 解码校验兜底。
   // 集合元素带点（.jpg），比较时补点——两侧口径不一致会全量漏判
@@ -370,6 +418,6 @@
     $, escapeHtml, fmtBytes, fileJoin, fileParent, downsample,
     lockScroll, unlockScroll,
     MONITOR_STEP_MAX, MONITOR_RANGE_LABEL, MONITOR_COLORS,
-    GEO_PRIVATE, geoLookup, flagHtml, osIconHtml, isSystemPath, isBinaryExt, loadScript, loadCss, setGeoEnabled, IdleGuard,
+    GEO_PRIVATE, geoLookup, flagHtml, osIconHtml, isSystemPath, isBinaryExt, loadScript, loadCss, loadMonaco, loadMarkdown, setGeoEnabled, IdleGuard,
   };
 })();

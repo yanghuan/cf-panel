@@ -4,7 +4,7 @@
   // 工具函数与 <cf-ip> 组件从 utils.js 解构；api 层从 api.js 解构（index.html 中均须先加载）
   const { $, escapeHtml, fmtBytes, fileJoin, fileParent, downsample, lockScroll, unlockScroll,
           MONITOR_STEP_MAX, MONITOR_RANGE_LABEL, MONITOR_COLORS,
-          GEO_PRIVATE, setGeoEnabled, flagHtml, osIconHtml, isSystemPath, isBinaryExt, loadScript, loadCss, geoLookup, IdleGuard } = CfUtils;
+          GEO_PRIVATE, setGeoEnabled, flagHtml, osIconHtml, isSystemPath, isBinaryExt, loadScript, loadCss, loadMonaco, loadMarkdown, geoLookup, IdleGuard } = CfUtils;
   const { api, setTokenGetter, FileSession, TermSession, PushSession } = CfApi;
   let token = localStorage.getItem('cfpanel_token') || '';
   setTokenGetter(() => token); // api 层通过 getter 读取当前 token
@@ -652,6 +652,7 @@
         renderSelectorList();
       } else {
         renderFileList(entries);
+        localStorage.setItem(`cfpanel_file_cwd:${fileServerId}`, path); // 记住最后浏览目录（下次打开恢复）
         $('#file-msg').textContent = truncated ? '目录条目过多，仅显示前 1000 项' : '';
       }
     },
@@ -695,13 +696,16 @@
     fileServerId = serverId;
     fileServerName = serverName;
     $('#file-title').textContent = `文件管理 · ${serverName}`;
-    $('#file-path').value = '/';
+    // 恢复该服务器上次浏览目录（列表成功时持久化；格式异常则回退根目录）
+    const saved = localStorage.getItem(`cfpanel_file_cwd:${serverId}`);
+    const cwd = saved && saved.startsWith('/') ? saved : '/';
+    $('#file-path').value = cwd;
     $('#file-filter').value = '';
     $('#file-msg').textContent = '';
     $('#file-list').innerHTML = '<tr><td colspan="4" class="muted">连接中...</td></tr>';
     $('#file-modal').classList.remove('hidden');
     lockScroll();
-    fileSess.open(serverId, '/'); // 建会话 + WS + auth + 初始列表
+    fileSess.open(serverId, cwd); // 建会话 + WS + auth + 初始列表
   }
 
   function closeFileModal() {
@@ -764,26 +768,173 @@
     });
   }
 
-  // 在线编辑器：editText 全文拉取 → textarea → 保存走 upload（overwrite）原路写回
+  // ---------- 在线编辑器：Monaco（CDN 懒加载，失败回退 textarea）----------
+  // dirty 跟踪：内容 != 打开时的初始文本 → 保存按钮高亮提示；扩大：toggle 全屏布局
   let editorPath = '';
-  function openFileEditor(path, text) {
-    editorPath = path;
-    $('#file-editor-title').textContent = `编辑：${path}`;
-    $('#file-editor-text').value = text;
-    $('#file-editor-modal').classList.remove('hidden');
-    lockScroll();
+  let editorInitial = '';   // 打开时的初始内容（dirty 判定基准）
+  let editorDirty = false;
+  let monacoEditor = null;  // Monaco 实例（null = textarea 回退模式）
+  let monacoReady = false;  // 本会话 Monaco 是否可用（失败后本会话直接走 textarea，不反复重试）
+  let editorPreviewing = false; // Markdown 预览模式（仅 md 文件显示切换按钮）
+
+  // 后缀 → Monaco 语言 ID（均为 min 版内置 basic-languages，无需额外加载）
+  const EDITOR_LANGS = {
+    js: 'javascript', mjs: 'javascript', cjs: 'javascript', jsx: 'javascript',
+    ts: 'typescript', tsx: 'typescript',
+    json: 'json', jsonc: 'json',
+    yaml: 'yaml', yml: 'yaml', xml: 'xml', svg: 'xml', xsl: 'xml', plist: 'xml',
+    html: 'html', htm: 'html', vue: 'html',
+    css: 'css', scss: 'scss', less: 'less',
+    md: 'markdown', mdx: 'markdown', rst: 'restructuredtext',
+    sql: 'sql', psql: 'sql', mysql: 'mysql',
+    sh: 'shell', bash: 'shell', zsh: 'shell', fish: 'shell',
+    py: 'python', pyw: 'python', rb: 'ruby', go: 'go', rs: 'rust',
+    c: 'c', h: 'c', cpp: 'cpp', cc: 'cpp', hpp: 'cpp', hxx: 'cpp', cxx: 'cpp',
+    cs: 'csharp', java: 'java', kt: 'kotlin', kts: 'kotlin', scala: 'scala',
+    swift: 'swift', dart: 'dart', php: 'php', phtml: 'php',
+    pl: 'perl', pm: 'perl', lua: 'lua', r: 'r', tcl: 'tcl',
+    groovy: 'shell', vb: 'vb',
+    bat: 'bat', cmd: 'bat', ps1: 'powershell', psm1: 'powershell',
+    ini: 'ini', conf: 'ini', cfg: 'ini', env: 'ini', toml: 'ini', properties: 'ini',
+    tf: 'hcl', tfvars: 'hcl', hcl: 'hcl',
+    graphql: 'graphql', gql: 'graphql', proto: 'protobuf',
+    log: 'plaintext', txt: 'plaintext',
+  };
+  // 无后缀 / 点文件的文件名 → 语言（basename 精确匹配）
+  const EDITOR_FILE_LANGS = {
+    dockerfile: 'dockerfile', makefile: 'shell', gnumakefile: 'shell',
+    bashrc: 'shell', bash_profile: 'shell', bash_logout: 'shell',
+    profile: 'shell', zshrc: 'shell', zshenv: 'shell', zprofile: 'shell',
+    gitconfig: 'ini', editorconfig: 'ini',
+  };
+  function editorLang(path) {
+    const base = path.slice(path.lastIndexOf('/') + 1).toLowerCase();
+    const ext = base.includes('.') ? base.slice(base.lastIndexOf('.') + 1) : base;
+    return EDITOR_FILE_LANGS[base] || EDITOR_LANGS[ext] || 'plaintext';
   }
+
+  function setEditorDirty(dirty) {
+    editorDirty = dirty;
+    const btn = $('#btn-editor-save');
+    btn.classList.toggle('dirty', dirty);
+    btn.textContent = dirty ? '保存 ●' : '保存';
+    // 有未保存改动时标题加标记
+    $('#file-editor-title').textContent = `编辑：${editorPath}${dirty ? ' *' : ''}`;
+  }
+
+  async function openFileEditor(path, text) {
+    editorPath = path;
+    editorInitial = text;
+    monacoEditor = null;
+    setEditorDirty(false);
+    // Markdown 文件显示「预览」按钮；打开新文件时预览态复位
+    editorPreviewing = false;
+    $('#btn-editor-preview').classList.toggle('hidden', editorLang(path) !== 'markdown');
+    $('#btn-editor-preview').textContent = '预览';
+    $('#editor-md-preview').classList.add('hidden');
+    $('#file-editor-title').textContent = `编辑：${path}`;
+    $('#file-editor-text').value = text; // textarea 始终持有内容（回退与保存兜底）
+    $('#file-editor-modal').classList.remove('hidden');
+    $('#file-editor-modal').classList.remove('expanded');
+    $('#btn-editor-expand').textContent = '扩大';
+    lockScroll();
+    if (!monacoReady) {
+      try {
+        const monaco = await loadMonaco();
+        monacoReady = true;
+        initMonaco(monaco, path, text);
+      } catch {
+        // CDN 不可达（无网/被墙）：回退 textarea，本会话不再重试
+        $('#file-editor-text').classList.remove('hidden');
+        $('#editor-monaco-host').classList.add('hidden');
+      }
+      return;
+    }
+    // Monaco 已就绪（本会话内重复打开）
+    initMonaco(window.monaco, path, text);
+  }
+
+  function initMonaco(monaco, path, text) {
+    $('#file-editor-text').classList.add('hidden');
+    const host = $('#editor-monaco-host');
+    host.classList.remove('hidden');
+    if (monacoEditor) {
+      monacoEditor.getModel().dispose();
+      monacoEditor.dispose();
+      monacoEditor = null;
+    }
+    monaco.editor.setTheme('vs-dark');
+    const model = monaco.editor.createModel(text, editorLang(path), monaco.Uri.parse('file://' + path));
+    monacoEditor = monaco.editor.create(host, {
+      model,
+      theme: 'vs-dark', fontSize: 13, automaticLayout: true,
+      minimap: { enabled: false }, scrollBeyondLastLine: false, tabSize: 4,
+      renderWhitespace: 'selection', wordWrap: 'on',
+    });
+    model.onDidChangeContent(() => setEditorDirty(model.getValue() !== editorInitial));
+    setTimeout(() => monacoEditor && monacoEditor.focus(), 50);
+  }
+
+  function editorGetValue() {
+    return monacoEditor ? monacoEditor.getValue() : $('#file-editor-text').value;
+  }
+
   function saveFileEditor() {
-    const text = $('#file-editor-text').value;
+    const text = editorGetValue();
     const name = editorPath.split('/').pop() || 'edit.tmp';
     // File 构造（Blob + name）：复用上传状态机分块写回；显式 path（编辑期间 cwd 可能已变化）
     fileSess.upload(new File([text], name, { type: 'text/plain' }), { overwrite: true, path: editorPath });
     closeFileEditor();
     $('#file-msg').textContent = '保存中...';
   }
+
+  function toggleEditorExpand() {
+    const modal = $('#file-editor-modal');
+    const expanded = modal.classList.toggle('expanded');
+    $('#btn-editor-expand').textContent = expanded ? '还原' : '扩大';
+    // Monaco automaticLayout 异步自适应；textarea 用 CSS flex 自动撑满
+    if (monacoEditor) setTimeout(() => monacoEditor && monacoEditor.layout(), 60);
+  }
+
+  // Markdown 预览/编辑切换：marked 渲染 + DOMPurify 消毒（内容来自服务器文件，innerHTML 前必须过滤 XSS）
+  async function toggleEditorPreview() {
+    const btn = $('#btn-editor-preview');
+    if (editorPreviewing) { // 预览 → 编辑：恢复原编辑视图（Monaco 或 textarea 回退）
+      $('#editor-md-preview').classList.add('hidden');
+      if (monacoEditor) $('#editor-monaco-host').classList.remove('hidden');
+      else $('#file-editor-text').classList.remove('hidden');
+      editorPreviewing = false;
+      btn.textContent = '预览';
+      return;
+    }
+    let md;
+    try { md = await loadMarkdown(); }
+    catch { toast('预览组件加载失败（CDN 不可达），请稍后重试'); return; }
+    $('#editor-md-preview').innerHTML = md.purify.sanitize(md.marked.parse(editorGetValue()));
+    $('#editor-md-preview').classList.remove('hidden');
+    $('#file-editor-text').classList.add('hidden');
+    $('#editor-monaco-host').classList.add('hidden');
+    editorPreviewing = true;
+    btn.textContent = '编辑';
+  }
+
   function closeFileEditor() {
     fileSess.cancelEditText();
+    editorPreviewing = false;
+    $('#btn-editor-preview').classList.add('hidden');
+    $('#btn-editor-preview').textContent = '预览';
+    $('#editor-md-preview').classList.add('hidden');
+    $('#editor-md-preview').innerHTML = ''; // 清空引用，释放大文档 DOM
+    if (monacoEditor) {
+      monacoEditor.getModel().dispose();
+      monacoEditor.dispose();
+      monacoEditor = null;
+    }
+    $('#file-editor-text').classList.remove('hidden'); // 复位：下次回退模式可见
+    $('#editor-monaco-host').classList.add('hidden');
     $('#file-editor-modal').classList.add('hidden');
+    $('#file-editor-modal').classList.remove('expanded');
+    setEditorDirty(false);
     unlockScroll();
   }
 
@@ -1734,7 +1885,21 @@
   $('#btn-file-mkdir').onclick = mkDir;
   $('#btn-file-touch').onclick = touchFile;
   $('#btn-editor-save').onclick = saveFileEditor;
-  $('#btn-editor-close').onclick = closeFileEditor;
+  $('#btn-editor-preview').onclick = toggleEditorPreview;
+  $('#btn-editor-close').onclick = () => {
+    // 有未保存改动时二次确认（Monaco 与 textarea 共用 editorDirty）
+    if (editorDirty) confirmDialog('有未保存的修改，确认放弃？', closeFileEditor);
+    else closeFileEditor();
+  };
+  $('#btn-editor-expand').onclick = toggleEditorExpand;
+  $('#file-editor-text').addEventListener('input', () => setEditorDirty($('#file-editor-text').value !== editorInitial));
+  // Ctrl/Cmd+S 保存
+  $('#file-editor-modal').addEventListener('keydown', (e) => {
+    if ((e.ctrlKey || e.metaKey) && e.key === 's') {
+      e.preventDefault();
+      saveFileEditor();
+    }
+  });
   $('#btn-sel-close').onclick = closeFileSelector;
   $('#btn-sel-ok').onclick = confirmSelectorMove;
   $('#btn-sel-up').onclick = selUp;

@@ -474,6 +474,9 @@ button.danger:hover { background: rgba(248, 113, 113, .12); }
 .modal:has(.settings-body) .modal-head { max-width: 640px; }
 .modal:has(.dialog-body) .modal-head { max-width: 560px; }
 .modal:has(.file-body) .modal-head { max-width: 760px; }
+/* 编辑器弹窗（file-editor-modal 也用 .file-body，但标题栏须跟随其自身宽度） */
+#file-editor-modal .modal-head { max-width: 760px; }
+#file-editor-modal.expanded .modal-head { max-width: none; }
 .modal-head span { font-weight: 600; }
 .term { flex: 1; background: #05070c; border: 1px solid var(--border); border-radius: 12px; padding: 8px; overflow: hidden; box-shadow: 0 0 40px rgba(99, 102, 241, .08); }
 .term .xterm { height: 100%; }
@@ -715,7 +718,7 @@ button.danger:hover { background: rgba(248, 113, 113, .12); }
 .sel-list-wrap .file-table { margin: 0; }
 a.f-dir.f-prot { opacity: .55; }
 
-/* 在线文件编辑器：等宽全高 textarea */
+/* 在线文件编辑器：等宽全高 textarea（Monaco 回退）*/
 .file-editor-area {
   width: 100%;
   min-height: 320px;
@@ -731,6 +734,42 @@ a.f-dir.f-prot { opacity: .55; }
   line-height: 1.5;
 }
 .file-editor-area:focus { outline: none; border-color: var(--accent); }
+
+/* Monaco 容器：默认与 textarea 同高；扩大时撑满弹窗 */
+#editor-monaco-host { flex: 1; min-height: 320px; border-radius: 10px; overflow: hidden; }
+/* 内容区固定视口高度：初始即接近全高；也避免 Monaco 棘轮效应
+   （扩大时 Monaco 写入内联像素高度，还原后内容撑高 host 不回落） */
+#file-editor-modal .file-body { display: flex; flex-direction: column; height: calc(100vh - 128px); }
+/* 扩大（全屏）：内容区解除 760 限宽，高度撑满视口（与终端弹窗同观感） */
+#file-editor-modal.expanded .file-body { max-width: none; height: calc(100vh - 96px); }
+#file-editor-modal.expanded { padding: 16px 20px; }
+#file-editor-modal.expanded #editor-monaco-host,
+#file-editor-modal.expanded .file-editor-area { min-height: 0; height: 100%; resize: none; }
+
+/* Markdown 预览：与编辑区同容器（flex:1 填满），GFM 风格排版 */
+#editor-md-preview { flex: 1; min-height: 0; overflow-y: auto; border: 1px solid var(--border); border-radius: 10px; padding: 16px 22px; background: rgba(20, 25, 40, .4); font-size: 14px; line-height: 1.7; }
+#editor-md-preview h1, #editor-md-preview h2 { border-bottom: 1px solid var(--border); padding-bottom: .3em; margin: .8em 0 .5em; }
+#editor-md-preview h1 { font-size: 1.5em; }
+#editor-md-preview h2 { font-size: 1.28em; }
+#editor-md-preview h3, #editor-md-preview h4 { margin: .8em 0 .4em; }
+#editor-md-preview p, #editor-md-preview ul, #editor-md-preview ol,
+#editor-md-preview blockquote, #editor-md-preview table, #editor-md-preview pre { margin: .6em 0; }
+#editor-md-preview code { background: rgba(99, 102, 241, .16); border-radius: 4px; padding: .1em .35em; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .9em; }
+#editor-md-preview pre { background: #0d1220; border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; overflow-x: auto; }
+#editor-md-preview pre code { background: none; padding: 0; }
+#editor-md-preview blockquote { border-left: 3px solid var(--accent); padding: .1em 0 .1em 12px; color: var(--muted); }
+#editor-md-preview table { border-collapse: collapse; }
+#editor-md-preview th, #editor-md-preview td { border: 1px solid var(--border); padding: 5px 10px; }
+#editor-md-preview th { background: rgba(99, 102, 241, .1); }
+#editor-md-preview img { max-width: 100%; }
+#editor-md-preview a { color: var(--accent); }
+
+/* 保存按钮 dirty 态：有未保存改动时高亮提示 */
+#btn-editor-save.dirty {
+  color: #fbbf24;
+  border-color: #fbbf24;
+  box-shadow: 0 0 0 1px rgba(251, 191, 36, .25);
+}
 .custom-editor {
   flex: 1;
   min-width: 0;

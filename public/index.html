@@ -6,10 +6,11 @@
   <title>cf-panel · 监控面板</title>
   <!-- favicon：程序内联 SVG（data URI，零资源文件；圆角方块 + 三横线 = 服务器/仪表盘） -->
   <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2032%2032'%3E%3Crect%20width='32'%20height='32'%20rx='7'%20fill='%238b5cf6'/%3E%3Cpath%20d='M9%2011h14M9%2016h14M9%2021h8'%20stroke='white'%20stroke-width='2.5'%20stroke-linecap='round'/%3E%3C/svg%3E">
-  <!-- 内容安全策略（防注入/点击劫持；本地 JS/CSS + WebSocket + IP 地理查询放行） -->
-  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https://flagcdn.com https://cdn.simpleicons.org; connect-src 'self' https://ipapi.co https://ipwho.is; frame-ancestors 'none'">
+  <!-- 内容安全策略（防注入/点击劫持；本地 JS/CSS + WebSocket + IP 地理查询放行；
+       Monaco 编辑器走 cdnjs（体量 ~3MB 不进 vendor），worker 经 blob proxy 加载 → worker-src blob:） -->
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' https://cdnjs.cloudflare.com; style-src 'self' 'unsafe-inline' https://cdnjs.cloudflare.com; img-src 'self' data: https://flagcdn.com https://cdn.simpleicons.org; connect-src 'self' https://ipapi.co https://ipwho.is; worker-src blob:; frame-ancestors 'none'">
   <!-- 依赖本地化（public/vendor，避免外部 CDN 不可达/供应链风险）；xterm/Chart.js 首次使用时由 JS 懒加载 -->
-  <link rel="stylesheet" href="/style.css?v=26" />
+  <link rel="stylesheet" href="/style.css?v=28" />
 </head>
 <body>
   <div id="app" class="hidden">
@@ -120,17 +121,21 @@
     </div>
   </div>
 
-  <!-- 在线文件编辑器 -->
+  <!-- 在线文件编辑器（Monaco 懒加载 + textarea 回退；扩大=全屏） -->
   <div id="file-editor-modal" class="modal hidden">
     <div class="modal-head">
       <span id="file-editor-title">编辑</span>
       <div>
         <button id="btn-editor-save" class="ghost">保存</button>
+        <button id="btn-editor-preview" class="ghost hidden">预览</button>
+        <button id="btn-editor-expand" class="ghost">扩大</button>
         <button id="btn-editor-close" class="ghost">取消</button>
       </div>
     </div>
     <div class="file-body">
       <textarea id="file-editor-text" class="file-editor-area" spellcheck="false"></textarea>
+      <div id="editor-monaco-host" class="hidden"></div>
+      <div id="editor-md-preview" class="hidden"></div>
     </div>
   </div>
 
@@ -381,8 +386,8 @@
 
   <div id="toast" class="toast hidden"></div>
 
-  <script src="/utils.js?v=5"></script>
+  <script src="/utils.js?v=7"></script>
   <script src="/api.js?v=5"></script>
-  <script src="/app.js?v=41"></script>
+  <script src="/app.js?v=44"></script>
 </body>
 </html>

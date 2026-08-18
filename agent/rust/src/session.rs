@@ -351,11 +351,12 @@ const SYSTEM_PATHS: &[&str] = &[
     "/lib64",
     "/efi",  // Arch/openSUSE 惯例：EFI 独立挂载（/boot/efi 已被 /boot 前缀覆盖）
     "/snap", // Ubuntu snap 系统
-    "/opt",
     "/root",
     "/run",
-    "/srv",
     "/lost+found",
+    // 注：/opt /srv 不拦——第三方软件部署目录（自编译服务/手动安装二进制的常规位置），
+    // 删错顶多重装软件不毁系统；拦截会挡住"上传可执行软件部署"的正常流程。
+    // 恶意场景（传二进制+执行）走终端 shell 本就可行，拦截不增加安全性（防误操作威胁模型）
 ];
 
 // 词法归一化：要求绝对路径；折叠重复 /；解析 . 与 .. 组件。
@@ -575,10 +576,11 @@ fn zip_directory(dir: &std::path::Path, out: &mut Vec<u8>) -> std::io::Result<()
     Ok(())
 }
 
-// 目录打包 zip（STORED）到临时文件，返回 (zip 路径, 字节数)；前端分段下载后发 delete 清理
+// 目录打包 zip（STORED）到临时文件，返回 (zip 路径, 字节数)；前端分段下载后发 delete 清理。
+// 系统路径拦截见 blocking 闭包处注释（zip 只读，允许系统目录下载）
 async fn file_zip(path: &str, sid: &str, tmp_dir: &str) -> Result<(String, u64), String> {
-    if is_system_path(path) {
-        return Err(SYSTEM_PATH_ERR.into());
+    if is_system_path(path) && normalize_abs(path).as_deref() == Some("") {
+        return Err(SYSTEM_PATH_ERR.into()); // 仅拒绝根目录 /（打包整盘无意义且必超限）
     }
     let meta = std::fs::metadata(path).map_err(|_| "path not found")?;
     if !meta.is_dir() {
@@ -614,10 +616,9 @@ async fn file_zip(path: &str, sid: &str, tmp_dir: &str) -> Result<(String, u64),
     }
     let zip_path = format!("{}/dl-{sid}.zip", tmp_dir.trim_end_matches('/'));
     let path = path.to_string();
+    // zip 为只读打包（供下载），允许系统目录——与前端一致：系统路径保留"下载"，
+    // 仅写操作（write/rename/delete）被拒；symlink 由 zip 内部跳过（不跟随）
     let r = blocking_with_timeout(120, move || -> Result<(String, u64), String> {
-        if is_system_path_resolved(&path) {
-            return Err(SYSTEM_PATH_ERR.into());
-        }
         let mut buf: Vec<u8> = Vec::new();
         zip_directory(std::path::Path::new(&path), &mut buf).map_err(|e| e.to_string())?;
         let size = buf.len() as u64;
@@ -1126,6 +1127,10 @@ mod tests {
         assert!(!is_system_path("/tmp"));
         assert!(!is_system_path("/mnt/data"));
         assert!(!is_system_path("/home/user/dir"));
+        // 软件部署目录放行（上传可执行软件的常规位置）
+        assert!(!is_system_path("/opt"));
+        assert!(!is_system_path("/opt/myapp/bin/run"));
+        assert!(!is_system_path("/srv/www"));
         // 词法绕过全部拒绝（fail closed）：重复斜杠 / .. 回溯 / 相对路径 / 尾斜杠
         assert!(is_system_path("//etc/passwd"));
         assert!(is_system_path("/home/../etc/passwd"));

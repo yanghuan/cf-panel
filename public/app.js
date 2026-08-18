@@ -4,7 +4,7 @@
   // 工具函数与 <cf-ip> 组件从 utils.js 解构；api 层从 api.js 解构（index.html 中均须先加载）
   const { $, escapeHtml, fmtBytes, fileJoin, fileParent, downsample, lockScroll, unlockScroll,
           MONITOR_STEP_MAX, MONITOR_RANGE_LABEL, MONITOR_COLORS,
-          GEO_PRIVATE, setGeoEnabled, flagHtml, osIconHtml, geoLookup, IdleGuard } = CfUtils;
+          GEO_PRIVATE, setGeoEnabled, flagHtml, osIconHtml, isSystemPath, geoLookup, IdleGuard } = CfUtils;
   const { api, setTokenGetter, FileSession, TermSession, PushSession } = CfApi;
   let token = localStorage.getItem('cfpanel_token') || '';
   setTokenGetter(() => token); // api 层通过 getter 读取当前 token
@@ -693,22 +693,37 @@
         ? `<a class="f-dir" data-path="${escapeHtml(path)}">📁 ${escapeHtml(e.name)}</a>`
         : `<span class="f-file">📄 ${escapeHtml(e.name)}</span>`;
       // 行操作：⋯ 下拉菜单（下载/重命名/删除）。目录下载 = 打包 zip。
+      // 受保护系统路径（与 agent 黑名单同规则）：仅保留下载（读操作），隐藏重命名/删除——
+      // 系统目录的写操作请走终端 Shell；agent 端仍有最终防线，此处是 UX 层
+      const prot = isSystemPath(path);
       const menu = `<div class="row-menu-wrap">
         <button class="row-menu" type="button" title="操作" aria-label="操作">⋯</button>
         <div class="row-menu-pop hidden">
           <button class="f-act-dl" type="button" data-path="${escapeHtml(path)}" data-type="${e.type}" data-size="${e.size}">下载</button>
-          <button class="f-act-ren" type="button" data-path="${escapeHtml(path)}">重命名</button>
-          <button class="f-act-del danger" type="button" data-path="${escapeHtml(path)}" data-type="${e.type}">删除</button>
+          ${prot ? '' : `<button class="f-act-ren" type="button" data-path="${escapeHtml(path)}">重命名</button>
+          <button class="f-act-del danger" type="button" data-path="${escapeHtml(path)}" data-type="${e.type}">删除</button>`}
         </div>
       </div>`;
       return `<tr><td>${nameCell}</td><td>${size}</td><td>${escapeHtml(time)}</td><td class="f-ops">${menu}</td></tr>`;
     });
     $('#file-list').innerHTML = rows.join('') || '<tr><td colspan="4" class="muted">空目录</td></tr>';
+    // cwd 为受保护系统目录时禁用上传（写操作会被 agent 拒；特殊需求走终端 Shell）
+    const cwdProt = isSystemPath(fileSess.cwd);
+    const upBtn = document.querySelector('label.file-upload');
+    if (upBtn) {
+      upBtn.classList.toggle('hidden', cwdProt);
+      upBtn.title = cwdProt ? '系统目录受保护，禁止上传；如需操作请使用终端 Shell' : '';
+    }
+    $('#file-input').disabled = cwdProt;
   }
 
   // 上传/下载入口：状态机在 FileSession（api.js），这里只负责 UI 接线。
   // 上传前检测当前目录同名文件（服务端首块同样强制校验 overwrite，双保险）——同名需二次确认
   function uploadFile(file) {
+    if (isSystemPath(fileSess.cwd)) {
+      toast('系统目录受保护，禁止上传；如需操作请使用终端 Shell');
+      return;
+    }
     const target = fileJoin(fileSess.cwd, file.name);
     const existing = fileEntries.some((e) => e.type !== 'dir' && fileJoin(fileSess.cwd, e.name) === target);
     if (existing) {

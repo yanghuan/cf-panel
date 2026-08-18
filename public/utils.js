@@ -176,8 +176,7 @@
     return `<img src="https://flagcdn.com/${c}.svg" alt="${escapeHtml(cc)}" loading="lazy" class="flag-img">`;
   }
 
-  // 操作系统图标：simple-icons CDN SVG（白色，适配深色主题）。
-  // 匹配 info.os 字符串（agent 上报的 PRETTY_NAME / 平台名）：Windows/macOS 走平台分支，
+  // 操作系统图标：simple-icons CDN SVG（白色，适配深色主题）。  // 匹配 info.os 字符串（agent 上报的 PRETTY_NAME / 平台名）：Windows/macOS 走平台分支，
   // Linux 按发行版关键字映射 slug，未知 Linux 兜底 linux 图标，无法识别返回 ''（不显示）。
   // Windows 图标：simple-icons 已于 2024 年下架全部微软品牌图标（含 windows 各变体），
   // 改用 bootstrap-icons 的 Windows 窗格图标路径（MIT），data URI 内联（CSP img-src 已放行 data:）
@@ -216,6 +215,28 @@
       }
     }
     return '';
+  }
+
+  // 受保护系统路径判定（与 agent 词法层同规则）：绝对路径归一化（折叠 //、解析 . ..）
+  // 后匹配黑名单；相对路径/越根一律视为受保护。前端用于隐藏系统目录/文件的删除与
+  // 重命名菜单（下载保留）；agent 端为最终防线，此处仅为 UX 层
+  const SYSTEM_PATH_PREFIXES = [
+    '/proc', '/sys', '/dev', '/etc', '/usr', '/var', '/boot', '/bin',
+    '/sbin', '/lib', '/lib64', '/efi', '/snap', '/root', '/run',
+    '/lost+found', // 注：/opt /srv 不拦（第三方软件部署目录，与 agent 端黑名单同步）
+  ];
+  function isSystemPath(path) {
+    if (!path || !path.startsWith('/')) return true; // 相对路径按受保护处理
+    const parts = [];
+    for (const seg of path.split('/')) {
+      if (seg === '' || seg === '.') continue;
+      if (seg === '..') {
+        if (!parts.pop()) return true; // 越根 → 受保护
+      } else parts.push(seg);
+    }
+    const norm = '/' + parts.join('/');
+    if (norm === '/') return true;
+    return SYSTEM_PATH_PREFIXES.some((s) => norm === s || norm.startsWith(s + '/'));
   }
 
   // ---------- 空闲观看保护（IdleGuard）：无操作计时 + 提示 + 自动暂停，动作经回调注入 ----------
@@ -298,6 +319,6 @@
     $, escapeHtml, fmtBytes, fileJoin, fileParent, downsample,
     lockScroll, unlockScroll,
     MONITOR_STEP_MAX, MONITOR_RANGE_LABEL, MONITOR_COLORS,
-    GEO_PRIVATE, geoLookup, flagHtml, osIconHtml, setGeoEnabled, IdleGuard,
+    GEO_PRIVATE, geoLookup, flagHtml, osIconHtml, isSystemPath, setGeoEnabled, IdleGuard,
   };
 })();

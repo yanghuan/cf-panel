@@ -1,5 +1,6 @@
 // cf-panel agent（Rust 版）——纯 Shell agent.sh 的对等实现
 // 功能：控制通道（断线重连）→ 监控上报 + 终端 PTY + 文件管理；信号清理
+mod blocking;
 mod metrics;
 mod session;
 
@@ -12,8 +13,8 @@ use std::time::Duration;
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::{Mutex, Notify};
 use tokio::time::sleep;
-use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
 type WsStream =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
@@ -107,6 +108,10 @@ fn log_sender() -> &'static std::sync::mpsc::SyncSender<String> {
     static TX: OnceLock<std::sync::mpsc::SyncSender<String>> = OnceLock::new();
     TX.get_or_init(|| {
         let (tx, rx) = std::sync::mpsc::sync_channel::<String>(1024);
+        // stdout 独立通道+线程：stdout 管道对端不消费（journalctl 停止、管道滞留）时
+        // write 会永久阻塞——若在同一线程顺序执行，文件日志也会随之停摆；
+        // 拆开后 stdout 阻塞只丢 stdout 日志，文件日志不受连坐
+        let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(256);
         std::thread::Builder::new()
             .name("log-writer".to_string())
             .spawn(move || {
@@ -116,16 +121,30 @@ fn log_sender() -> &'static std::sync::mpsc::SyncSender<String> {
                     .append(true)
                     .open(&cfg.log_file)
                     .unwrap_or_else(|_| std::fs::File::create(&cfg.log_file).unwrap());
+                // 轮转判定用自累计字节数（append-only 单写者），替代每行一次
+                // f.metadata() 的 fstat 系统调用
+                let mut written: u64 = 0;
                 while let Ok(line) = rx.recv() {
-                    // 轮转：文件超上限直接截断（原写入前检查逻辑移入写线程）
-                    if f.metadata().map(|m| m.len()).unwrap_or(0) > cfg.log_max {
+                    if written > cfg.log_max {
                         let _ = f.set_len(0);
+                        written = 0;
                     }
                     let _ = f.write_all(line.as_bytes());
-                    let _ = std::io::stdout().write_all(line.as_bytes());
+                    written += line.len() as u64;
+                    // 满即丢弃（stdout 线程积压）：文件日志已落盘，stdout 尽力而为
+                    let _ = out_tx.try_send(line);
                 }
             })
             .expect("spawn log writer thread");
+        std::thread::Builder::new()
+            .name("log-stdout".to_string())
+            .spawn(move || {
+                let mut out = std::io::stdout().lock();
+                while let Ok(line) = out_rx.recv() {
+                    let _ = out.write_all(line.as_bytes());
+                }
+            })
+            .expect("spawn log stdout thread");
         tx
     })
 }
@@ -207,11 +226,10 @@ async fn control_conn(
     let url = format!("{}/control", cfg.wss);
     let mut req = url.into_client_request()?;
     req.headers_mut().insert("X-Agent-Key", cfg.key.parse()?);
-    // 控制通道入站限制 64KB，防恶意超大消息整包占内存（异常帧读循环报错即重连）
-    let cfg_ws = tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
-        max_message_size: Some(CTRL_MSG_LIMIT),
-        ..Default::default()
-    };
+    // 控制通道入站限制 64KB，防恶意超大消息整包占内存（异常帧读循环报错即重连）。
+    // tungstenite 0.24+ WebSocketConfig 为 non_exhaustive：default() 后逐字段赋值
+    let mut cfg_ws = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default();
+    cfg_ws.max_message_size = Some(CTRL_MSG_LIMIT);
     let (ws, _) = tokio_tungstenite::connect_async_with_config(req, Some(cfg_ws), false).await?;
     log("control channel connected");
     let (write, mut read) = ws.split();
@@ -249,8 +267,16 @@ async fn control_conn(
             };
         match msg {
             Message::Text(t) => {
-                if let Err(e) =
-                    dispatch(cfg, sessions, file_sessions, &write, &interval, &note, &t).await
+                if let Err(e) = dispatch(
+                    cfg,
+                    sessions,
+                    file_sessions,
+                    &write,
+                    &interval,
+                    &note,
+                    t.as_str(),
+                )
+                .await
                 {
                     break Err(e);
                 }
@@ -317,8 +343,14 @@ async fn handle_upload_frame(
     }
     // 数据转 owned：spawn_blocking 闭包需 'static（块 ≤48KB，拷贝可接受）
     let data = frame[nl + 1..].to_vec();
-    // 该 upload 已失败（首帧拒绝后跳过后续帧，避免重复回执/写入）
-    if failed.lock().unwrap().contains(&upload_id) {
+    // 该 upload 已失败（首帧拒绝后跳过后续帧，避免重复回执/写入）。
+    // Mutex poison 容忍（与其余处 if let Ok 风格一致）：poison 视为未失败继续处理，
+    // async 读循环里 panic 会杀进程，不能 unwrap
+    if failed
+        .lock()
+        .map(|f| f.contains(&upload_id))
+        .unwrap_or(false)
+    {
         return Ok(());
     }
     let reject = |write: &Arc<Mutex<Sink>>, msg: &str| {
@@ -329,33 +361,41 @@ async fn handle_upload_frame(
         let w = write.clone();
         tokio::spawn(async move {
             let mut w = w.lock().await;
-            let _ = w.send(Message::Text(resp.to_string())).await;
+            let _ = w.send(Message::Text(resp.to_string().into())).await;
         });
     };
     // DISABLE_EXEC=1：上传属命令执行类写操作，与终端/文件管理一致拒绝
     if cfg.disable_exec {
-        failed.lock().unwrap().insert(upload_id.clone());
+        if let Ok(mut f) = failed.lock() {
+            f.insert(upload_id.clone());
+        }
         reject(write, "exec disabled (DISABLE_EXEC=1)");
         return Ok(());
     }
     // 系统路径保护：写操作拒绝系统目录（/proc /sys /etc /usr /var /root 等，与文件会话一致）
     if session::is_system_path(&path) {
-        failed.lock().unwrap().insert(upload_id.clone());
+        if let Ok(mut f) = failed.lock() {
+            f.insert(upload_id.clone());
+        }
         reject(write, session::SYSTEM_PATH_ERR);
         return Ok(());
     }
     // 首帧（offset==0）：overwrite=false 且目标已存在 → 拒绝（防误覆盖）
     if offset == 0 && !overwrite && std::path::Path::new(&path).exists() {
-        failed.lock().unwrap().insert(upload_id.clone());
+        if let Ok(mut f) = failed.lock() {
+            f.insert(upload_id.clone());
+        }
         reject(write, "target already exists (use overwrite=1)");
         return Ok(());
     }
     // 复用文件会话的原子写：临时文件 {path}.upload.{upload_id}，offset 严格校验，commit 时 fsync+rename。
-    // 写入在 spawn_blocking 内完成（磁盘 IO 不阻塞 async 读循环）
+    // 统一走 blocking 封装（超时 + 信号量 + 文件操作熔断）——此前裸 spawn_blocking 无超时：
+    // 挂死挂载点上 write_bytes（canonicalize + 磁盘写）挂死会连坐控制读循环（超时作用域外
+    // await），心跳/半开检测/后续指令全部失效，agent 表现为「假活」只能重启
     let created = created.clone();
     let failed = failed.clone();
     let (upload_id_err, path_err) = (upload_id.clone(), path.clone());
-    let r = match tokio::task::spawn_blocking(move || {
+    let r = match crate::blocking::file_blocking(30, move || {
         let res = session::write_bytes(&path, offset, &data, commit, &upload_id, &created);
         // 解析 write_bytes 回执（write_result / error），统一包装为 upload_result
         let v: serde_json::Value = serde_json::from_str(&res).unwrap_or(serde_json::Value::Null);
@@ -370,7 +410,9 @@ async fn handle_upload_frame(
                 .and_then(|x| x.as_str())
                 .unwrap_or("write failed")
                 .to_string();
-            failed.lock().unwrap().insert(upload_id.clone());
+            if let Ok(mut f) = failed.lock() {
+                f.insert(upload_id.clone());
+            }
             serde_json::json!({
                 "type": "upload_result", "upload_id": upload_id, "path": path,
                 "ok": false, "error": msg,
@@ -379,14 +421,14 @@ async fn handle_upload_frame(
     })
     .await
     {
-        Ok(v) => v,
-        Err(_) => serde_json::json!({
+        Some(v) => v,
+        None => serde_json::json!({
             "type": "upload_result", "upload_id": upload_id_err, "path": path_err,
-            "ok": false, "error": "write task failed",
+            "ok": false, "error": "write timeout",
         }),
     };
     let mut w = write.lock().await;
-    let _ = w.send(Message::Text(r.to_string())).await;
+    let _ = w.send(Message::Text(r.to_string().into())).await;
     Ok(())
 }
 
@@ -440,11 +482,15 @@ async fn dispatch(
                 let mut map = sessions.lock().await;
                 if let Some(existing) = map.get(&sid) {
                     if existing.is_alive() {
+                        // 先释放 sessions 锁再发送：控制通道拥塞时 send 可能长时间 pending，
+                        // 持锁 await 会连坐 resize 等所有会话操作
+                        drop(map);
                         let mut w = write.lock().await;
                         let _ = w
-                            .send(Message::Text(format!(
-                                r#"{{"type":"terminal_ready","stream_id":"{sid}"}}"#
-                            )))
+                            .send(Message::Text(
+                                format!(r#"{{"type":"terminal_ready","stream_id":"{sid}"}}"#)
+                                    .into(),
+                            ))
                             .await;
                         return Ok(());
                     }
@@ -464,9 +510,9 @@ async fn dispatch(
             // 回执 terminal_ready：停止 DO 的 open_terminal 确认重发
             let mut w = write.lock().await;
             let _ = w
-                .send(Message::Text(format!(
-                    r#"{{"type":"terminal_ready","stream_id":"{sid}"}}"#
-                )))
+                .send(Message::Text(
+                    format!(r#"{{"type":"terminal_ready","stream_id":"{sid}"}}"#).into(),
+                ))
                 .await;
             drop(w);
             // 启动数据流（独立任务；结束时自动 cleanup + 从 sessions 移除）
@@ -492,9 +538,9 @@ async fn dispatch(
             if !file_sessions.lock().await.insert(sid.clone()) {
                 let mut w = write.lock().await;
                 let _ = w
-                    .send(Message::Text(format!(
-                        r#"{{"type":"file_ready","stream_id":"{sid}"}}"#
-                    )))
+                    .send(Message::Text(
+                        format!(r#"{{"type":"file_ready","stream_id":"{sid}"}}"#).into(),
+                    ))
                     .await;
                 return Ok(());
             }
@@ -502,9 +548,9 @@ async fn dispatch(
             // 回执 file_ready，停止 DO 的 open_file 确认重发
             let mut w = write.lock().await;
             let _ = w
-                .send(Message::Text(format!(
-                    r#"{{"type":"file_ready","stream_id":"{sid}"}}"#
-                )))
+                .send(Message::Text(
+                    format!(r#"{{"type":"file_ready","stream_id":"{sid}"}}"#).into(),
+                ))
                 .await;
             drop(w);
             let cfg2 = cfg.clone();
@@ -573,7 +619,8 @@ async fn dispatch(
                                 "timed_out": false,
                                 "error": "exec disabled (DISABLE_EXEC=1)",
                             })
-                            .to_string(),
+                            .to_string()
+                            .into(),
                         ))
                         .await;
                     return;
@@ -591,6 +638,7 @@ async fn dispatch(
                     .stdout(std::process::Stdio::piped())
                     .stderr(std::process::Stdio::piped())
                     .process_group(0)
+                    .kill_on_drop(true)
                     .spawn()
                 {
                     Ok(c) => c,
@@ -605,7 +653,7 @@ async fn dispatch(
                             "timed_out": false,
                         });
                         let mut w = write.lock().await;
-                        let _ = w.send(Message::Text(msg.to_string())).await;
+                        let _ = w.send(Message::Text(msg.to_string().into())).await;
                         return;
                     }
                 };
@@ -613,29 +661,20 @@ async fn dispatch(
                 // 手动收集 stdout/stderr（timeout 到期时随 future drop 丢弃，无部分输出语义）
                 let mut out_pipe = child.stdout.take();
                 let mut err_pipe = child.stderr.take();
-                // 有界读取：stdout/stderr 分别取 48KB/16KB 上限（稍大于截断阈值，留 UTF-8 边界余量），
-                // 避免刷屏命令（25s 窗口）无界物化导致峰值内存数百 MB
+                // 有界读取（48KB/16KB 上限 + 读满后 drain）语义见 read_limited 注释
                 let out = tokio::time::timeout(Duration::from_secs(timeout_s), async {
                     let (o, e) = tokio::join!(
                         async {
-                            let mut buf = Vec::new();
-                            if let Some(r) = out_pipe.as_mut() {
-                                let mut limited = tokio::io::AsyncReadExt::take(r, 48 * 1024);
-                                let _ =
-                                    tokio::io::AsyncReadExt::read_to_end(&mut limited, &mut buf)
-                                        .await;
+                            match out_pipe.as_mut() {
+                                Some(r) => read_limited(r, 48 * 1024).await,
+                                None => Vec::new(),
                             }
-                            buf
                         },
                         async {
-                            let mut buf = Vec::new();
-                            if let Some(r) = err_pipe.as_mut() {
-                                let mut limited = tokio::io::AsyncReadExt::take(r, 16 * 1024);
-                                let _ =
-                                    tokio::io::AsyncReadExt::read_to_end(&mut limited, &mut buf)
-                                        .await;
+                            match err_pipe.as_mut() {
+                                Some(r) => read_limited(r, 16 * 1024).await,
+                                None => Vec::new(),
                             }
-                            buf
                         },
                     );
                     let status = child.wait().await;
@@ -656,13 +695,14 @@ async fn dispatch(
                         false,
                     ),
                     Err(_) => {
-                        // 超时：kill 整个进程组（SIGKILL 不可忽略，孙进程一并清理），再 wait 回收防僵尸
+                        // 超时：kill 整个进程组（SIGKILL 不可忽略，孙进程一并清理），再 wait 回收防僵尸。
+                        // wait 加短超时：D 状态进程收不到 SIGKILL，裸 wait 会永久挂起本任务
                         if pid > 0 {
                             unsafe {
                                 libc::kill(-(pid as i32), libc::SIGKILL);
                             }
                         }
-                        let _ = child.wait().await;
+                        let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
                         (
                             String::new(),
                             format!("timed out after {timeout_s}s"),
@@ -683,7 +723,7 @@ async fn dispatch(
                     "timed_out": timed_out,
                 });
                 let mut w = write.lock().await;
-                let _ = w.send(Message::Text(msg.to_string())).await;
+                let _ = w.send(Message::Text(msg.to_string().into())).await;
             });
         }
         _ => {}
@@ -706,6 +746,27 @@ fn truncate_utf8(s: &str, max_bytes: usize) -> String {
     out
 }
 
+// exec 有界读取：stdout/stderr 分别取 48KB/16KB 上限（稍大于截断阈值，留 UTF-8 边界
+// 余量），避免刷屏命令（25s 窗口）无界物化导致峰值内存数百 MB。
+// 限额读满后继续丢弃式 drain：take 到上限即返回 EOF ≠ 子进程写完——不排空的话
+// 子进程写满管道缓冲（Linux 默认 64KB）后阻塞在 write() 上永不退出，wait() 挂到
+// 整体超时，大输出命令（输出 > ~112KB = 限额 + 管道缓冲）一律被误报 timed out
+// + 丢掉已读输出且拖满超时窗口；drain 到真 EOF 让子进程自然退出，按截断语义上报
+//（持续输出的命令仍由外层超时兜底 kill 进程组）
+async fn read_limited(r: &mut (impl tokio::io::AsyncRead + Unpin), cap: u64) -> Vec<u8> {
+    let mut buf = Vec::new();
+    let mut limited = tokio::io::AsyncReadExt::take(&mut *r, cap);
+    let _ = tokio::io::AsyncReadExt::read_to_end(&mut limited, &mut buf).await;
+    let mut sink = [0u8; 8 * 1024];
+    loop {
+        match tokio::io::AsyncReadExt::read(r, &mut sink).await {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+    }
+    buf
+}
+
 // 上报循环：立即上报 + 分段等待（每 5s 重读间隔，interval 变更立即生效）
 async fn report_loop(
     cfg: &Config,
@@ -716,7 +777,7 @@ async fn report_loop(
     loop {
         if let Some(r) = metrics::collect_report(cfg).await {
             let mut w = write.lock().await;
-            if w.send(Message::Text(r)).await.is_err() {
+            if w.send(Message::Text(r.into())).await.is_err() {
                 log("report send failed, control channel closed");
                 return;
             }
@@ -885,23 +946,24 @@ mod tests {
     #[test]
     fn is_auth_error_detects_401_http() {
         use tokio_tungstenite::tungstenite::http::{Response, StatusCode};
-        // HTTP 401（key 失效/服务器删除）→ 判为鉴权失败，走长退避
+        // HTTP 401（key 失效/服务器删除）→ 判为鉴权失败，走长退避。
+        // tungstenite 0.24+ Error::Http 变体为 Box<Response<Option<Vec<u8>>>>
         let err: Box<dyn Error + Send + Sync> =
-            Box::new(tokio_tungstenite::tungstenite::Error::Http(
+            Box::new(tokio_tungstenite::tungstenite::Error::Http(Box::new(
                 Response::builder()
                     .status(StatusCode::UNAUTHORIZED)
                     .body(None)
                     .unwrap(),
-            ));
+            )));
         assert!(is_auth_error(err.as_ref()));
         // 其他状态码（如 404 反代不存在）→ 非鉴权失败，走指数退避
         let err404: Box<dyn Error + Send + Sync> =
-            Box::new(tokio_tungstenite::tungstenite::Error::Http(
+            Box::new(tokio_tungstenite::tungstenite::Error::Http(Box::new(
                 Response::builder()
                     .status(StatusCode::NOT_FOUND)
                     .body(None)
                     .unwrap(),
-            ));
+            )));
         assert!(!is_auth_error(err404.as_ref()));
         // 非 Http 错误 → 非鉴权失败
         let io_err: Box<dyn Error + Send + Sync> = Box::new(std::io::Error::new(
@@ -914,7 +976,9 @@ mod tests {
     // env 操作集中在单个测试内顺序执行（Rust 测试并行，避免 ALLOW_INSECURE_WS 竞争）
     #[test]
     fn validate_wss_loopback_and_env_control() {
-        std::env::remove_var("ALLOW_INSECURE_WS");
+        // SAFETY: edition 2024 将 set_var/remove_var 标记为 unsafe（非线程安全 API）。
+        // 本测试是 ALLOW_INSECURE_WS 的唯一读写者（其余测试不触碰该变量），无并发竞争
+        unsafe { std::env::remove_var("ALLOW_INSECURE_WS") };
         assert!(validate_wss("ws://127.0.0.1:8787/ws/agent").is_ok());
         assert!(validate_wss("ws://localhost/ws/agent").is_ok());
         assert!(validate_wss("ws://::1/ws/agent").is_ok());
@@ -932,12 +996,15 @@ mod tests {
             validate_wss("ws://user:pass@127.0.0.1/ws/agent").is_ok(),
             "userinfo@真实 loopback 放行（host 解析正确）"
         );
-        std::env::set_var("ALLOW_INSECURE_WS", "1");
+        // SAFETY: 同上，本测试是该变量的唯一读写者
+        unsafe { std::env::set_var("ALLOW_INSECURE_WS", "1") };
         assert!(
             validate_wss("ws://example.com/ws/agent").is_ok(),
             "显式 ALLOW_INSECURE_WS=1 放行"
         );
-        std::env::remove_var("ALLOW_INSECURE_WS");
+        // SAFETY: edition 2024 将 set_var/remove_var 标记为 unsafe（非线程安全 API）。
+        // 本测试是 ALLOW_INSECURE_WS 的唯一读写者（其余测试不触碰该变量），无并发竞争
+        unsafe { std::env::remove_var("ALLOW_INSECURE_WS") };
     }
 
     #[test]
@@ -945,5 +1012,36 @@ mod tests {
         assert!(validate_wss("http://example.com/ws/agent").is_err());
         assert!(validate_wss("").is_err());
         assert!(validate_wss("wss").is_err());
+    }
+
+    // M4 回归：限额读满后必须 drain——否则对端（子进程）写满管道缓冲后阻塞在
+    // write() 上永不结束。模拟：duplex(64KB) 一端写 200KB 后关闭，读端 cap 48KB。
+    // 无 drain 时写端任务永远挂住（join 超时）；有 drain 时写端正常写完退出
+    #[tokio::test]
+    async fn read_limited_drains_beyond_cap() {
+        use tokio::io::AsyncWriteExt;
+        let (client, mut server) = tokio::io::duplex(64 * 1024);
+        let writer = tokio::spawn(async move {
+            let chunk = vec![b'x'; 8 * 1024];
+            for _ in 0..25 {
+                // 25 × 8KB = 200KB > cap(48KB) + 管道缓冲(64KB)
+                tokio::io::AsyncWriteExt::write_all(&mut server, &chunk)
+                    .await
+                    .unwrap();
+            }
+            server.shutdown().await.unwrap();
+        });
+        let buf = tokio::time::timeout(Duration::from_secs(10), async {
+            let mut client = client;
+            read_limited(&mut client, 48 * 1024).await
+        })
+        .await
+        .expect("read_limited 未挂死（drain 生效）");
+        assert_eq!(buf.len(), 48 * 1024, "返回数据恰为限额值");
+        // 写端必须已自然完成（写完 200KB 并关闭），而非阻塞在管道 write 上
+        tokio::time::timeout(Duration::from_secs(10), writer)
+            .await
+            .expect("写端应能写完退出")
+            .expect("writer join ok");
     }
 }

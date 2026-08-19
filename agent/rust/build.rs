@@ -10,7 +10,9 @@ fn main() {
 
     // rustfmt 未安装：直接报错（与 CI 对齐：agent-rust test job 已装组件，格式检查是硬性要求）
     if Command::new("rustfmt").arg("--version").output().is_err() {
-        panic!("rustfmt 未安装：请先运行 `rustup component add rustfmt`（CI 会强制 cargo fmt --check）");
+        panic!(
+            "rustfmt 未安装：请先运行 `rustup component add rustfmt`（CI 会强制 cargo fmt --check）"
+        );
     }
 
     // 收集 src/ 下所有 .rs（新增文件自动纳入）

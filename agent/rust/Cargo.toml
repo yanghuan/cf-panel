@@ -7,13 +7,14 @@
 #   （本机无 sudo/系统 gcc 时，需先搭宿主机 C 工具链供 ring 等 build script 使用）
 [package]
 name = "cf-panel-agent"
-version = "0.2.0"
-edition = "2021"
+version = "0.3.0"
+edition = "2024"
+rust-version = "1.85" # edition 2024 最低要求；本机工具链 1.97
 description = "cf-panel agent（Rust 版）：控制通道 + 监控上报 + 终端 PTY + 文件管理"
 
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal", "process", "fs", "net", "io-util", "sync"] }
-tokio-tungstenite = { version = "0.21", default-features = false, features = ["connect", "handshake", "rustls-tls-webpki-roots"] }
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "handshake", "rustls-tls-webpki-roots"] }
 futures-util = "0.3"
 serde_json = "1"
 portable-pty = "0.9"

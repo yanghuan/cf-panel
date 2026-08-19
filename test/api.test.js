@@ -350,6 +350,38 @@ test('handleReport 落库：系统信息/探活/custom 写入 + MetricsDO 转发
   assert.equal(after[0].online, true);
 });
 
+// W-M1：probe_json 对比剥离 ms——探活耗时 ms 每帧必抖动，若全量 JSON 对比则快采时段
+// 每 5s 一条 UPDATE（6,240 行写/天/机）；稳定投影 [name,ok,code] 相同时不写，状态真变才写
+test('W-M1：probe_json 仅 ms 抖动不触发写，状态变化才落库', async () => {
+  const env = makeEnv();
+  const token = await login(env);
+  await addServer(env, token, { name: 'node-w1' });
+  const list = await (await call(env, { path: '/api/servers', token })).json();
+  const id = list[0].id;
+
+  // 首帧：写入 probe_json（含 ms）
+  await I.handleReport(env, { serverId: id, probes: [{ name: 'web', ok: true, code: 200, ms: 5 }] });
+  let row = await env.DB.prepare('SELECT probe_json FROM servers WHERE id = ?').bind(id).first();
+  const first = row.probe_json;
+  assert.ok(first.includes('"web"'), '首帧写入');
+
+  // 仅 ms 抖动（5 → 88）：稳定投影不变 → 不写（probe_json 保持原值，ms 不落库）
+  await I.handleReport(env, { serverId: id, probes: [{ name: 'web', ok: true, code: 200, ms: 88 }] });
+  row = await env.DB.prepare('SELECT probe_json FROM servers WHERE id = ?').bind(id).first();
+  assert.equal(row.probe_json, first, 'ms 抖动不触发 UPDATE');
+
+  // 状态真变（ok: true → false）：写入新值
+  await I.handleReport(env, { serverId: id, probes: [{ name: 'web', ok: false, code: 0, ms: 88 }] });
+  row = await env.DB.prepare('SELECT probe_json FROM servers WHERE id = ?').bind(id).first();
+  assert.notEqual(row.probe_json, first, '状态变化写 D1');
+  assert.ok(row.probe_json.includes('false'), '新状态落库');
+
+  // code 变化（200 → 502，ok 不变）：同样属状态真变 → 写入
+  await I.handleReport(env, { serverId: id, probes: [{ name: 'web', ok: false, code: 502, ms: 88 }] });
+  row = await env.DB.prepare('SELECT probe_json FROM servers WHERE id = ?').bind(id).first();
+  assert.ok(row.probe_json.includes('502'), 'code 变化写 D1');
+});
+
 test('服务器行缓存 + MetricsDO 转发节流（降额）', async () => {
   const env = makeEnv();
   const token = await login(env);

@@ -152,10 +152,18 @@ export async function handleReport(env, payload) {
   // 见 getServerRow 注释；热区由 MetricsDO /drop + alarm 清理兜底）。
   const server = await getServerRow(env, payload.serverId);
   if (!server) return;
-  // 探活状态：变更才写 probe_json（告警去重状态在 MetricsDO 顺风车处理），写后更新行缓存
+  // 探活状态：变更才写 probe_json（告警去重状态在 MetricsDO 顺风车处理），写后更新行缓存。
+  // W-M1：对比剥离 ms——探活耗时 ms 每次探测必然毫秒级抖动，全量 JSON 对比会每帧触发
+  // UPDATE（快采 6,240 行写/天/机，「变更才写」对 probes 完全失效）；改用稳定投影
+  // [name,ok,code] 对比，仅状态真变时落全量（含当时 ms；前端探活延迟展示随之停更，可接受）
   if (Array.isArray(payload.probes)) {
-    const probeJson = JSON.stringify(payload.probes);
-    if (server.probe_json !== probeJson) {
+    const proj = (list) => JSON.stringify(list.map((p) => [p.name, !!p.ok, p.code ?? null]));
+    let prevProj = null;
+    if (server.probe_json) {
+      try { prevProj = proj(JSON.parse(server.probe_json)); } catch { prevProj = null; }
+    }
+    if (proj(payload.probes) !== prevProj) {
+      const probeJson = JSON.stringify(payload.probes);
       await env.DB.prepare('UPDATE servers SET probe_json = ? WHERE id = ?').bind(probeJson, payload.serverId).run();
       serverRowCache.set(payload.serverId, { ...server, probe_json: probeJson, ts: Date.now() });
     }

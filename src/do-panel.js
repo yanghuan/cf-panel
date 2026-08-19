@@ -23,16 +23,19 @@ export class PanelDO {
     this.listCache = null; // {rows, ts} 服务器列表缓存（TTL 4500ms，多观看者共享，降 D1 读）
     this.latestCache = null; // {data, ts} MetricsDO /latest 共享缓存（TTL 4s，sync 链 DO 事件 −50%）
     this.syncAt = new Map(); // ws -> 上次 sync 时间（频率下限 <2s 忽略，防刷）
-    this.authCache = new Map(); // token -> {user, ts} 鉴权缓存（5s TTL；PAT 删除后 ≤5s 失效）
+    this.authCache = new Map(); // token -> {user, ts} 鉴权缓存（30s TTL；PAT 撤销由 clear_auth_cache RPC 即时失效，TTL 仅兜底。
+    // W-M2：此前 5s TTL 与 latest_push 5s 节拍精确同频 → 挂机 PAT 连接每拍必 miss api_tokens 点查
+    //（17,280 行读/天/连接）；30s TTL 错开节拍（每 6 拍 1 次 miss，−83%），撤销时效靠 RPC 主路径保证秒级）
     this.fastSince = 0; // 最近一次 0→1 切快采时刻（毫秒）；过渡期内在线判定用慢宽限，避免首次显示离线
   }
 
-  // 鉴权缓存：JWT 本身是 HMAC（无 D1 读）；PAT 每次读 D1，缓存短 TTL 降频
+  // 鉴权缓存：JWT 本身是 HMAC（无 D1 读）；PAT 每次读 D1，缓存 TTL 降频（30s；撤销即时性由
+  // routes 的 clear_auth_cache RPC 保证，TTL 只兜 RPC 失败的极端场景）
   async authUserCached(token) {
     if (!token) return null;
     const now = Date.now();
     const c = this.authCache.get(token);
-    if (c && now - c.ts < 5000) return c.user;
+    if (c && now - c.ts < 30000) return c.user;
     const user = await authUserByToken(token, this.env);
     if (this.authCache.size > 1000) this.authCache.clear(); // 防 Map 无限增长
     this.authCache.set(token, { user, ts: now });
@@ -69,7 +72,7 @@ export class PanelDO {
       const count = (this.state.getWebSockets?.() || []).filter((w) => w.deserializeAttachment?.()).length;
       return json({ count, fastSince: count > 0 ? this.fastSince : 0 });
     }
-    // 内部 RPC：PAT 撤销后清鉴权缓存（已建观看者连接下个推送即失效关闭；清失败由 5s TTL 兜底）
+    // 内部 RPC：PAT 撤销后清鉴权缓存（已建观看者连接下个推送即失效关闭；清失败由 30s TTL 兜底）
     if (url.pathname === '/rpc/clear_auth_cache' && request.method === 'POST') {
       this.authCache.clear();
       return json({ ok: true });

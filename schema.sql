@@ -49,6 +49,10 @@ CREATE TABLE IF NOT EXISTS audit_logs (
 -- 保留期清理 `DELETE FROM audit_logs WHERE created_at < ?` 走索引（迁移 0006；无索引时全表扫）
 CREATE INDEX IF NOT EXISTS idx_audit_logs_created ON audit_logs(created_at);
 
+-- 筛选查询走索引（迁移 0008；action 精确匹配 / target_server_id + id 倒序分页，此前全表扫）
+CREATE INDEX IF NOT EXISTS idx_audit_logs_action ON audit_logs(action);
+CREATE INDEX IF NOT EXISTS idx_audit_logs_server_id ON audit_logs(target_server_id, id);
+
 -- 监控时序（分钟级聚合：1 行/分钟/机器；默认归档开启，保留 30 天）
 CREATE TABLE IF NOT EXISTS metrics_min (
   server_id INTEGER NOT NULL,

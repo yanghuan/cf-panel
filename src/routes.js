@@ -521,7 +521,7 @@ async function handleApiInner(request, env) {
     // PAT 撤销即时生效：清 PanelDO 鉴权缓存，已建观看者连接下个推送（≤5s）内关闭
     try {
       await doPanel(env).fetch('https://do.internal/rpc/clear_auth_cache', { method: 'POST' });
-    } catch { /* 清缓存失败由 authCache 5s TTL 兜底 */ }
+    } catch { /* 清缓存失败由 authCache 30s TTL 兜底 */ }
     return json({ ok: true });
   }
 
@@ -953,7 +953,7 @@ async function mcpRevokeToken(user, env, args) {
   // PAT 撤销即时生效：清 PanelDO 鉴权缓存
   try {
     await doPanel(env).fetch('https://do.internal/rpc/clear_auth_cache', { method: 'POST' });
-  } catch { /* 清缓存失败由 authCache 5s TTL 兜底 */ }
+  } catch { /* 清缓存失败由 authCache 30s TTL 兜底 */ }
   return { ok: true, token_id: id };
 }
 

@@ -7,6 +7,32 @@
           GEO_PRIVATE, setGeoEnabled, flagHtml, osIconHtml, isSystemPath, isBinaryExt, loadScript, loadCss, loadMonaco, loadMarkdown, geoLookup, IdleGuard } = CfUtils;
   const { api, setTokenGetter, FileSession, TermSession, PushSession } = CfApi;
   let token = localStorage.getItem('cfpanel_token') || '';
+
+  // ---------- 主题（dark / light） ----------
+  let theme = localStorage.getItem('cfpanel_theme') === 'light' ? 'light' : 'dark';
+  let activeTerm = null; // 打开中的 xterm 实例（主题切换热更新；关闭时置 null）
+  const cssVar = (name) => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+  // 终端配色：从 CSS 变量取（与 .term 容器底色一致）；xterm 需显式前景/光标色
+  const termTheme = () => ({
+    background: cssVar('--term-bg'),
+    foreground: cssVar('--text'),
+    cursor: cssVar('--accent'),
+    cursorAccent: cssVar('--term-bg'),
+    selectionBackground: theme === 'light' ? 'rgba(99, 102, 241, .25)' : 'rgba(103, 113, 154, .45)',
+  });
+  function applyTheme(t) {
+    theme = t;
+    document.documentElement.dataset.theme = t;
+    localStorage.setItem('cfpanel_theme', t);
+    const btn = $('#btn-theme');
+    if (btn) btn.textContent = t === 'light' ? '🌙' : '☀️'; // 显示"将切换到"的目标图标
+    if (window.monaco) window.monaco.editor.setTheme(t === 'light' ? 'vs' : 'vs-dark');
+    if (activeTerm) activeTerm.options.theme = termTheme(); // 终端开着 → 热更新配色
+    // 监控弹窗开着 → 用缓存数据重建图表（轴/文字/tooltip 颜色随主题）
+    if (monitorLast && !$('#monitor-modal').classList.contains('hidden')) {
+      renderMonitorChart(monitorLast.rows, monitorLast.custom, monitorLast.downsampled);
+    }
+  }
   setTokenGetter(() => token); // api 层通过 getter 读取当前 token
   let canExec = true; // 当前用户是否有 exec 权限（PAT 按 scopes，admin 恒有；控制终端/文件菜单显隐）
   let isAdmin = true; // 当前用户是否面板管理员（JWT 登录；PAT 恒 false；控制修改/删除等管理菜单显隐）
@@ -15,6 +41,7 @@
   let pushTimer = null;    // 每 3 秒发一次 sync 请求的定时器（老化）
   let monitorState = null; // { serverId, serverName, range } 当前监控视图
   let monitorCharts = []; // Chart.js 实例数组（每指标一张图，切换范围时全部销毁重建）
+  let monitorLast = null; // 最近一次图表渲染参数（主题切换时零请求重建）
 
   // ---------- 基础 ----------
   function toast(msg, ms = 2500) {
@@ -629,7 +656,8 @@
 
     const Term = window.Terminal;
     const Fit = (window.FitAddon && window.FitAddon.FitAddon) || window.FitAddon;
-    const term = new Term({ cursorBlink: true, fontSize: 13, theme: { background: '#000' } });
+    const term = new Term({ cursorBlink: true, fontSize: 13, theme: termTheme() });
+    activeTerm = term; // 主题切换时热更新 options.theme（applyTheme 引用）
     const fit = new Fit();
     term.loadAddon(fit);
     term.open($('#term'));
@@ -646,6 +674,7 @@
     $('#btn-term-close').onclick = () => {
       sess.close(); // 内部 dispose + 关 WS + 清定时器
       window.removeEventListener('resize', onResize); // 防多次开关终端累积内存泄漏
+      activeTerm = null;
       $('#term-modal').classList.add('hidden');
       unlockScroll();
     };
@@ -881,11 +910,11 @@
       monacoEditor.dispose();
       monacoEditor = null;
     }
-    monaco.editor.setTheme('vs-dark');
+    monaco.editor.setTheme(theme === 'light' ? 'vs' : 'vs-dark');
     const model = monaco.editor.createModel(text, editorLang(path), monaco.Uri.parse('file://' + path));
     monacoEditor = monaco.editor.create(host, {
       model,
-      theme: 'vs-dark', fontSize: 13, automaticLayout: true,
+      theme: theme === 'light' ? 'vs' : 'vs-dark', fontSize: 13, automaticLayout: true,
       minimap: { enabled: false }, scrollBeyondLastLine: false, tabSize: 4,
       renderWhitespace: 'selection', wordWrap: 'on',
     });
@@ -1083,6 +1112,7 @@
   // 监控图表：每个指标独立一张图（CPU / 内存 / 网络 / 自定义指标），纵向排列，
   // 各自独立刻度轴——量纲不同不再挤在一张图（原双轴方案可读性差）
   function renderMonitorChart(rows, custom, downsampled) {
+    monitorLast = { rows, custom, downsampled }; // 缓存：主题切换时零请求重建
     const wrap = $('#monitor-modal .chart-wrap');
     monitorCharts.forEach((c) => { try { c.destroy(); } catch { /* ignore */ } });
     monitorCharts = [];
@@ -1099,21 +1129,22 @@
     const tsArr = rows.map((r) => r.ts);
     const labels = rows.map((r) => new Date(r.ts * 60000).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }));
     const lineCfg = (color, fill) => ({ borderColor: color, backgroundColor: fill, tension: 0.3, pointRadius: 0, borderWidth: 1.8, spanGaps: true });
-    // 公共刻度样式；unit 可选（如 '%'/'KB/s'）→ Y 轴刻度值后追加单位
+    // 公共刻度样式；unit 可选（如 '%'/'KB/s'）→ Y 轴刻度值后追加单位。
+    // 颜色读 CSS 变量：随 data-theme 切换（主题切换时整图重建取新值）
     const axisStyle = (unit) => ({
       ticks: {
-        color: '#8b949e', maxTicksLimit: 8, maxRotation: 0,
+        color: cssVar('--muted'), maxTicksLimit: 8, maxRotation: 0,
         callback: unit ? (v) => `${v}${unit}` : undefined,
       },
-      grid: { color: 'rgba(255,255,255,.04)' },
+      grid: { color: cssVar('--chart-grid') },
     });
     const chartOpts = (yUnit) => ({
       responsive: true,
       maintainAspectRatio: false,
       interaction: { mode: 'index', intersect: false },
       plugins: {
-        legend: { labels: { color: '#8b949e', boxWidth: 12 } },
-        tooltip: { backgroundColor: '#1c2230', borderColor: '#2d333b', borderWidth: 1, titleColor: '#e6edf3', bodyColor: '#8b949e' },
+        legend: { labels: { color: cssVar('--muted'), boxWidth: 12 } },
+        tooltip: { backgroundColor: cssVar('--panel-solid'), borderColor: cssVar('--border'), borderWidth: 1, titleColor: cssVar('--text'), bodyColor: cssVar('--muted') },
       },
       scales: { x: axisStyle(), y: axisStyle(yUnit) },
     });
@@ -1892,6 +1923,7 @@
     // 关闭时销毁图表实例（释放内存；下次打开 renderMonitorChart 会重建）
     monitorCharts.forEach((c) => { try { c.destroy(); } catch { /* ignore */ } });
     monitorCharts = [];
+    monitorLast = null; // 数据缓存一并释放
     monitorLive = null;
   };
 
@@ -1924,6 +1956,9 @@
   };
   $('#file-path').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('#file-refresh').click(); });
   $('#file-up').onclick = () => { fileSess.cwd = fileParent(fileSess.cwd); $('#file-path').value = fileSess.cwd; reloadFileList(); };
+  // 主题切换（顶栏 ☀️/🌙）：切换 data-theme + Monaco + 监控图表重建（applyTheme 内处理）
+  $('#btn-theme').onclick = () => applyTheme(theme === 'light' ? 'dark' : 'light');
+  applyTheme(theme); // 初始化按钮图标（data-theme 已由 theme-init.js 预置，无 FOUC）
   $('#file-input').addEventListener('change', (e) => { const f = e.target.files[0]; if (f) uploadFile(f); e.target.value = ''; });
   // 新建目录 / 新建文件 / 在线编辑器 / 移动选择器
   $('#btn-file-mkdir').onclick = mkDir;

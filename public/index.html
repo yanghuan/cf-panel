@@ -10,13 +10,15 @@
        Monaco 编辑器走 cdnjs（体量 ~3MB 不进 vendor），worker 经 blob proxy 加载 → worker-src blob:） -->
   <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' https://cdnjs.cloudflare.com; style-src 'self' 'unsafe-inline' https://cdnjs.cloudflare.com; img-src 'self' data: https://flagcdn.com https://cdn.simpleicons.org; font-src 'self' https://cdnjs.cloudflare.com; connect-src 'self' https://ipapi.co https://ipwho.is https://cdnjs.cloudflare.com; worker-src blob:; frame-ancestors 'none'">
   <!-- 依赖本地化（public/vendor，避免外部 CDN 不可达/供应链风险）；xterm/Chart.js 首次使用时由 JS 懒加载 -->
-  <link rel="stylesheet" href="/style.css?v=31" />
+  <script src="/theme-init.js"></script>
+  <link rel="stylesheet" href="/style.css?v=33" />
 </head>
 <body>
   <div id="app" class="hidden">
     <header>
       <div class="header-left">
         <button id="btn-menu" class="menu-btn" aria-label="菜单" title="菜单">☰</button>
+        <button id="btn-theme" class="menu-btn" aria-label="切换主题" title="切换深浅主题">☀️</button>
         <span id="whoami"></span>
       </div>
       <div id="dropdown" class="dropdown hidden">
@@ -387,6 +389,6 @@
 
   <script src="/utils.js?v=9"></script>
   <script src="/api.js?v=5"></script>
-  <script src="/app.js?v=47"></script>
+  <script src="/app.js?v=49"></script>
 </body>
 </html>

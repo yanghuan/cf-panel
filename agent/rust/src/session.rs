@@ -1043,7 +1043,7 @@ async fn handle_file_cmd_binary(
 
 // spawn_blocking 封装（超时 + 信号量 + 文件操作熔断）已统一收敛至 blocking.rs
 //（此前 metrics.rs run_blocking 与本文件 blocking_with_timeout 是两套重复实现、
-// 两个独立 4-permit 信号量，注释与实际并发模型不符——见 2026-08-19 review L9/M3）
+// 两个独立 4-permit 信号量，注释与实际并发模型不符）
 
 // 通配符匹配：* 匹配任意（含空），? 匹配单字符（大小写由调用方归一）
 fn wildcard_match(pattern: &str, name: &str) -> bool {

@@ -350,9 +350,9 @@ test('handleReport 落库：系统信息/探活/custom 写入 + MetricsDO 转发
   assert.equal(after[0].online, true);
 });
 
-// W-M1：probe_json 对比剥离 ms——探活耗时 ms 每帧必抖动，若全量 JSON 对比则快采时段
+// probe_json 对比剥离 ms——探活耗时 ms 每帧必抖动，若全量 JSON 对比则快采时段
 // 每 5s 一条 UPDATE（6,240 行写/天/机）；稳定投影 [name,ok,code] 相同时不写，状态真变才写
-test('W-M1：probe_json 仅 ms 抖动不触发写，状态变化才落库', async () => {
+test('probe_json 仅 ms 抖动不触发写，状态变化才落库', async () => {
   const env = makeEnv();
   const token = await login(env);
   await addServer(env, token, { name: 'node-w1' });

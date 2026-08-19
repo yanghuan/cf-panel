@@ -1014,7 +1014,7 @@ mod tests {
         assert!(validate_wss("wss").is_err());
     }
 
-    // M4 回归：限额读满后必须 drain——否则对端（子进程）写满管道缓冲后阻塞在
+    // 限额读满后必须 drain——否则对端（子进程）写满管道缓冲后阻塞在
     // write() 上永不结束。模拟：duplex(64KB) 一端写 200KB 后关闭，读端 cap 48KB。
     // 无 drain 时写端任务永远挂住（join 超时）；有 drain 时写端正常写完退出
     #[tokio::test]

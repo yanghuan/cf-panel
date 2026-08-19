@@ -24,7 +24,7 @@ export class PanelDO {
     this.latestCache = null; // {data, ts} MetricsDO /latest 共享缓存（TTL 4s，sync 链 DO 事件 −50%）
     this.syncAt = new Map(); // ws -> 上次 sync 时间（频率下限 <2s 忽略，防刷）
     this.authCache = new Map(); // token -> {user, ts} 鉴权缓存（30s TTL；PAT 撤销由 clear_auth_cache RPC 即时失效，TTL 仅兜底。
-    // W-M2：此前 5s TTL 与 latest_push 5s 节拍精确同频 → 挂机 PAT 连接每拍必 miss api_tokens 点查
+    // 此前 5s TTL 与 latest_push 5s 节拍精确同频 → 挂机 PAT 连接每拍必 miss api_tokens 点查
     //（17,280 行读/天/连接）；30s TTL 错开节拍（每 6 拍 1 次 miss，−83%），撤销时效靠 RPC 主路径保证秒级）
     this.fastSince = 0; // 最近一次 0→1 切快采时刻（毫秒）；过渡期内在线判定用慢宽限，避免首次显示离线
   }

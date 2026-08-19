@@ -1,4 +1,4 @@
--- cf-panel D1 迁移 0008：审计日志筛选索引（W-M3）
+-- cf-panel D1 迁移 0008：审计日志筛选索引
 -- 场景：/api/audit-logs 与 MCP get_audit_logs 的筛选查询（routes.js）按
 --   action = ? / target_server_id = ? 过滤 + ORDER BY id DESC LIMIT/OFFSET，
 --   此前仅有 idx_audit_logs_created（created_at），筛选走全表扫——

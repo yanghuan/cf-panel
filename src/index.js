@@ -16,7 +16,7 @@ import {
   sanitizeAlerts, hashSecret, renderTemplate, parseHeaders, sendWebhook,
   shardForServerId, makeStreamId, shardFromStreamId,
 } from './utils.js';
-import { isAdmin, canAccessServer, canExec, serverListCache } from './auth.js';
+import { isAdmin, canAccessServer, canExec, serverListCache, __clearGraceCache } from './auth.js';
 import { SETTINGS_CACHE } from './db.js';
 import {
   handleReport, lastSeenWrite, LAST_SEEN_THROTTLE_S, customWritten,
@@ -61,6 +61,7 @@ export const __internals = {
     apiCounts.clear();
     serverRowCache.clear();
     reportBatch.clear();
+    __clearGraceCache(); // 宽限期缓存（模块级静态，测试间 mock 不同需隔离）
     setReportFlushAt(0);
   },
 };

@@ -230,8 +230,10 @@
     // 磁盘整体使用率（累计，与 tooltip 标题栏一致）
     const dSum = diskSumOf(m);
     const dPct = dSum ? dSum.pct : null;
+    // 指标区只挂 data-id：完整指标 JSON 不再内嵌 DOM 属性（50 机 ≈ 75KB 属性膨胀 +
+    // 推送每 5s outerHTML 重建时的重复序列化）；tooltip 展开时从 serversCache 现取
     return `
-        <div class="metric" data-metric="${escapeHtml(JSON.stringify({ metric: m, info: s.info || null }))}">
+        <div class="metric" data-id="${s.id}">
           <span class="m-cell"${barAttr(m.cpu)}><b>${m.cpu == null ? '-' : m.cpu.toFixed(1) + '%'}</b><i>CPU</i></span>
           <span class="m-cell"${barAttr(memPct)}><b>${fmtBytes(m.mem_used)}</b><i>内存</i></span>
           <span class="m-cell" data-nobar><b>${m.extra && m.extra.load1 != null ? Number(m.extra.load1).toFixed(2) : '-'}</b><i>负载</i></span>
@@ -1775,15 +1777,13 @@
         tipSource = null;
         return;
       }
-      const raw = metricEl.dataset.metric;
-      if (!raw) return;
-      let d;
-      try { d = JSON.parse(raw); } catch { return; }
-      // 兼容新结构 {metric, info} 与旧结构（直接 metric 对象）
-      const mm = d && d.metric ? d.metric : d;
-      const ii = d && d.metric ? d.info : null;
+      // 指标区只挂 data-id，从 serversCache 现取最新数据（推送每 5s 更新缓存，
+      // 展开时即最新——旧 data-metric 内嵌是快照，反而可能过期）
+      const sid = Number(metricEl.dataset.id);
+      const s = serversCache.find((x) => x.id === sid);
+      if (!s || !s.metric) return;
       tipSource = metricEl;
-      metricTip.innerHTML = metricTipHtml(mm, ii);
+      metricTip.innerHTML = metricTipHtml(s.metric, s.info || null);
       metricTip.classList.add('show');
       positionTipForMetric(metricTip, metricEl);
       return;

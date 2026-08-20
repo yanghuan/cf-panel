@@ -143,9 +143,16 @@ static NET: std::sync::OnceLock<Arc<tokio::sync::Mutex<Option<NetState>>>> =
     std::sync::OnceLock::new();
 
 // 虚拟网卡过滤：按接口名前缀/关键字（Windows 接口是友好名「以太网/Loopback…」，
-// macOS 是 en0/lo0/bridge*/utun*——跨平台合并一张表，误杀/漏杀个别命名影响极小）
+// macOS 是 en0/lo0/bridge*/utun*）。两级匹配降低误杀：
+//   1) 前缀 + 后跟数字（Unix 接口命名惯例 tun0/tap0/veth1/br-0/utun3）：短子串必须
+//      精确到「前缀+数字」才命中——contains("tun") 会误杀 "Tunnel-ISP" 这类用户命名；
+//   2) 足够长的关键字用 contains（loopback/virtual/vmware/…），误杀率低
 fn is_virtual_iface(name: &str) -> bool {
     let lower = name.to_lowercase();
+    const VIRT_PREFIXES: &[&str] = &[
+        "tun", "tap", "veth", "br-", "virbr", "utun", "llw", "anpi", "bridge", "vmnet", "vxlan",
+        "gretap", "dummy", "vnet", "docker",
+    ];
     const VIRT_KEYWORDS: &[&str] = &[
         "loopback",
         "isatap",
@@ -158,23 +165,17 @@ fn is_virtual_iface(name: &str) -> bool {
         "vpn",
         "bluetooth",
         "awdl",
-        "llw",
-        "anpi",
-        "bridge",
-        "utun",
-        "vmnet",
-        "veth",
-        "docker",
-        "br-",
-        "virbr",
-        "tun",
-        "tap",
-        "vxlan",
-        "gretap",
-        "dummy",
-        "vnet",
     ];
-    lower == "lo" || VIRT_KEYWORDS.iter().any(|k| lower.contains(k))
+    let has_prefix = |p: &str| {
+        lower.starts_with(p)
+            && lower
+                .as_bytes()
+                .get(p.len())
+                .map_or(true, |c| c.is_ascii_digit())
+    };
+    lower == "lo"
+        || VIRT_PREFIXES.iter().any(|p| has_prefix(p))
+        || VIRT_KEYWORDS.iter().any(|k| lower.contains(k))
 }
 
 pub async fn collect_net() -> (u64, u64) {
@@ -331,10 +332,18 @@ mod tests {
         assert!(is_virtual_iface("Loopback Pseudo-Interface 1"));
         assert!(is_virtual_iface("utun3"));
         assert!(is_virtual_iface("bridge100"));
-        // 物理接口保留
+        assert!(is_virtual_iface("tun0"));
+        assert!(is_virtual_iface("veth1"));
+        assert!(is_virtual_iface("br-0"));
+        assert!(is_virtual_iface("docker0"));
+        assert!(is_virtual_iface("vEthernet (WSL)")); // Windows Hyper-V 虚拟网卡
+        // 物理接口与用户自定义名保留（前缀规则不误杀：tun 后必须跟数字才命中）
         assert!(!is_virtual_iface("en0"));
         assert!(!is_virtual_iface("以太网"));
         assert!(!is_virtual_iface("Ethernet"));
+        assert!(!is_virtual_iface("Tunnel-ISP")); // 含 tun 但非接口命名惯例
+        assert!(!is_virtual_iface("Fortune-NIC"));
+        assert!(!is_virtual_iface("tap-water")); // 含 tap 但非 tap0 形态
     }
 
     #[tokio::test]

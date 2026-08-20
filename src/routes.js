@@ -228,7 +228,9 @@ export const apiCounts = new Map(); // `${method} ${path}` -> 次数
 // 每个实体一条计数（服务器/令牌较多时超 200 条 clear() 全量清零，/api/usage 计数失去趋势意义）
 function normalizeApiPath(path) {
   return path
-    .replace(/^(\/api\/[a-z-]+)\/\d+/, '$1/:id')
+    // 任意层级动态段（/api/servers/123/metrics → /api/servers/:id/metrics）：
+    // 旧正则只覆盖单段资源名，嵌套路径会退化为逐实体计数触顶 200 清空（用量失去趋势）
+    .replace(/^(\/api\/[a-z-]+(?:\/[a-z-]+)*)\/\d+(?=\/|$)/, '$1/:id')
     .replace(/^(\/ws\/[a-z]+)\/\w+/, '$1/:stream');
 }
 function countApi(method, path) {
@@ -405,23 +407,7 @@ async function handleApiInner(request, env) {
   // GET /api/usage —— 用量观测（仅管理员）：Worker 请求计数 + MetricsDO 上报/查询计数（近 24h 估算参考）
   if (method === 'GET' && path === '/api/usage') {
     if (!isAdmin(user)) return err('forbidden', 403);
-    let doUsage = {};
-    try {
-      doUsage = await (await doMetrics(env).fetch('https://do.internal/usage')).json();
-    } catch { /* 用量读取失败不影响 */ }
-    const reportFrames = Number(doUsage.persisted?.report || 0);
-    const api = {};
-    for (const [k, v] of apiCounts) api[k] = v;
-    return json({
-      note: 'Worker 计数为实例级（evict/重启清零，趋势参考）；MetricsDO 计数每 10 分钟 alarm 汇总到 storage（跨 evict 保留）。',
-      api,
-      metrics_do: doUsage,
-      estimates_per_day: {
-        report_frames: reportFrames, // 上报帧：快采 17,280/天/机、慢采 720/天/机
-        do_events: reportFrames * 2, // 每帧上报链约 2 个 DO 事件（report + 推送/告警顺风车）
-        d1_writes: Math.round(reportFrames * 0.5), // last_seen 60s 节流(~0.08/帧) + custom 去重 + info/probe 变更
-      },
-    });
+    return json(await collectUsageView(env));
   }
 
   // POST /api/terminal —— 创建终端会话（exec 权限 + 服务器归属）
@@ -670,6 +656,28 @@ async function handleUploadSigned(request, env, u) {
 function serverListCacheClear() {
   serverListCache.clear(); // 服务器增删改后立即使列表缓存失效
   serverRowCache.clear(); // 行缓存同步失效
+}
+
+// 用量观测公共构建（REST /api/usage 与 MCP get_usage 共用，避免两处重复实现漂移）：
+// Worker 请求计数（实例级）+ MetricsDO 上报/查询计数（10min alarm 汇总，跨 evict 保留）
+async function collectUsageView(env) {
+  let doUsage = {};
+  try {
+    doUsage = await (await doMetrics(env).fetch('https://do.internal/usage')).json();
+  } catch { /* 用量读取失败不影响 */ }
+  const reportFrames = Number(doUsage.persisted?.report || 0);
+  const api = {};
+  for (const [k, v] of apiCounts) api[k] = v;
+  return {
+    note: 'Worker 计数为实例级（evict/重启清零，趋势参考）；MetricsDO 计数每 10 分钟 alarm 汇总到 storage（跨 evict 保留）。',
+    api,
+    metrics_do: doUsage,
+    estimates_per_day: {
+      report_frames: reportFrames, // 上报帧：快采 17,280/天/机、慢采 720/天/机
+      do_events: reportFrames * 2, // 每帧上报链约 2 个 DO 事件（report + 推送/告警顺风车）
+      d1_writes: Math.round(reportFrames * 0.5), // last_seen 60s 节流(~0.08/帧) + custom 去重 + info/probe 变更
+    },
+  };
 }
 
 // ---------------- MCP（Model Context Protocol）----------------
@@ -983,23 +991,7 @@ async function mcpGetAuditLogs(user, env, args) {
 
 async function mcpGetUsage(user, env) {
   requireAdmin(user);
-  let doUsage = {};
-  try {
-    doUsage = await (await doMetrics(env).fetch('https://do.internal/usage')).json();
-  } catch { /* 用量读取失败不影响 */ }
-  const reportFrames = Number(doUsage.persisted?.report || 0);
-  const api = {};
-  for (const [k, v] of apiCounts) api[k] = v;
-  return {
-    note: 'Worker 计数为实例级（evict/重启清零，趋势参考）；MetricsDO 计数每 10 分钟 alarm 汇总到 storage（跨 evict 保留）。',
-    api,
-    metrics_do: doUsage,
-    estimates_per_day: {
-      report_frames: reportFrames,
-      do_events: reportFrames * 2,
-      d1_writes: Math.round(reportFrames * 0.5),
-    },
-  };
+  return collectUsageView(env);
 }
 
 async function mcpGetSettings(user, env) {

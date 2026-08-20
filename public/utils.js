@@ -89,9 +89,11 @@
   let geoEnabled = false; // IP 归属地第三方查询开关（默认关闭，隐私保护；由 app.js 设置）
   function setGeoEnabled(v) { geoEnabled = !!v; }
 
-  const geoCache = new Map(); // ip -> {label, cc}（内存缓存：同页会话命中）
+  const geoCache = new Map(); // ip -> {label, cc, ts}（内存缓存：同页会话命中）
   const GEO_CACHE_KEY = 'cfpanel_geo_cache';
   const GEO_CACHE_TTL = 45 * 24 * 3600 * 1000; // 持久化缓存 45 天（服务器 IP 归属地几乎不变，吸收第三方数据库修正即可，避免频繁重查）
+  const GEO_FAIL_TTL = 60 * 1000; // 查询失败的内存缓存短 TTL：第三方瞬时抖动（限流 429 等）
+  // 过后 60s 自动重查——原实现失败永久缓存，同页会话该 IP 归属地永不恢复（刷新才恢复）
   const GEO_CACHE_MAX = 500;
   // 启动时从 localStorage 恢复持久化缓存（仅未过期条目）。
   // 只恢复新格式（含 cc 字段）：旧格式（仅 label 字符串，无国家代码）直接丢弃——
@@ -128,7 +130,8 @@
   async function geoLookup(ip) {
     if (!geoEnabled || !ip || GEO_PRIVATE.test(ip)) return null;
     const cached = geoCache.get(ip);
-    if (cached) return cached;
+    // 成功结果（有 label）或失败结果仍在短 TTL 内 → 命中；失败超 TTL 自动重查
+    if (cached && (cached.label || Date.now() - cached.ts < GEO_FAIL_TTL)) return cached;
     let label = '';
     let cc = '';
     // 仅用 HTTPS 源（http:// 在 HTTPS 面板下是混合内容，会被浏览器直接拦截）
@@ -162,7 +165,8 @@
       geoCacheSave(ip, obj); // 成功：内存 + localStorage 持久化（跨会话复用）
       return obj;
     }
-    geoCache.set(ip, { label: '', cc: '' }); // 失败：仅内存缓存（避免同批重复查，不持久化坏数据）
+    // 失败：仅内存缓存（避免同批重复查，不持久化坏数据），带 ts 供 GEO_FAIL_TTL 过期重查
+    geoCache.set(ip, { label: '', cc: '', ts: Date.now() });
     return null;
   }
   // 旗帜渲染：ISO 3166-1 alpha-2 代码 → 旗帜。

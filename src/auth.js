@@ -81,20 +81,30 @@ export async function queryServersForUser(env, user) {
 // 已超 30s 过渡期才用快宽限 15s；过渡期内（agent 尚未切快采完成首帧上报）用慢宽限 180s，
 // 避免首观者上线后 REST/MCP 列表短暂误判离线。查询失败按无观看者（慢宽限）处理。
 const PANEL_SWITCH_GRACE_MS = 30 * 1000;
+// 独立 2s TTL 缓存：/viewers 结果是全局量（与用户无关），却挂在按用户缓存的
+// listServersWithState 路径上——多用户/PAT 并发轮询时该 DO 调用数 = 用户数 × (1/2s)。
+// 独立缓存把读放大收敛为全局 1 次/2s（与 listCache 4.5s 错峰，防同频 miss）
+const GRACE_CACHE_TTL_MS = 2000;
+let graceCache = null; // { ts, value }
+// 测试隔离：__internals.__reset 调用（宽限期缓存是模块级静态，跨测试 mock 会互相污染）
+export function __clearGraceCache() {
+  graceCache = null;
+}
 export async function panelGraceSeconds(env) {
+  const now = Date.now();
+  if (graceCache && now - graceCache.ts < GRACE_CACHE_TTL_MS) return graceCache.value;
+  let value = ONLINE_GRACE_SLOW_S;
   try {
     const resp = await doPanel(env).fetch('https://do.internal/viewers');
     const v = await resp.json();
     const count = Number(v.count || 0);
     const fastSince = Number(v.fastSince || 0);
-    const now = Date.now();
     if (count > 0 && (!fastSince || now - fastSince >= PANEL_SWITCH_GRACE_MS)) {
-      return ONLINE_GRACE_FAST_S;
+      value = ONLINE_GRACE_FAST_S;
     }
-    return ONLINE_GRACE_SLOW_S;
-  } catch {
-    return ONLINE_GRACE_SLOW_S;
-  }
+  } catch { /* 查询失败按无观看者（慢宽限）处理 */ }
+  graceCache = { ts: now, value };
+  return value;
 }
 
 // 服务器列表 + 实时状态公共构建（GET /api/servers 与 MCP list_servers 共用）：

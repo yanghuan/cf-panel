@@ -279,11 +279,13 @@ export class TerminalDO {
     }, UPLOAD_TIMEOUT_MS);
     this.pendingUpload.set(uploadId, { resolve: resolveResult, timer });
     // 大小上限：优先环境变量 UPLOAD_MAX_MB（磁盘耗尽防护）。
-    // 显式解析 + 上限校验：`|| 回退` 语义下 UPLOAD_MAX_MB=0（意图"不限制"）会静默变成
-    // 100MB、非数字同样回退——不支持 0=无限（agent 端 FILE_LIMIT 500MB 是绝对上限）
+    // 显式解析：0/非数字回退默认 100MB（不支持 0=无限）；上限钳到 agent 端 FILE_LIMIT
+    //（500MB 绝对硬上限，README/routes.js 工具描述同口径——UPLOAD_MAX_DEFAULT 是默认值
+    // 不是上限，钳 100 会静默砍掉文档承诺的"调高到 500"能力）
+    const UPLOAD_ABS_MAX_MB = 500;
     const rawMax = Number(this.env.UPLOAD_MAX_MB);
     const maxMb = Number.isFinite(rawMax) && rawMax > 0
-      ? Math.min(rawMax, UPLOAD_MAX_DEFAULT / (1024 * 1024))
+      ? Math.min(rawMax, UPLOAD_ABS_MAX_MB)
       : UPLOAD_MAX_DEFAULT / (1024 * 1024);
     const maxBytes = maxMb * 1024 * 1024;
     try {

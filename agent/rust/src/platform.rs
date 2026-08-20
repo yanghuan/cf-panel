@@ -316,6 +316,50 @@ pub mod imp {
         fn TerminateProcess(hProcess: *mut std::ffi::c_void, uExitCode: u32) -> i32;
         fn CloseHandle(hObject: *mut std::ffi::c_void) -> i32;
     }
+
+    // 真机 FFI 生命周期验证（仅 Windows 编译，CI build-windows 的 cargo test 执行）：
+    // 交叉 check 只能验证布局正确，QueryInformationJobObject 的实际返回值需真进程实证
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn job_accounting_lifecycle() {
+            // cmd ping 约 1s 存活：保证 attach 后查询时进程仍在运行
+            let mut child = std::process::Command::new("cmd")
+                .args(["/C", "ping -n 2 127.0.0.1 >nul"])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("spawn cmd");
+            let pid = child.id();
+            attach_job(pid);
+            let job = JOBS
+                .lock()
+                .ok()
+                .and_then(|jobs| jobs.get(&pid).copied())
+                .expect("attach 后表项存在");
+            let job = job as *mut std::ffi::c_void;
+            // 运行中：ActiveProcesses > 0（上限清理的"只关无存活 job"依赖此判定）
+            assert!(
+                job_has_active_processes(job),
+                "存活进程的 job 应报告 active"
+            );
+            let _ = child.wait();
+            // 退出后：内核递减计数，应报告 inactive
+            assert!(
+                !job_has_active_processes(job),
+                "进程退出后 job 应报告 inactive"
+            );
+            detach_job(pid); // 清理表项与句柄
+            assert!(
+                JOBS.lock()
+                    .map(|jobs| !jobs.contains_key(&pid))
+                    .unwrap_or(true),
+                "detach 后表项移除"
+            );
+        }
+    }
 }
 
 pub use imp::*;

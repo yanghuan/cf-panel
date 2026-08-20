@@ -29,8 +29,14 @@
     return i <= 0 ? '/' : t.slice(0, i);
   }
 
-  function lockScroll() { document.body.style.overflow = 'hidden'; }
-  function unlockScroll() { document.body.style.overflow = ''; }
+  // 滚动锁计数栈：嵌套弹窗（文件弹窗内开新建目录 promptDialog）关闭内层时外层仍锁——
+  // 无计数的赋值式会在关内层时误解锁背景
+  let scrollLockCount = 0;
+  function lockScroll() { scrollLockCount += 1; document.body.style.overflow = 'hidden'; }
+  function unlockScroll() {
+    scrollLockCount = Math.max(0, scrollLockCount - 1);
+    if (scrollLockCount === 0) document.body.style.overflow = '';
+  }
 
   // 监控常量与降采样
   const MONITOR_STEP_MAX = 240; // 长区间降采样目标点数
@@ -97,9 +103,11 @@
   }
   // 私网/保留地址不查询：10.x 172.16-31.x 192.168.x 127.x 169.254.x 0.x 100.64-127.x
   const GEO_PRIVATE = /^(0\.|10\.|127\.|169\.254\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.|100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.)/;
-  // 返回 {label, cc}（label=展示文本，cc=ISO 3166-1 alpha-2 国家代码，旗帜渲染用）；失败/私网返回 null
+  // 返回 {label, cc}（label=展示文本，cc=ISO 3166-1 alpha-2 国家代码，旗帜渲染用）；失败/私网/开关关闭返回 null。
+  // geoEnabled 入口统一收口：卡片旗帜（updateFlags）与 <cf-ip> 组件两个调用方都受控——
+  // 隐私开关关闭时绝不向第三方地理服务发送 IP（开关文案承诺的行为）
   async function geoLookup(ip) {
-    if (!ip || GEO_PRIVATE.test(ip)) return null;
+    if (!geoEnabled || !ip || GEO_PRIVATE.test(ip)) return null;
     const cached = geoCache.get(ip);
     if (cached) return cached;
     let label = '';
@@ -351,7 +359,7 @@
   // 任何活动恢复。暂停/恢复/提示等 UI 动作由 handlers 提供（app.js 注入 stopPush/startPush/confirmDialog）
   class IdleGuard {
     constructor(handlers = {}) {
-      this.h = handlers; // { timeout, promptMs, isActive, onPrompt(continueFn, pauseFn), onPause, onResume }
+      this.h = handlers; // { timeout, promptMs, isActive, onPrompt(continueFn, pauseFn), onPause, onResume, onPromptDismiss? }
       this.timeout = handlers.timeout || 10 * 60 * 1000;  // 无操作判定阈值
       this.promptMs = handlers.promptMs || 60 * 1000;     // 提示后无响应自动暂停
       this.timer = null;
@@ -372,8 +380,10 @@
       if (!this._active() || this.paused || this.prompting) return;
       this.prompting = true;
       const pause = () => { this.prompting = false; this.pause(); };
-      // 确认=继续（重置计时）；取消=立即暂停；关闭弹窗=忽略（promptMs 倒计时自动暂停兜底）
-      if (this.h.onPrompt) this.h.onPrompt(() => { this.prompting = false; this.reset(); }, pause);
+      // 确认=继续（已自动暂停则先恢复——弹窗停留期间 60s 倒计时可能已触发 pause）；
+      // 取消=立即暂停；关闭弹窗=忽略（promptMs 倒计时自动暂停兜底）
+      const cont = () => { this.prompting = false; if (this.paused) this.resume(); else this.reset(); };
+      if (this.h.onPrompt) this.h.onPrompt(cont, pause);
       this.promptTimer = setTimeout(() => { this.prompting = false; this.pause(); }, this.promptMs);
     }
     pause() {
@@ -383,6 +393,9 @@
       clearTimeout(this.timer);
       clearTimeout(this.promptTimer);
       if (this.h.onPause) this.h.onPause();
+      // 自动/手动暂停时提示弹窗可能仍显示（60s 无响应路径、用户点取消由 confirmDialog 自身关闭）——
+      // 经回调交由 UI 侧关闭残留弹窗（本类零 DOM 依赖，不直接操作）
+      if (this.h.onPromptDismiss) this.h.onPromptDismiss();
     }
     resume() {
       if (!this.paused) return;

@@ -62,7 +62,18 @@
     }
     // 断线重连（保留 serverId/cwd）
     reconnect() { return this.open(this.serverId, this.cwd); }
-    close() { if (this.ws) { try { this.ws.close(); } catch { /* ignore */ } this.ws = null; } }
+    // 关闭会话：中断进行中的传输并复位状态——否则重开弹窗后被残留状态挡住
+    //（「已有上传/下载进行中」而取消按钮已随弹窗关闭不可达，永久卡死直到刷新）。
+    // 上传先发 abort（连接还在时）通知 agent 删临时文件；断开时 agent 会话结束清理兜底
+    close() {
+      if (this.uploadState) {
+        this.send({ type: 'abort', path: this.uploadState.path, upload_id: this.uploadState.uploadId });
+        this.uploadState = null;
+      }
+      this.downloadState = null;
+      this.editState = null;
+      if (this.ws) { try { this.ws.close(); } catch { /* ignore */ } this.ws = null; }
+    }
     send(obj) { if (this.connected) this.ws.send(JSON.stringify(obj)); }
 
     // 列表（Everything 风格：无通配符纯文本按子串匹配 *文本*）

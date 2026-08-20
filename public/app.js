@@ -298,8 +298,14 @@
   }
 
   // 在线老化：服务端只在推送时算 online，两次推送之间由前端按 last_seen_s 倒计时判离线。
-  // 20s = 快宽限 15s + 5s 余量；无最新指标（冷启动/D1 兜底）的服务器保留服务端判定不覆盖
+  // 20s = 快宽限 15s + 5s 余量；无最新指标（冷启动/D1 兜底）的服务器保留服务端判定不覆盖。
+  // 推送后 30s 内跳过老化：服务端对"首观者切快采"有 30s 过渡期（慢宽限 180s，防 agent
+  // 切快采完成前误判离线），本地 20s 阈值若立即覆盖会把刚推送判在线的徽章打成离线——
+  // 后台超一个慢采周期后切回时必现在线→离线→在线闪烁；30s 后 agent 已恢复快采，阈值正常生效
+  let lastPushAt = 0; // 最近一次推送/同步到达时刻（ms）
+  const AGING_PUSH_GRACE_MS = 30 * 1000; // 与服务端 PANEL_SWITCH_GRACE_MS 过渡期对齐
   function agingServers() {
+    if (Date.now() - lastPushAt < AGING_PUSH_GRACE_MS) return;
     const agingNow = Date.now() / 1000;
     for (const s of serversCache) {
       if (s.metric && s.metric.last_seen_s) {
@@ -518,7 +524,7 @@
   // PushSession：连接生命周期 + 指数重连 + 30s 兜底 + 1008 权限失效，数据经回调交给 UI
   const pushSess = new PushSession({
     onOpen: () => startPushTimer(), // 连接建立后启动老化计时器
-    onData: (list) => { serversCache = list; updateServerCards(); },
+    onData: (list) => { serversCache = list; lastPushAt = Date.now(); updateServerCards(); },
     onAuthFail: () => { token = ''; localStorage.removeItem('cfpanel_token'); showAuth(); },
     onLongRetry: () => toast('实时刷新连接失败，正在自动重试...'),
   });
@@ -541,6 +547,12 @@
     onPrompt: (onContinue, onPause) => {
       // 确认=继续观看（重置计时）；取消=立即暂停；关闭弹窗=忽略提示（60s 倒计时自动暂停兜底）
       confirmDialog('长时间未操作。为节省 Cloudflare 额度，将暂停实时刷新（agent 将恢复慢采）。\n\n点击「确认」继续观看，或「取消」暂停；60 秒无响应将自动暂停。', onContinue, onPause);
+    },
+    onPromptDismiss: () => {
+      // 暂停时提示弹窗可能仍显示（60s 无响应自动暂停路径）——关闭残留的过期弹窗；
+      // 仅在确实开着时关闭（保持滚动锁计数严格配对，见 utils.js lockScroll）
+      const d = $('#dialog');
+      if (d && !d.classList.contains('hidden')) closeDialog();
     },
     onPause: () => {
       stopPush(); // 断开 /ws/push → 观看者减 1 → agent 恢复慢采
@@ -704,7 +716,7 @@
       }
     },
     onUploadProgress: (pct) => { $('#file-msg').textContent = `上传中：${pct}%`; },
-    onUploadDone: (path) => { $('#btn-file-cancel').classList.add('hidden'); reloadFileList(); },
+    onUploadDone: (path) => { $('#btn-file-cancel').classList.add('hidden'); $('#file-msg').textContent = ''; toast(`已上传：${path}`); reloadFileList(); },
     onUploadCanceled: () => { $('#btn-file-cancel').classList.add('hidden'); $('#file-msg').textContent = '已取消上传'; },
     onDownloadProgress: (pct) => { $('#file-msg').textContent = `下载中：${pct}%`; },
     onDownloadDone: (path, parts, dlName) => {
@@ -729,7 +741,8 @@
     onTouchDone: () => { reloadFileList(); toast('文件已创建'); },
     onMoveDone: (path) => { reloadFileList(); toast(`已移动到：${path}`); },
     onEditLoaded: (path, text) => openFileEditor(path, text),
-    onError: (msg) => { $('#file-msg').textContent = `错误：${msg}`; },
+    // 错误同时 toast：编辑器保存后弹窗已关闭、文件弹窗可能未开——仅写 file-msg 会零提示
+    onError: (msg) => { $('#file-msg').textContent = `错误：${msg}`; toast(`文件操作错误：${msg}`); },
     onDisconnected: () => { if (!$('#file-modal').classList.contains('hidden')) $('#file-msg').textContent = '连接断开，点击「刷新」重连'; },
   });
 
@@ -927,6 +940,12 @@
   }
 
   function saveFileEditor() {
+    // 连接断开（文件弹窗被关/WS 掉线）时 upload 会静默丢弃发送帧——编辑内容丢失且零提示。
+    // 先校验连接，断开则阻止保存（编辑器保持打开，重连后可重试）
+    if (!fileSess.connected) {
+      toast('文件连接已断开，无法保存。请打开文件管理器并点击「刷新」重连后重试');
+      return;
+    }
     const text = editorGetValue();
     const name = editorPath.split('/').pop() || 'edit.tmp';
     // File 构造（Blob + name）：复用上传状态机分块写回；显式 path（编辑期间 cwd 可能已变化）
@@ -2078,17 +2097,22 @@
     });
     modals.forEach((m) => mo.observe(m, { attributes: true, attributeFilter: ['class'] }));
     // Esc 关闭当前打开的弹窗：模拟点击其"关闭"按钮，走既有清理逻辑（如终端 ws/resize），
-    // 焦点恢复由上面的 MutationObserver 统一处理
+    // 焦点恢复由上面的 MutationObserver 统一处理。
+    // 目标弹窗取最后一个非 hidden（弹窗统一 z-index:10，DOM 顺序即视觉叠放顺序——
+    // 编辑器叠在文件弹窗之上时，第一次 Esc 应关编辑器而非背景文件弹窗）；
+    // 关闭按钮只认 ✕（button.icon）——编辑器 head 第一个按钮是「保存」、选择器是
+    // 「移动到此处」，取第一个按钮会把 Esc 变成危险操作（保存/移动）导致内容丢失
     document.addEventListener('keydown', (e) => {
       if (e.key !== 'Escape') return;
-      const open = modals.find((m) => !m.classList.contains('hidden'));
+      const open = [...modals].reverse().find((m) => !m.classList.contains('hidden'));
       if (!open) return;
-      const closeBtn = open.querySelector('.modal-head button');
-      if (closeBtn) closeBtn.click();
-      else {
-        open.classList.add('hidden');
-        unlockScroll();
-      }
+      const closeBtn = open.querySelector('.modal-head button.icon');
+      if (closeBtn) { closeBtn.click(); return; }
+      // 无 ✕ 按钮的弹窗分派到各自的关闭入口（保持 dirty 确认/状态清理等既有逻辑）
+      if (open.id === 'file-editor-modal') { $('#btn-editor-close').click(); return; }
+      if (open.id === 'file-selector-modal') { closeFileSelector(); return; }
+      open.classList.add('hidden');
+      unlockScroll();
     });
   }
 

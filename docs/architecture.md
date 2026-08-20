@@ -246,6 +246,33 @@ agent 可能运行在低内存设备（OpenWrt 路由器 / 树莓派 Zero 等）
 - **保留 Shell 的真正理由不是内存，而是运维/部署**：零编译、脚本即改即用、无需任何工具链、对已有机器直接跑（`apt install socat jq` + 下载 websocat）。
 - 决策建议：**Rust 版已实现（`agent/rust/`）为推荐默认**（内存最省、全静态单文件、任意发行版直跑）；Shell 版废弃。若团队 Rust 维护成本高且设备内存 ≥256MB，可用 Go 重写（协议不变，见 §3.5 权衡）。
 
+#### 3.5.2 跨平台实现（2026-08-20，Windows/macOS 支持）
+
+Rust 版以 `#[cfg(unix)]` / `#[cfg(windows)]` 条件编译实现三平台（平台代码互不编译、零运行时分派成本），公共原语收口于 `platform.rs`：
+
+| 原语 | Unix（Linux/macOS） | Windows |
+| --- | --- | --- |
+| 进程树终止 | 进程组（spawn 时 setsid，`kill(-pgid)`） | **Job Object**（手写 kernel32 FFI：挂入 + `KILL_ON_JOB_CLOSE` 兜底 agent 崩溃整树清理；`detach_job` 正常退出回收；JOBS 上限清理按 `QueryInformationJobObject` ActiveProcesses 只关无存活 job） |
+| exec / 自定义指标 shell | `sh -c` | `cmd /C` |
+| 终端交互 shell | `$SHELL` → `/bin/bash` → `/bin/sh` | `powershell.exe` → `cmd.exe` |
+| 终端 PTY | portable-pty（Unix pty） | **ConPTY**（portable-pty 内置） |
+| 临时目录/日志 | `/tmp` | `%TEMP%` |
+| 信号 | SIGTERM/SIGINT | `tokio::signal::ctrl_c`（Ctrl+C/Break） |
+
+**系统指标按平台双实现**（`metrics/` 目录，同签名函数集，`collect_report` 零平台分支）：
+- `metrics/linux.rs`：原生 `/proc`、`/sys` 读取（与 Shell 版同口径，零额外依赖）；CPU/内存/负载/温度/TCP-UDP 连接数/磁盘(statvfs+挂载过滤)/网络差分/磁盘 IO 差分全量。
+- `metrics/other.rs`（Windows/macOS 共用）：**sysinfo crate**（目标特定依赖，不进 Linux 依赖树）；CPU/内存/磁盘/网络为真实数据，`load_average`（macOS 有 / Windows 无→0）、温度（Windows 多数驱动不暴露→None）。
+- **平台缺失项（如实上报空值，服务端白名单丢弃）**：磁盘 IO 差分与 TCP-UDP 连接数无跨平台 API（Windows/macOS 均为空）；macOS 系统信息 IP 为空（卡片展示走服务端 `wan_ip` 不受影响）。
+
+**路径模型**（文件管理协议从 Unix 绝对路径扩展）：
+- Unix：`/` 分隔 + FHS 系统目录黑名单（`/etc` `/usr` `/var` 等，fail closed）。
+- Windows：盘符路径（`C:\...`，统一大写盘符 + `\` 分隔，大小写不敏感），驱动器根一级目录黑名单（`Windows` / `Program Files` / `ProgramData` / `$Recycle.Bin` 等，任意盘符生效）；`C:\Users` 放行（等同 `/home`）；UNC、保留字符、越根 fail closed；`canonicalize` 的 `\\?\` verbatim 前缀剥离（真实路径层防 symlink/junction 写穿）。
+- 前端 `utils.js` 的 `fileJoin` / `fileParent` / `fileBase` / `isSystemPath` 与 agent 端同步支持盘符路径（黑名单逐条对账）。
+
+**CI 与产物**：workflow 四 job 流水线（test → build-macos/build-windows → build-release），Release 提供 5 个产物（Linux x86_64 + UPX 压缩版 + aarch64、macOS ARM64、Windows x86_64）。Windows job 先跑 `cargo test`（真机验证：路径模型、NTFS 真实文件系统操作、Job Object FFI 生命周期）。
+
+> **跨平台验证边界（如实标注）**：`cargo check --all-targets` 三平台全绿 + Windows CI 真机测试；macOS 指标（sysinfo 数值/温度）与 ConPTY 交互体验建议发布后真机冒烟。
+
 ### 3.6 PTY（伪终端）
 - 用 `creack/pty`（Go）或等价的 PTY 库（其它语言）在 slave 端启动 shell，`TERM=xterm`。
 - agent 持有 master 文件句柄：

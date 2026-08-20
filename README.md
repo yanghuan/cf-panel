@@ -261,6 +261,72 @@ wrangler secret put PANEL_USERS      # 回车后粘贴值，如 alice:pass1,bob:
    ```
    `CUSTOM_METRICS` 为 JSON 数组：`name` 指标名、`cmd` 采集命令（输出第一行数值）、`cycle` 采样周期（当前随上报周期）。命令执行带 5 秒超时；非数值输出自动跳过。
 
+### 跨平台部署（Windows / macOS）
+
+Rust 版 agent 三平台产物从 GitHub Releases 下载（`cf-panel-agent-windows.exe` / `cf-panel-agent-macos`），功能矩阵与差异见下方；环境变量与 Linux 版完全一致（`AGENT_WSS_URL` / `AGENT_KEY` 必填，`--help` 可查全部配置）。
+
+**Windows（x86_64，Windows 10+）**
+
+1. 下载 `cf-panel-agent-windows.exe`，放任意目录（如 `C:\cf-panel-agent\`）。
+2. 创建环境变量（系统属性 → 环境变量，或 PowerShell 会话内 `$env:AGENT_WSS_URL=...`）：
+   ```powershell
+   $env:AGENT_WSS_URL = "wss://<面板域名>/ws/agent"
+   $env:AGENT_KEY     = "<你的 key>"
+   # 可选：DISABLE_EXEC=1 禁用终端/文件/exec；PROBES / CUSTOM_METRICS 同 Linux
+   .\cf-panel-agent-windows.exe
+   ```
+3. 开机自启（管理员 PowerShell）：
+   ```powershell
+   sc.exe create cf-panel-agent binPath= "C:\cf-panel-agent\cf-panel-agent-windows.exe" start= auto
+   sc.exe start cf-panel-agent
+   # 停止：sc.exe stop cf-panel-agent
+   ```
+4. 差异与边界：
+   - **终端走 ConPTY**（PowerShell 交互，portable-pty 内置）；exec/自定义指标走 `cmd /C`（命令写法按 Windows 习惯）。
+   - **文件管理为盘符路径**（如 `C:\Users\me\app`）；`C:\Users` 可写，`C:\Windows`、`Program Files`、`ProgramData` 等系统目录受保护（写/删/改名拒绝，下载保留）。
+   - 指标经 sysinfo 采集：CPU/内存/磁盘/网络为真实数据；**磁盘 IO 图与 TCP/UDP 连接数为空**（无跨平台 API）。
+   - 临时目录/日志默认在 `%TEMP%\cfpanel-<key前8位>...`（`AGENT_TMPDIR` / `AGENT_LOG` 可改）。
+   - 进程树清理走 Job Object（exec 超时/会话关闭时整树终止）。
+
+**macOS（Apple Silicon，M1/M2/M3…）**
+
+1. 下载 `cf-panel-agent-macos` 并赋予执行权限（`chmod +x`）；终端交互 shell 与 Linux 同逻辑：`$SHELL` 优先（默认 zsh），回退 `/bin/bash` → `/bin/sh`；exec/自定义指标走 `sh -c`。
+2. 环境变量 + 启动：
+   ```bash
+   AGENT_WSS_URL=wss://<面板域名>/ws/agent AGENT_KEY=<你的 key> ./cf-panel-agent-macos
+   ```
+3. 开机自启（launchd，`~/Library/LaunchAgents/com.cfpanel.agent.plist`）：
+   ```xml
+   <?xml version="1.0" encoding="UTF-8"?>
+   <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+   <plist version="1.0"><dict>
+     <key>Label</key><string>com.cfpanel.agent</string>
+     <key>ProgramArguments</key><array><string>/path/to/cf-panel-agent-macos</string></array>
+     <key>EnvironmentVariables</key><dict>
+       <key>AGENT_WSS_URL</key><string>wss://<面板域名>/ws/agent</string>
+       <key>AGENT_KEY</key><string><你的 key></string>
+     </dict>
+     <key>RunAtLoad</key><true/>
+     <key>KeepAlive</key><true/>
+   </dict></plist>
+   ```
+   ```bash
+   launchctl load ~/Library/LaunchAgents/com.cfpanel.agent.plist
+   ```
+4. 差异与边界：终端/文件管理/exec/探活/自定义指标可用；指标经 sysinfo（真实 CPU/内存/磁盘/网络；**磁盘 IO 与连接数为空**）；系统信息 IP 为空（卡片展示走服务端 wan_ip，不受影响）；临时目录默认 `/tmp`。
+
+> **平台能力矩阵**（与 Linux 完整版对照）：
+
+| 能力 | Linux | macOS | Windows |
+| --- | --- | --- | --- |
+| 控制通道 / WS / TLS | ✅ | ✅ | ✅ |
+| 终端 PTY | ✅ | ✅ | ✅（ConPTY） |
+| exec / 自定义指标 | sh -c | sh -c | cmd /C |
+| 文件管理 | ✅（/ 路径） | ✅（/ 路径） | ✅（盘符路径，系统目录受保护） |
+| CPU/内存/磁盘/网络指标 | ✅ | ✅ | ✅ |
+| 磁盘 IO / TCP-UDP 连接数 | ✅ | 空 | 空 |
+| 进程树清理 | 进程组 | 进程组 | Job Object |
+
 ## 三、使用
 
 - **概览与实时指标**：顶部概览条显示服务器总数/在线数/平均 CPU/负载/总内存；每张服务器卡片实时显示 CPU / 内存 / 负载（经 `/ws/push` 上报驱动实时推送，PanelDO 从 MetricsDO 取最新值；前端仅首帧 sync，1s 定时器只做本地老化）。

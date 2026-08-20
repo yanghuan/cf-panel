@@ -144,14 +144,16 @@ static NET: std::sync::OnceLock<Arc<tokio::sync::Mutex<Option<NetState>>>> =
 
 // 虚拟网卡过滤：按接口名前缀/关键字（Windows 接口是友好名「以太网/Loopback…」，
 // macOS 是 en0/lo0/bridge*/utun*）。两级匹配降低误杀：
-//   1) 前缀 + 后跟数字（Unix 接口命名惯例 tun0/tap0/veth1/br-0/utun3）：短子串必须
-//      精确到「前缀+数字」才命中——contains("tun") 会误杀 "Tunnel-ISP" 这类用户命名；
+//   1) 前缀 + 后跟数字或结尾（Unix 接口命名惯例 tun0/tap0/veth1/br-0/utun3/lo0）：
+//      短子串必须精确到「前缀+数字」才命中——contains("tun") 会误杀 "Tunnel-ISP" 这类
+//      用户命名；lo/lo0 经前缀命中，loopback 靠关键字 contains（lo 后跟 'o' 非数字，
+//      前缀路径自然不命中，两路径互补不冲突）；
 //   2) 足够长的关键字用 contains（loopback/virtual/vmware/…），误杀率低
 fn is_virtual_iface(name: &str) -> bool {
     let lower = name.to_lowercase();
     const VIRT_PREFIXES: &[&str] = &[
-        "tun", "tap", "veth", "br-", "virbr", "utun", "llw", "anpi", "bridge", "vmnet", "vxlan",
-        "gretap", "dummy", "vnet", "docker",
+        "lo", "tun", "tap", "veth", "br-", "virbr", "utun", "llw", "anpi", "bridge", "vmnet",
+        "vxlan", "gretap", "dummy", "vnet", "docker",
     ];
     const VIRT_KEYWORDS: &[&str] = &[
         "loopback",
@@ -159,7 +161,10 @@ fn is_virtual_iface(name: &str) -> bool {
         "teredo",
         "6to4",
         "hyper-v",
+        // 两种形态都保留：Windows 英文名 "vEthernet (WSL)" 小写为无空格 "vethernet (wsl)"，
+        // 带空格变体为历史命名（不同版本/区域可能不同）
         "v ethernet",
+        "vethernet",
         "vmware",
         "virtual",
         "vpn",
@@ -171,11 +176,9 @@ fn is_virtual_iface(name: &str) -> bool {
             && lower
                 .as_bytes()
                 .get(p.len())
-                .map_or(true, |c| c.is_ascii_digit())
+                .is_none_or(|c| c.is_ascii_digit())
     };
-    lower == "lo"
-        || VIRT_PREFIXES.iter().any(|p| has_prefix(p))
-        || VIRT_KEYWORDS.iter().any(|k| lower.contains(k))
+    VIRT_PREFIXES.iter().any(|p| has_prefix(p)) || VIRT_KEYWORDS.iter().any(|k| lower.contains(k))
 }
 
 pub async fn collect_net() -> (u64, u64) {

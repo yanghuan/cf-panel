@@ -526,9 +526,10 @@ fn lexical_system_hit(norm: &str) -> bool {
 // 少数场景同样受保护；用户目录 C:\Users 放行，等同 Unix /home 放行）
 #[cfg(windows)]
 fn lexical_system_hit(norm: &str) -> bool {
-    let parts: Vec<&str> = norm.split('\\').collect();
+    // 过滤空段："C:\" split('\\') 得 ["C:", ""]（尾空段）——不过滤时 len==2 绕过根判定
+    let parts: Vec<&str> = norm.split('\\').filter(|s| !s.is_empty()).collect();
     if parts.len() <= 1 {
-        return true; // 驱动器根 C:\（split 后为 ["C:"]）
+        return true; // 驱动器根 C:\
     }
     let root_dir = parts[1];
     WIN_SYSTEM_ROOT_DIRS

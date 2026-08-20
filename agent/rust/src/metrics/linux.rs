@@ -1,15 +1,7 @@
-// 监控采集：/proc 指标 + 磁盘 + 网络差分 + 系统信息 + 探活 + 自定义指标
-// 与 agent.sh collect_report 对齐（字段名/结构一致）
-// blocking 调用统一走 crate::blocking（此前本文件的 run_blocking 与 session.rs 的
-// blocking_with_timeout 是两套重复实现、两个独立 4-permit 信号量）
-use crate::Config;
-use futures_util::future::join_all;
+// Linux 系统指标采集：/proc、/sys 原生实现（无外部依赖，与 agent.sh collect_report 同口径）。
+// 函数集签名见 imp.rs 注释——与 other.rs（sysinfo 实现）一一对应。
 use serde_json::json;
-use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Instant;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 use tokio::time::Duration;
 
@@ -28,14 +20,12 @@ fn read_file(path: &str) -> Option<String> {
     std::fs::read_to_string(path).ok()
 }
 
-// 阻塞并发上限与超时的统一封装已移至 blocking.rs（信号量 + 超时 + 文件操作熔断）
-
 // CPU：两次采样（间隔 200ms）求差值。
 // 扩展 8 字段口径（shell 版已弃用，不再对齐其 4 字段简化算法）——
 // total = user+nice+system+idle+iowait+irq+softirq+steal（guest/guest_nice 内核已计入 user/nice，
 // 不重复累加）；usage = (total - idle) / total，iowait/irq/softirq/steal 计入忙碌，
 // 高 iowait（磁盘/网络慢）与云主机 steal 被抢占时读数不再偏低
-async fn collect_cpu() -> f64 {
+pub async fn collect_cpu() -> f64 {
     let s1 = read_file("/proc/stat").and_then(|s| s.lines().next().map(|l| l.to_string()));
     tokio::time::sleep(Duration::from_millis(200)).await;
     let s2 = read_file("/proc/stat").and_then(|s| s.lines().next().map(|l| l.to_string()));
@@ -66,7 +56,7 @@ async fn collect_cpu() -> f64 {
 }
 
 // 内存/swap：/proc/meminfo（返回 used, total, swap_used, swap_total）
-fn collect_mem() -> (u64, u64, u64, u64) {
+pub fn collect_mem() -> (u64, u64, u64, u64) {
     let text = read_file("/proc/meminfo").unwrap_or_default();
     let mut t = 0u64;
     let mut a = 0u64;
@@ -93,7 +83,7 @@ fn collect_mem() -> (u64, u64, u64, u64) {
 }
 
 // 负载 / 进程数 / 开机时间
-fn collect_load() -> (f64, f64, f64, u64, u64) {
+pub fn collect_load() -> (f64, f64, f64, u64, u64) {
     let text = read_file("/proc/loadavg").unwrap_or_default();
     let mut it = text.split_whitespace();
     let l1: f64 = it.next().and_then(|v| v.parse().ok()).unwrap_or(0.0);
@@ -112,7 +102,7 @@ fn collect_load() -> (f64, f64, f64, u64, u64) {
 }
 
 // 温度：第一个热区（℃）
-fn collect_temp() -> Option<f64> {
+pub fn collect_temp() -> Option<f64> {
     let dir = "/sys/class/thermal";
     if let Ok(rd) = std::fs::read_dir(dir) {
         for e in rd.flatten() {
@@ -141,7 +131,7 @@ fn count_lines(path: &str) -> u64 {
 // 文件不存在（老内核）时 count_lines 返回 0，天然兼容）
 // 阻塞读取放 blocking 线程：50 万连接时 /proc/net/tcp 是几十 MB 文本（BufReader 流式
 // 计数已避免物化整串，但同步 read 仍会占住 async worker 几十 ms~秒级）
-async fn collect_conns() -> (u64, u64) {
+pub async fn collect_conns() -> (u64, u64) {
     crate::blocking::run_blocking(5, || {
         (
             count_lines("/proc/net/tcp") + count_lines("/proc/net/tcp6"),
@@ -168,7 +158,7 @@ async fn disk_cache()
 // statvfs 同样会阻塞，与 df 行为等价；60s 缓存 + 失败真熔断逻辑不变。
 // 统一走 blocking.rs 信号量（此前裸 spawn_blocking 不占信号量，与注释「峰值 2<4」不符）
 // include：DISK_FSTYPE_INCLUDE 强制保留的 fstype 列表（默认排除的网络盘可借此计入统计）
-async fn collect_disk(include: &[String]) -> Vec<serde_json::Value> {
+pub async fn collect_disk(include: &[String]) -> Vec<serde_json::Value> {
     let now = std::time::Instant::now();
     if let Some((ts, disk)) = disk_cache().await.as_ref()
         && now.duration_since(*ts).as_secs() < 60
@@ -257,6 +247,44 @@ fn disk_usage_static(include: &[String]) -> Result<Vec<serde_json::Value>, ()> {
     Ok(out)
 }
 
+// 磁盘统计过滤判断：伪文件系统 / 虚拟内存盘（tmpfs/ramfs/overlay/squashfs/drvfs/9p）/
+// 网络盘（nfs*/cifs/smbfs/fuse.*）默认排除；include 中显式列出的 fstype 强制保留。
+// fuseblk（NTFS 外接数据盘，走 fuse 驱动）是真实分区，不排除
+fn disk_excluded(fstype: &str, include: &[String]) -> bool {
+    if include.iter().any(|s| s == fstype) {
+        return false;
+    }
+    const FAKE: &[&str] = &[
+        "proc",
+        "sysfs",
+        "devpts",
+        "devtmpfs",
+        "cgroup",
+        "cgroup2",
+        "pstore",
+        "securityfs",
+        "debugfs",
+        "tracefs",
+        "fusectl",
+        "configfs",
+        "mqueue",
+        "binfmt_misc",
+        "hugetlbfs",
+        "autofs",
+        "rpc_pipefs",
+        "nsfs",
+        "bpf",
+    ];
+    const VIRT: &[&str] = &[
+        "tmpfs", "ramfs", "overlay", "squashfs", "drvfs", "9p", "rootfs",
+    ];
+    const NET: &[&str] = &["nfs", "nfs4", "cifs", "smbfs", "fuse"];
+    FAKE.contains(&fstype)
+        || VIRT.contains(&fstype)
+        || NET.contains(&fstype)
+        || fstype.starts_with("fuse.")
+}
+
 // 网络速率：/proc/net/dev 累计差分（字节/秒）
 // 跳过回环与常见虚拟网卡前缀（lo/docker*/veth*/br-*/virbr*/tun*/tap*/vxlan*/gretap*/ip6tnl*/sit*/
 // ——否则容器宿主/本机回环流量计入速率导致虚高）
@@ -267,7 +295,7 @@ fn is_virtual_iface(name: &str) -> bool {
     ];
     VIRT_PREFIXES.iter().any(|p| name.starts_with(p))
 }
-async fn collect_net() -> (u64, u64) {
+pub async fn collect_net() -> (u64, u64) {
     let mut rx = 0u64;
     let mut tx = 0u64;
     if let Some(text) = read_file("/proc/net/dev") {
@@ -400,7 +428,7 @@ fn disk_io_diff(prev: &DiskIoState, cur: &DiskIoState) -> serde_json::Value {
     })
 }
 
-async fn collect_disk_io() -> serde_json::Value {
+pub async fn collect_disk_io() -> serde_json::Value {
     let (reads, writes, r_sectors, w_sectors, t_io_ms) = read_disk_io_totals();
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -435,7 +463,7 @@ async fn info_cache()
 }
 
 // 系统信息：OS / 内核 / IP / agent 版本（uname/hostname 放线程池+超时）
-async fn collect_info() -> serde_json::Value {
+pub async fn collect_info() -> serde_json::Value {
     let now = std::time::Instant::now();
     if let Some((ts, v)) = info_cache().await.as_ref()
         && now.duration_since(*ts).as_secs() < 600
@@ -515,291 +543,6 @@ async fn collect_info() -> serde_json::Value {
         *info_cache().await = Some((now, val.clone()));
     }
     val
-}
-
-// ---- 探活 PROBES：名称:类型:目标,...（http 检查 2xx/3xx，tcp 测连通）----
-// 注：仅支持 http://（明文）与 tcp 探测；https:// 探活暂不支持（记为失败），wss 不受影响
-async fn http_probe(url: &str, timeout_secs: u64) -> Option<(u16, u128)> {
-    let (scheme, rest) = url.split_once("://")?;
-    if scheme != "http" {
-        return None; // https 探活暂不支持
-    }
-    let (hostport, path) = match rest.find('/') {
-        Some(i) => rest.split_at(i),
-        None => (rest, ""),
-    };
-    let (host, port) = match hostport.rsplit_once(':') {
-        Some((h, p)) if p.parse::<u16>().is_ok() => (h.to_string(), p.parse().unwrap()),
-        _ => (hostport.to_string(), 80u16),
-    };
-    let path = if path.is_empty() { "/" } else { path };
-    // 域名兜底：IP 字面量直接解析；否则 lookup_host DNS（与 tcp_probe 对齐），
-    // 修复 http://域名/ 探活永远 DOWN（此前仅 IP 字面量，域名场景持续误告警）。
-    // DNS 解析必须纳入 timeout 作用域：glibc resolver 默认 5s×2 次，DNS 故障时
-    // 每个探活额外多挂 10s+ 且无上界（timeout 只包 connect+请求的旧实现形同虚设）
-    let addr: SocketAddr = match format!("{host}:{port}").parse() {
-        Ok(a) => a,
-        Err(_) => {
-            match tokio::time::timeout(
-                Duration::from_secs(timeout_secs),
-                tokio::net::lookup_host((host.as_str(), port)),
-            )
-            .await
-            {
-                Ok(Ok(mut it)) => match it.next() {
-                    Some(a) => a,
-                    None => return None,
-                },
-                _ => return None,
-            }
-        }
-    };
-    let t0 = Instant::now();
-    let fut = async {
-        let mut conn = TcpStream::connect(addr).await.ok()?;
-        let req = format!(
-            "GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\nUser-Agent: cf-panel-agent\r\n\r\n"
-        );
-        conn.write_all(req.as_bytes()).await.ok()?;
-        conn.flush().await.ok()?;
-        let mut buf = vec![0u8; 4096];
-        let n = conn.read(&mut buf).await.ok()?;
-        let head = String::from_utf8_lossy(&buf[..n]);
-        let status: u16 = head
-            .lines()
-            .next()?
-            .split_whitespace()
-            .nth(1)?
-            .parse()
-            .ok()?;
-        Some(status)
-    };
-    let status = tokio::time::timeout(Duration::from_secs(timeout_secs), fut)
-        .await
-        .ok()
-        .flatten()?;
-    Some((status, t0.elapsed().as_millis()))
-}
-
-async fn tcp_probe(target: &str, timeout_secs: u64) -> bool {
-    // DNS 解析纳入 timeout 作用域（与 http_probe 同理，防 glibc resolver 无上界挂起）
-    let addr: SocketAddr = match target.parse() {
-        Ok(a) => a,
-        Err(_) => match target.rsplit_once(':') {
-            Some((h, p)) if p.parse::<u16>().is_ok() => {
-                let p = p.parse().unwrap();
-                match tokio::time::timeout(
-                    Duration::from_secs(timeout_secs),
-                    tokio::net::lookup_host((h, p)),
-                )
-                .await
-                {
-                    Ok(Ok(mut it)) => match it.next() {
-                        Some(a) => a,
-                        None => return false,
-                    },
-                    _ => return false,
-                }
-            }
-            _ => return false,
-        },
-    };
-    tokio::time::timeout(Duration::from_secs(timeout_secs), TcpStream::connect(addr))
-        .await
-        .map(|r| r.is_ok())
-        .unwrap_or(false)
-}
-
-// 探活并行执行（join_all）：串行旧实现 N 个探活最坏 5N 秒（http 5s 超时 ×N），
-// 5 个探活 + 3 个自定义指标最坏 40s，直接绑架 report_loop 帧率（快采 5s 承诺失效）；
-// 并行后总时长 = max(单探活) 而非 sum
-async fn collect_probes(cfg: &Config) -> Vec<serde_json::Value> {
-    if cfg.probes.trim().is_empty() {
-        return Vec::new();
-    }
-    let futs: Vec<_> = cfg
-        .probes
-        .split(',')
-        .map(str::trim)
-        .filter(|p| !p.is_empty())
-        .filter_map(|p| {
-            let mut it = p.splitn(3, ':');
-            let name = it.next().unwrap_or("").to_string();
-            let ty = it.next().unwrap_or("").to_string();
-            let target = it.next().unwrap_or("").to_string();
-            if name.is_empty() || ty.is_empty() || target.is_empty() {
-                None
-            } else {
-                Some((name, ty, target))
-            }
-        })
-        .map(|(name, ty, target)| async move {
-            match ty.as_str() {
-                "http" => {
-                    let t0 = Instant::now();
-                    let (code, ok) = match http_probe(&target, 5).await {
-                        Some((c, _)) => (c, (200..400).contains(&c)),
-                        None => (0, false),
-                    };
-                    json!({ "name": name, "ok": ok, "code": code, "ms": t0.elapsed().as_millis() as u64 })
-                }
-                "tcp" => {
-                    let t0 = Instant::now();
-                    let ok = tcp_probe(&target, 3).await;
-                    json!({ "name": name, "ok": ok, "code": 0, "ms": t0.elapsed().as_millis() as u64 })
-                }
-                _ => serde_json::Value::Null, // 未知类型：占位，收尾过滤
-            }
-        })
-        .collect();
-    join_all(futs)
-        .await
-        .into_iter()
-        .filter(|v| !v.is_null())
-        .collect()
-}
-
-// ---- 自定义指标 CUSTOM_METRICS：[{"name","cmd"}] 执行命令取第一行数值（5s 超时）----
-// 并行执行（join_all，同探活）：串行旧实现 N 个命令最坏 5N 秒，绑架快采帧率
-async fn collect_custom(cfg: &Config) -> Vec<serde_json::Value> {
-    let raw = cfg.custom_metrics.trim();
-    if raw.is_empty() {
-        return Vec::new();
-    }
-    let arr: serde_json::Value = match serde_json::from_str(raw) {
-        Ok(v) => v,
-        Err(_) => return Vec::new(),
-    };
-    let items = match arr.as_array() {
-        Some(a) => a.clone(),
-        None => return Vec::new(),
-    };
-    let futs: Vec<_> = items
-        .iter()
-        .filter_map(|item| {
-            let name = item.get("name")?.as_str()?.to_string();
-            let cmd = item.get("cmd")?.as_str()?.to_string();
-            if name.is_empty() || cmd.is_empty() {
-                None
-            } else {
-                Some((name, cmd))
-            }
-        })
-        .map(|(name, cmd)| async move {
-            // kill_on_drop + process_group(0)：超时取消时杀掉整个子进程组，防孤儿残留
-            let mut c = tokio::process::Command::new("sh");
-            c.arg("-c").arg(&cmd).kill_on_drop(true);
-            #[cfg(unix)]
-            c.process_group(0);
-            if let Ok(Ok(o)) = tokio::time::timeout(Duration::from_secs(5), c.output()).await {
-                let line = String::from_utf8_lossy(&o.stdout)
-                    .lines()
-                    .next()
-                    .unwrap_or("")
-                    .trim()
-                    .to_string();
-                if let Ok(v) = line.parse::<f64>() {
-                    return Some(json!({ "name": name, "value": v }));
-                }
-            }
-            None
-        })
-        .collect();
-    join_all(futs).await.into_iter().flatten().collect()
-}
-
-// DISK_FSTYPE_INCLUDE 解析：逗号分隔、去空白、去空项
-pub fn disk_include(cfg: &Config) -> Vec<String> {
-    cfg.disk_fstype_include
-        .split(',')
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect()
-}
-
-// 磁盘统计过滤判断：伪文件系统 / 虚拟内存盘（tmpfs/ramfs/overlay/squashfs/drvfs/9p）/
-// 网络盘（nfs*/cifs/smbfs/fuse.*）默认排除；include 中显式列出的 fstype 强制保留。
-// fuseblk（NTFS 外接数据盘，走 fuse 驱动）是真实分区，不排除
-fn disk_excluded(fstype: &str, include: &[String]) -> bool {
-    if include.iter().any(|s| s == fstype) {
-        return false;
-    }
-    const FAKE: &[&str] = &[
-        "proc",
-        "sysfs",
-        "devpts",
-        "devtmpfs",
-        "cgroup",
-        "cgroup2",
-        "pstore",
-        "securityfs",
-        "debugfs",
-        "tracefs",
-        "fusectl",
-        "configfs",
-        "mqueue",
-        "binfmt_misc",
-        "hugetlbfs",
-        "autofs",
-        "rpc_pipefs",
-        "nsfs",
-        "bpf",
-    ];
-    const VIRT: &[&str] = &[
-        "tmpfs", "ramfs", "overlay", "squashfs", "drvfs", "9p", "rootfs",
-    ];
-    const NET: &[&str] = &["nfs", "nfs4", "cifs", "smbfs", "fuse"];
-    FAKE.contains(&fstype)
-        || VIRT.contains(&fstype)
-        || NET.contains(&fstype)
-        || fstype.starts_with("fuse.")
-}
-
-// ---- 汇总上报 ----
-pub async fn collect_report(cfg: &Config) -> Option<String> {
-    // 无依赖采集项并行（join!），消除串行累积（cpu 200ms + df/uname/hostname 5s 上限 +
-    // probes/custom 5s/个）对快采帧率的稀释。blocking 统一走 blocking.rs 信号量
-    //（4 permits）：采集峰值 = info(2: uname+hostname) + disk(1) + conns(1) = 4，
-    // 与文件操作共享；超限排队而非泄漏（conns/disk 读取毫秒级，排队影响可忽略）
-    let disk_inc = disk_include(cfg);
-    let (cpu, mem, load, conns, net, info, probes, custom, disk, disk_io) = tokio::join!(
-        collect_cpu(),
-        async { collect_mem() },
-        async { collect_load() },
-        collect_conns(),
-        collect_net(),
-        collect_info(),
-        collect_probes(cfg),
-        collect_custom(cfg),
-        collect_disk(&disk_inc),
-        collect_disk_io(),
-    );
-    let (mem_used, mem_total, swap, swap_total) = mem;
-    let (l1, l5, l15, procs, uptime) = load;
-    let (tcp, udp) = conns;
-    let (net_in, net_out) = net;
-    let report = json!({
-        "type": "report",
-        "cpu": cpu,
-        "mem_used": mem_used,
-        "mem_total": mem_total,
-        "net_in": net_in,
-        "net_out": net_out,
-        "extra": {
-            "swap": swap,
-            "swap_total": swap_total,
-            "disk": disk,
-            "disk_io": disk_io,
-            "load1": l1, "load5": l5, "load15": l15,
-            "temp": collect_temp(),
-            "procs": procs, "tcp": tcp, "udp": udp,
-            "uptime": uptime,
-        },
-        "info": info,
-        "probes": probes,
-        "custom": custom,
-    });
-    Some(report.to_string())
 }
 
 #[cfg(test)]
@@ -910,25 +653,5 @@ mod tests {
         assert!(disk_excluded("nfs", &inc)); // 未列出的网络盘仍排除
         // include 是精确匹配：fuse.sshfs 不会被 fuse.rclone 放行
         assert!(disk_excluded("fuse.sshfs", &inc));
-    }
-
-    #[test]
-    fn disk_include_parses_csv() {
-        let cfg = crate::Config {
-            wss: String::new(),
-            key: String::new(),
-            report_interval: 120,
-            disable_exec: false,
-            probes: String::new(),
-            custom_metrics: String::new(),
-            disk_fstype_include: " fuse.rclone, tmpfs ,,".to_string(),
-            tmp_dir: String::new(),
-            log_file: String::new(),
-            log_max: 0,
-        };
-        assert_eq!(
-            disk_include(&cfg),
-            vec!["fuse.rclone".to_string(), "tmpfs".to_string()]
-        );
     }
 }

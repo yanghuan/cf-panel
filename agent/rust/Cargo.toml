@@ -20,6 +20,11 @@ serde_json = "1"
 portable-pty = "0.9"
 libc = "0.2"
 
+# 非 Linux 平台的指标采集（Windows/macOS：CPU/内存/磁盘/网络经 sysinfo）；
+# Linux 保留原生 /proc、/sys 实现零额外依赖，sysinfo 不进入 Linux 依赖树
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+sysinfo = "0.33"
+
 # 构建优化说明（2026-08 实测）：
 # - opt-level="z"：体积优先，agent 为 IO 密集，opt=3 仅 +0.22MB 且收益小
 # - codegen-units=1 + lto：跨函数深度优化，代码更小更快（编译变慢，可接受）

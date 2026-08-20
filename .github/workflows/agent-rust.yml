@@ -1,6 +1,9 @@
 # cf-panel agent（Rust 版）构建并发布到 GitHub Releases
 # 触发：仅 agent/rust/**（或本 workflow 文件）变更时编译；可手动 workflow_dispatch
 # 产物：x86_64 全静态（musl）二进制，任意 Linux 发行版直跑
+#   + aarch64（ARM64 Linux）+ macOS（Apple Silicon）+ Windows（x86_64）
+# 跨平台说明：代码经 cfg(unix)/cfg(windows) 双实现（platform.rs 进程树/路径模型、
+#   metrics/ 平台指标采集）；三平台 cargo check --all-targets 全绿
 name: agent-rust
 
 on:
@@ -30,8 +33,79 @@ jobs:
           cargo clippy --all-targets -- -D warnings
           cargo test
 
-  build-release:
+  # macOS 构建（仅 ARM64/Apple Silicon：macos-14+ runner 本身是 ARM，原生构建零交叉成本；
+  # Intel Mac 已过时不再产出）。代码层 cargo check --target aarch64-apple-darwin 通过
+  # （libc::statvfs、signal::unix、process_group 在 macOS 均可用）。UPX 不支持 mach-o——无压缩版。
+  # 能力边界（如实标注到 Release）：终端 PTY / 文件管理 / exec / 探活可用；
+  # 系统指标（CPU/内存/磁盘/网络）依赖 /proc、/sys——macOS 无此路径，上报为 0/空。
+  build-macos:
     needs: test
+    permissions:
+      contents: read
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4.2.2 # 固定具体版本（防 supply chain 变更）
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      # 产物统一 mv 到 target/macos-out/（单目录）：upload-artifact v4 以多路径的公共祖先
+      # 为 artifact 根——跨 target 目录上传会保留目录层级，下载侧无法平铺引用
+      - name: 编译 aarch64-apple-darwin（Apple Silicon，原生）
+        working-directory: agent/rust
+        run: |
+          AGENT_BUILD_TS=$(date -u +'%Y.%m.%d-%H%M') cargo build --release --target aarch64-apple-darwin
+          mkdir -p target/macos-out
+          mv target/aarch64-apple-darwin/release/cf-panel-agent target/macos-out/cf-panel-agent-macos
+          shasum -a 256 target/macos-out/cf-panel-agent-macos > target/macos-out/cf-panel-agent-macos.sha256
+
+      - name: 上传产物（供发布 job 聚合）
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-macos
+          retention-days: 1
+          path: agent/rust/target/macos-out/
+          if-no-files-found: error
+
+  # Windows 构建（x86_64 MSVC）。终端走 ConPTY（portable-pty 内置）、exec 走 cmd /C、
+  # 进程树终止走 Job Object（platform.rs）；指标走 sysinfo（磁盘 IO 差分与 TCP/UDP
+  # 连接数无跨平台 API，为空——Release 说明已标注）。Windows 测试在本 job 先行执行。
+  build-windows:
+    needs: test
+    permissions:
+      contents: read
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4.2.2 # 固定具体版本（防 supply chain 变更）
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: 单元测试（Windows）
+        working-directory: agent/rust
+        run: cargo test
+
+      # shell: bash（windows runner 自带 git bash）保持与 macOS/Linux job 一致的命令风格
+      - name: 编译 x86_64-pc-windows-msvc
+        working-directory: agent/rust
+        shell: bash
+        run: |
+          export AGENT_BUILD_TS=$(date -u +'%Y.%m.%d-%H%M')
+          cargo build --release
+          mkdir -p target/win-out
+          mv target/release/cf-panel-agent.exe target/win-out/cf-panel-agent-windows.exe
+          sha256sum target/win-out/cf-panel-agent-windows.exe > target/win-out/cf-panel-agent-windows.exe.sha256
+
+      - name: 上传产物（供发布 job 聚合）
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-windows
+          retention-days: 1
+          path: agent/rust/target/win-out/
+          if-no-files-found: error
+
+  build-release:
+    needs: [test, build-macos, build-windows]
     permissions:
       contents: write # 仅发布 job 需要写权限（创建 Release）
     runs-on: ubuntu-latest
@@ -46,6 +120,19 @@ jobs:
 
       - name: 安装 musl 工具链与交叉编译工具（ring 等 build script 与静态链接需要；binutils-aarch64-linux-gnu 提供 aarch64 的 GNU ld，clang 交叉链接缺它时报 unrecognised emulation mode）
         run: sudo apt-get update && sudo apt-get install -y musl-tools clang llvm binutils-aarch64-linux-gnu
+
+      # macOS/Windows 产物由对应 job 构建，经 artifact 传递（download-artifact v4 平铺到指定目录）
+      - name: 下载 macOS 产物
+        uses: actions/download-artifact@v4
+        with:
+          name: agent-macos
+          path: macos-artifacts
+
+      - name: 下载 Windows 产物
+        uses: actions/download-artifact@v4
+        with:
+          name: agent-windows
+          path: windows-artifacts
 
       - name: 编译 x86_64 全静态二进制（musl）
         working-directory: agent/rust
@@ -97,12 +184,17 @@ jobs:
           ./agent/rust/target/x86_64-unknown-linux-musl/release/cf-panel-agent --help > /tmp/agent-help.txt
           # 固定用法文本
           cat > /tmp/release-body.md <<'EOF'
-          Rust 版 cf-panel agent 全静态二进制（musl，仅依赖系统调用，任意 Linux 发行版直跑）。
+          Rust 版 cf-panel agent 二进制：Linux 为全静态（musl，仅依赖系统调用，任意发行版直跑）；macOS（Apple Silicon）与 Windows（x86_64）为原生构建。
 
           平台（校验和见同名 `.sha256` 文件）：
           - `cf-panel-agent`：x86_64 完整版（约 2MB），无启动额外开销
           - `cf-panel-agent.upx`：x86_64 UPX `--lzma` 压缩版（约 0.9MB，省磁盘 ~58%），启动约 +60ms、常驻内存 +0.5MB
-          - `cf-panel-agent-aarch64`：ARM64（树莓派 4/5、ARM 小主机等）
+          - `cf-panel-agent-aarch64`：ARM64 Linux（树莓派 4/5、ARM 小主机等）
+          - `cf-panel-agent-macos`：macOS Apple Silicon（M1/M2/M3…；Intel Mac 已过时不再提供）
+          - `cf-panel-agent-windows.exe`：Windows x86_64（Windows 10+）
+
+          macOS 说明：终端 / 文件管理 / exec / 服务探活 / 自定义指标可用；**系统监控指标（CPU/内存/磁盘/网络）依赖 Linux 的 /proc、/sys，macOS 上报为 0/空**——如需 macOS 指标采集需另行移植（sysctl/IOKit 路径）。
+          Windows 说明：终端（ConPTY）/ 文件管理（盘符路径，C:\Users 可写、系统目录受保护）/ exec（cmd /C）/ 服务探活 / 自定义指标（cmd 命令）可用；指标经 sysinfo（CPU/内存/磁盘/网络真实数据；磁盘 IO 差分与 TCP/UDP 连接数无跨平台 API，为空）。超时清理走 Job Object（整棵进程树）。
 
           用法：
           ```
@@ -146,6 +238,10 @@ jobs:
             agent/rust/target/x86_64-unknown-linux-musl/release/cf-panel-agent.upx.sha256
             agent/rust/target/aarch64-unknown-linux-musl/release/cf-panel-agent-aarch64
             agent/rust/target/aarch64-unknown-linux-musl/release/cf-panel-agent-aarch64.sha256
+            macos-artifacts/cf-panel-agent-macos
+            macos-artifacts/cf-panel-agent-macos.sha256
+            windows-artifacts/cf-panel-agent-windows.exe
+            windows-artifacts/cf-panel-agent-windows.exe.sha256
           name: ${{ steps.release.outputs.title }}
           tag_name: ${{ steps.release.outputs.tag }}
           body_path: /tmp/release-body.md

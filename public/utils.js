@@ -19,14 +19,26 @@
     return v.toFixed(v >= 100 ? 0 : 1) + units[i];
   }
 
+  // 路径拼接/父目录：跨平台（Unix '/' 与 Windows 盘符 '\'）。
+  // Windows agent 返回的路径形如 C:\Users\me（反斜杠）；按 cwd 判定分隔符，
+  // 尾分隔符正确处理（'/' 根与 'C:\' 根都不重复加分隔符）
   function fileJoin(dir, name) {
-    return (dir === '/' ? '' : dir) + '/' + name;
+    const sep = dir.includes('\\') || /^[A-Za-z]:$/.test(dir) ? '\\' : '/';
+    const base = dir.endsWith(sep) || dir === '/' ? dir : dir + sep;
+    return base + name;
   }
-
   function fileParent(p) {
-    const t = String(p || '/').replace(/\/+$/, '');
-    const i = t.lastIndexOf('/');
-    return i <= 0 ? '/' : t.slice(0, i);
+    const s = String(p || '/');
+    // Windows 驱动器根（C:\）：无法再上溯，返回自身
+    if (/^[A-Za-z]:\\?$/.test(s.replace(/[\\/]+$/, '')) || /^[A-Za-z]:$/.test(s)) {
+      return s.replace(/[\\/]+$/, '') + '\\';
+    }
+    const t = s.replace(/[\\/]+$/, '');
+    const i = Math.max(t.lastIndexOf('/'), t.lastIndexOf('\\'));
+    if (i <= 0) return '/';
+    let parent = t.slice(0, i);
+    if (/^[A-Za-z]:$/.test(parent)) parent += '\\'; // C:\Users → C:（补回根斜杠）
+    return parent;
   }
 
   // 滚动锁计数栈：嵌套弹窗（文件弹窗内开新建目录 promptDialog）关闭内层时外层仍锁——
@@ -227,16 +239,39 @@
 
   // 受保护系统路径判定（与 agent 词法层同规则）：绝对路径归一化（折叠 //、解析 . ..）
   // 后匹配黑名单；相对路径/越根一律视为受保护。前端用于隐藏系统目录/文件的删除与
-  // 重命名菜单（下载保留）；agent 端为最终防线，此处仅为 UX 层
+  // 重命名菜单（下载保留）；agent 端为最终防线，此处仅为 UX 层。
+  // Windows 盘符路径（C:\...）：归一化后按驱动器根一级目录黑名单（大小写不敏感，
+  // 任意盘符；与 agent 端 WIN_SYSTEM_ROOT_DIRS 同规则）
   const SYSTEM_PATH_PREFIXES = [
     '/proc', '/sys', '/dev', '/etc', '/usr', '/var', '/boot', '/bin',
     '/sbin', '/lib', '/lib64', '/efi', '/snap', '/root', '/run',
     '/lost+found', // 注：/opt /srv 不拦（第三方软件部署目录，与 agent 端黑名单同步）
   ];
+  const WIN_SYSTEM_ROOT_DIRS = [
+    'windows', 'program files', 'program files (x86)', 'programdata',
+    'perflogs', 'recovery', '$recycle.bin', 'system volume information',
+  ];
   function isSystemPath(path) {
-    if (!path || !path.startsWith('/')) return true; // 相对路径按受保护处理
+    if (!path) return true; // 相对路径按受保护处理
+    const s = String(path);
+    // Windows 盘符路径分支
+    const m = s.match(/^([A-Za-z]:)[\\/](.*)$/);
+    if (m) {
+      const segs = [];
+      for (const seg of m[2].split(/[\\/]/)) {
+        if (seg === '' || seg === '.') continue;
+        if (seg === '..') {
+          if (!segs.pop()) return true; // 越过驱动器根 → 受保护
+        } else segs.push(seg);
+      }
+      if (segs.length === 0) return true; // 驱动器根本身
+      const first = segs[0].toLowerCase();
+      return WIN_SYSTEM_ROOT_DIRS.includes(first);
+    }
+    // Unix 绝对路径（或无盘符输入 → fail closed）
+    if (!s.startsWith('/')) return true;
     const parts = [];
-    for (const seg of path.split('/')) {
+    for (const seg of s.split('/')) {
       if (seg === '' || seg === '.') continue;
       if (seg === '..') {
         if (!parts.pop()) return true; // 越根 → 受保护
@@ -244,7 +279,7 @@
     }
     const norm = '/' + parts.join('/');
     if (norm === '/') return true;
-    return SYSTEM_PATH_PREFIXES.some((s) => norm === s || norm.startsWith(s + '/'));
+    return SYSTEM_PATH_PREFIXES.some((p) => norm === p || norm.startsWith(p + '/'));
   }
 
   // 脚本/CSS 懒加载（首屏不拉 vendor 大文件：xterm 283KB 仅终端用、Chart.js 200KB 仅监控用）。

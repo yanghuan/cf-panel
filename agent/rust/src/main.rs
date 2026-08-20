@@ -1,7 +1,9 @@
 // cf-panel agent（Rust 版）——纯 Shell agent.sh 的对等实现
 // 功能：控制通道（断线重连）→ 监控上报 + 终端 PTY + 文件管理；信号清理
+// 跨平台：Linux 原生 /proc 指标；Windows/macOS 经 sysinfo（见 metrics/ 子模块与 platform.rs）
 mod blocking;
 mod metrics;
+mod platform;
 mod session;
 
 use std::error::Error;
@@ -51,9 +53,20 @@ fn read_config() -> Config {
         // 磁盘统计强制保留的 fstype（逗号分隔）：默认排除虚拟/内存与网络文件系统，
         // 如挂载 OneDrive 的 fuse.rclone 想计入统计则配置 DISK_FSTYPE_INCLUDE=fuse.rclone
         disk_fstype_include: std::env::var("DISK_FSTYPE_INCLUDE").unwrap_or_default(),
-        tmp_dir: std::env::var("AGENT_TMPDIR").unwrap_or_else(|_| format!("/tmp/cfpanel-{slug}")),
-        log_file: std::env::var("AGENT_LOG")
-            .unwrap_or_else(|_| format!("/tmp/cfpanel-{slug}-agent.log")),
+        // 平台临时目录基址：Linux 固定 /tmp（与 agent.sh 历史一致），
+        // Windows 用 %TEMP%（C:\Users\<u>\AppData\Local\Temp）
+        tmp_dir: std::env::var("AGENT_TMPDIR").unwrap_or_else(|_| {
+            platform::tmp_base()
+                .join(format!("cfpanel-{slug}"))
+                .to_string_lossy()
+                .into_owned()
+        }),
+        log_file: std::env::var("AGENT_LOG").unwrap_or_else(|_| {
+            platform::tmp_base()
+                .join(format!("cfpanel-{slug}-agent.log"))
+                .to_string_lossy()
+                .into_owned()
+        }),
         log_max: std::env::var("AGENT_LOG_MAX")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -631,16 +644,18 @@ async fn dispatch(
                 // 丢弃，不存在"部分输出"），DO 定时器仅防悬挂。
                 // 防孤儿：process_group(0) 让子进程成为新进程组组长，超时后 kill(-pid) 连同
                 // 孙进程一并清理（与终端会话 cleanup 的进程组语义一致，见 session.rs）。
-                let mut child = match tokio::process::Command::new("sh")
-                    .arg("-c")
-                    .arg(&command)
+                // 跨平台：Unix 进程组（setsid + kill(-pgid)）/ Windows Job Object（terminate 整树）
+                let mut cmd = tokio::process::Command::new(platform::EXEC_SHELL);
+                for a in platform::exec_shell_args() {
+                    cmd.arg(a);
+                }
+                cmd.arg(&command)
                     .stdin(std::process::Stdio::null())
                     .stdout(std::process::Stdio::piped())
                     .stderr(std::process::Stdio::piped())
-                    .process_group(0)
-                    .kill_on_drop(true)
-                    .spawn()
-                {
+                    .kill_on_drop(true);
+                platform::set_new_process_group(cmd.as_std_mut());
+                let mut child = match cmd.spawn() {
                     Ok(c) => c,
                     Err(e) => {
                         // spawn 失败（如 fork 资源不足）：立即回执，无需等待
@@ -658,6 +673,8 @@ async fn dispatch(
                     }
                 };
                 let pid = child.id().unwrap_or(0);
+                #[cfg(windows)]
+                platform::attach_job(pid); // Windows：spawn 后挂 Job Object（树终止依赖）
                 // 手动收集 stdout/stderr（timeout 到期时随 future drop 丢弃，无部分输出语义）
                 let mut out_pipe = child.stdout.take();
                 let mut err_pipe = child.stderr.take();
@@ -682,12 +699,15 @@ async fn dispatch(
                 })
                 .await;
                 let (stdout, stderr, exit_code, timed_out) = match out {
-                    Ok((o, e, Ok(status))) => (
-                        String::from_utf8_lossy(&o).into_owned(),
-                        String::from_utf8_lossy(&e).into_owned(),
-                        status.code().unwrap_or(-1),
-                        false,
-                    ),
+                    Ok((o, e, Ok(status))) => {
+                        platform::detach_job(pid); // 正常退出：释放 Job 表项与句柄（Windows）
+                        (
+                            String::from_utf8_lossy(&o).into_owned(),
+                            String::from_utf8_lossy(&e).into_owned(),
+                            status.code().unwrap_or(-1),
+                            false,
+                        )
+                    }
                     Ok((o, _e, Err(w))) => (
                         String::from_utf8_lossy(&o).into_owned(),
                         format!("wait failed: {w}"),
@@ -695,13 +715,10 @@ async fn dispatch(
                         false,
                     ),
                     Err(_) => {
-                        // 超时：kill 整个进程组（SIGKILL 不可忽略，孙进程一并清理），再 wait 回收防僵尸。
+                        // 超时：终止整棵进程树（Unix SIGKILL 进程组 / Windows TerminateJobObject，
+                        // 孙进程一并清理），再 wait 回收防僵尸。
                         // wait 加短超时：D 状态进程收不到 SIGKILL，裸 wait 会永久挂起本任务
-                        if pid > 0 {
-                            unsafe {
-                                libc::kill(-(pid as i32), libc::SIGKILL);
-                            }
-                        }
+                        platform::kill_tree(pid);
                         let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
                         (
                             String::new(),
@@ -868,20 +885,28 @@ async fn main() {
     let file_sessions: Arc<Mutex<std::collections::HashSet<String>>> =
         Arc::new(Mutex::new(Default::default()));
 
-    // 信号：SIGTERM/SIGINT → 清理退出
+    // 信号：SIGTERM/SIGINT（Windows 为 Ctrl+C/Ctrl+Break/关窗）→ 清理退出
     let shutdown = Arc::new(Notify::new());
     {
         let shutdown = shutdown.clone();
         tokio::spawn(async move {
-            let mut sigterm =
-                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                    .expect("sigterm");
-            let mut sigint =
-                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
-                    .expect("sigint");
-            tokio::select! {
-                _ = sigterm.recv() => {}
-                _ = sigint.recv() => {}
+            #[cfg(unix)]
+            {
+                let mut sigterm =
+                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                        .expect("sigterm");
+                let mut sigint =
+                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+                        .expect("sigint");
+                tokio::select! {
+                    _ = sigterm.recv() => {}
+                    _ = sigint.recv() => {}
+                }
+            }
+            #[cfg(windows)]
+            {
+                // ctrl_c 覆盖 Ctrl+C 与 Ctrl+Break；关窗/注销由 CONSOLE_CONTROL 处理器兜底
+                let _ = tokio::signal::ctrl_c().await;
             }
             log("shutdown signal received");
             shutdown.notify_waiters();

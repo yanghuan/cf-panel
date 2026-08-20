@@ -66,26 +66,18 @@ impl TermSession {
             pixel_width: 0,
             pixel_height: 0,
         })?;
-        // shell 探测 $SHELL → /bin/bash → /bin/sh（busybox/Alpine/OpenWrt 无 bash 时终端仍可用；
-        // 显式声明 xterm-256color：systemd 环境无 TERM 时 TUI 程序检测不到终端类型会输出一屏立即退出）
-        let shell = std::env::var("SHELL")
-            .ok()
-            .filter(|s| !s.is_empty() && std::path::Path::new(s).exists())
-            .unwrap_or_else(|| {
-                // Alpine/busybox/OpenWrt 无 bash：/bin/sh 即 ash（busybox applet），绝对路径避免 PATH 依赖
-                if std::path::Path::new("/bin/bash").exists() {
-                    "/bin/bash".to_string()
-                } else if std::path::Path::new("/bin/sh").exists() {
-                    "/bin/sh".to_string()
-                } else {
-                    "sh".to_string()
-                }
-            });
+        // shell 探测跨平台收口（Unix: $SHELL→bash→sh；Windows: powershell→cmd）；
+        // 显式声明 xterm-256color：systemd 环境无 TERM 时 TUI 程序检测不到终端类型会输出一屏立即退出
+        let shell = crate::platform::terminal_shell();
         let mut cmd = CommandBuilder::new(&shell);
-        cmd.arg("-i");
+        for a in crate::platform::terminal_shell_args() {
+            cmd.arg(a);
+        }
         cmd.env("TERM", "xterm-256color");
         let child = pair.slave.spawn_command(cmd)?;
         let child_pid = child.process_id().unwrap_or(0);
+        #[cfg(windows)]
+        crate::platform::attach_job(child_pid); // Windows：shell 及其子进程整树随 job 终止
         drop(pair.slave);
         let writer = pair.master.take_writer()?;
         Ok(TermSession {
@@ -110,20 +102,16 @@ impl TermSession {
         }
     }
 
-    // 会话结束清理：kill 进程组（bash 由 portable-pty setsid 启动，负 PID 即整组）。
-    // 幂等：首调 kill 后 PID 即释放，双调用再 kill(-pid) 可能命中被复用的进程组——
+    // 会话结束清理：终止进程树（Unix: portable-pty setsid 启动 shell，kill(-pgid, SIGHUP) 整组；
+    // Windows: Job Object 终止整树）。
+    // 幂等：首调 kill 后 PID 即释放，双调用再杀可能命中被复用的进程组——
     // 用 AtomicBool 保证 cleanup 只执行一次
     pub async fn cleanup(&self) {
         if self.cleaned.swap(true, std::sync::atomic::Ordering::SeqCst) {
             return;
         }
         self.alive.store(false, std::sync::atomic::Ordering::SeqCst); // 会话结束标记
-        #[cfg(unix)]
-        if self.child_pid > 0 {
-            unsafe {
-                libc::kill(-(self.child_pid as i32), libc::SIGHUP);
-            }
-        }
+        crate::platform::hangup_tree(self.child_pid);
         let mut child = self.child.lock().await;
         if let Some(c) = child.take() {
             // kill+wait 是阻塞调用：D 状态子进程收不到信号、wait 会永久挂住，
@@ -404,7 +392,7 @@ pub async fn run_file_session(cfg: Config, sid: String) {
     // 断线/会话结束：清理本会话创建的临时文件（.upload.{id} + 目录打包 dl-{sid}.zip）
     let _ = std::fs::remove_file(format!(
         "{}/dl-{sid}.zip",
-        cfg.tmp_dir.trim_end_matches('/')
+        cfg.tmp_dir.trim_end_matches(['/', '\\'])
     ));
     // Mutex poison 容忍
     if let Ok(tmp) = created.lock() {
@@ -419,6 +407,9 @@ pub async fn run_file_session(cfg: Config, sid: String) {
 // 定位：文件管理器从严屏蔽；操作系统目录的特殊需求走终端 shell 完成。
 // 分两层：词法层（is_system_path，纯内存零 IO，async 上下文安全）与真实路径层
 //（is_system_path_resolved，防符号链接写穿，含文件系统调用，仅限 blocking 上下文）。
+// 路径模型按平台双实现：Unix 为 / 绝对路径 + FHS 目录黑名单；
+// Windows 为盘符路径（C:\，分隔符统一 \，大小写不敏感）+ 驱动器根一级目录黑名单。
+#[cfg(unix)]
 const SYSTEM_PATHS: &[&str] = &[
     "/proc",
     "/sys",
@@ -441,9 +432,25 @@ const SYSTEM_PATHS: &[&str] = &[
     // 恶意场景（传二进制+执行）走终端 shell 本就可行，拦截不增加安全性（防误操作威胁模型）
 ];
 
-// 词法归一化：要求绝对路径；折叠重复 /；解析 . 与 .. 组件。
-// 返回 None 表示无法归一（相对路径、.. 越过根）——调用方一律 fail closed 拒绝，
-// 否则 "//etc/x"、"/home/../etc/x"、"etc/x"（agent cwd=/ 时）均可词法绕过黑名单
+// Windows：驱动器根下的一级目录黑名单（任意盘符；大小写不敏感比较）。
+// 语义与 Unix 黑名单对齐：系统目录/程序目录拦截，用户目录（C:\Users\...，等同 /home）放行。
+// 注：Program Files 不拦会挡住"上传软件部署"——但 Unix 侧 /usr /opt 的取舍里 /opt 放行了；
+// Windows 程序默认装 Program Files，删除/覆盖正在运行的系统组件风险高，从拦截（fail closed）。
+#[cfg(windows)]
+const WIN_SYSTEM_ROOT_DIRS: &[&str] = &[
+    "Windows",
+    "Program Files",
+    "Program Files (x86)",
+    "ProgramData",
+    "PerfLogs",
+    "Recovery",
+    "$Recycle.Bin",
+    "System Volume Information",
+];
+
+// 词法归一化：要求绝对路径；折叠重复分隔符；解析 . 与 .. 组件。
+// 返回 None 表示无法归一（相对路径、.. 越过根、无盘符/UNC）——调用方一律 fail closed 拒绝。
+#[cfg(unix)]
 fn normalize_abs(path: &str) -> Option<String> {
     if !path.starts_with('/') {
         return None;
@@ -464,10 +471,47 @@ fn normalize_abs(path: &str) -> Option<String> {
     Some(format!("/{}", parts.join("/")))
 }
 
+// Windows 词法归一化：盘符路径（C:\ 或 C:/ 均接受，统一为 C:\ 大写盘符 + \ 分隔）。
+// UNC（\\server\share）与相对路径 → None（fail closed：文件管理协议不使用 UNC）。
+// "C:\Users\x\..\y" → "C:\Users\y"；"C:\" → 根 "C:\"；越根（C:\..）→ None。
+#[cfg(windows)]
+fn normalize_abs(path: &str) -> Option<String> {
+    let b = path.as_bytes();
+    if b.len() < 2 || !b[0].is_ascii_alphabetic() || b[1] != b':' {
+        return None; // 无盘符（含 UNC / 相对路径 / 前导空格等）
+    }
+    let drive = path[..1].to_ascii_uppercase();
+    let rest = path[2..].trim_start_matches(['/', '\\']);
+    let mut parts: Vec<&str> = Vec::new();
+    for seg in rest.split(['/', '\\']) {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                parts.pop()?; // 越过驱动器根 → None 拒绝
+            }
+            // 设备命名空间（COM1/LPT1/CON/NUL 等）与保留字符拦截：防 Win32 设备路径逃逸
+            _ => {
+                if seg
+                    .chars()
+                    .any(|c| matches!(c, '<' | '>' | '"' | '|' | '?' | '*'))
+                {
+                    return None;
+                }
+                parts.push(seg);
+            }
+        }
+    }
+    if parts.is_empty() {
+        return Some(format!("{drive}:\\")); // 驱动器根
+    }
+    Some(format!("{drive}:\\{}", parts.join("\\")))
+}
+
 // 系统路径拦截统一提示（前端 toast 直接展示该文本）
 pub const SYSTEM_PATH_ERR: &str =
     "system path is protected (安全拦截：系统目录受保护，如需操作请使用终端 Shell)";
 
+#[cfg(unix)]
 fn lexical_system_hit(norm: &str) -> bool {
     if norm.is_empty() {
         return true; // 根目录
@@ -475,6 +519,21 @@ fn lexical_system_hit(norm: &str) -> bool {
     SYSTEM_PATHS
         .iter()
         .any(|s| norm == *s || norm.starts_with(&format!("{s}/")))
+}
+
+// Windows：norm 形如 "C:\Windows\System32"。驱动器根本身（"C:\"）拦截（等同 Unix 拦 "/"）；
+// 其余按根下第一级目录名（大小写不敏感）匹配黑名单——任意盘符生效（Windows 装在 D: 的
+// 少数场景同样受保护；用户目录 C:\Users 放行，等同 Unix /home 放行）
+#[cfg(windows)]
+fn lexical_system_hit(norm: &str) -> bool {
+    let parts: Vec<&str> = norm.split('\\').collect();
+    if parts.len() <= 1 {
+        return true; // 驱动器根 C:\（split 后为 ["C:"]）
+    }
+    let root_dir = parts[1];
+    WIN_SYSTEM_ROOT_DIRS
+        .iter()
+        .any(|d| root_dir.eq_ignore_ascii_case(d))
 }
 
 pub fn is_system_path(path: &str) -> bool {
@@ -503,6 +562,12 @@ pub fn is_system_path_resolved(path: &str) -> bool {
             for t in tail.iter().rev() {
                 full.push(t);
             }
+            // Windows：canonicalize 返回 verbatim 前缀（\\?\C:\...），剥离后才能过词法判定
+            #[cfg(windows)]
+            let full = {
+                let s = full.to_string_lossy().into_owned();
+                std::path::PathBuf::from(s.trim_start_matches(r"\\?\"))
+            };
             return is_system_path(&full.to_string_lossy());
         }
         match cur.file_name() {
@@ -725,7 +790,7 @@ async fn file_zip(path: &str, sid: &str, tmp_dir: &str) -> Result<(String, u64),
             FILE_LIMIT as f64 / 1_048_576.0
         ));
     }
-    let zip_path = format!("{}/dl-{sid}.zip", tmp_dir.trim_end_matches('/'));
+    let zip_path = format!("{}/dl-{sid}.zip", tmp_dir.trim_end_matches(['/', '\\']));
     let path = path.to_string();
     // zip 为只读打包（供下载），允许系统目录——与前端一致：系统路径保留"下载"，
     // 仅写操作（write/rename/delete）被拒；symlink 由 zip 内部跳过（不跟随）
@@ -890,7 +955,10 @@ async fn file_move(path: &str, dest: &str) -> String {
         }
         match std::fs::rename(&path, &dest) {
             Ok(()) => Ok(dest.clone()),
-            Err(e) if e.raw_os_error() == Some(libc::EXDEV) => {
+            // 跨卷判定用 ErrorKind（跨平台）：Unix 映射 EXDEV(18)，Windows 映射
+            // ERROR_NOT_SAME_DEVICE(17)——按 raw_os_error==EXDEV 比对在 Windows 永不命中，
+            // 跨卷移动会直接失败而不回退 copy+delete
+            Err(e) if e.kind() == std::io::ErrorKind::CrossesDevices => {
                 // 跨分区：仅文件回退 copy+delete（大小上限同 zip/upload）
                 if meta.is_dir() {
                     return Err(
@@ -1330,6 +1398,8 @@ mod tests {
         assert!(wildcard_match("*", "anything"));
     }
 
+    // Unix 路径模型：黑名单命中/放行/词法绕过（Windows 等价测试见下方 cfg(windows) 块）
+    #[cfg(unix)]
     #[test]
     fn system_path_check() {
         // 系统目录及其子路径拒绝
@@ -1363,6 +1433,9 @@ mod tests {
         assert!(!is_system_path("/mnt/data/./x"));
     }
 
+    // 符号链接写穿（std::os::unix::fs）——Windows 无该 API，对应 NTFS junction 场景由
+    // canonicalize 路径层覆盖（词法层测试见 system_path_check_windows）
+    #[cfg(unix)]
     #[test]
     fn system_path_resolved_blocks_symlink_traversal() {
         // 静态符号链接写穿：用户目录内 link -> /etc，经 link/x 操作等价 /etc/x → 拒绝
@@ -1388,35 +1461,40 @@ mod tests {
         let _ = std::fs::remove_dir(&tmp);
     }
 
+    // 词法层在两个平台均 fail closed（无盘符/相对路径 → 拒绝）；
+    // symlink 写穿部分仅 Unix（见上）
     #[test]
     fn write_bytes_rejects_system_path() {
         let created = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
-        // 词法层：直接系统路径
+        // 词法层：直接系统路径（Unix 黑名单 / Windows 无盘符 fail closed，两平台均拒）
         let r = write_bytes("/etc/cfp-test", 0, b"x", true, "id1", &created);
         assert!(
             r.contains("system path is protected"),
             "直接系统路径拒绝: {r}"
         );
-        // 词法层：绕过形态
+        // 词法层：绕过形态（同上，两平台均拒）
         let r = write_bytes("//etc/cfp-test", 0, b"x", true, "id2", &created);
         assert!(
             r.contains("system path is protected"),
             "重复斜杠绕过拒绝: {r}"
         );
-        // 真实路径层：symlink 写穿（tmp/link -> /etc）
-        let tmp = std::env::temp_dir().join(format!("cfp-wtest-{}", std::process::id()));
-        std::fs::create_dir_all(&tmp).unwrap();
-        let link = tmp.join("lnk");
-        let _ = std::fs::remove_file(&link);
-        std::os::unix::fs::symlink("/etc", &link).unwrap();
-        let via = link.join("cfp-test");
-        let r = write_bytes(via.to_str().unwrap(), 0, b"x", true, "id3", &created);
-        assert!(
-            r.contains("system path is protected"),
-            "symlink 写穿拒绝: {r}"
-        );
-        let _ = std::fs::remove_file(&link);
-        let _ = std::fs::remove_dir_all(&tmp);
+        // 真实路径层：symlink 写穿（tmp/link -> /etc），仅 Unix
+        #[cfg(unix)]
+        {
+            let tmp = std::env::temp_dir().join(format!("cfp-wtest-{}", std::process::id()));
+            std::fs::create_dir_all(&tmp).unwrap();
+            let link = tmp.join("lnk");
+            let _ = std::fs::remove_file(&link);
+            std::os::unix::fs::symlink("/etc", &link).unwrap();
+            let via = link.join("cfp-test");
+            let r = write_bytes(via.to_str().unwrap(), 0, b"x", true, "id3", &created);
+            assert!(
+                r.contains("system path is protected"),
+                "symlink 写穿拒绝: {r}"
+            );
+            let _ = std::fs::remove_file(&link);
+            let _ = std::fs::remove_dir_all(&tmp);
+        }
     }
 
     #[test]
@@ -1574,6 +1652,34 @@ mod tests {
                 .contains("already exists")
         );
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // Windows 路径模型：盘符归一化（大小写/正反斜杠/.. 解析）、系统目录黑名单（大小写不敏感、
+    // 任意盘符）、驱动器根拦截、越根/无盘符/保留字符 fail closed
+    #[cfg(windows)]
+    #[test]
+    fn system_path_check_windows() {
+        // 系统目录拒绝（大小写不敏感 / 正反斜杠混用 / 任意盘符）
+        assert!(is_system_path(r"C:\Windows\System32"));
+        assert!(is_system_path(r"c:\windows"));
+        assert!(is_system_path("C:/Program Files/app"));
+        assert!(is_system_path(r"D:\ProgramData\x"));
+        assert!(is_system_path(r"C:\$Recycle.Bin"));
+        // 驱动器根本身拦截（等同 Unix 拦 "/"），但子目录按黑名单判定
+        assert!(is_system_path(r"C:\"));
+        // 用户目录放行（等同 Unix /home）
+        assert!(!is_system_path(r"C:\Users\me\app"));
+        assert!(!is_system_path(r"D:\data"));
+        // 归一化：.. 回溯、重复分隔符折叠
+        assert!(!is_system_path(r"C:\Users\me\..\me"));
+        assert!(is_system_path(r"C:\Users\me\..\..\Windows"));
+        assert!(!is_system_path(r"C:\\Users\\me"));
+        // fail closed：无盘符（Unix 风格路径/相对路径）、越根、UNC、保留字符
+        assert!(is_system_path("/etc/passwd"));
+        assert!(is_system_path(r"Users\me"));
+        assert!(is_system_path(r"C:\..\..\Windows"));
+        assert!(is_system_path(r"\\server\share"));
+        assert!(is_system_path(r"C:\data<a>b"));
     }
 
     #[test]

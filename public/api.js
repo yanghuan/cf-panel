@@ -119,8 +119,16 @@
         if (this._zipCleanup) this._zipCleanup = false;
         else if (this.h.onDeleteDone) this.h.onDeleteDone();
       } else if (j.type === 'error') {
-        // 读取失败时复位编辑器状态——否则 editState 残留导致"已有编辑读取进行中"永久卡死
+        // 失败复位全部传输状态——否则残留状态让下次上传/下载被"已有传输进行中"挡住
+        // （取消按钮已可见但实际无传输，用户需额外操作才能重试）；editState 同理
+        const wasUploading = !!this.uploadState;
+        const wasDownloading = !!this.downloadState;
         if (this.editState) this.editState = null;
+        this.uploadState = null;
+        this.downloadState = null;
+        // 通知 UI 隐藏取消按钮（复用 canceled 回调路径，语义为"传输已终止"）
+        if (wasUploading && this.h.onUploadCanceled) this.h.onUploadCanceled();
+        if (wasDownloading && this.h.onDownloadCanceled) this.h.onDownloadCanceled();
         if (this.h.onError) this.h.onError(j.message);
       }
     }
@@ -192,7 +200,7 @@
     // 分段 read 拉取完成后发 delete 清理临时文件（文件名用目录名.zip）
     zipDownload(path) {
       if (this.downloadState) { if (this.h.onError) this.h.onError('已有下载进行中，请等待完成'); return; }
-      this._zipBaseName = (CfUtils.fileJoin('', path).split('/').pop() || 'download') + '.zip';
+      this._zipBaseName = (CfUtils.fileBase(path) || 'download') + '.zip';
       this.send({ type: 'zip', path });
     }
     _startZipDownload(zipPath, size) {

@@ -2,7 +2,7 @@
 (() => {
   'use strict';
   // 工具函数与 <cf-ip> 组件从 utils.js 解构；api 层从 api.js 解构（index.html 中均须先加载）
-  const { $, escapeHtml, fmtBytes, fileJoin, fileParent, downsample, lockScroll, unlockScroll,
+  const { $, escapeHtml, fmtBytes, fileJoin, fileParent, fileBase, downsample, lockScroll, unlockScroll,
           MONITOR_STEP_MAX, MONITOR_RANGE_LABEL, MONITOR_COLORS,
           GEO_PRIVATE, setGeoEnabled, flagHtml, osIconHtml, isSystemPath, isBinaryExt, loadScript, loadCss, loadMonaco, loadMarkdown, geoLookup, IdleGuard } = CfUtils;
   const { api, setTokenGetter, FileSession, TermSession, PushSession } = CfApi;
@@ -725,7 +725,7 @@
         // Blob 直接引用分块数组（不复制），避免 500MB 级文件的二次内存拷贝
         const a = document.createElement('a');
         a.href = URL.createObjectURL(new Blob(parts));
-        a.download = dlName || path.split('/').pop() || 'download';
+        a.download = dlName || CfUtils.fileBase(path) || 'download';
         document.body.appendChild(a);
         a.click();
         a.remove();
@@ -947,7 +947,7 @@
       return;
     }
     const text = editorGetValue();
-    const name = editorPath.split('/').pop() || 'edit.tmp';
+    const name = CfUtils.fileBase(editorPath) || 'edit.tmp';
     // File 构造（Blob + name）：复用上传状态机分块写回；显式 path（编辑期间 cwd 可能已变化）
     fileSess.upload(new File([text], name, { type: 'text/plain' }), { overwrite: true, path: editorPath });
     closeFileEditor();
@@ -1059,7 +1059,8 @@
   function confirmSelectorMove() {
     if (!fileSelector) return;
     const name = $('#sel-name').value.trim();
-    if (!name || name.includes('/')) return toast('文件名不能为空且不含 /');
+    // 两种分隔符都拒绝（Windows '\' 越目录；与 agent 端 file_rename/file_move 校验同步）
+    if (!name || name.includes('/') || name.includes('\\')) return toast('文件名不能为空且不含路径分隔符');
     const dest = fileJoin(fileSelector.cwd, name);
     if (dest === fileSelector.srcPath) return toast('与源位置相同');
     fileSess.move(fileSelector.srcPath, dest);
@@ -2038,9 +2039,10 @@
     const ren = e.target.closest('.f-act-ren');
     if (ren) {
       closeRowMenus();
-      const old = ren.dataset.path.split('/').pop();
+      const old = CfUtils.fileBase(ren.dataset.path);
       // 原生 prompt() → promptDialog（对话框体系一致，回车确认/Esc 取消）
       promptDialog(`重命名：${ren.dataset.path}（仅改名，不支持跨目录）`, old, (name) => {
+        if (name.includes('/') || name.includes('\\')) return toast('名称不能包含路径分隔符');
         fileSess.rename(ren.dataset.path, name);
       });
       return;
@@ -2048,7 +2050,7 @@
     const mv = e.target.closest('.f-act-mv');
     if (mv) {
       closeRowMenus();
-      openFileSelector(mv.dataset.path, mv.dataset.path.split('/').pop(), mv.dataset.type === 'dir');
+      openFileSelector(mv.dataset.path, CfUtils.fileBase(mv.dataset.path), mv.dataset.type === 'dir');
       return;
     }
     const ed = e.target.closest('.f-act-edit');

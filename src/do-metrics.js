@@ -531,7 +531,9 @@ export class MetricsDO {
     try {
       const keys = await this.listStorage('alert:offline:');
       for (const k of keys) {
-        this.offlineState.set(k.name.slice('alert:offline:'.length), k.value);
+        // 键归一为 number：读写侧用 s.id（D1 返回 number）——Map 按 SameValueZero 比较，
+        // 字符串 "12" 与数字 12 不相等，不归一会导致 evict 恢复后首轮对已离线机器重复告警
+        this.offlineState.set(Number(k.name.slice('alert:offline:'.length)), k.value);
       }
     } catch { /* 加载失败按全在线处理 */ }
   }

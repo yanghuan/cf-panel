@@ -40,6 +40,13 @@
     if (/^[A-Za-z]:$/.test(parent)) parent += '\\'; // C:\Users → C:（补回根斜杠）
     return parent;
   }
+  // basename 提取（跨平台）：同时按 / 与 \ 取最后一段——Windows agent 返回 C:\Users\me\a.txt，
+  // 仅按 / 切分会取到整条路径（下载文件名/重命名默认值/移动源名全部错位）
+  function fileBase(p) {
+    const s = String(p || '');
+    const i = Math.max(s.lastIndexOf('/'), s.lastIndexOf('\\'));
+    return i < 0 ? s : s.slice(i + 1);
+  }
 
   // 滚动锁计数栈：嵌套弹窗（文件弹窗内开新建目录 promptDialog）关闭内层时外层仍锁——
   // 无计数的赋值式会在关内层时误解锁背景
@@ -471,7 +478,7 @@
 
   // 导出（app.js 开头解构）
   window.CfUtils = {
-    $, escapeHtml, fmtBytes, fileJoin, fileParent, downsample,
+    $, escapeHtml, fmtBytes, fileJoin, fileParent, fileBase, downsample,
     lockScroll, unlockScroll,
     MONITOR_STEP_MAX, MONITOR_RANGE_LABEL, MONITOR_COLORS,
     GEO_PRIVATE, geoLookup, flagHtml, osIconHtml, isSystemPath, isBinaryExt, loadScript, loadCss, loadMonaco, loadMarkdown, setGeoEnabled, IdleGuard,

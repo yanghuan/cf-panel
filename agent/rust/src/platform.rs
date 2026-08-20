@@ -150,16 +150,41 @@ pub mod imp {
             CloseHandle(h);
             if let Ok(mut jobs) = JOBS.lock() {
                 if jobs.len() > 1024 {
-                    // 上限清理必须 CloseHandle：句柄是 isize 数值，直接 clear 只丢数值
-                    // 不关内核对象 → 句柄泄漏（快采下自定义指标每 5s 一个 job，日泄漏数万）
-                    for (_, j) in jobs.drain() {
-                        unsafe {
-                            CloseHandle(j as *mut std::ffi::c_void);
+                    // 上限清理只关「无存活进程」的 job：job 设有 KILL_ON_JOB_CLOSE，关闭
+                    // 最后一个句柄会终止 job 内全部仍在运行的进程——全部 drain 会误杀
+                    // 存活中的 exec/自定义指标/终端 shell（症状为"终端莫名断开"）。
+                    // QueryInformationJobObject 查 ActiveProcesses：0 才关；查询失败保留
+                    // （宁可泄漏一个句柄也不误杀，泄漏由 detach/kill 正常路径回收）
+                    let mut retained = std::collections::HashMap::new();
+                    for (p, j) in jobs.drain() {
+                        if job_has_active_processes(j as *mut std::ffi::c_void) {
+                            retained.insert(p, j);
+                        } else {
+                            unsafe {
+                                let _ = CloseHandle(j as *mut std::ffi::c_void);
+                            }
                         }
                     }
+                    *jobs = retained;
                 }
                 jobs.insert(pid, job as isize);
             }
+        }
+    }
+
+    /// job 内是否仍有存活进程（Accounting 的 ActiveProcesses）；查询失败按「有存活」处理
+    /// （保守方向：误判为存活只是多保留一个句柄，误判为退出会杀掉运行中的进程树）
+    fn job_has_active_processes(job: *mut std::ffi::c_void) -> bool {
+        unsafe {
+            let mut info: JOBOBJECTBASICACCOUNTINGINFORMATION = std::mem::zeroed();
+            let ok = QueryInformationJobObject(
+                job,
+                JobObjectBasicAccountingInformation,
+                &mut info as *mut _ as *mut std::ffi::c_void,
+                std::mem::size_of::<JOBOBJECTBASICACCOUNTINGINFORMATION>() as u32,
+                std::ptr::null_mut(),
+            );
+            ok != 0 && info.ActiveProcesses > 0
         }
     }
 
@@ -239,10 +264,25 @@ pub mod imp {
         PeakProcessMemoryUsed: usize,
         PeakJobMemoryUsed: usize,
     }
+    #[allow(non_snake_case)]
+    #[repr(C)]
+    struct JOBOBJECTBASICACCOUNTINGINFORMATION {
+        TotalUserTime: i64,
+        TotalKernelTime: i64,
+        ThisPeriodTotalUserTime: i64,
+        ThisPeriodTotalKernelTime: i64,
+        TotalPageFaultCount: u32,
+        TotalProcesses: u32,
+        ActiveProcesses: u32,
+        TotalTerminatedProcesses: u32,
+        IoInfo: IO_COUNTERS,
+    }
     const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: u32 = 0x2000;
     // Win32 原名 JobObjectExtendedLimitInformation（保留可读性，不按 Rust 常量命名风格改写）
     #[allow(non_upper_case_globals)]
     const JobObjectExtendedLimitInformation: i32 = 9;
+    #[allow(non_upper_case_globals)]
+    const JobObjectBasicAccountingInformation: i32 = 1;
     const PROCESS_ALL_ACCESS: u32 = 0x1F0FFF;
     #[link(name = "kernel32")]
     unsafe extern "system" {
@@ -255,6 +295,13 @@ pub mod imp {
             JobObjectInfoClass: i32,
             lpJobObjectInfo: *const std::ffi::c_void,
             cbJobObjectInfoLength: u32,
+        ) -> i32;
+        fn QueryInformationJobObject(
+            hJob: *mut std::ffi::c_void,
+            JobObjectInfoClass: i32,
+            lpJobObjectInfo: *mut std::ffi::c_void,
+            cbJobObjectInfoLength: u32,
+            lpReturnLength: *mut u32,
         ) -> i32;
         fn AssignProcessToJobObject(
             hJob: *mut std::ffi::c_void,

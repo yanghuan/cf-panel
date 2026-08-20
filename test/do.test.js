@@ -620,6 +620,27 @@ test('MetricsDO: alarm 离线/恢复告警（DO Storage 状态去重）', async 
   }
 });
 
+test('MetricsDO: 离线告警状态跨 evict 恢复不重复告警（storage 键数字归一）', async () => {
+  const env = makeEnv();
+  await insertServer(env, 'k1', 'srv1', { last_seen: Math.floor(Date.now() / 1000) - 1000 });
+  await env.DB.prepare("INSERT INTO kv_json (key, value) VALUES ('settings', ?)")
+    .bind(JSON.stringify({ alerts: { webhook_url: 'https://example.com/hook', offline_after_s: 180 } })).run();
+  // 模拟「上个实例已告警离线并持久化」的 storage：alert:offline:1 = 'off'
+  // （storage 恢复路径 ensureOfflineLoaded 从键名字符串切片——旧实现不归一为 number，
+  //   Map 里挂的是字符串键 "1"，与 checkOfflineAlerts 读写的数字键 s.id 永不匹配）
+  const st = mockState({ 'alert:offline:1': 'off' });
+  const { inst } = mkMetrics(env, st);
+  const cap = captureFetch();
+  try {
+    await inst.alarm(); // evict 后首个 alarm：机器仍离线但状态已持久化为 off
+    assert.equal(cap.calls.length, 0, '已告警过的离线机器恢复状态后不得重复告警');
+    // 状态应为数字键（与 s.id 匹配），storage 持久化值不变
+    assert.equal(inst.offlineState.get(1), 'off');
+  } finally {
+    cap.restore();
+  }
+});
+
 // ---------------- MetricsDO：阈值告警 / 探活告警（/report 顺风车，单实例去重） ----------------
 test('MetricsDO: /report 顺风车触发 CPU 阈值告警，冷却期内抑制', async () => {
   const env = makeEnv();
@@ -1102,6 +1123,76 @@ test('TerminalDO: file_ready 确认后停止 open_file 重发', async (t) => {
     await inst.webSocketMessage(agentWs, JSON.stringify({ type: 'file_ready', stream_id: '0-fid' }));
     t.mock.timers.tick(5000);
     assert.equal(sent.length, 1);
+  } finally {
+    t.mock.timers.reset();
+  }
+});
+
+test('TerminalDO: /rpc/upload 仅 commit 帧回执才 resolve（多分片上传不被首帧提前判定成功）', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  try {
+    const env = makeEnv();
+    const sent = [];
+    const agentWs = { send: (m) => sent.push(m), readyState: 1 };
+    const inst = new TerminalDO(mockState(), env);
+    inst.agents.set(1, agentWs);
+
+    // 100KB body（> 48KB 分片阈值 → 2 个数据帧 + 1 个 commit 帧）。
+    // upload_id 由 DO 随机生成，从实际发出的帧头提取（与生产 agent 收帧回执的时序同构）
+    const resultPromise = inst.fetch(new Request('https://do.internal/rpc/upload?server_id=1&path=/tmp/up.bin', {
+      method: 'POST',
+      body: new Uint8Array(96 * 1024).fill(0x61),
+    }));
+    for (let i = 0; i < 100 && sent.length < 3; i++) {
+      await new Promise((r) => setImmediate(r)); // 等读循环把全部帧发出（mock timers 不拦 setImmediate）
+    }
+    assert.equal(sent.length, 3, '两个数据帧 + 一个 commit 帧');
+    const headOf = (f) => {
+      const u = new Uint8Array(f.buffer ?? f);
+      const nl = u.indexOf(10);
+      return JSON.parse(new TextDecoder().decode(u.subarray(0, nl)));
+    };
+    const heads = sent.map(headOf);
+    const uploadId = heads[0].upload_id;
+    assert.equal(heads.filter((h) => h.commit === false).length, 2, '两个数据帧');
+    assert.equal(heads.filter((h) => h.commit === true).length, 1, '一个 commit 帧');
+
+    // agent 对非 commit 分片帧回执（生产语义：ok:true 仅表示该块写入临时文件）
+    await inst.webSocketMessage(agentWs, JSON.stringify({
+      type: 'upload_result', upload_id: uploadId, ok: true, size: 49152, commit: false,
+    }));
+    // 不得 resolve：清空微任务后仍应 pending
+    let resolvedEarly = false;
+    resultPromise.then(() => { resolvedEarly = true; });
+    await new Promise((r) => setImmediate(r));
+    assert.equal(resolvedEarly, false, '非 commit 帧回执不得提前 resolve（旧实现在此返回假成功）');
+
+    // commit 帧回执 → resolve 成功，size 为最终偏移
+    await inst.webSocketMessage(agentWs, JSON.stringify({
+      type: 'upload_result', upload_id: uploadId, ok: true, size: 98304, commit: true,
+    }));
+    const res = await resultPromise;
+    assert.equal(res.status, 200);
+    const j = await res.json();
+    assert.equal(j.ok, true);
+    assert.equal(j.size, 98304);
+
+    // 失败帧（ok:false）保持立即 resolve 的快速失败语义（未到 commit 即失败）
+    const failPromise = inst.fetch(new Request('https://do.internal/rpc/upload?server_id=1&path=/tmp/up2.bin', {
+      method: 'POST',
+      body: new Uint8Array(10),
+    }));
+    for (let i = 0; i < 100 && sent.length < 4; i++) {
+      await new Promise((r) => setImmediate(r));
+    }
+    const failId = headOf(sent[3]).upload_id;
+    await inst.webSocketMessage(agentWs, JSON.stringify({
+      type: 'upload_result', upload_id: failId, ok: false, error: 'write failed', commit: false,
+    }));
+    const failRes = await failPromise;
+    assert.equal(failRes.status, 400);
+    const fj = await failRes.json();
+    assert.equal(fj.error, 'write failed');
   } finally {
     t.mock.timers.reset();
   }

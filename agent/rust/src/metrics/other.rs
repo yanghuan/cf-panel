@@ -93,9 +93,20 @@ pub async fn collect_disk(_include: &[String]) -> Vec<serde_json::Value> {
     // 枚举放 blocking 线程（与 Linux 版对挂死 NFS 的防御同构）：Windows 上指向
     // 已断开网络驱动器的卷、macOS 上挂起的外置盘，GetDiskFreeSpaceEx/statfs 可阻塞秒级
     let out = crate::blocking::run_blocking(5, disk_snapshot).await;
-    let out = out.unwrap_or_default();
-    *disk_cache().await = Some((now, out.clone()));
-    out
+    match out {
+        Some(v) => {
+            *disk_cache().await = Some((now, v.clone())); // 成功：更新缓存
+            v
+        }
+        None => {
+            // 超时：保留旧值并刷新时间戳（与 Linux 版熔断语义对齐——否则一次超时把缓存
+            // 刷成空数组，断开的网络驱动器场景下 60s 内磁盘信息周期性闪空）
+            let mut c = disk_cache().await;
+            let old = c.as_ref().map(|(_, v)| v.clone());
+            *c = Some((now, old.clone().unwrap_or_default()));
+            old.unwrap_or_default()
+        }
+    }
 }
 
 fn disk_snapshot() -> Vec<serde_json::Value> {
@@ -181,8 +192,11 @@ pub async fn collect_net() -> (u64, u64) {
                 if is_virtual_iface(name) {
                     continue;
                 }
-                rx += data.received();
-                tx += data.transmitted();
+                // 必须用 total_*（自系统启动的累计值）参与差分：received() 是「自上次
+                // refresh 的增量」——对增量再做二次差分得到的是增量的变化率（稳定流量下
+                // 恒 0，突增时虚高尖峰），与 Linux 版 /proc/net/dev 的累计值口径不符
+                rx += data.total_received();
+                tx += data.total_transmitted();
             }
         }
     }

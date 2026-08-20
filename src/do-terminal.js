@@ -278,8 +278,14 @@ export class TerminalDO {
       resolveResult({ ok: false, error: 'upload timed out' });
     }, UPLOAD_TIMEOUT_MS);
     this.pendingUpload.set(uploadId, { resolve: resolveResult, timer });
-    // 大小上限：优先环境变量 UPLOAD_MAX_MB（磁盘耗尽防护）
-    const maxBytes = (Number(this.env.UPLOAD_MAX_MB) || UPLOAD_MAX_DEFAULT / (1024 * 1024)) * 1024 * 1024;
+    // 大小上限：优先环境变量 UPLOAD_MAX_MB（磁盘耗尽防护）。
+    // 显式解析 + 上限校验：`|| 回退` 语义下 UPLOAD_MAX_MB=0（意图"不限制"）会静默变成
+    // 100MB、非数字同样回退——不支持 0=无限（agent 端 FILE_LIMIT 500MB 是绝对上限）
+    const rawMax = Number(this.env.UPLOAD_MAX_MB);
+    const maxMb = Number.isFinite(rawMax) && rawMax > 0
+      ? Math.min(rawMax, UPLOAD_MAX_DEFAULT / (1024 * 1024))
+      : UPLOAD_MAX_DEFAULT / (1024 * 1024);
+    const maxBytes = maxMb * 1024 * 1024;
     try {
       const encoder = new TextEncoder();
       let failed = false; // agent 断连/超限后置位：停止发帧并提前退出读循环
@@ -572,9 +578,12 @@ export class TerminalDO {
             return;
           }
           if (j && j.type === 'upload_result') {
-            // /api/file_upload 结果：resolve 等待中的 /rpc/upload（每个 upload_id 只回执一次，幂等）
+            // /api/file_upload 结果。agent 对每个分片帧都回执（非 commit 帧 ok:true 表示
+            // "该块已写入临时文件"）——只有 commit 帧的回执才代表"文件已 fsync+rename 完成"。
+            // 首帧即 resolve 会在大文件上传中提前返回成功（目标文件尚不存在/后续块写失败
+            // 客户端无从得知）。失败帧（ok:false）保持立即 resolve 的快速失败语义。
             const r = this.pendingUpload.get(j.upload_id);
-            if (r) {
+            if (r && (j.commit === true || !j.ok)) {
               clearTimeout(r.timer);
               this.pendingUpload.delete(j.upload_id);
               r.resolve({ ok: !!j.ok, error: j.error || null, size: j.size || 0 });

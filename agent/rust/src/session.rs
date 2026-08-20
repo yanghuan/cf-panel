@@ -764,7 +764,7 @@ async fn file_zip(path: &str, sid: &str, tmp_dir: &str) -> Result<(String, u64),
         return Err("not a directory".into());
     }
     // 目录大小上限使用 FILE_LIMIT（500 MB），防止 OOM。
-    // 与 collect_zip_entries 同口径：符号链接跳过（M3——此前 metadata() 不跟随链接，
+    // 与 collect_zip_entries 同口径：符号链接跳过（此前 metadata() 不跟随链接，
     // 预检通过后打包 fs::read 跟随链接读取大文件，可绕过 500MB 上限导致 OOM）
     fn walk_dir_size(path: &std::path::Path) -> Result<u64, std::io::Error> {
         let mut size: u64 = 0;
@@ -823,7 +823,14 @@ async fn file_rename(path: &str, new_name: &str) -> String {
         return err_json(SYSTEM_PATH_ERR);
     }
     let new_name = new_name.trim();
-    if new_name.is_empty() || new_name.contains('/') || new_name == "." || new_name == ".." {
+    // 同时拒绝两种分隔符：Windows 上 '\' 是路径分隔符，"..\\..\\Users\\x" 可越出目录
+    //（Unix 文件名含 '\' 合法但极罕见，从严拒绝可接受）；与前端校验同步
+    if new_name.is_empty()
+        || new_name.contains('/')
+        || new_name.contains('\\')
+        || new_name == "."
+        || new_name == ".."
+    {
         return err_json("bad new name");
     }
     let path = path.to_string();
@@ -839,6 +846,11 @@ async fn file_rename(path: &str, new_name: &str) -> String {
             .parent()
             .unwrap_or(std::path::Path::new("/"));
         let target = parent.join(new_name);
+        // 目标路径兜底拦截：仅改名语义下 target 应与源同目录——理论上 new_name 校验
+        //（拒绝两种分隔符）后不可能越出，此层防御纵深覆盖校验遗漏的组合场景
+        if is_system_path(&target.to_string_lossy()) {
+            return Err(SYSTEM_PATH_ERR.into());
+        }
         if target.exists() {
             return Err("target already exists".into());
         }

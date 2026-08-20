@@ -104,7 +104,13 @@ fn validate_wss(wss: &str) -> Result<(), String> {
         } else {
             host_port.split(':').next().unwrap_or(host_port)
         };
-        if host == "127.0.0.1" || host == "localhost" || host == "::1" {
+        // 大小写不敏感（LOCALHOST 等价）+ 尾点剥离（"localhost." 是 DNS 等价的 FQDN）——
+        // 否则合法回环调试会被误判为远程而拒绝明文；严格方向不变（仍只放行回环）
+        let host = host.trim_end_matches('.');
+        if host.eq_ignore_ascii_case("127.0.0.1")
+            || host.eq_ignore_ascii_case("localhost")
+            || host == "::1"
+        {
             return Ok(()); // 本地回环调试/E2E
         }
         return Err(

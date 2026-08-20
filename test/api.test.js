@@ -1186,6 +1186,11 @@ test('MCP：tools/list 与 tools/call', async () => {
   assert.equal(ds.result.isError, false);
   const dsRes = JSON.parse(ds.result.content[0].text);
   assert.equal(dsRes.ok, true);
+
+  // delete_server 缺参：前置校验（区分「缺参」与「目标不存在」，AI 客户端可自纠）
+  const noArg = await (await mcp(env, { token, body: { jsonrpc: '2.0', id: 33, method: 'tools/call', params: { name: 'delete_server', arguments: {} } } })).json();
+  assert.equal(noArg.result.isError, true);
+  assert.match(noArg.result.content[0].text, /必须提供其一/);
 });
 
 test('MCP：坏 JSON → Parse error；协议版本不一致 → HeaderMismatch', async () => {

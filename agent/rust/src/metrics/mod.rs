@@ -268,7 +268,13 @@ pub async fn collect_report(cfg: &Config) -> Option<String> {
     let (cpu, mem, load, conns, net, info, probes, custom, disk, disk_io) = tokio::join!(
         collect_cpu(),
         async { collect_mem() },
-        async { collect_load() },
+        // 进程快照放 blocking（Windows CreateToolhelp32Snapshot 5-30ms、上千进程更久；
+        // Linux /proc 毫秒级，包 blocking 无行为差异——执行位置统一到线程池）
+        async {
+            crate::blocking::run_blocking(5, collect_load)
+                .await
+                .unwrap_or((0.0, 0.0, 0.0, 0, 0))
+        },
         collect_conns(),
         collect_net(),
         collect_info(),

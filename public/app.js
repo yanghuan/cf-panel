@@ -756,9 +756,11 @@
     fileServerId = serverId;
     fileServerName = serverName;
     $('#file-title').textContent = `文件管理 · ${serverName}`;
-    // 恢复该服务器上次浏览目录（列表成功时持久化；格式异常则回退根目录）
+    // 恢复该服务器上次浏览目录（列表成功时持久化；格式异常则回退根目录）。
+    // 绝对路径判定兼容 Windows 盘符（C:\Users\me）——仅认 / 会把 Windows 上次目录
+    // 回退成 "/"，在 Windows agent 上被 fail closed 判为系统路径导致列表为空
     const saved = localStorage.getItem(`cfpanel_file_cwd:${serverId}`);
-    const cwd = saved && saved.startsWith('/') ? saved : '/';
+    const cwd = saved && /^(?:[/]|[A-Za-z]:[\\/])/.test(saved) ? saved : '/';
     $('#file-path').value = cwd;
     $('#file-filter').value = '';
     $('#file-msg').textContent = '';

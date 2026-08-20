@@ -5,7 +5,8 @@
   'use strict';
 
   // 文件协议常量（文件会话专用）
-  const FILE_CHUNK = 512 * 1024;       // 分段传输块大小 512KB（base64 后 ~683KB < workerd 入站 1MB 限制）
+  const FILE_CHUNK = 512 * 1024;       // 分段传输块大小 512KB（Binary 混合帧直传无 base64；
+  // 512KB 远小于 workerd WS 1MB 消息限制与 agent 侧 READ_BLOCK/WS_MSG_LIMIT）
   const FILE_MAX = 500 * 1024 * 1024;  // 单文件大小上限 500MB
 
   // ---------- token 管理（app.js 注册 getter，token 本体仍由 app.js 持有） ----------

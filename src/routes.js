@@ -811,9 +811,15 @@ async function mcpCreateUpload(user, env, args, host, ip) {
 
 // ---- 管理类工具（仅管理员：JWT 登录，PAT 一律拒绝；复用 REST API 语义）----
 
-// 按 server_id 或 server_name 定位服务器（重名拒绝，防在错误的机器上操作）
+// 按 server_id 或 server_name 定位服务器（重名拒绝，防在错误的机器上操作）。
+// 参数缺失前置校验：delete_server 这类破坏性操作上「缺参」与「目标不存在」必须区分，
+// 否则 AI 客户端无法自纠（缺参报 not found 会误导去查服务器列表）
 async function mcpFindServer(env, args) {
   const serverId = Number(args.server_id) || 0;
+  const hasName = !!(args.server_name && String(args.server_name).trim());
+  if (!serverId && !hasName) {
+    throw new Error('server_id 或 server_name 必须提供其一（destructive 操作建议用 server_id）');
+  }
   let server = null;
   if (serverId) {
     server = await env.DB.prepare('SELECT * FROM servers WHERE id = ?').bind(serverId).first();

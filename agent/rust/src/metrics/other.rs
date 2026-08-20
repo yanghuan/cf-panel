@@ -34,19 +34,17 @@ pub fn collect_mem() -> (u64, u64, u64, u64) {
 }
 
 // 负载 / 进程数 / 开机时间。load_average 在 Windows 未实现（返回 0，与「无此概念」一致）；
-// 进程数需全量快照——Windows CreateToolhelp32Snapshot ~5-30ms（5s 上报周期下占比可忽略，
-// 内联同步；macOS sysctl KERN_PROC ~1ms）
+// 进程数需全量快照（Windows CreateToolhelp32Snapshot ~5-30ms，上千进程的服务器更久）——
+// 放 blocking 线程（与 collect_conns/collect_disk 一致；快采 5s 下常规机器占比虽可忽略，
+// 但进程多的机器不应占 async worker）
 pub fn collect_load() -> (f64, f64, f64, u64, u64) {
     let la = System::load_average();
-    let mut sys = System::new();
-    sys.refresh_processes(sysinfo::ProcessesToUpdate::All, false);
-    (
-        la.one,
-        la.five,
-        la.fifteen,
-        sys.processes().len() as u64,
-        System::uptime(),
-    )
+    let (procs, uptime) = {
+        let mut sys = System::new();
+        sys.refresh_processes(sysinfo::ProcessesToUpdate::All, false);
+        (sys.processes().len() as u64, System::uptime())
+    };
+    (la.one, la.five, la.fifteen, procs, uptime)
 }
 
 // 温度：第一个有效热区（℃）。Windows 多数机器驱动不暴露 → None；macOS M 系列有 SoC 温度

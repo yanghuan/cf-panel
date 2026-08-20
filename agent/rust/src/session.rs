@@ -655,9 +655,11 @@ fn collect_zip_entries(
 
 // 目录 → zip（STORED 无压缩，手写格式；UTF-8 文件名标志；条目为相对路径）。
 // 流式写出（&mut dyn Write，不物化整个 zip 进内存）：local header 的 CRC/大小字段
-// 后置到 data descriptor（通用标志 bit 3，RFC 6455 流式 zip 标准做法，主流解压器
-// 均支持），CRC 逐块增量计算——内存占用从 O(目录大小) 降为 O(central directory)。
+// 后置到 data descriptor（通用标志 bit 3，APPNOTE.TXT（PKWARE）流式 zip 标准做法，
+// 主流解压器均支持），CRC 逐块增量计算——内存占用从 O(目录大小) 降为 O(central directory)。
 // 返回写入的总字节数。
+// data descriptor = 签名(4) + CRC(4) + 压缩大小(4) + 原始大小(4) = 16 字节
+const DATA_DESCRIPTOR_LEN: u64 = 16;
 fn zip_directory(dir: &std::path::Path, out: &mut dyn Write) -> std::io::Result<u64> {
     let mut entries: Vec<(String, bool)> = Vec::new();
     collect_zip_entries(dir, "", &mut entries)?;
@@ -734,7 +736,9 @@ fn zip_directory(dir: &std::path::Path, out: &mut dyn Write) -> std::io::Result<
         ch.extend_from_slice(&(offset as u32).to_le_bytes()); // local header offset
         ch.extend_from_slice(name_bytes);
         central.extend_from_slice(&ch);
-        offset += lh.len() as u64 + size + 16; // header + 数据 + data descriptor
+        // header + 数据 + data descriptor（长度与上方 DATA_DESCRIPTOR_LEN 常量耦合——
+        // 改动 descriptor 格式时此处必须同步，否则 central 的 offset 全部错位 → zip 损坏）
+        offset += lh.len() as u64 + size + DATA_DESCRIPTOR_LEN;
         // offset 超 u32 上限（4GB zip）明确报错（500MB 预检已先挡，双保险）
         if offset > u32::MAX as u64 {
             return Err(std::io::Error::other("zip too large (>4GB)"));

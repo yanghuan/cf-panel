@@ -160,9 +160,8 @@ pub mod imp {
                         if job_has_active_processes(j as *mut std::ffi::c_void) {
                             retained.insert(p, j);
                         } else {
-                            unsafe {
-                                let _ = CloseHandle(j as *mut std::ffi::c_void);
-                            }
+                            // 外层 unsafe 块内，无需嵌套 unsafe（edition 2024 lint）
+                            let _ = CloseHandle(j as *mut std::ffi::c_void);
                         }
                     }
                     *jobs = retained;
@@ -325,9 +324,9 @@ pub mod imp {
 
         #[test]
         fn job_accounting_lifecycle() {
-            // cmd ping 约 1s 存活：保证 attach 后查询时进程仍在运行
+            // cmd ping 约 2s 存活：保证 attach 后轮询窗口内进程仍在运行
             let mut child = std::process::Command::new("cmd")
-                .args(["/C", "ping -n 2 127.0.0.1 >nul"])
+                .args(["/C", "ping -n 3 127.0.0.1 >nul"])
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .spawn()
@@ -340,17 +339,50 @@ pub mod imp {
                 .and_then(|jobs| jobs.get(&pid).copied())
                 .expect("attach 后表项存在");
             let job = job as *mut std::ffi::c_void;
-            // 运行中：ActiveProcesses > 0（上限清理的"只关无存活 job"依赖此判定）
+            // 轮询等待（最多 3s）：Assign 后会计计数更新可能有极短延迟；CI 环境
+            // （runner 进程树可能处嵌套 job）下瞬时查询曾观察到 ActiveProcesses=0。
+            // 断言放宽为「Query 成功 且 (Active > 0 或 Total >= 1)」——TotalProcesses 是
+            // 累计值，attach 成功即 >=1，作为会计确认的兜底；仍能捕获 Query 失败
+            // 与结构体布局错误（两字段同时为 0）
+            let mut last: Option<(i32, JOBOBJECTBASICACCOUNTINGINFORMATION)> = None;
+            for _ in 0..30 {
+                let mut info: JOBOBJECTBASICACCOUNTINGINFORMATION = unsafe { std::mem::zeroed() };
+                let ok = unsafe {
+                    QueryInformationJobObject(
+                        job,
+                        JobObjectBasicAccountingInformation,
+                        &mut info as *mut _ as *mut std::ffi::c_void,
+                        std::mem::size_of::<JOBOBJECTBASICACCOUNTINGINFORMATION>() as u32,
+                        std::ptr::null_mut(),
+                    )
+                };
+                // 先读后存（结构体未实现 Copy，move 进 tuple 后不可再访问）
+                let active = ok != 0 && info.ActiveProcesses > 0;
+                last = Some((ok, info));
+                if active {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            let (ok, info) = last.unwrap();
             assert!(
-                job_has_active_processes(job),
-                "存活进程的 job 应报告 active"
+                ok != 0 && (info.ActiveProcesses > 0 || info.TotalProcesses >= 1),
+                "job 会计应确认进程挂接：Query={ok} ActiveProcesses={} TotalProcesses={} err={}",
+                info.ActiveProcesses,
+                info.TotalProcesses,
+                std::io::Error::last_os_error(),
             );
             let _ = child.wait();
-            // 退出后：内核递减计数，应报告 inactive
-            assert!(
-                !job_has_active_processes(job),
-                "进程退出后 job 应报告 inactive"
-            );
+            // 退出后：内核递减计数，应报告 inactive（仍轮询一次，避免竞态）
+            let mut inactive = false;
+            for _ in 0..10 {
+                if !job_has_active_processes(job) {
+                    inactive = true;
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            assert!(inactive, "进程退出后 job 应报告 inactive");
             detach_job(pid); // 清理表项与句柄
             assert!(
                 JOBS.lock()

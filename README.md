@@ -203,6 +203,8 @@ wrangler secret put PANEL_USERS      # 回车后粘贴值，如 alice:pass1,bob:
 | Bark | GET | `https://api.day.app/{token}/{title}/{message}` | 无 |
 | Slack | POST | 默认 | 留空 Body 发结构化 JSON，Headers `{"Authorization":"Bearer {token}"}` |
 
+> Webhook 执行出站安全检查：仅允许 HTTP(S)，拒绝 URL 内嵌凭据、常见本地域名、私网/保留 IP 字面量及 HTTP 重定向；域名解析与最终出站限制由 Cloudflare Workers 执行。发送失败日志不会记录完整 URL，避免路径或 query 中的 `{token}` 泄露。
+
 **Webhook payload 结构**（`event` 区分 `alert` / `offline` / `recovered`）：
 
 ```json
@@ -219,6 +221,7 @@ wrangler secret put PANEL_USERS      # 回车后粘贴值，如 alice:pass1,bob:
 > 告警支持：CPU/内存/磁盘（根分区）/负载超阈值 + 机器离线/恢复通知。内存告警依赖 agent 上报 `mem_total`。
 
 本地调试：`npm run dev`（`predev` 钩子自动生成 `.dev.vars` 随机密钥，若不存在；本地 SQLite 自动应用 migrations）。手动建表：`npm run migrate:local`。
+> 本地没有 Cloudflare 注入的 `CF-Connecting-IP` 时，登录限流会统一落入 `unknown` 桶；同一开发实例上的多人调试会共享失败次数。这是避免信任可伪造 `X-Forwarded-For` 的安全取舍。
 > ⚠️ 生产环境密钥（`JWT_SECRET`/`HASH_SECRET`/`PANEL_PASSWORD`）**不要**用本地随机生成：请固定配置为 dashboard secrets 或 `wrangler secret put`（随机生成后丢失无法找回）。
 
 ## 二、添加服务器并安装 agent
@@ -429,9 +432,9 @@ curl -X POST https://<面板域名>/mcp -H "Authorization: Bearer <token>" \
 ## 五、安全要点（实现清单已覆盖）
 
 - `/ws/terminal/{id}` 仅允许会话创建者或管理员连接（防 stream UUID 劫持，GHSA 教训）。
-- agent 建连必须提供 `X-Agent-Key`（或 query key）；服务端先用 key 的 SHA-256 指纹（`servers.agent_key_id`）反查服务器，再与 `servers.agent_key_hash` 比对；`/ws/agent/terminal` 额外校验 stream 归属。
+- agent 建连必须通过 `X-Agent-Key` 请求头提供凭证（不接受 URL query，避免边缘日志/代理记录泄露）；服务端先用 key 的 SHA-256 指纹（`servers.agent_key_id`）反查服务器，再用 Web Crypto HMAC verify 校验 `servers.agent_key_hash`；`/ws/agent/terminal` 额外校验 stream 归属。
 - 面板登录密码存 CF secret（`PANEL_USERS`/`PANEL_PASSWORD`），不进代码库；agent key 与 PAT 只存哈希（key 指纹用于检索，HMAC 哈希用于校验）。
-- 审计日志：`server.create/update/delete`、`terminal.open`、`file.open/upload/write/zip/rename/delete`、`exec.command` 写 `audit_logs`（WS 文件操作在 DO 拦截指令记录；`exec.command` 含命令与 exit_code）。
+- 审计日志：`server.create/update/delete`、`terminal.open`、`file.open/upload/write/zip/rename/delete`、`exec.command` 写 `audit_logs`（WS 文件操作在 DO 拦截指令记录；`exec.command` 含命令与 exit_code）。终端/文件会话横跨 DO 与 D1，审计写入为 best-effort：D1 短暂失败时记录 Worker 错误但仍返回已创建的可用会话，避免遗留不可访问的远端会话。
 - agent 侧 `DISABLE_EXEC=1` 可全局禁止命令执行（终端任务直接忽略）。
 - 终端/监控接口按权限收敛：JWT 管理员全量；PAT 按 scopes + server_ids 白名单收窄。
 

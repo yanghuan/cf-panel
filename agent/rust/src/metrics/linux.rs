@@ -285,15 +285,19 @@ fn disk_excluded(fstype: &str, include: &[String]) -> bool {
         || fstype.starts_with("fuse.")
 }
 
-// 网络速率：/proc/net/dev 累计差分（字节/秒）
-// 跳过回环与常见虚拟网卡前缀（lo/docker*/veth*/br-*/virbr*/tun*/tap*/vxlan*/gretap*/ip6tnl*/sit*/
-// ——否则容器宿主/本机回环流量计入速率导致虚高）
+// 网络速率：/proc/net/dev 累计差分（字节/秒）。
+// lo/tun/tap 仅匹配精确名称或数字后缀（lo0/tun0/tap1），避免误杀 logical0、tunnel0、tap-water；
+// 其余前缀是 Linux 明确的虚拟接口命名族（如 vethXXXX、docker_gwbridge），继续按前缀过滤。
 fn is_virtual_iface(name: &str) -> bool {
+    const NUMBERED_PREFIXES: &[&str] = &["lo", "tun", "tap"];
     const VIRT_PREFIXES: &[&str] = &[
-        "lo", "docker", "veth", "br-", "virbr", "tun", "tap", "vxlan", "gretap", "ip6tnl", "sit",
-        "dummy", "vnet",
+        "docker", "veth", "br-", "virbr", "tunl", "vxlan", "gretap", "ip6tnl", "sit", "dummy",
+        "vnet",
     ];
-    VIRT_PREFIXES.iter().any(|p| name.starts_with(p))
+    NUMBERED_PREFIXES.iter().any(|p| {
+        name.strip_prefix(p)
+            .is_some_and(|suffix| suffix.is_empty() || suffix.bytes().all(|b| b.is_ascii_digit()))
+    }) || VIRT_PREFIXES.iter().any(|p| name.starts_with(p))
 }
 pub async fn collect_net() -> (u64, u64) {
     let mut rx = 0u64;
@@ -570,6 +574,21 @@ mod tests {
         let (tcp, udp) = collect_conns().await;
         assert!(tcp > 0, "/proc/net/tcp 应可读");
         assert!(udp > 0);
+    }
+
+    #[test]
+    fn is_virtual_iface_avoids_broad_short_prefixes() {
+        assert!(is_virtual_iface("lo"));
+        assert!(is_virtual_iface("lo0"));
+        assert!(is_virtual_iface("tun0"));
+        assert!(is_virtual_iface("tap12"));
+        assert!(is_virtual_iface("tunl0"));
+        assert!(is_virtual_iface("vethabcd"));
+        assert!(is_virtual_iface("docker_gwbridge"));
+        assert!(!is_virtual_iface("logical0"));
+        assert!(!is_virtual_iface("tunnel0"));
+        assert!(!is_virtual_iface("tap-water"));
+        assert!(!is_virtual_iface("eth0"));
     }
 
     #[test]

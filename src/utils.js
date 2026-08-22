@@ -49,9 +49,20 @@ export function b64uDecode(s) {
 export function bytesToHex(bytes) {
   return [...bytes].map((b) => b.toString(16).padStart(2, '0')).join('');
 }
+export function hexToBytes(value) {
+  const hex = String(value);
+  if (hex.length % 2 !== 0 || !/^[0-9a-f]*$/i.test(hex)) throw new Error('invalid hex');
+  const bytes = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < bytes.length; i++) bytes[i] = Number.parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+  return bytes;
+}
 export async function hmacSha256(keyBytes, dataBytes) {
   const key = await crypto.subtle.importKey('raw', keyBytes, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
   return new Uint8Array(await crypto.subtle.sign('HMAC', key, dataBytes));
+}
+export async function verifyHmacSha256(keyBytes, dataBytes, signatureBytes) {
+  const key = await crypto.subtle.importKey('raw', keyBytes, { name: 'HMAC', hash: 'SHA-256' }, false, ['verify']);
+  return crypto.subtle.verify('HMAC', key, signatureBytes, dataBytes);
 }
 export async function signJwt(payload, env) {
   const h = b64u(JSON.stringify({ alg: 'HS256', typ: 'JWT' }));
@@ -62,9 +73,15 @@ export async function signJwt(payload, env) {
 export async function verifyJwt(token, env) {
   try {
     const parts = token.split('.');
-    if (parts.length !== 3) return null;
-    const sig = await hmacSha256(new TextEncoder().encode(secret(env)), new TextEncoder().encode(parts[0] + '.' + parts[1]));
-    if (b64u(sig) !== parts[2]) return null;
+    if (parts.length !== 3 || !/^[A-Za-z0-9_-]+$/.test(parts[2])) return null;
+    const sig = b64uDecode(parts[2]);
+    if (sig.length !== 32) return null;
+    const valid = await verifyHmacSha256(
+      new TextEncoder().encode(secret(env)),
+      new TextEncoder().encode(parts[0] + '.' + parts[1]),
+      sig
+    );
+    if (!valid) return null;
     const payload = JSON.parse(new TextDecoder().decode(b64uDecode(parts[1])));
     if (payload.exp && payload.exp * 1000 < Date.now()) return null;
     return payload;
@@ -142,6 +159,20 @@ export async function hashSecret(value, env) {
   const hashKey = env.HASH_SECRET || secret(env);
   return bytesToHex(await hmacSha256(new TextEncoder().encode(hashKey), new TextEncoder().encode(value)));
 }
+export async function verifySecretHash(value, expectedHex, env) {
+  try {
+    const signature = hexToBytes(expectedHex);
+    if (signature.length !== 32) return false;
+    const hashKey = env.HASH_SECRET || secret(env);
+    return await verifyHmacSha256(
+      new TextEncoder().encode(hashKey),
+      new TextEncoder().encode(value),
+      signature
+    );
+  } catch {
+    return false;
+  }
+}
 
 // 上传签名 URL（无状态自验证）：HMAC(secret, serverId|path|overwrite|exp)。
 // 验证所需信息全部编码在 URL（server_id/path/overwrite/exp），secret 只在环境变量——
@@ -159,15 +190,18 @@ export async function verifyUploadToken(token, serverId, path, overwrite, env) {
     if (dot <= 0) return { ok: false, error: 'bad token' };
     const exp = Number(token.slice(0, dot));
     if (!Number.isFinite(exp) || exp < Math.floor(Date.now() / 1000)) return { ok: false, error: 'token expired' };
+    const got = token.slice(dot + 1);
+    if (!/^[A-Za-z0-9_-]+$/.test(got)) return { ok: false, error: 'bad token' };
+    const signature = b64uDecode(got);
+    if (signature.length !== 32) return { ok: false, error: 'bad token' };
     const payload = `${serverId}|${path}|${overwrite ? 1 : 0}|${exp}`;
     const hashKey = env.HASH_SECRET || secret(env);
-    const expect = b64u(await hmacSha256(new TextEncoder().encode(hashKey), new TextEncoder().encode(payload)));
-    const got = token.slice(dot + 1);
-    // 恒定时间比较（防时序侧信道）
-    if (expect.length !== got.length) return { ok: false, error: 'bad token' };
-    let diff = 0;
-    for (let i = 0; i < expect.length; i++) diff |= expect.charCodeAt(i) ^ got.charCodeAt(i);
-    return diff === 0 ? { ok: true } : { ok: false, error: 'bad token' };
+    const valid = await verifyHmacSha256(
+      new TextEncoder().encode(hashKey),
+      new TextEncoder().encode(payload),
+      signature
+    );
+    return valid ? { ok: true } : { ok: false, error: 'bad token' };
   } catch {
     return { ok: false, error: 'bad token' };
   }
@@ -229,9 +263,88 @@ export function parseHeaders(s, vars) {
   return out;
 }
 
+// Webhook 目标基线校验：拒绝 URL 凭据、常见本地域名及私网/保留 IP 字面量；
+// redirect:error 阻止已校验 URL 再跳转到非预期目标。域名最终解析与出站限制仍由 Workers fetch 完成。
+function parseIpv4(host) {
+  const parts = host.split('.');
+  if (parts.length !== 4 || parts.some((p) => !/^\d+$/.test(p) || Number(p) > 255)) return null;
+  return parts.map(Number);
+}
+function isPrivateIpv4(ip) {
+  const [a, b, c] = ip;
+  return a === 0 || a === 10 || a === 127 || a >= 224 ||
+    (a === 100 && b >= 64 && b <= 127) ||
+    (a === 169 && b === 254) ||
+    (a === 172 && b >= 16 && b <= 31) ||
+    (a === 192 && b === 168) ||
+    (a === 192 && b === 0 && (c === 0 || c === 2)) ||
+    (a === 198 && (b === 18 || b === 19)) ||
+    (a === 198 && b === 51 && c === 100) ||
+    (a === 203 && b === 0 && c === 113);
+}
+function parseIpv6(host) {
+  let value = host.toLowerCase();
+  if (value.startsWith('[') && value.endsWith(']')) value = value.slice(1, -1);
+  if (value.includes('%')) return null;
+  if (value.includes('.')) {
+    const split = value.lastIndexOf(':');
+    const v4 = parseIpv4(value.slice(split + 1));
+    if (!v4) return null;
+    value = `${value.slice(0, split)}:${((v4[0] << 8) | v4[1]).toString(16)}:${((v4[2] << 8) | v4[3]).toString(16)}`;
+  }
+  const halves = value.split('::');
+  if (halves.length > 2) return null;
+  const parseHalf = (half) => half ? half.split(':').map((p) => (/^[0-9a-f]{1,4}$/.test(p) ? Number.parseInt(p, 16) : NaN)) : [];
+  const left = parseHalf(halves[0]);
+  const right = parseHalf(halves[1] || '');
+  if ([...left, ...right].some(Number.isNaN)) return null;
+  if (halves.length === 1) return left.length === 8 ? left : null;
+  const zeros = 8 - left.length - right.length;
+  return zeros >= 1 ? [...left, ...Array(zeros).fill(0), ...right] : null;
+}
+function isPrivateIpv6(ip) {
+  const allZeroPrefix = ip.slice(0, 6).every((v) => v === 0);
+  const mappedV4 = ip.slice(0, 5).every((v) => v === 0) && ip[5] === 0xffff;
+  if (allZeroPrefix || mappedV4) {
+    const v4 = [ip[6] >> 8, ip[6] & 0xff, ip[7] >> 8, ip[7] & 0xff];
+    if (isPrivateIpv4(v4)) return true;
+  }
+  const unspecified = ip.every((v) => v === 0);
+  const loopback = ip.slice(0, 7).every((v) => v === 0) && ip[7] === 1;
+  return unspecified || loopback ||
+    (ip[0] & 0xfe00) === 0xfc00 || // fc00::/7 ULA
+    (ip[0] & 0xffc0) === 0xfe80 || // fe80::/10 link-local
+    (ip[0] & 0xffc0) === 0xfec0 || // fec0::/10 site-local（历史保留）
+    (ip[0] & 0xff00) === 0xff00 || // ff00::/8 multicast
+    (ip[0] === 0x2001 && ip[1] === 0x0db8); // 文档保留地址
+}
+export function validateWebhookUrl(rawUrl) {
+  let url;
+  try { url = new URL(rawUrl); } catch { return { ok: false, error: 'invalid webhook url' }; }
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+    return { ok: false, error: `unsupported protocol: ${url.protocol}` };
+  }
+  if (url.username || url.password) return { ok: false, error: 'webhook URL credentials are not allowed' };
+  const host = url.hostname.toLowerCase().replace(/^\[|\]$/g, '').replace(/\.$/, '');
+  if (host === 'localhost' || host === 'localdomain' || host === 'ip6-localhost' ||
+      host.endsWith('.localhost') || host.endsWith('.local') || host.endsWith('.localdomain') ||
+      host.endsWith('.internal') || host.endsWith('.home.arpa')) {
+    return { ok: false, error: 'private webhook targets are not allowed' };
+  }
+  const ip4 = parseIpv4(host);
+  const ip6 = host.includes(':') ? parseIpv6(host) : null;
+  if ((ip4 && isPrivateIpv4(ip4)) || (ip6 && isPrivateIpv6(ip6))) {
+    return { ok: false, error: 'private webhook targets are not allowed' };
+  }
+  return { ok: true, url };
+}
+function redactUrls(message) {
+  return String(message || '').replace(/https?:\/\/[^\s]+/gi, '[redacted-url]').slice(0, 200);
+}
+
 // 发送告警 Webhook（模板化）：method/url/body/headers 均支持占位符；
 // token 仅作为 {token} 占位符变量，由用户放在 URL/header/body 任意位置。
-// 检查 HTTP 状态，失败/异常记 console.error（Cloudflare 后台 Worker 日志可见，便于排查丢失的告警）。
+// 日志只记录事件与状态，不记录可能携带 token 的完整 URL。
 // sendWebhookRaw 返回 {ok, status, error}（测试 Webhook 按钮回显状态用）；sendWebhook 转布尔供告警链路复用。
 export async function sendWebhookRaw(cfg, payload) {
   if (!cfg.enabled || !cfg.webhook_url) return { ok: false, status: 0, error: 'webhook not configured' };
@@ -245,31 +358,23 @@ export async function sendWebhookRaw(cfg, payload) {
     time: payload.time,
     token: cfg.webhook_token,
   };
-  // 统一允许的 HTTP 方法（GET/POST/PUT），不再把 PUT 静默当 POST
   const method = ['GET', 'POST', 'PUT'].includes(cfg.method) ? cfg.method : 'POST';
-  const url = renderTemplate(cfg.webhook_url, vars);
-  // 协议白名单：仅允许 http/https（拒绝 file://、gopher:// 等奇形 scheme，防 SSRF 类误配）
-  try {
-    const pu = new URL(url);
-    if (pu.protocol !== 'http:' && pu.protocol !== 'https:') {
-      return { ok: false, status: 0, error: `unsupported protocol: ${pu.protocol}` };
-    }
-  } catch {
-    return { ok: false, status: 0, error: 'invalid webhook url' };
-  }
+  const checked = validateWebhookUrl(renderTemplate(cfg.webhook_url, vars));
+  if (!checked.ok) return { ok: false, status: 0, error: checked.error };
   const headers = parseHeaders(cfg.headers, vars);
   if (!headers['content-type']) headers['content-type'] = cfg.content_type || 'application/json';
   const body = method === 'GET' ? undefined : (cfg.body_template ? renderTemplate(cfg.body_template, vars) : JSON.stringify(payload));
   try {
-    const resp = await fetch(url, { method, headers, body });
+    const resp = await fetch(checked.url.toString(), { method, headers, body, redirect: 'error' });
     if (!resp.ok) {
-      console.error(`[cf-panel] webhook failed: ${payload.event} → ${url} HTTP ${resp.status}`);
+      console.error(`[cf-panel] webhook failed: ${payload.event} HTTP ${resp.status}`);
       return { ok: false, status: resp.status, error: `HTTP ${resp.status}` };
     }
     return { ok: true, status: resp.status, error: null };
   } catch (e) {
-    console.error(`[cf-panel] webhook error: ${payload.event} → ${url} ${e && e.message ? e.message : e}`);
-    return { ok: false, status: 0, error: (e && e.message) || String(e) };
+    const message = redactUrls((e && e.message) || e || 'request failed');
+    console.error(`[cf-panel] webhook error: ${payload.event} ${message}`);
+    return { ok: false, status: 0, error: message };
   }
 }
 export async function sendWebhook(cfg, payload) {

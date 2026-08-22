@@ -913,6 +913,21 @@ test('设置：geo_lookup 开关默认关闭，可开启并在 public settings �
 });
 
 // ---------------- 终端 / 文件 会话 ----------------
+test('Agent 控制通道只接受 X-Agent-Key 请求头，不接受 query key', async () => {
+  const env = makeEnv();
+  const adminToken = await login(env);
+  const added = await addServer(env, adminToken, { name: 'agent-auth' });
+
+  const queryOnly = await call(env, { path: `/ws/agent/control?key=${encodeURIComponent(added.agent_key)}` });
+  assert.equal(queryOnly.status, 401);
+  assert.equal(await queryOnly.text(), 'missing agent key');
+  assert.equal(env.TERMINAL.calls.length, 0, 'query key 不进入 DO');
+
+  const header = await call(env, { path: '/ws/agent/control', headers: { 'x-agent-key': added.agent_key } });
+  assert.equal(header.status, 200);
+  assert.equal(env.TERMINAL.calls.length, 1, 'header key 正常路由到所属分片');
+});
+
 test('终端与文件会话：需要 exec 权限 + 服务器归属', async () => {
   const env = makeEnv();
   const adminToken = await login(env);
@@ -935,6 +950,37 @@ test('终端与文件会话：需要 exec 权限 + 服务器归属', async () =>
   // 审计日志落库
   const logs = await env.DB.prepare("SELECT action FROM audit_logs WHERE action = 'terminal.open'").all();
   assert.equal(logs.results.length, 1);
+});
+
+test('终端与文件会话：审计写入失败仍返回已创建会话', async () => {
+  const env = makeEnv();
+  const adminToken = await login(env);
+  await addServer(env, adminToken, { name: 'audit-fallback' });
+
+  const originalPrepare = env.DB.prepare.bind(env.DB);
+  const originalError = console.error;
+  const errors = [];
+  env.DB.prepare = (sql) => {
+    if (sql.startsWith('INSERT INTO audit_logs') && sql.includes('target_server_id')) {
+      return { bind: () => ({ run: async () => { throw new Error('audit unavailable'); } }) };
+    }
+    return originalPrepare(sql);
+  };
+  console.error = (...args) => errors.push(args.map(String).join(' '));
+  try {
+    const terminal = await call(env, { method: 'POST', path: '/api/terminal', token: adminToken, body: { server_id: 1 } });
+    const file = await call(env, { method: 'POST', path: '/api/file/open', token: adminToken, body: { server_id: 1 } });
+    assert.equal(terminal.status, 200, '终端会话保持可用');
+    assert.equal(file.status, 200, '文件会话保持可用');
+    assert.match((await terminal.json()).session_id, /^\d-/);
+    assert.match((await file.json()).session_id, /^\d-/);
+    assert.equal(errors.length, 2, '两次审计失败均写服务端错误日志');
+    assert.match(errors[0], /terminal\.open audit failed/);
+    assert.match(errors[1], /file\.open audit failed/);
+  } finally {
+    env.DB.prepare = originalPrepare;
+    console.error = originalError;
+  }
 });
 
 // ---------------- MCP ----------------

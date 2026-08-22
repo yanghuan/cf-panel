@@ -19,6 +19,9 @@ CREATE TABLE IF NOT EXISTS servers (
   created_at     TEXT    NOT NULL DEFAULT (datetime('now'))
 );
 
+-- MCP 按 server_name 定位服务器时走索引；名称允许重复，调用方遇到重名会拒绝并要求使用 id
+CREATE INDEX IF NOT EXISTS idx_servers_name ON servers(name);
+
 -- API Token（PAT，预留：只存哈希，支持 scopes + server_ids 白名单）
 CREATE TABLE IF NOT EXISTS api_tokens (
   id         INTEGER PRIMARY KEY AUTOINCREMENT,

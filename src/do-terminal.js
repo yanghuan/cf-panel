@@ -1,5 +1,5 @@
 // cf-panel — Durable Object：WebSocket 中转核心（分片实例 TerminalDO）
-import { json, err, doPanel, sha256Hex, hashSecret } from './utils.js';
+import { json, err, doPanel, sha256Hex, verifySecretHash } from './utils.js';
 import { authUserByToken, isAdmin, canExec } from './auth.js';
 import { handleReport } from './report.js';
 
@@ -202,14 +202,16 @@ export class TerminalDO {
       return new Response(null, { status: 101, webSocket: pair[0] });
     }
 
-    // GET /ws/agent/control —— agent 常驻控制通道（key 指纹定位 + hash 校验）
+    // GET /ws/agent/control —— agent 常驻控制通道（只接受请求头，避免凭证进入 URL 日志/历史）
     if (path === '/ws/agent/control') {
-      const key = request.headers.get('x-agent-key') || url.searchParams.get('key') || '';
+      const key = request.headers.get('x-agent-key') || '';
+      if (!key) return new Response('missing agent key', { status: 401 });
       const keyId = await sha256Hex(key);
       const server = await this.env.DB.prepare('SELECT * FROM servers WHERE agent_key_id = ?').bind(keyId).first();
       if (!server) return new Response('unknown agent', { status: 401 });
-      const hash = await hashSecret(key, this.env);
-      if (hash !== server.agent_key_hash) return new Response('bad key', { status: 401 });
+      if (!(await verifySecretHash(key, server.agent_key_hash, this.env))) {
+        return new Response('bad key', { status: 401 });
+      }
       const pair = new WebSocketPair();
       this.state.acceptWebSocket(pair[1]);
       // 控制通道（重）连接：说明旧连接已断/网络切换，关闭该服务器旧的终端/文件会话流，
@@ -242,16 +244,18 @@ export class TerminalDO {
       return new Response(null, { status: 101, webSocket: pair[0] });
     }
 
-    // GET /ws/agent/terminal?sid= | /ws/agent/file?sid= —— agent 数据流（key 校验 + stream 归属校验）
+    // GET /ws/agent/terminal?sid= | /ws/agent/file?sid= —— agent 数据流（header key + stream 归属校验）
     if (path === '/ws/agent/terminal' || path === '/ws/agent/file') {
       const sid = url.searchParams.get('sid') || '';
-      const key = request.headers.get('x-agent-key') || url.searchParams.get('key') || '';
+      const key = request.headers.get('x-agent-key') || '';
+      if (!key) return new Response('missing agent key', { status: 401 });
       const sess = await this.hydrateSession(sid);
       if (!sess) return new Response('session not found', { status: 404 });
       const server = await this.env.DB.prepare('SELECT * FROM servers WHERE id = ?').bind(sess.serverId).first();
       if (!server) return new Response('unknown agent', { status: 401 });
-      const hash = await hashSecret(key, this.env);
-      if (hash !== server.agent_key_hash) return new Response('bad key', { status: 401 });
+      if (!(await verifySecretHash(key, server.agent_key_hash, this.env))) {
+        return new Response('bad key', { status: 401 });
+      }
       const pair = new WebSocketPair();
       this.state.acceptWebSocket(pair[1]);
       // 挂接 agent 数据流并按序补发缓冲的浏览器输入

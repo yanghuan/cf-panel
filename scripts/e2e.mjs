@@ -26,6 +26,7 @@ const PORT = parseInt(process.env.E2E_PORT || '8787', 10);
 const BASE = `http://127.0.0.1:${PORT}`;
 const PASSWORD = readPassword();
 const AGENT_CMD = process.env.AGENT_CMD || join(ROOT, 'agent/rust/target/release/cf-panel-agent');
+const WRANGLER_CLI = join(ROOT, 'node_modules/wrangler/wrangler-dist/cli.js');
 
 // ---- 全局状态 ----
 const TMP = mkdtempSync(join(tmpdir(), 'cf-panel-e2e-'));
@@ -107,17 +108,17 @@ function registerCleanup() {
 
 // ---- 节标题 ----
 let stepIdx = 0;
-function section(desc) { stepIdx++; console.log(`\n[${stepIdx}/8] ${desc}...`); }
+function section(desc) { stepIdx++; console.log(`\n[${stepIdx}/9] ${desc}...`); }
 
 // ============================================================
 // 第 1 步：D1 migrations
 // ============================================================
 async function step1_migrations() {
   section('D1 migrations');
-  const r = spawnSync('npx', [
-    'wrangler', 'd1', 'migrations', 'apply', 'cf-panel',
+  const r = spawnSync(process.execPath, [
+    '--no-warnings', WRANGLER_CLI, 'd1', 'migrations', 'apply', 'cf-panel',
     '--local', '--persist-to', STATE,
-  ], { cwd: ROOT, stdio: 'pipe', timeout: 60_000, encoding: 'utf8' });
+  ], { cwd: ROOT, stdio: 'pipe', timeout: 300_000, encoding: 'utf8' });
   if (r.status !== 0) {
     bad(`D1 migrations 失败：${r.stderr || r.stdout}`);
     process.exit(1);
@@ -132,8 +133,8 @@ async function step2_wrangler() {
   section('启动 wrangler dev --local');
 
   const logStream = createWriteStream(WRANGLER_LOG);
-  wranglerProc = spawn('npx', [
-    'wrangler', 'dev', '--local', '--port', String(PORT), '--persist-to', STATE,
+  wranglerProc = spawn(process.execPath, [
+    '--no-warnings', WRANGLER_CLI, 'dev', '--local', '--port', String(PORT), '--persist-to', STATE,
   ], {
     cwd: ROOT,
     detached: true,
@@ -567,15 +568,15 @@ async function step8_mcp() {
     }
   } else bad(`MCP update_settings 失败：${JSON.stringify(upsData)}`);
 
-  // ---- 8.13) 测试 Webhook（指向面板自身 → 非 2xx，验证端点可达并回显状态） ----
+  // ---- 8.13) 测试 Webhook（本地回环目标必须在发起请求前被 SSRF 基线校验拒绝） ----
   const tw = await fetch(`${BASE}/api/settings/test_webhook`, {
     method: 'POST',
     headers: { 'authorization': `Bearer ${token}`, 'content-type': 'application/json' },
     body: JSON.stringify({ alerts: { webhook_url: `${BASE}/api/public/settings` } }),
   });
   const twData = await tw.json();
-  if (tw.status === 200 && twData.ok === false && twData.status >= 400)
-    ok(`测试 Webhook：端点可达并回显 HTTP 状态（${twData.status}）`);
+  if (tw.status === 200 && twData.ok === false && twData.status === 0 && /private webhook targets/.test(twData.error || ''))
+    ok('测试 Webhook：本地回环目标被安全校验拒绝');
   else bad(`测试 Webhook 异常：HTTP ${tw.status} ${JSON.stringify(twData)}`);
 }
 

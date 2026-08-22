@@ -966,6 +966,19 @@ test('PanelDO: PAT 只看白名单内的服务器', async () => {
 });
 
 // ---------------- TerminalDO ----------------
+test('TerminalDO: Agent 控制与数据通道拒绝 query key', async () => {
+  const inst = new TerminalDO(mockState(), makeEnv());
+  for (const path of [
+    '/ws/agent/control?key=secret',
+    '/ws/agent/terminal?sid=0-test&key=secret',
+    '/ws/agent/file?sid=0-test&key=secret',
+  ]) {
+    const res = await inst.fetch(new Request(`https://do.internal${path}`));
+    assert.equal(res.status, 401, `${path} 应拒绝 query key`);
+    assert.equal(await res.text(), 'missing agent key');
+  }
+});
+
 test('TerminalDO: /rpc/set_viewers 按观看者数切换快/慢采', async () => {
   const env = makeEnv();
   const sent = [];

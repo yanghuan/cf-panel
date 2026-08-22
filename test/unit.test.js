@@ -88,6 +88,21 @@ test('hashSecret 确定性且随输入/密钥变化', async () => {
   assert.notEqual(h1, await I.hashSecret('key1', { JWT_SECRET: 'other' }));
 });
 
+test('verifySecretHash 使用 HMAC verify 校验且拒绝畸形哈希', async () => {
+  const hash = await I.hashSecret('agent-key', env);
+  assert.equal(await I.verifySecretHash('agent-key', hash, env), true);
+  assert.equal(await I.verifySecretHash('wrong-key', hash, env), false);
+  assert.equal(await I.verifySecretHash('agent-key', 'not-hex', env), false);
+  assert.equal(await I.verifySecretHash('agent-key', '00', env), false);
+});
+
+test('上传签名使用 HMAC verify 并拒绝篡改', async () => {
+  const signed = await I.signUploadToken(7, '/tmp/a.txt', false, env);
+  assert.deepEqual(await I.verifyUploadToken(signed.token, 7, '/tmp/a.txt', false, env), { ok: true });
+  assert.equal((await I.verifyUploadToken(signed.token, 8, '/tmp/a.txt', false, env)).ok, false);
+  assert.equal((await I.verifyUploadToken(`${signed.token}x`, 7, '/tmp/a.txt', false, env)).ok, false);
+});
+
 test('hashSecret：未配置 HASH_SECRET 时回退 JWT_SECRET（平滑迁移）', async () => {
   // 只有 JWT_SECRET，无 HASH_SECRET → 用 JWT_SECRET 作为哈希密钥
   const noHash = await I.hashSecret('key1', env);
@@ -268,36 +283,39 @@ test('parseHeaders 支持对象与 JSON 字符串并做占位符替换', () => {
   assert.deepEqual(I.parseHeaders(123, vars), {});
 });
 
-test('sendWebhook：非 2xx / 网络异常记错误日志并返回 false', async () => {
+test('sendWebhook：目标校验、禁重定向且日志不泄露 URL 凭证', async () => {
   const origFetch = globalThis.fetch;
   const origErr = console.error;
   const errs = [];
   console.error = (m) => errs.push(String(m));
-  const cfg = { webhook_url: 'https://x/hook', enabled: true };
+  const cfg = { webhook_url: 'https://hooks.example.com/secret-path?access_token=query-secret', enabled: true };
   try {
-    // 非 2xx → false + 错误日志（Cloudflare 后台 Worker 日志可见）
+    // 非 2xx → false + 错误日志，但不记录带凭证的完整 URL
     globalThis.fetch = async () => new Response('err', { status: 500 });
     assert.equal(await I.sendWebhook(cfg, { event: 'alert' }), false, '500 返回 false');
     assert.equal(errs.length, 1, '记录错误日志');
     assert.match(errs[0], /webhook failed.*500/);
+    assert.doesNotMatch(errs[0], /secret-path|query-secret/);
 
-    // 网络异常 → false + 错误日志
-    globalThis.fetch = async () => { throw new Error('net down'); };
+    // 网络异常中的 URL 同样脱敏
+    globalThis.fetch = async () => { throw new Error('net down at https://hooks.example.com/secret-path?access_token=query-secret'); };
     assert.equal(await I.sendWebhook(cfg, { event: 'probe_down' }), false, '网络异常返回 false');
     assert.equal(errs.length, 2, '记录网络错误日志');
-    assert.match(errs[1], /webhook error.*net down/);
+    assert.match(errs[1], /webhook error.*net down.*\[redacted-url\]/);
+    assert.doesNotMatch(errs[1], /secret-path|query-secret/);
 
     // 2xx → true，不记日志
     globalThis.fetch = async () => new Response('ok');
     assert.equal(await I.sendWebhook(cfg, { event: 'alert' }), true, '2xx 返回 true');
     assert.equal(errs.length, 2, '成功不记日志');
 
-    // PUT 方法透传，不再被改写成 POST；GET 无 body
+    // PUT 方法透传，GET 无 body，所有请求禁止自动跟随重定向
     let lastInit = null;
     globalThis.fetch = async (url, init) => { lastInit = init; return new Response('ok'); };
     await I.sendWebhook({ webhook_url: 'https://x/hook', enabled: true, method: 'PUT' }, { event: 'alert' });
     assert.equal(lastInit.method, 'PUT', 'PUT 透传');
     assert.ok(lastInit.body, 'PUT 携带 body');
+    assert.equal(lastInit.redirect, 'error', '禁止跟随重定向');
     await I.sendWebhook({ webhook_url: 'https://x/hook', enabled: true, method: 'GET' }, { event: 'alert' });
     assert.equal(lastInit.method, 'GET', 'GET 透传');
     assert.equal(lastInit.body, undefined, 'GET 无 body');
@@ -308,16 +326,31 @@ test('sendWebhook：非 2xx / 网络异常记错误日志并返回 false', async
     assert.equal(await I.sendWebhook({ enabled: false }, { event: 'alert' }), false);
     assert.equal(await I.sendWebhook({ enabled: true }, { event: 'alert' }), false);
 
-    // 协议白名单：非 http/https（file://、畸形 URL）不发请求直接失败
-    globalThis.fetch = async () => { throw new Error('should not fetch'); };
-    const badProto = await I.sendWebhook({ webhook_url: 'file:///etc/passwd', enabled: true }, { event: 'alert' });
-    assert.equal(badProto, false, 'file:// 拒绝');
-    const badUrl = await I.sendWebhook({ webhook_url: 'not a url', enabled: true }, { event: 'alert' });
-    assert.equal(badUrl, false, '畸形 URL 拒绝');
+    // 协议、URL 凭据及私网/保留地址在 fetch 前拒绝
+    assert.equal(I.validateWebhookUrl('https://hooks.example.com/a').ok, true);
+    for (const target of [
+      'file:///etc/passwd', 'not a url', 'https://user:pass@example.com/hook',
+      'http://localhost/hook', 'http://localhost./hook', 'http://127.0.0.1/hook', 'http://2130706433/hook',
+      'http://10.0.0.1/hook', 'http://169.254.169.254/latest', 'http://[::1]/hook',
+      'http://[fc00::1]/hook',
+    ]) {
+      assert.equal(I.validateWebhookUrl(target).ok, false, `应拒绝 ${target}`);
+    }
   } finally {
     globalThis.fetch = origFetch;
     console.error = origErr;
   }
+});
+
+test('静态资源通过 _headers 下发完整 CSP', () => {
+  const root = nodePath.join(nodePath.dirname(fileURLToPath(import.meta.url)), '..');
+  const headers = nodeFs.readFileSync(nodePath.join(root, 'public/_headers'), 'utf8');
+  const html = nodeFs.readFileSync(nodePath.join(root, 'public/index.html'), 'utf8');
+  assert.match(headers, /Content-Security-Policy:/);
+  assert.match(headers, /frame-ancestors 'none'/);
+  assert.match(headers, /object-src 'none'/);
+  assert.match(headers, /X-Frame-Options: DENY/);
+  assert.doesNotMatch(html, /http-equiv="Content-Security-Policy"/i, 'CSP 只维护一份响应头配置');
 });
 
 // ---------------- 分片路由 ----------------

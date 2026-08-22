@@ -11,9 +11,10 @@ import { MetricsDO } from './do-metrics.js';
 import { PanelDO } from './do-panel.js';
 import { parsePanelUsers } from './config.js';
 import {
-  json, err, secret, b64u, b64uDecode, bytesToHex, hmacSha256,
+  json, err, secret, b64u, b64uDecode, bytesToHex, hexToBytes, hmacSha256, verifyHmacSha256,
   signJwt, verifyJwt, randomHex, sha256Hex, parseRangeHours, safeJson,
-  sanitizeAlerts, hashSecret, renderTemplate, parseHeaders, sendWebhook,
+  sanitizeAlerts, hashSecret, verifySecretHash, signUploadToken, verifyUploadToken,
+  renderTemplate, parseHeaders, validateWebhookUrl, sendWebhookRaw, sendWebhook,
   shardForServerId, makeStreamId, shardFromStreamId,
 } from './utils.js';
 import { isAdmin, canAccessServer, canExec, serverListCache, __clearGraceCache } from './auth.js';
@@ -42,10 +43,10 @@ export { TerminalDO, MetricsDO, PanelDO };
 // ============================================================
 export const __internals = {
   parsePanelUsers, json, err, secret,
-  b64u, b64uDecode, bytesToHex, hmacSha256,
+  b64u, b64uDecode, bytesToHex, hexToBytes, hmacSha256, verifyHmacSha256,
   signJwt, verifyJwt, randomHex, sha256Hex,
-  parseRangeHours, safeJson, sanitizeAlerts, hashSecret,
-  renderTemplate, parseHeaders, sendWebhook, sanitizeReportPayload,
+  parseRangeHours, safeJson, sanitizeAlerts, hashSecret, verifySecretHash, signUploadToken, verifyUploadToken,
+  renderTemplate, parseHeaders, validateWebhookUrl, sendWebhookRaw, sendWebhook, sanitizeReportPayload,
   shardForServerId, makeStreamId, shardFromStreamId,
   isAdmin, canAccessServer, canExec, handleReport,
   lastSeenWrite, LAST_SEEN_THROTTLE_S, customWritten, serverListCache, apiCounts, serverRowCache, reportBatch,

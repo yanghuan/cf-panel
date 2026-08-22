@@ -187,6 +187,18 @@ function clientIp(request) {
   return request.headers.get('cf-connecting-ip') || 'unknown';
 }
 
+// DO 会话创建与 D1 不支持跨资源事务。会话已启动后审计失败时采用 best-effort：
+// 记录服务端错误但仍把可用 session 返回客户端，避免“API 500、远端 PTY 已启动”的孤儿会话。
+async function auditSessionOpen(env, user, request, action, serverId) {
+  try {
+    await env.DB.prepare('INSERT INTO audit_logs (user_id, username, client_ip, action, target_server_id) VALUES (?,?,?,?,?)')
+      .bind(user.id, user.username, clientIp(request), action, serverId)
+      .run();
+  } catch (e) {
+    console.error(`${action} audit failed for server ${serverId}:`, e);
+  }
+}
+
 // 返回剩余锁定秒数；未锁定返回 null（并惰性清理过期窗口）
 function loginLockRemaining(ip) {
   const now = Date.now();
@@ -424,9 +436,7 @@ async function handleApiInner(request, env) {
       body: JSON.stringify({ op: 'create', streamId, serverId: server.id, creatorUserId: user.id, clientIp: clientIp(request) }),
     });
     if (!resp.ok) return err(`agent not reachable: ${await resp.text()}`, 502);
-    await env.DB.prepare('INSERT INTO audit_logs (user_id, username, client_ip, action, target_server_id) VALUES (?,?,?,?,?)')
-      .bind(user.id, user.username, clientIp(request), 'terminal.open', server.id)
-      .run();
+    await auditSessionOpen(env, user, request, 'terminal.open', server.id);
     return json({ session_id: streamId, server_id: server.id, server_name: server.name });
   }
 
@@ -444,9 +454,7 @@ async function handleApiInner(request, env) {
       body: JSON.stringify({ op: 'open_file', streamId, serverId: server.id, creatorUserId: user.id, clientIp: clientIp(request) }),
     });
     if (!resp.ok) return err(`agent not reachable: ${await resp.text()}`, 502);
-    await env.DB.prepare('INSERT INTO audit_logs (user_id, username, client_ip, action, target_server_id) VALUES (?,?,?,?,?)')
-      .bind(user.id, user.username, clientIp(request), 'file.open', server.id)
-      .run();
+    await auditSessionOpen(env, user, request, 'file.open', server.id);
     return json({ session_id: streamId, server_id: server.id, server_name: server.name });
   }
 
@@ -1200,8 +1208,9 @@ async function handleWsInner(request, env) {
   } else if (path.startsWith('/ws/file/')) {
     shard = shardFromStreamId(path.slice('/ws/file/'.length));
   } else if (path === '/ws/agent/control') {
-    // 用 key 指纹反查服务器定位分片（身份与凭证合一）
-    const key = request.headers.get('x-agent-key') || url.searchParams.get('key') || '';
+    // 用 header key 指纹反查服务器定位分片；凭证禁止出现在 URL，避免边缘日志/代理记录泄露
+    const key = request.headers.get('x-agent-key') || '';
+    if (!key) return new Response('missing agent key', { status: 401 });
     const keyId = await sha256Hex(key);
     const server = await env.DB.prepare('SELECT * FROM servers WHERE agent_key_id = ?').bind(keyId).first();
     if (!server) return new Response('unknown agent', { status: 401 });

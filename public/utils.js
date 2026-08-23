@@ -19,6 +19,21 @@
     return v.toFixed(v >= 100 ? 0 : 1) + units[i];
   }
 
+  // Agent 文件列表属于不可信输入：在进入 HTML/属性和数值格式化前统一收口。
+  function normalizeFileEntry(entry) {
+    const raw = entry && typeof entry === 'object' ? entry : {};
+    const numberOrZero = (value) => {
+      const n = Number(value);
+      return Number.isFinite(n) && n >= 0 ? Math.min(n, Number.MAX_SAFE_INTEGER) : 0;
+    };
+    return {
+      name: String(raw.name ?? '').slice(0, 4096),
+      type: raw.type === 'dir' ? 'dir' : 'file',
+      size: numberOrZero(raw.size),
+      mtime: numberOrZero(raw.mtime),
+    };
+  }
+
   // 路径拼接/父目录：跨平台（Unix '/' 与 Windows 盘符 '\'）。
   // Windows agent 返回的路径形如 C:\Users\me（反斜杠）；按 cwd 判定分隔符，
   // 尾分隔符正确处理（'/' 根与 'C:\' 根都不重复加分隔符）
@@ -482,7 +497,7 @@
 
   // 导出（app.js 开头解构）
   window.CfUtils = {
-    $, escapeHtml, fmtBytes, fileJoin, fileParent, fileBase, downsample,
+    $, escapeHtml, fmtBytes, normalizeFileEntry, fileJoin, fileParent, fileBase, downsample,
     lockScroll, unlockScroll,
     MONITOR_STEP_MAX, MONITOR_RANGE_LABEL, MONITOR_COLORS,
     GEO_PRIVATE, geoLookup, flagHtml, osIconHtml, isSystemPath, isBinaryExt, loadScript, loadCss, loadMonaco, loadMarkdown, setGeoEnabled, IdleGuard,

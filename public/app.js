@@ -2,7 +2,7 @@
 (() => {
   'use strict';
   // 工具函数与 <cf-ip> 组件从 utils.js 解构；api 层从 api.js 解构（index.html 中均须先加载）
-  const { $, escapeHtml, fmtBytes, fileJoin, fileParent, fileBase, downsample, lockScroll, unlockScroll,
+  const { $, escapeHtml, fmtBytes, normalizeFileEntry, fileJoin, fileParent, fileBase, downsample, lockScroll, unlockScroll,
           MONITOR_STEP_MAX, MONITOR_RANGE_LABEL, MONITOR_COLORS,
           GEO_PRIVATE, setGeoEnabled, flagHtml, osIconHtml, isSystemPath, isBinaryExt, loadScript, loadCss, loadMonaco, loadMarkdown, geoLookup, IdleGuard } = CfUtils;
   const { api, setTokenGetter, FileSession, TermSession, PushSession } = CfApi;
@@ -779,8 +779,9 @@
   }
 
   function renderFileList(entries) {
-    fileEntries = entries || []; // 缓存条目供上传同名检测
-    const rows = entries.map((e) => {
+    const safeEntries = (Array.isArray(entries) ? entries : []).map(normalizeFileEntry);
+    fileEntries = safeEntries; // 缓存已收口条目供上传同名检测
+    const rows = safeEntries.map((e) => {
       const size = e.type === 'dir' ? '—' : fmtBytes(e.size);
       const time = e.mtime ? new Date(e.mtime * 1000).toLocaleString('zh-CN') : '—';
       const path = fileJoin(fileSess.cwd, e.name);
@@ -796,11 +797,11 @@
       const menu = `<div class="row-menu-wrap">
         <button class="row-menu" type="button" title="操作" aria-label="操作">⋯</button>
         <div class="row-menu-pop hidden">
-          <button class="f-act-dl" type="button" data-path="${escapeHtml(path)}" data-type="${e.type}" data-size="${e.size}">下载</button>
-          ${editable ? `<button class="f-act-edit" type="button" data-path="${escapeHtml(path)}" data-size="${e.size}">编辑</button>` : ''}
+          <button class="f-act-dl" type="button" data-path="${escapeHtml(path)}" data-type="${escapeHtml(e.type)}" data-size="${escapeHtml(e.size)}">下载</button>
+          ${editable ? `<button class="f-act-edit" type="button" data-path="${escapeHtml(path)}" data-size="${escapeHtml(e.size)}">编辑</button>` : ''}
           ${prot ? '' : `<button class="f-act-mv" type="button" data-path="${escapeHtml(path)}">移动</button>
           <button class="f-act-ren" type="button" data-path="${escapeHtml(path)}">重命名</button>
-          <button class="f-act-del danger" type="button" data-path="${escapeHtml(path)}" data-type="${e.type}">删除</button>`}
+          <button class="f-act-del danger" type="button" data-path="${escapeHtml(path)}" data-type="${escapeHtml(e.type)}">删除</button>`}
         </div>
       </div>`;
       return `<tr><td>${nameCell}</td><td>${size}</td><td>${escapeHtml(time)}</td><td class="f-ops">${menu}</td></tr>`;

@@ -1,12 +1,14 @@
 // cf-panel — Durable Object：WebSocket 中转核心（分片实例 TerminalDO）
 import { json, err, doPanel, sha256Hex, verifySecretHash } from './utils.js';
-import { authUserByToken, isAdmin, canExec } from './auth.js';
+import { authIdentityByToken, authUserByIdentity, isAdmin, canExec } from './auth.js';
 import { handleReport } from './report.js';
 
 // 本模块专用常量（会话/上报间隔/PAT 校验，就近定义便于对照使用代码）
 const SESSION_TTL_MS = 10 * 60 * 1000; // 会话两端都断开超过 10 分钟 → 回收
 const MAX_SESSIONS_PER_SERVER = 8; // 每服务器并发会话上限（超限 429，防 PTY/bash/FD 耗尽）
 const SESSION_ABS_MS = 4 * 60 * 60 * 1000; // 会话绝对最长时长（含活跃连接，到期强制回收）
+const WS_AUTH_TIMEOUT_MS = 10 * 1000; // 浏览器 WS 建连后必须在 10s 内发送 auth 首帧
+const MAX_PENDING_USER_WS = 128; // 单分片未鉴权浏览器连接上限
 const PAT_CHECK_INTERVAL_MS = 10 * 1000; // PAT 终端连接重校验间隔（每条消息 → 10s 一次，−98%）
 const REPORT_FAST_INTERVAL_S = 5;  // 有观看者：5 秒上报（快采 28,800 → 17,280 帧/天/机）
 const REPORT_SLOW_INTERVAL_S = 120; // 无人查看：120 秒上报
@@ -98,6 +100,7 @@ export class TerminalDO {
           streamId: body.streamId,
           serverId: body.serverId,
           creatorUserId: body.creatorUserId,
+          creatorUser: String(body.creatorUser || ''),
           clientIp: String(body.clientIp || ''), // 文件写审计用（WS 消息路径无请求头，随会话存储）
           createdAt,
           type: isFile ? 'file' : 'terminal',
@@ -113,6 +116,7 @@ export class TerminalDO {
             streamId: body.streamId,
             serverId: body.serverId,
             creatorUserId: body.creatorUserId,
+            creatorUser: String(body.creatorUser || ''),
             clientIp: String(body.clientIp || ''),
             createdAt,
             type: isFile ? 'file' : 'terminal',
@@ -193,12 +197,22 @@ export class TerminalDO {
       const streamId = m[2];
       const sess = await this.hydrateSession(streamId);
       if (!sess) return new Response('session not found', { status: 404 });
+      const pending = (this.state.getWebSockets?.() || []).filter((ws) => {
+        try { return ws.deserializeAttachment?.()?.role === 'user-pending'; } catch { return false; }
+      }).length;
+      if (pending >= MAX_PENDING_USER_WS) return new Response('too many pending connections', { status: 429 });
       const pair = new WebSocketPair();
       this.state.acceptWebSocket(pair[1]);
+      const authDeadline = Date.now() + WS_AUTH_TIMEOUT_MS;
       pair[1].serializeAttachment({
         role: 'user-pending', sid: streamId, serverId: sess.serverId,
-        creatorUserId: sess.creatorUserId, type: sess.type, createdAt: sess.createdAt,
+        creatorUserId: sess.creatorUserId, creatorUser: sess.creatorUser || '',
+        clientIp: sess.clientIp || '', type: sess.type, createdAt: sess.createdAt, authDeadline,
       });
+      try {
+        const existing = await this.state.storage.getAlarm();
+        if (existing == null || authDeadline < existing) await this.state.storage.setAlarm(authDeadline);
+      } catch { /* 无法安排 alarm 时仍受 pending 数量硬上限保护 */ }
       return new Response(null, { status: 101, webSocket: pair[0] });
     }
 
@@ -263,7 +277,8 @@ export class TerminalDO {
       // 附件随连接持久化：休眠唤醒后靠它重建会话索引
       pair[1].serializeAttachment({
         role: 'agent', sid, serverId: sess.serverId,
-        creatorUserId: sess.creatorUserId, type: sess.type, createdAt: sess.createdAt,
+        creatorUserId: sess.creatorUserId, creatorUser: sess.creatorUser || '',
+        clientIp: sess.clientIp || '', type: sess.type, createdAt: sess.createdAt,
       });
       return new Response(null, { status: 101, webSocket: pair[0] });
     }
@@ -410,6 +425,18 @@ export class TerminalDO {
         this.pendingOpen.delete(sid);
       }
     }
+    // 未鉴权浏览器连接不属于 sess.userWs，必须单独按 attachment deadline 回收。
+    for (const ws of this.state.getWebSockets?.() || []) {
+      let att = null;
+      try { att = ws.deserializeAttachment?.(); } catch { /* ignore */ }
+      if (!att || att.role !== 'user-pending') continue;
+      const deadline = Number(att.authDeadline) || 0;
+      if (deadline <= now) {
+        try { ws.close(1008, 'authentication timeout'); } catch { /* ignore */ }
+      } else {
+        next = Math.min(next, deadline);
+      }
+    }
     if (next !== Infinity) {
       try { await this.state.storage.setAlarm(next + 1000); } catch { /* ignore */ }
     }
@@ -467,6 +494,8 @@ export class TerminalDO {
             streamId: att.sid,
             serverId: att.serverId,
             creatorUserId: att.creatorUserId,
+            creatorUser: att.creatorUser || '',
+            clientIp: att.clientIp || '',
             createdAt: att.createdAt,
             type: att.type,
             userWs: null,
@@ -475,6 +504,10 @@ export class TerminalDO {
             agentBuf: [],
           };
           this.sessions.set(att.sid, sess);
+        } else {
+          // 兼容升级前缺字段的 agent 附件：后遇到的新 user 附件时补齐审计上下文。
+          if (!sess.creatorUser && att.creatorUser) sess.creatorUser = att.creatorUser;
+          if (!sess.clientIp && att.clientIp) sess.clientIp = att.clientIp;
         }
         if (att.role === 'user') sess.userWs = ws;
         else sess.agentWs = ws;
@@ -508,11 +541,16 @@ export class TerminalDO {
     // 浏览器侧待鉴权连接（role: user-pending）：首帧必须是 {type:'auth', token}
     const att = ws.deserializeAttachment?.();
     if (att && att.role === 'user-pending') {
+      if (att.authDeadline && Date.now() > att.authDeadline) {
+        try { ws.close(1008, 'authentication timeout'); } catch { /* ignore */ }
+        return;
+      }
       let j = null;
       try { j = JSON.parse(typeof message === 'string' ? message : ''); } catch { /* 非 JSON */ }
       const token = j && j.type === 'auth' ? String(j.token || '') : '';
       // WS 首帧鉴权与 REST 一致（JWT 管理员直接放行；PAT/member 需服务器存在且可执行/为创建者）
-      const user = token ? await authUserByToken(token, this.env) : null;
+      const authenticated = token ? await authIdentityByToken(token, this.env) : null;
+      const user = authenticated && authenticated.user;
       const sess = await this.hydrateSession(att.sid);
       if (!user || !sess) {
         try { ws.close(1008, 'unauthorized'); } catch { /* ignore */ }
@@ -533,15 +571,17 @@ export class TerminalDO {
         try { ws.close(1008, 'unauthorized'); } catch { /* ignore */ }
         return;
       }
-      // 鉴权通过 → 挂接为会话用户端；附件升级为 user 角色（供休眠唤醒重建索引）。
-      // patToken 随附件持久化：PAT 撤销后每次浏览器消息重校验，撤销即关闭（JWT 不存，保持零 D1 读）
-      sess.creatorUser = user.username || ''; // 文件写操作审计用（休眠唤醒后首帧鉴权会重新设置）
+      // 鉴权通过 → 挂接为会话用户端；附件只保存不可逆 PAT HMAC 或已验证 JWT claims。
+      // 创建者身份/IP 随附件保存，休眠唤醒后文件操作审计仍完整。
+      if (!sess.creatorUser) sess.creatorUser = user.username || '';
+      if (!sess.clientIp && att.clientIp) sess.clientIp = att.clientIp;
       sess.userWs = ws;
-      sess.lastPatCheck = Date.now(); // 首帧已校验，PAT 重校验节流起点
+      sess.lastAuthCheck = Date.now();
       ws.serializeAttachment({
         role: 'user', sid: att.sid, serverId: sess.serverId,
-        creatorUserId: sess.creatorUserId, type: sess.type, createdAt: sess.createdAt,
-        patToken: user.pat ? token : null,
+        creatorUserId: sess.creatorUserId, creatorUser: sess.creatorUser || '',
+        clientIp: sess.clientIp || '', type: sess.type, createdAt: sess.createdAt,
+        auth: authenticated.identity,
       });
       // 补发鉴权前缓冲的 agent 输出（如初始 bash 提示符），保证打开即见首屏
       if (sess.userBuf && sess.userBuf.length) {
@@ -630,14 +670,27 @@ export class TerminalDO {
     }
 
     if (ws === sess.userWs) {
-      // PAT 撤销校验（节流）：每 10s 重查一次 D1（打字 2~5 消息/s → 10s 一次，−98%；
-      // 撤销后最迟 10s 内的一次输入即关闭连接；挂机连接由会话 TTL/绝对 TTL 兜底回收）
-      const uatt = ws.deserializeAttachment?.();
-      if (uatt && uatt.patToken) {
+      // PAT 撤销/JWT 过期校验（10s 节流）。新附件只保存 PAT HMAC 或 JWT claims；
+      // 旧版本 patToken 附件在首次活动时校验并原地迁移，避免在线升级强制中断会话。
+      let uatt = ws.deserializeAttachment?.();
+      let identity = uatt && uatt.auth;
+      if (!identity && uatt && uatt.patToken) {
+        const migrated = await authIdentityByToken(uatt.patToken, this.env);
+        if (!migrated) {
+          try { ws.close(1008, 'unauthorized'); } catch { /* ignore */ }
+          return;
+        }
+        const { patToken: _discard, ...safe } = uatt;
+        safe.auth = migrated.identity;
+        ws.serializeAttachment(safe);
+        uatt = safe;
+        identity = safe.auth;
+      }
+      if (identity) {
         const nowP = Date.now();
-        if (!sess.lastPatCheck || nowP - sess.lastPatCheck >= PAT_CHECK_INTERVAL_MS) {
-          sess.lastPatCheck = nowP;
-          const u = await authUserByToken(uatt.patToken, this.env);
+        if (!sess.lastAuthCheck || nowP - sess.lastAuthCheck >= PAT_CHECK_INTERVAL_MS) {
+          sess.lastAuthCheck = nowP;
+          const u = await authUserByIdentity(identity, this.env);
           if (!u) {
             try { ws.close(1008, 'unauthorized'); } catch { /* ignore */ }
             return;

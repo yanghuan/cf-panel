@@ -421,6 +421,93 @@ test('MetricsDO: evict 后空 Map 上报水位不误推进，fullSweep 兜底归
   assert.equal(Number(await state.storage.get('arc:1')), oldTs, 'fullSweep 推进水位到实际归档行');
 });
 
+test('MetricsDO: fullSweep 某服务器跨批失败时保留其全部源行与旧水位，其他服务器继续完成', async () => {
+  const env = makeEnv();
+  const nowMin = Math.floor(Date.now() / 1000 / 60);
+  const oldArc = nowMin - 2000;
+  const store = { 'arc:1': String(oldArc), 'arc:2': String(oldArc) };
+  const server1Keys = [];
+  for (let i = 0; i < 101; i++) {
+    const ts = nowMin - 800 - i;
+    const key = `m:1:${ts}`;
+    server1Keys.push(key);
+    store[key] = JSON.stringify({ cpu: i });
+  }
+  const server2Ts = nowMin - 850;
+  store[`m:2:${server2Ts}`] = JSON.stringify({ cpu: 2 });
+  const state = mockState(store);
+  const { inst } = mkMetrics(env, state);
+  const realBatch = env.DB.batch.bind(env.DB);
+  let batchNo = 0;
+  env.DB.batch = async (stmts) => {
+    batchNo += 1;
+    if (batchNo === 2) throw new Error('transient D1 failure'); // server 1 的第二批
+    return realBatch(stmts);
+  };
+  const origError = console.error;
+  console.error = () => {};
+  try {
+    assert.equal(await inst.fullSweep(true), false, '部分失败必须反馈给 housekeep');
+  } finally {
+    console.error = origError;
+  }
+  assert.equal(server1Keys.every((k) => state.storage.map.has(k)), true, '失败服务器全部源行保留');
+  assert.equal(Number(await state.storage.get('arc:1')), oldArc, '失败服务器水位不推进');
+  assert.equal(state.storage.map.has(`m:2:${server2Ts}`), false, '其他服务器仍可完成清理');
+  assert.equal(Number(await state.storage.get('arc:2')), server2Ts, '其他服务器水位正常推进');
+
+  env.DB.batch = realBatch;
+  assert.equal(await inst.fullSweep(true), true, '恢复后幂等重放成功');
+  assert.equal(server1Keys.some((k) => state.storage.map.has(k)), false, '重试后源行清理');
+  assert.equal(Number(await state.storage.get('arc:1')), nowMin - 800, '重试后推进到实际最大时间戳');
+  const archived = await env.DB.prepare('SELECT COUNT(*) AS c FROM metrics_min WHERE server_id = 1').first();
+  assert.equal(Number(archived.c), 101, '成功批次重放由 INSERT OR IGNORE 去重，无数据空洞');
+});
+
+test('MetricsDO: fullSweep 源行删除失败返回未完成并保留数据供重试', async () => {
+  const nowMin = Math.floor(Date.now() / 1000 / 60);
+  const ts = nowMin - 800;
+  const state = mockState({ [`m:1:${ts}`]: JSON.stringify({ cpu: 1 }), 'arc:1': String(ts) });
+  const { inst } = mkMetrics(makeEnv(), state);
+  const realDelete = state.storage.delete.bind(state.storage);
+  state.storage.delete = async () => { throw new Error('storage unavailable'); };
+  const origError = console.error;
+  console.error = () => {};
+  try {
+    assert.equal(await inst.fullSweep(true), false);
+  } finally {
+    console.error = origError;
+  }
+  assert.equal(state.storage.map.has(`m:1:${ts}`), true, '删除失败后源行仍存在');
+  state.storage.delete = realDelete;
+  assert.equal(await inst.fullSweep(true), true);
+  assert.equal(state.storage.map.has(`m:1:${ts}`), false, '恢复后重试删除成功');
+});
+
+test('MetricsDO: fullSweep/prune 失败不推进家政时间戳', async () => {
+  const now = Date.now();
+  const state = mockState({ housekeep: JSON.stringify({ lastSweepAt: 0, lastPruneAt: now }) });
+  const env = makeEnv();
+  const { inst } = mkMetrics(env, state);
+  inst.fullSweep = async () => false;
+  const origError = console.error;
+  console.error = () => {};
+  try {
+    await inst.alarm();
+    assert.equal(inst.lastSweepAt, 0, 'fullSweep 未完成时不推进时间戳');
+
+    inst.lastSweepAt = Date.now();
+    inst.lastPruneAt = 0;
+    const realBatch = env.DB.batch;
+    env.DB.batch = async () => { throw new Error('prune unavailable'); };
+    await inst.alarm();
+    env.DB.batch = realBatch;
+    assert.equal(inst.lastPruneAt, 0, 'prune 失败时不推进时间戳');
+  } finally {
+    console.error = origError;
+  }
+});
+
 test('MetricsDO: evict 后热写空 Map 不误判已加载，/query 完整恢复（回归修复）', async () => {
   const env = makeEnv({ ARCHIVE_TO_D1: '0' });
   const nowMin = Math.floor(Date.now() / 1000 / 60);
@@ -780,14 +867,22 @@ test('MetricsDO: /drop 清理 storage 告警/探活状态', async () => {
   await env.DB.prepare("INSERT INTO kv_json (key, value) VALUES ('settings', ?)")
     .bind(JSON.stringify({ alerts: { webhook_url: 'https://example.com/hook', cpu_pct: 90, cooldown_min: 30 } })).run();
   const st = mockState();
-  const { call } = mkMetrics(env, st);
+  const { inst, call } = mkMetrics(env, st);
   const nowMin = Math.floor(Date.now() / 1000 / 60);
   await call('/report', { method: 'POST', body: JSON.stringify({ serverId: 1, serverName: 's1', minTs: nowMin, cpu: 95, probes: [{ name: 'web', ok: false }] }) });
+  st.storage.map.set('alert:offline:1', 'off');
+  st.storage.map.set('arc:1', String(nowMin - 60));
+  inst.offlineState.set(1, 'off');
+  inst.arcCache.set(1, nowMin - 60);
   assert.ok(st.storage.map.has('alert:1:cpu'), '告警状态已写入');
   assert.ok(st.storage.map.has('probe:1:web'), '探活状态已写入');
   await call('/drop', { method: 'POST', body: JSON.stringify({ server_id: 1 }) });
   assert.equal(st.storage.map.has('alert:1:cpu'), false, 'drop 清理告警状态');
   assert.equal(st.storage.map.has('probe:1:web'), false, 'drop 清理探活状态');
+  assert.equal(st.storage.map.has('alert:offline:1'), false, 'drop 清理离线状态');
+  assert.equal(st.storage.map.has('arc:1'), false, 'drop 清理归档水位');
+  assert.equal(inst.offlineState.has(1), false, 'drop 清理内存离线状态');
+  assert.equal(inst.arcCache.has(1), false, 'drop 清理内存归档水位');
 });
 
 // ---------------- PanelDO ----------------
@@ -803,6 +898,31 @@ test('PanelDO: /viewers 只统计已鉴权观看者，返回 fastSince 过渡标
   assert.equal((await inst.fetch(new Request('https://do.internal/other'))).status, 404);
 });
 
+test('PanelDO: alarm 回收超时未鉴权连接并续排下一截止时间', async () => {
+  const now = Date.now();
+  const makeWs = (attachment) => ({
+    attachment, closed: false,
+    deserializeAttachment() { return this.attachment; },
+    close() { this.closed = true; },
+  });
+  const expired = makeWs({ role: 'viewer-pending', authDeadline: now - 1 });
+  const future = makeWs({ role: 'viewer-pending', authDeadline: now + 5000 });
+  const viewer = makeWs({ role: 'viewer', auth: { kind: 'jwt', id: 1, username: 'admin', exp: Math.floor(now / 1000) + 60 } });
+  const state = mockState();
+  state.getWebSockets = () => [expired, future, viewer];
+  const inst = new PanelDO(state, makeEnv());
+  await inst.alarm();
+  assert.equal(expired.closed, true, '超时 pending 连接关闭');
+  assert.equal(future.closed, false, '未到期 pending 连接保留');
+  assert.equal(viewer.closed, false, '已鉴权连接不受影响');
+  assert.equal(state.storage.alarmTs, future.attachment.authDeadline, '续排下一鉴权截止时间');
+
+  const saturated = mockState();
+  saturated.getWebSockets = () => Array.from({ length: 128 }, () => makeWs({ role: 'viewer-pending', authDeadline: now + 5000 }));
+  const limited = await new PanelDO(saturated, makeEnv()).fetch(new Request('https://do.internal/ws/push'));
+  assert.equal(limited.status, 429, 'pending 达到硬上限后拒绝新连接');
+});
+
 test('PanelDO: 首帧 auth 鉴权通过后推送，非法 token 断开并触发快采唤醒', async () => {
   const env = makeEnv();
   const token = await I.signJwt({ uid: 1, username: 'admin', role: 1, exp: Math.floor(Date.now() / 1000) + 3600 }, env);
@@ -814,7 +934,7 @@ test('PanelDO: 首帧 auth 鉴权通过后推送，非法 token 断开并触发�
   await inst.webSocketMessage(bad, JSON.stringify({ type: 'auth', token: 'bogus' }));
   assert.equal(bad.closed, true);
 
-  // 合法 token → 鉴权通过（attachment 存 token），首位观看者触发各分片快采唤醒，之后 sync 推送列表
+  // 合法 token → 鉴权通过（attachment 只存安全身份），首位观看者触发快采唤醒
   const ws = {
     closed: false, attachment: null, sent: [],
     deserializeAttachment() { return this.attachment; },
@@ -825,7 +945,9 @@ test('PanelDO: 首帧 auth 鉴权通过后推送，非法 token 断开并触发�
   const inst2 = new PanelDO({ getWebSockets: () => [ws] }, env);
   await inst2.webSocketMessage(ws, JSON.stringify({ type: 'auth', token }));
   assert.equal(ws.closed, false);
-  assert.equal(ws.attachment, token);
+  assert.equal(ws.attachment.role, 'viewer');
+  assert.equal(ws.attachment.auth.kind, 'jwt');
+  assert.doesNotMatch(JSON.stringify(ws.attachment), new RegExp(token.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
   assert.ok(env.TERMINAL.calls.some((c) => c.path === '/rpc/set_viewers')); // 快采唤醒
 
   await inst2.webSocketMessage(ws, 'sync');
@@ -841,7 +963,8 @@ test('PanelDO: 服务器列表与鉴权缓存（3s/5s TTL，降 D1 读）', asyn
   const inst = new PanelDO({ getWebSockets: () => [] }, env);
   await inst.webSocketMessage({ deserializeAttachment: () => token, send() {} }, 'sync'); // 首次查 D1
   assert.ok(inst.listCache && inst.listCache.rows.length === 1, '列表已缓存');
-  assert.ok(inst.authCache.has(token), '鉴权已缓存');
+  assert.equal(inst.authCache.size, 1, '鉴权已缓存');
+  assert.equal([...inst.authCache.keys()].some((k) => k.includes(token)), false, '缓存键不含 bearer 明文');
   // 二次 sync 走缓存（不重复查 D1）
   const sent = [];
   await inst.webSocketMessage({ deserializeAttachment: () => token, send: (m) => sent.push(m) }, 'sync');
@@ -960,9 +1083,25 @@ test('PanelDO: PAT 只看白名单内的服务器', async () => {
     .bind(1, 'pat', hash, JSON.stringify(['server:read']), JSON.stringify([1])).run();
 
   const sent = [];
-  const inst = new PanelDO({ getWebSockets: () => [] }, env);
-  await inst.webSocketMessage({ deserializeAttachment: () => pat, send: (m) => sent.push(m) }, 'sync');
+  const ws = {
+    attachment: { role: 'viewer-pending', authDeadline: Date.now() + 10000 }, closed: false,
+    deserializeAttachment() { return this.attachment; },
+    serializeAttachment(att) { this.attachment = att; },
+    send: (m) => sent.push(m), close() { this.closed = true; },
+  };
+  const inst = new PanelDO({ getWebSockets: () => [ws] }, env);
+  await inst.webSocketMessage(ws, JSON.stringify({ type: 'auth', token: pat }));
+  assert.equal(ws.attachment.role, 'viewer');
+  assert.equal(ws.attachment.auth.kind, 'pat');
+  assert.equal(ws.attachment.auth.tokenHash, hash);
+  assert.equal(JSON.stringify(ws.attachment).includes(pat), false, 'Hibernation 附件不含 PAT 明文');
+  await inst.webSocketMessage(ws, 'sync');
   assert.deepEqual(JSON.parse(sent[0]).map((s) => s.name), ['srv-a']);
+  await env.DB.prepare('DELETE FROM api_tokens WHERE token_hash = ?').bind(hash).run();
+  inst.authCache.clear();
+  inst.syncAt.delete(ws);
+  await inst.webSocketMessage(ws, 'sync');
+  assert.equal(ws.closed, true, '安全 PAT 身份在撤销后重新查询并关闭连接');
 });
 
 // ---------------- TerminalDO ----------------
@@ -1267,6 +1406,36 @@ test('TerminalDO: 文件写操作指令写审计（delete/zip/rename Text 帧 + 
   assert.equal(Number(all.results[0].c), 4, '仅 4 条文件审计（delete/rename/zip/write）');
 });
 
+test('TerminalDO: 休眠唤醒后文件审计保留 username 与 client_ip', async () => {
+  const env = makeEnv();
+  const createdAt = Date.now();
+  const auth = { kind: 'jwt', id: 7, username: 'alice', role: 1, exp: Math.floor(Date.now() / 1000) + 3600 };
+  const agentWs = {
+    attachment: {
+      role: 'agent', sid: '0-fid', serverId: 1, creatorUserId: 7,
+      creatorUser: 'alice', clientIp: '203.0.113.7', type: 'file', createdAt,
+    },
+    sent: [], deserializeAttachment() { return this.attachment; }, send(m) { this.sent.push(m); },
+  };
+  const userWs = {
+    attachment: {
+      role: 'user', sid: '0-fid', serverId: 1, creatorUserId: 7,
+      creatorUser: 'alice', clientIp: '203.0.113.7', type: 'file', createdAt, auth,
+    },
+    deserializeAttachment() { return this.attachment; }, send() {}, close() {},
+  };
+  const state = mockState();
+  state.getWebSockets = () => [agentWs, userWs]; // agent 先重建，随后 user 补齐/挂接
+  const inst = new TerminalDO(state, env);
+  await inst.webSocketMessage(userWs, JSON.stringify({ type: 'delete', path: '/tmp/a.txt' }));
+
+  const row = await env.DB.prepare("SELECT * FROM audit_logs WHERE action = 'file.delete'").first();
+  assert.equal(row.user_id, 7);
+  assert.equal(row.username, 'alice');
+  assert.equal(row.client_ip, '203.0.113.7');
+  assert.equal(agentWs.sent.length, 1, '休眠恢复后消息仍转发给 agent');
+});
+
 test('TerminalDO: /rpc/exec 下发 exec 指令，收到 exec_result 后返回结果', async () => {
   const env = makeEnv();
   const sent = [];
@@ -1371,6 +1540,34 @@ test('TerminalDO: 僵尸会话超 TTL 由 alarm 清理，未到期安排下次 a
   assert.equal(inst.sessions.has('0-live'), true);
   // 安排了 alarm：最早僵尸到期时间 +1s
   assert.equal(st.storage.alarmTs, now - 1000 + TTL + 1000);
+});
+
+test('TerminalDO: alarm 回收超时 user-pending 连接', async () => {
+  const now = Date.now();
+  const makeWs = (authDeadline) => ({
+    attachment: { role: 'user-pending', authDeadline }, closed: false,
+    deserializeAttachment() { return this.attachment; },
+    close() { this.closed = true; },
+  });
+  const expired = makeWs(now - 1);
+  const future = makeWs(now + 5000);
+  const st = mockState();
+  st.getWebSockets = () => [expired, future];
+  const inst = new TerminalDO(st, makeEnv());
+  await inst.alarm();
+  assert.equal(expired.closed, true, '超时 pending 连接关闭');
+  assert.equal(future.closed, false, '未到期 pending 连接保留');
+  assert.equal(st.storage.alarmTs, future.attachment.authDeadline + 1000, '续排下一鉴权截止时间');
+
+  const saturated = mockState();
+  saturated.getWebSockets = () => Array.from({ length: 128 }, () => makeWs(now + 5000));
+  const limitedInst = new TerminalDO(saturated, makeEnv());
+  limitedInst.sessions.set('0-sid', {
+    streamId: '0-sid', serverId: 1, creatorUserId: 1, createdAt: now,
+    type: 'terminal', userWs: null, agentWs: null,
+  });
+  const limited = await limitedInst.fetch(new Request('https://do.internal/ws/terminal/0-sid'));
+  assert.equal(limited.status, 429, 'pending 达到硬上限后拒绝新连接');
 });
 
 test('TerminalDO: 每服务器并发会话上限，超限 429（H-04）', async () => {
@@ -1498,6 +1695,13 @@ test('TerminalDO: user-pending 首帧鉴权接受 PAT（server:exec + 白名单�
   await inst.webSocketMessage(ok, JSON.stringify({ type: 'auth', token: okToken }));
   assert.equal(ok.closed, false, '白名单内 PAT（exec）放行');
   assert.equal(inst.sessions.get('0-sid').userWs, ok);
+  assert.equal(ok.attachment.auth.kind, 'pat');
+  assert.equal(ok.attachment.auth.tokenHash, await I.hashSecret(okToken, env));
+  assert.equal(JSON.stringify(ok.attachment).includes(okToken), false, 'Hibernation 附件不含 PAT 明文');
+  await env.DB.prepare('DELETE FROM api_tokens WHERE token_hash = ?').bind(ok.attachment.auth.tokenHash).run();
+  inst.sessions.get('0-sid').lastAuthCheck = 0;
+  await inst.webSocketMessage(ok, 'echo after revoke');
+  assert.equal(ok.closed, true, '仅凭附件 HMAC 即可在撤销后关闭连接');
 
   // 白名单外（[999]）→ 拒绝
   const noToken = await insertPat('pat-no', ['server:read', 'server:exec'], [999]);

@@ -33,32 +33,42 @@
       this.ws = null;
       this.serverId = 0;
       this.cwd = '/';
+      this._generation = 0;      // open/close 代际：丢弃乱序 API 响应与旧 WebSocket 事件
       this.uploadState = null;   // { file, size, sent, acked, uploadId, path, reader }
       this.downloadState = null; // { path, size, parts, received }
     }
     get connected() { return this.ws && this.ws.readyState === 1; }
 
-    // 建会话 + WS + auth + 初始列表
+    // 建会话 + WS + auth + 初始列表。代际守卫覆盖 await 响应乱序、关闭弹窗和旧 WS 迟到事件。
     async open(serverId, cwd = '/') {
+      this.close(); // 同时使此前 pending open 失效
+      const generation = this._generation;
       this.serverId = serverId;
       this.cwd = cwd;
-      this.close();
       try {
         const res = await api('/api/file/open', { method: 'POST', body: JSON.stringify({ server_id: serverId }) });
+        if (generation !== this._generation) return;
         const proto = location.protocol === 'https:' ? 'wss' : 'ws';
         // token 不放 URL（避免进访问日志/浏览器历史），连接后首帧发送鉴权
         const ws = new WebSocket(`${proto}://${location.host}/ws/file/${res.session_id}`);
+        if (generation !== this._generation) { try { ws.close(); } catch { /* ignore */ } return; }
         this.ws = ws;
-        ws.onopen = () => { this.send({ type: 'auth', token: tokenGetter() }); this.list(this.cwd, ''); };
-        ws.onmessage = (ev) => this._onMessage(ev);
+        ws.onopen = () => {
+          if (generation !== this._generation || this.ws !== ws) { try { ws.close(); } catch { /* ignore */ } return; }
+          this.send({ type: 'auth', token: tokenGetter() });
+          this.list(this.cwd, '');
+        };
+        ws.onmessage = (ev) => {
+          if (generation === this._generation && this.ws === ws) this._onMessage(ev);
+        };
         ws.onclose = () => {
-          if (this.ws !== ws) return;
+          if (generation !== this._generation || this.ws !== ws) return;
           this.ws = null;
           if (this.h.onDisconnected) this.h.onDisconnected();
         };
         ws.onerror = () => { try { ws.close(); } catch { /* ignore */ } };
       } catch (e) {
-        if (this.h.onError) this.h.onError(e.message);
+        if (generation === this._generation && this.h.onError) this.h.onError(e.message);
       }
     }
     // 断线重连（保留 serverId/cwd）
@@ -67,6 +77,7 @@
     //（「已有上传/下载进行中」而取消按钮已随弹窗关闭不可达，永久卡死直到刷新）。
     // 上传先发 abort（连接还在时）通知 agent 删临时文件；断开时 agent 会话结束清理兜底
     close() {
+      this._generation += 1; // 取消尚未返回的 open() 及旧 WebSocket 的迟到事件
       if (this.uploadState) {
         this.send({ type: 'abort', path: this.uploadState.path, upload_id: this.uploadState.uploadId });
         this.uploadState = null;

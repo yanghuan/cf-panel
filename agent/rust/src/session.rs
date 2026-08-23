@@ -471,6 +471,35 @@ fn normalize_abs(path: &str) -> Option<String> {
     Some(format!("/{}", parts.join("/")))
 }
 
+// Win32 设备名在任意目录、任意扩展名下仍解析为设备（如 NUL.txt、COM1.log）。
+// 同时拒绝 Win32 会归一化掉的尾随点/空格、ADS 冒号与控制字符，避免显示路径和实际目标不一致。
+#[cfg(any(windows, test))]
+fn invalid_windows_segment(seg: &str) -> bool {
+    if seg.is_empty() || seg.trim_end_matches([' ', '.']) != seg {
+        return true;
+    }
+    if seg
+        .chars()
+        .any(|c| c <= '\u{1f}' || matches!(c, '<' | '>' | '"' | ':' | '|' | '?' | '*'))
+    {
+        return true;
+    }
+    let stem = seg.split('.').next().unwrap_or("").to_ascii_uppercase();
+    matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL" | "CLOCK$")
+        || stem.strip_prefix("COM").is_some_and(|n| {
+            matches!(
+                n,
+                "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
+            )
+        })
+        || stem.strip_prefix("LPT").is_some_and(|n| {
+            matches!(
+                n,
+                "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
+            )
+        })
+}
+
 // Windows 词法归一化：盘符路径（C:\ 或 C:/ 均接受，统一为 C:\ 大写盘符 + \ 分隔）。
 // UNC（\\server\share）与相对路径 → None（fail closed：文件管理协议不使用 UNC）。
 // "C:\Users\x\..\y" → "C:\Users\y"；"C:\" → 根 "C:\"；越根（C:\..）→ None。
@@ -489,12 +518,9 @@ fn normalize_abs(path: &str) -> Option<String> {
             ".." => {
                 parts.pop()?; // 越过驱动器根 → None 拒绝
             }
-            // 设备命名空间（COM1/LPT1/CON/NUL 等）与保留字符拦截：防 Win32 设备路径逃逸
+            // 设备名/ADS/保留字符/尾随点空格统一拒绝，防 Win32 路径别名与设备路径逃逸。
             _ => {
-                if seg
-                    .chars()
-                    .any(|c| matches!(c, '<' | '>' | '"' | '|' | '?' | '*'))
-                {
+                if invalid_windows_segment(seg) {
                     return None;
                 }
                 parts.push(seg);
@@ -757,65 +783,68 @@ fn zip_directory(dir: &std::path::Path, out: &mut dyn Write) -> std::io::Result<
     Ok(offset + central.len() as u64 + 22)
 }
 
+// zip 预检与打包均为同步文件系统遍历，只能在 file_blocking 内调用。
+// 超过上限后提前返回，避免继续扫描超大目录；符号链接与打包口径一致，一律跳过。
+fn walk_dir_size_limited(path: &std::path::Path, limit: u64) -> Result<u64, std::io::Error> {
+    let mut size: u64 = 0;
+    for entry in std::fs::read_dir(path)? {
+        let entry = entry?;
+        let ft = entry.file_type()?;
+        if ft.is_symlink() {
+            continue;
+        }
+        let entry_size = if ft.is_dir() {
+            walk_dir_size_limited(&entry.path(), limit.saturating_sub(size))?
+        } else {
+            entry.metadata()?.len()
+        };
+        size = size.saturating_add(entry_size);
+        if size > limit {
+            return Ok(size);
+        }
+    }
+    Ok(size)
+}
+
 // 目录打包 zip（STORED）到临时文件，返回 (zip 路径, 字节数)；前端分段下载后发 delete 清理。
 // 系统路径拦截见 blocking 闭包处注释（zip 只读，允许系统目录下载）
 async fn file_zip(path: &str, sid: &str, tmp_dir: &str) -> Result<(String, u64), String> {
     if is_system_path(path) && normalize_abs(path).as_deref() == Some("") {
         return Err(SYSTEM_PATH_ERR.into()); // 仅拒绝根目录 /（打包整盘无意义且必超限）
     }
-    let meta = std::fs::metadata(path).map_err(|_| "path not found")?;
-    if !meta.is_dir() {
-        return Err("not a directory".into());
-    }
-    // 目录大小上限使用 FILE_LIMIT（500 MB），防止 OOM。
-    // 与 collect_zip_entries 同口径：符号链接跳过（此前 metadata() 不跟随链接，
-    // 预检通过后打包 fs::read 跟随链接读取大文件，可绕过 500MB 上限导致 OOM）
-    fn walk_dir_size(path: &std::path::Path) -> Result<u64, std::io::Error> {
-        let mut size: u64 = 0;
-        for entry in std::fs::read_dir(path)? {
-            let entry = entry?;
-            let ft = entry.file_type()?; // 不跟随符号链接
-            if ft.is_symlink() {
-                continue;
-            }
-            if ft.is_dir() {
-                size += walk_dir_size(&entry.path())?;
-            } else {
-                size += entry.metadata()?.len();
-            }
-        }
-        Ok(size)
-    }
-    let total_size = walk_dir_size(std::path::Path::new(&path))
-        .map_err(|e| format!("failed to read directory: {}", e))?;
-    if total_size > FILE_LIMIT {
-        return Err(format!(
-            "directory too large ({:.1} MB > {:.1} MB limit)",
-            total_size as f64 / 1_048_576.0,
-            FILE_LIMIT as f64 / 1_048_576.0
-        ));
-    }
     let zip_path = format!("{}/dl-{sid}.zip", tmp_dir.trim_end_matches(['/', '\\']));
-    let path = path.to_string();
-    // zip 为只读打包（供下载），允许系统目录——与前端一致：系统路径保留"下载"，
-    // 仅写操作（write/rename/delete）被拒；symlink 由 zip 内部跳过（不跟随）
-    // 流式写文件（BufWriter）：内存占用 O(1)（旧实现整包物化 Vec<u8>，峰值 ≈ 目录 × 2，
-    // 512MB 内存的 VPS 打包 300MB 目录即可能触发 OOM killer，连带杀掉全部终端会话）
+    let source_path = path.to_string();
+    // metadata、全树大小预检与真正打包全部放在同一个 blocking 熔断域内：挂死 NFS 子目录
+    // 最多触发超时与文件熔断，不占死 tokio worker。zip 流式写文件，内存占用 O(1)。
     let r = crate::blocking::file_blocking(120, move || -> Result<(String, u64), String> {
-        let mut f = std::fs::File::create(&zip_path).map_err(|e| e.to_string())?;
-        let mut w = std::io::BufWriter::with_capacity(64 * 1024, &mut f);
-        let size = match zip_directory(std::path::Path::new(&path), &mut w) {
-            Ok(s) => s,
-            Err(e) => {
-                // 失败清理半成品（流式写已产生部分文件；超时场景由会话结束清理兜底）
-                let _ = w.flush();
-                drop(w);
-                let _ = std::fs::remove_file(&zip_path);
-                return Err(e.to_string());
+        let result = (|| -> Result<(String, u64), String> {
+            let source = std::path::Path::new(&source_path);
+            let meta = std::fs::metadata(source).map_err(|_| "path not found")?;
+            if !meta.is_dir() {
+                return Err("not a directory".into());
             }
-        };
-        w.flush().map_err(|e| e.to_string())?;
-        Ok((zip_path, size))
+            let total_size = walk_dir_size_limited(source, FILE_LIMIT)
+                .map_err(|e| format!("failed to read directory: {e}"))?;
+            if total_size > FILE_LIMIT {
+                return Err(format!(
+                    "directory too large ({:.1} MB > {:.1} MB limit)",
+                    total_size as f64 / 1_048_576.0,
+                    FILE_LIMIT as f64 / 1_048_576.0
+                ));
+            }
+
+            let mut f = std::fs::File::create(&zip_path).map_err(|e| e.to_string())?;
+            let mut w = std::io::BufWriter::with_capacity(64 * 1024, &mut f);
+            let size = zip_directory(source, &mut w).map_err(|e| e.to_string())?;
+            w.flush().map_err(|e| e.to_string())?;
+            drop(w);
+            Ok((zip_path.clone(), size))
+        })();
+        if result.is_err() {
+            // 预检失败时文件尚不存在；打包/flush 失败时删除半成品。
+            let _ = std::fs::remove_file(&zip_path);
+        }
+        result
     })
     .await;
     r.ok_or_else(|| "zip timeout".to_string())?
@@ -1399,6 +1428,36 @@ mod tests {
     }
 
     #[test]
+    fn windows_reserved_segments_are_rejected() {
+        for name in [
+            "CON",
+            "con.txt",
+            "NUL",
+            "aux.log",
+            "COM1",
+            "com9.json",
+            "LPT1",
+            "lpt9.txt",
+            "CLOCK$",
+            "name:stream",
+            "trailing.",
+            "trailing ",
+        ] {
+            assert!(invalid_windows_segment(name), "应拒绝 Win32 路径段: {name}");
+        }
+        for name in [
+            "console.txt",
+            "com0",
+            "com10",
+            "lpt0",
+            "report.txt",
+            "normal-dir",
+        ] {
+            assert!(!invalid_windows_segment(name), "正常路径段不应拒绝: {name}");
+        }
+    }
+
+    #[test]
     fn wildcard_match_basic() {
         // 大小写已由调用方 to_ascii_lowercase 归一，此处 pattern/name 均传小写
         assert!(wildcard_match("*.log", "app.log"));
@@ -1519,6 +1578,17 @@ mod tests {
         // 标准测试向量：CRC32("123456789") = 0xCBF43926
         assert_eq!(crc32(b"123456789"), 0xCBF43926);
         assert_eq!(crc32(b""), 0);
+    }
+
+    #[test]
+    fn zip_size_precheck_stops_after_limit() {
+        let tmp = std::env::temp_dir().join(format!("cfp-zip-size-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("sub")).unwrap();
+        std::fs::write(tmp.join("a.bin"), [0u8; 8]).unwrap();
+        std::fs::write(tmp.join("sub/b.bin"), [0u8; 8]).unwrap();
+        assert!(walk_dir_size_limited(&tmp, 10).unwrap() > 10);
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
@@ -1697,6 +1767,10 @@ mod tests {
         assert!(is_system_path(r"C:\..\..\Windows"));
         assert!(is_system_path(r"\\server\share"));
         assert!(is_system_path(r"C:\data<a>b"));
+        assert!(is_system_path(r"C:\Users\me\NUL.txt"));
+        assert!(is_system_path(r"C:\Users\me\com1"));
+        assert!(is_system_path(r"C:\Users\me\name:stream"));
+        assert!(is_system_path(r"C:\Users\me\trailing."));
     }
 
     #[test]

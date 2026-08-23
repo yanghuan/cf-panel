@@ -2,29 +2,59 @@
 import { PAT_PREFIX, SCOPE_READ, SCOPE_EXEC, ONLINE_GRACE_FAST_S, ONLINE_GRACE_SLOW_S } from './config.js';
 import { hashSecret, verifyJwt, safeJson, doPanel, doMetrics } from './utils.js';
 
-export async function authUserByToken(token, env) {
-  if (!token) return null;
-
-  // 1) PAT：以 cfp_ 开头
-  if (token.startsWith(PAT_PREFIX)) {
-    const hash = await hashSecret(token, env);
-    const row = await env.DB.prepare('SELECT * FROM api_tokens WHERE token_hash = ?').bind(hash).first();
-    if (!row) return null;
-    // 有效期：expires_at 为 unix 秒，NULL=永久；已过期拒绝（token 本身不删除，列表可见）
-    if (row.expires_at && row.expires_at < Math.floor(Date.now() / 1000)) return null;
-    let scopes = [];
-    try { scopes = JSON.parse(row.scopes || '[]'); } catch { /* ignore */ }
-    let serverIDs = null;
-    if (row.server_ids) {
-      try { serverIDs = JSON.parse(row.server_ids); } catch { serverIDs = null; }
-    }
-    return { id: row.user_id, username: `token:${row.name}`, role: 0, pat: { scopes, serverIDs } };
+function userFromPatRow(row) {
+  if (!row) return null;
+  // 有效期：expires_at 为 unix 秒，NULL=永久；已过期拒绝（token 本身不删除，列表可见）
+  if (row.expires_at && row.expires_at < Math.floor(Date.now() / 1000)) return null;
+  let scopes = [];
+  try { scopes = JSON.parse(row.scopes || '[]'); } catch { /* ignore */ }
+  let serverIDs = null;
+  if (row.server_ids) {
+    try { serverIDs = JSON.parse(row.server_ids); } catch { serverIDs = null; }
   }
+  return { id: row.user_id, username: `token:${row.name}`, role: 0, pat: { scopes, serverIDs } };
+}
 
-  // 2) JWT（面板登录）
+export async function authUserByPatHash(tokenHash, env) {
+  if (!tokenHash) return null;
+  const row = await env.DB.prepare('SELECT * FROM api_tokens WHERE token_hash = ?').bind(tokenHash).first();
+  return userFromPatRow(row);
+}
+
+// WebSocket 首帧校验后只把不可逆 PAT HMAC 或已验证 JWT 身份放入 hibernation attachment，
+// 不持久化原始 bearer token。identity 只能由服务端在本函数校验成功后构造。
+export async function authIdentityByToken(token, env) {
+  if (!token) return null;
+  if (token.startsWith(PAT_PREFIX)) {
+    const tokenHash = await hashSecret(token, env);
+    const user = await authUserByPatHash(tokenHash, env);
+    return user ? { user, identity: { kind: 'pat', tokenHash } } : null;
+  }
   const payload = await verifyJwt(token, env);
   if (!payload || !payload.uid) return null;
-  return { id: payload.uid, username: payload.username || 'admin', role: 1, pat: null };
+  const user = { id: payload.uid, username: payload.username || 'admin', role: 1, pat: null };
+  return {
+    user,
+    identity: {
+      kind: 'jwt', id: user.id, username: user.username, role: user.role,
+      exp: Number(payload.exp) || 0,
+    },
+  };
+}
+
+export async function authUserByIdentity(identity, env) {
+  if (!identity || typeof identity !== 'object') return null;
+  if (identity.kind === 'pat') return authUserByPatHash(identity.tokenHash, env);
+  if (identity.kind === 'jwt') {
+    if (!identity.id || (identity.exp && identity.exp * 1000 < Date.now())) return null;
+    return { id: identity.id, username: identity.username || 'admin', role: 1, pat: null };
+  }
+  return null;
+}
+
+export async function authUserByToken(token, env) {
+  const authenticated = await authIdentityByToken(token, env);
+  return authenticated ? authenticated.user : null;
 }
 
 export async function authUser(request, env) {

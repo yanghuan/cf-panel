@@ -214,17 +214,19 @@ async fn collect_custom(cfg: &Config) -> Vec<serde_json::Value> {
             crate::platform::attach_job(pid);
             let mut out_pipe = child.stdout.take();
             let res = tokio::time::timeout(Duration::from_secs(5), async {
-                let mut buf = Vec::new();
-                if let Some(r) = out_pipe.as_mut() {
-                    let _ = tokio::io::AsyncReadExt::read_to_end(r, &mut buf).await;
-                }
-                buf
+                let buf = match out_pipe.as_mut() {
+                    // 只解析第一行数值，保留 4KB 已足够；超过后继续 drain 管道但不扩容，
+                    // 防刷屏命令在 5s 内无界物化数百 MB，同时避免子进程因管道写满阻塞。
+                    Some(r) => crate::read_limited(r, 4 * 1024).await,
+                    None => Vec::new(),
+                };
+                let status = child.wait().await;
+                (buf, status)
             })
             .await;
             match res {
-                Ok(buf) => {
-                    let _ = child.wait().await; // stdout EOF 后进程即将退出，wait 立即返回
-                    crate::platform::detach_job(pid); // 正常退出：释放 Job 表项（Windows）
+                Ok((buf, _status)) => {
+                    crate::platform::detach_job(pid); // 退出/等待失败均释放 Job 表项（Windows）
                     let line = String::from_utf8_lossy(&buf)
                         .lines()
                         .next()
@@ -314,6 +316,26 @@ pub async fn collect_report(cfg: &Config) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn custom_metric_large_stdout_keeps_first_value() {
+        let cfg = crate::Config {
+            wss: String::new(),
+            key: String::new(),
+            report_interval: 120,
+            disable_exec: false,
+            probes: String::new(),
+            custom_metrics: r#"[{"name":"large","cmd":"printf '42\\n'; yes x | head -c 1048576"}]"#
+                .to_string(),
+            disk_fstype_include: String::new(),
+            tmp_dir: String::new(),
+            log_file: String::new(),
+            log_max: 0,
+        };
+        let values = collect_custom(&cfg).await;
+        assert_eq!(values, vec![json!({ "name": "large", "value": 42.0 })]);
+    }
 
     #[test]
     fn disk_include_parses_csv() {

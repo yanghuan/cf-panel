@@ -346,15 +346,14 @@ export class MetricsDO {
       this.latestByServer.delete(serverId);
       this.lastSeenSec.delete(serverId);
       this.pendingArcRetry.delete(serverId);
-      // 清理该服务器的告警冷却与探活状态（内存 + storage）
-      try {
-        const ak = await this.listStorage(`alert:${serverId}:`);
-        const pk = await this.listStorage(`probe:${serverId}:`);
-        await Promise.all([
-          ...ak.map((k) => this.state.storage.delete(k.name)),
-          ...pk.map((k) => this.state.storage.delete(k.name)),
-        ]);
-      } catch { /* storage 不可用则仅清内存 */ }
+      // 清理该服务器的告警冷却、探活、离线状态与归档水位（内存 + storage）。
+      // 两类前缀 list 互相隔离；即使某次 list 失败，也仍尝试删除可精确定位的状态键。
+      const stateKeys = [`alert:offline:${serverId}`, `arc:${serverId}`];
+      try { stateKeys.push(...(await this.listStorage(`alert:${serverId}:`)).map((k) => k.name)); } catch { /* ignore */ }
+      try { stateKeys.push(...(await this.listStorage(`probe:${serverId}:`)).map((k) => k.name)); } catch { /* ignore */ }
+      await Promise.allSettled([...new Set(stateKeys)].map((name) => this.state.storage.delete(name)));
+      this.offlineState.delete(serverId);
+      this.arcCache.delete(serverId);
       for (const k of [...this.alertLast.keys()]) {
         if (k.startsWith(`${serverId}:`)) this.alertLast.delete(k);
       }
@@ -614,9 +613,16 @@ export class MetricsDO {
     // 慢采/空闲下 MetricsDO 无 WS、两次 alarm 间实例常被 evict，旧内存计数（sweepCount）
     // 会停在 1 导致 fullSweep 永不执行（>12h 热区无限增长 + 兜底归档停摆）
     if (now - this.lastSweepAt >= 6 * ARCHIVE_INTERVAL_MS) {
-      this.lastSweepAt = now;
-      housekeepChanged = true;
-      await this.fullSweep(archiveOn);
+      try {
+        const complete = await this.fullSweep(archiveOn);
+        // 只有归档、删源与水位持久化全部成功才记本轮完成；部分失败在下个 alarm 重试。
+        if (complete) {
+          this.lastSweepAt = now;
+          housekeepChanged = true;
+        }
+      } catch (e) {
+        console.error('fullSweep failed:', e);
+      }
     }
     // 保留期清理（每天一次）：删除超过 METRICS_RETENTION_DAYS 的旧数据，以及超过
     // AUDIT_RETENTION_DAYS 的审计日志（created_at 为 datetime('now') 文本，可直接比较）。
@@ -624,17 +630,22 @@ export class MetricsDO {
     // 时间戳持久化跨 evict：避免慢采/空闲下 lastPrune 被重置为 0 导致每天 144 次全表扫
     //（metrics_custom 无 ts 索引时最坏 6.2M×S×C 读/天，见迁移 0003 补索引）
     if (now - this.lastPruneAt >= PRUNE_INTERVAL_MS) {
-      this.lastPruneAt = now;
-      housekeepChanged = true;
       const retention = Number(this.env.METRICS_RETENTION_DAYS) > 0
         ? Number(this.env.METRICS_RETENTION_DAYS) : METRICS_RETENTION_DAYS;
       const minTs = Math.floor(now / 1000 / 60) - retention * 1440;
-      await this.env.DB.batch([
-        this.env.DB.prepare('DELETE FROM metrics_min WHERE ts < ?').bind(minTs),
-        this.env.DB.prepare('DELETE FROM metrics_custom WHERE ts < ?').bind(minTs),
-        this.env.DB.prepare('DELETE FROM audit_logs WHERE created_at < datetime(\'now\', ?)')
-          .bind(`-${AUDIT_RETENTION_DAYS} days`),
-      ]);
+      try {
+        await this.env.DB.batch([
+          this.env.DB.prepare('DELETE FROM metrics_min WHERE ts < ?').bind(minTs),
+          this.env.DB.prepare('DELETE FROM metrics_custom WHERE ts < ?').bind(minTs),
+          this.env.DB.prepare('DELETE FROM audit_logs WHERE created_at < datetime(\'now\', ?)')
+            .bind(`-${AUDIT_RETENTION_DAYS} days`),
+        ]);
+        // 与归档一致：成功后才推进时间戳，失败由下个 alarm 重试而不是静默等待 24h。
+        this.lastPruneAt = now;
+        housekeepChanged = true;
+      } catch (e) {
+        console.error('metrics prune failed:', e);
+      }
     }
     // 家政状态持久化（仅变化时写）
     if (housekeepChanged) {
@@ -662,65 +673,109 @@ export class MetricsDO {
   async fullSweep(archiveOn) {
     const archiveCutoff = Math.floor(Date.now() / 1000 / 60) - ARCHIVE_AFTER_MIN;
     const keepCutoff = Math.floor(Date.now() / 1000 / 60) - METRICS_KEEP_MIN;
-    const stmts = [];
-    const keysToDelete = [];
-    const arcMax = new Map(); // serverId -> 兜底归档到的最大 ts
+    const rowsByServer = new Map();
+    let keys;
     try {
-      const keys = await this.listStorage('m:');
-      for (const k of keys) {
-        const rest = k.name.slice(2); // 去掉 'm:'
-        const sep = rest.indexOf(':');
-        if (sep <= 0) continue;
-        const serverId = Number(rest.slice(0, sep));
-        const ts = Number(rest.slice(sep + 1));
-        // 兜底归档：水位之后、归档线之前的行（正常水位=归档线，此处仅兜底异常）
-        if (ts <= archiveCutoff && archiveOn) {
-          const arcKey = `arc:${serverId}`;
-          let arcTs = this.arcCache.get(serverId);
-          if (arcTs == null) {
-            try { arcTs = Number(await this.state.storage.get(arcKey)) || 0; } catch { arcTs = 0; }
-            this.arcCache.set(serverId, arcTs);
-          }
-          if (ts > arcTs) {
-            const v = JSON.parse(k.value);
-            // 数值归一化：历史坏数据（修复前写入）不得让整批归档失败
+      keys = await this.listStorage('m:');
+    } catch (e) {
+      console.error('fullSweep storage list failed:', e);
+      return false;
+    }
+    for (const k of keys) {
+      const rest = k.name.slice(2); // 去掉 'm:'
+      const sep = rest.indexOf(':');
+      if (sep <= 0) continue;
+      const serverId = Number(rest.slice(0, sep));
+      const ts = Number(rest.slice(sep + 1));
+      if (!Number.isInteger(serverId) || !Number.isFinite(ts)) continue;
+      if (!rowsByServer.has(serverId)) rowsByServer.set(serverId, []);
+      rowsByServer.get(serverId).push({ name: k.name, ts, value: k.value });
+    }
+
+    let complete = true;
+    for (const [serverId, rows] of rowsByServer) {
+      let effectiveArcTs = archiveOn ? this.arcCache.get(serverId) : Number.POSITIVE_INFINITY;
+      if (archiveOn && effectiveArcTs == null) {
+        try {
+          effectiveArcTs = Number(await this.state.storage.get(`arc:${serverId}`)) || 0;
+          this.arcCache.set(serverId, effectiveArcTs);
+        } catch (e) {
+          console.error(`fullSweep watermark read failed (server=${serverId}):`, e);
+          complete = false;
+          continue;
+        }
+      }
+
+      const candidates = archiveOn
+        ? rows.filter((row) => row.ts <= archiveCutoff && row.ts > effectiveArcTs)
+        : [];
+      if (candidates.length) {
+        const stmts = [];
+        try {
+          for (const row of candidates) {
+            const v = JSON.parse(row.value);
+            // 数值归一化：历史坏数值不得让整批归档失败。
             stmts.push(
               this.env.DB.prepare(
                 'INSERT OR IGNORE INTO metrics_min (server_id, ts, cpu, mem_used, mem_total, net_in, net_out, extra) VALUES (?,?,?,?,?,?,?,?)'
               ).bind(
-                serverId, ts,
+                serverId, row.ts,
                 numOrNull(v.cpu), numOrNull(v.mem_used), numOrNull(v.mem_total),
                 numOrNull(v.net_in), numOrNull(v.net_out),
                 v.extra ? JSON.stringify(v.extra) : null
               )
             );
-            arcMax.set(serverId, Math.max(arcMax.get(serverId) || 0, ts));
+          }
+        } catch (e) {
+          // 无法解析的源行必须保留，不能越过它推进同服务器水位。
+          console.error(`fullSweep row decode failed (server=${serverId}):`, e);
+          complete = false;
+          continue;
+        }
+
+        let archived = true;
+        // 每台服务器独立提交；任一批失败时不删该服务器任何新源行、不推进水位。
+        // 已成功批次下轮由 INSERT OR IGNORE 安全重放，避免跨批次水位越过失败区间。
+        for (let i = 0; i < stmts.length; i += 100) {
+          try {
+            await this.env.DB.batch(stmts.slice(i, i + 100));
+          } catch (e) {
+            console.error(`fullSweep batch failed (server=${serverId}, rows=${stmts.length}):`, e);
+            archived = false;
+            complete = false;
+            break;
           }
         }
-        // 超过热区上限（12h）：删除 storage 行（防无限增长；D1 已含归档数据）
-        if (ts <= keepCutoff) keysToDelete.push(k.name);
+        if (archived) {
+          const nextArcTs = candidates.reduce((max, row) => Math.max(max, row.ts), effectiveArcTs);
+          try {
+            // 先持久化水位再删源；失败时保留源行，下轮幂等重放。
+            await this.state.storage.put(`arc:${serverId}`, String(nextArcTs));
+            this.arcCache.set(serverId, nextArcTs);
+            effectiveArcTs = nextArcTs;
+          } catch (e) {
+            console.error(`fullSweep watermark write failed (server=${serverId}):`, e);
+            complete = false;
+          }
+        }
       }
-    } catch { /* storage 不可用则跳过本次清理（行保留，下次重试） */ }
-    // D1 写入成功后才删除 storage 行（防 D1 失败时两端数据丢失）；分批提交。
-    // 单批失败不得中断后续批次/清理/水位推进（归档失败不再连带跳过 prune 与家政持久化）
-    for (let i = 0; i < stmts.length; i += 100) {
-      try {
-        await this.env.DB.batch(stmts.slice(i, i + 100));
-      } catch (e) {
-        console.error(`fullSweep batch failed (${stmts.length} rows):`, e);
+
+      // 仅删除已被持久水位覆盖的源行；归档关闭时按 12h 热区策略直接清理。
+      for (const row of rows) {
+        if (row.ts > keepCutoff || (archiveOn && row.ts > effectiveArcTs)) continue;
+        try {
+          await this.state.storage.delete(row.name);
+          const memory = this.data.get(serverId);
+          if (memory) {
+            memory.delete(row.ts);
+            if (memory.size === 0) this.data.delete(serverId);
+          }
+        } catch (e) {
+          console.error(`fullSweep source delete failed (${row.name}):`, e);
+          complete = false;
+        }
       }
     }
-    await Promise.all(keysToDelete.map((name) => this.state.storage.delete(name)));
-    // 同步清理内存缓存中超过热区上限的数据
-    for (const [, m] of this.data) {
-      for (const ts of [...m.keys()]) {
-        if (ts <= keepCutoff) m.delete(ts);
-      }
-    }
-    // 兜底后推进水位（到实际归档的最大 ts）
-    for (const [serverId, ts] of arcMax) {
-      this.arcCache.set(serverId, ts);
-      try { await this.state.storage.put(`arc:${serverId}`, String(ts)); } catch { /* ignore */ }
-    }
+    return complete;
   }
 }

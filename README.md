@@ -262,7 +262,7 @@ wrangler secret put PANEL_USERS      # 回车后粘贴值，如 alice:pass1,bob:
    # 追加到 /etc/cf-panel-agent.env
    CUSTOM_METRICS='[{"name":"cpu_temp","cmd":"cat /sys/class/thermal/thermal_zone0/temp"},{"name":"estab_conns","cmd":"ss -t state established | wc -l"}]'
    ```
-   `CUSTOM_METRICS` 为 JSON 数组：`name` 指标名、`cmd` 采集命令（输出第一行数值）、`cycle` 采样周期（当前随上报周期）。命令执行带 5 秒超时；非数值输出自动跳过。
+   `CUSTOM_METRICS` 为 JSON 数组：`name` 指标名、`cmd` 采集命令（输出第一行数值）、`cycle` 采样周期（当前随上报周期）。命令执行带 5 秒总超时；stdout 仅保留前 4KB 并持续排空，防刷屏命令放大内存；非数值输出自动跳过。
 
 ### 跨平台部署（Windows / macOS）
 
@@ -286,7 +286,7 @@ Rust 版 agent 三平台产物从 GitHub Releases 下载（`cf-panel-agent-windo
    ```
 4. 差异与边界：
    - **终端走 ConPTY**（PowerShell 交互，portable-pty 内置）；exec/自定义指标走 `cmd /C`（命令写法按 Windows 习惯）。
-   - **文件管理为盘符路径**（如 `C:\Users\me\app`）；`C:\Users` 可写，`C:\Windows`、`Program Files`、`ProgramData` 等系统目录受保护（写/删/改名拒绝，下载保留）。
+   - **文件管理为盘符路径**（如 `C:\Users\me\app`）；`C:\Users` 可写，`C:\Windows`、`Program Files`、`ProgramData` 等系统目录受保护（写/删/改名拒绝，下载保留）；`CON`、`NUL`、`COM1`、`LPT1` 等 Win32 保留设备名及 ADS 路径同样拒绝。
    - 指标经 sysinfo 采集：CPU/内存/磁盘/网络为真实数据；**磁盘 IO 图与 TCP/UDP 连接数为空**（无跨平台 API）。
    - 临时目录/日志默认在 `%TEMP%\cfpanel-<key前8位>...`（`AGENT_TMPDIR` / `AGENT_LOG` 可改）。
    - 进程树清理走 Job Object（exec 超时/会话关闭时整树终止）。
@@ -337,7 +337,7 @@ Rust 版 agent 三平台产物从 GitHub Releases 下载（`cf-panel-agent-windo
 - **自定义监控项**：agent 配置 `CUSTOM_METRICS`（JSON：`name`+`cmd`）后，执行任意命令采集数值指标；监控图中以独立曲线展示（按 ts 对齐系统时间轴，共用右轴看趋势），数据直写 D1 `metrics_custom` 表（30 天保留）。
 - **实时列表**：登录后前端与 `/ws/push` 保持 WebSocket，连接建立发一次 sync 拉初始列表，此后由 MetricsDO 上报驱动推送（PanelDO，Hibernation 休眠态，费用趋近普通 Worker）按权限广播服务器列表（在线状态前端本地老化自动更新），无需手动刷新。
 - **终端**：面板服务器卡片点「终端」→ xterm.js 弹出 → 按键实时到达被控机 shell；窗口拉伸自动 resize（经控制通道 `stty` 下发）；断线自动重连（最多 3 次）。
-- **文件管理**：面板服务器卡片点「文件」→ 弹出文件管理器，可浏览目录（点击进入/上级/路径跳转）、**上传**（本地文件写入 agent）、**下载**（agent 文件回传浏览器）；文件经独立 WS 会话**分段传输**（512KB/段，Binary 混合帧 = JSON 头 + 原始字节，无 base64 膨胀），支持文件名通配符过滤（`*`/`?`，agent 端先过滤再截断），**单文件默认上限 100MB**（`UPLOAD_MAX_MB` 可调高，受 agent 端 500MB 硬上限约束）。每行最右侧 **⋯** 下拉菜单提供：下载（目录自动打包 ZIP 下载，文件名为 `目录名.zip`）、重命名（仅改名，不支持跨目录）、删除（目录递归删除）；**重命名/删除/打包对系统目录（`/proc`、`/sys`、`/etc`、`/usr`、`/var`、`/root` 等）自动拒绝**，防止误操作破坏系统。
+- **文件管理**：面板服务器卡片点「文件」→ 弹出文件管理器，可浏览目录（点击进入/上级/路径跳转）、**上传**（本地文件写入 agent）、**下载**（agent 文件回传浏览器）；文件经独立 WS 会话**分段传输**（512KB/段，Binary 混合帧 = JSON 头 + 原始字节，无 base64 膨胀），支持文件名通配符过滤（`*`/`?`，agent 端先过滤再截断），**单文件默认上限 100MB**（`UPLOAD_MAX_MB` 可调高，受 agent 端 500MB 硬上限约束）。每行最右侧 **⋯** 下拉菜单提供：下载（目录自动打包 ZIP 下载，文件名为 `目录名.zip`）、重命名（仅改名，不支持跨目录）、删除（目录递归删除）；系统目录（`/proc`、`/sys`、`/etc`、`/usr`、`/var`、`/root` 等）拒绝上传/重命名/删除等写操作，ZIP 属只读下载，仅拒绝打包文件系统根。
 - **监控**：点「监控」默认看近 12 小时分钟数据（内存 DO 热区，秒回）；可切 1小时/3天/7天/30天查看 D1 归档历史（分钟粒度，超长区间自动降采样）。指标：CPU / 内存 / Swap / 磁盘（根分区）/ 负载 / 温度 / 进程数；服务器卡片显示 OS / 内核 / IP 系统信息。
 - **分组与排序**：添加服务器可填「分组」和「序号」，列表按分组展示、组内按序号排序（未填归入「未分组」）。
 - **登录**：`PANEL_USERS` 多用户（`user:pass,user:pass`）或单管理员（`PANEL_PASSWORD`），登录即管理员。**应用内置失败限流**（同一 IP 在 15 分钟窗口内失败 ≥5 次 → 锁定 15 分钟并返回 `429` + `Retry-After`，登录成功自动清零）；生产部署**必须**再前置 **Cloudflare Access**（登录密码作为第二层），以覆盖跨边缘实例的限流一致性。
@@ -368,7 +368,7 @@ Rust 版 agent 三平台产物从 GitHub Releases 下载（`cf-panel-agent-windo
 | GET | `/api/monitor?server_id=&range=` | 监控历史（range: 1h/12h/3d/7d/30d，默认 12h 走内存，更早走 D1） |
 | GET | `/api/tokens` | PAT 列表（仅管理员） |
 | POST | `/api/tokens` | 创建 PAT（scopes + server_ids 白名单 + 可选 `expires_in_days` 有效期，缺省永久；明文只返回一次） |
-| DELETE | `/api/tokens/:id` | 删除 PAT（仅管理员） |
+| DELETE | `/api/tokens/:id` | 删除 PAT（仅管理员；不存在的 id 返回 404） |
 | GET | `/api/audit-logs` | 审计日志（仅管理员，倒序分页：`?limit=&offset=&action=&user=&server_id=`，`?format=csv` 导出，保留 90 天） |
 | GET | `/api/settings` | 读取全部设置（含告警配置，仅管理员） |
 | PUT | `/api/settings` | 更新站点名/公告/告警配置（D1 kv_json，仅管理员） |
@@ -433,17 +433,20 @@ curl -X POST https://<面板域名>/mcp -H "Authorization: Bearer <token>" \
 
 - `/ws/terminal/{id}` 仅允许会话创建者或管理员连接（防 stream UUID 劫持，GHSA 教训）。
 - agent 建连必须通过 `X-Agent-Key` 请求头提供凭证（不接受 URL query，避免边缘日志/代理记录泄露）；服务端先用 key 的 SHA-256 指纹（`servers.agent_key_id`）反查服务器，再用 Web Crypto HMAC verify 校验 `servers.agent_key_hash`；`/ws/agent/terminal` 额外校验 stream 归属。
-- 面板登录密码存 CF secret（`PANEL_USERS`/`PANEL_PASSWORD`），不进代码库；agent key 与 PAT 只存哈希（key 指纹用于检索，HMAC 哈希用于校验）。
-- 审计日志：`server.create/update/delete`、`terminal.open`、`file.open/upload/write/zip/rename/delete`、`exec.command` 写 `audit_logs`（WS 文件操作在 DO 拦截指令记录；`exec.command` 含命令与 exit_code）。终端/文件会话横跨 DO 与 D1，审计写入为 best-effort：D1 短暂失败时记录 Worker 错误但仍返回已创建的可用会话，避免遗留不可访问的远端会话。
-- agent 侧 `DISABLE_EXEC=1` 可全局禁止命令执行（终端任务直接忽略）。
+- 面板登录密码存 CF secret（`PANEL_USERS`/`PANEL_PASSWORD`），不进代码库；agent key 与 PAT 只存哈希（key 指纹用于检索，HMAC 哈希用于校验）。WebSocket Hibernation 附件同样不保存 bearer 明文：PAT 仅保存 HMAC，JWT 仅保存已验证身份及过期时间。
+- 浏览器 WebSocket 建连后须在 10 秒内完成首帧鉴权；PanelDO 与每个 TerminalDO 分片最多保留 128 条待鉴权连接，超时由 DO alarm 主动关闭。
+- 审计日志：`server.create/update/delete`、`terminal.open`、`file.open/upload/write/zip/rename/delete`、`exec.command` 写 `audit_logs`（WS 文件操作在 DO 拦截指令记录；`exec.command` 含命令与 exit_code）。终端/文件会话横跨 DO 与 D1，审计写入为 best-effort：D1 短暂失败时记录 Worker 错误但仍返回已创建的可用会话，避免遗留不可访问的远端会话。审计用户名与客户端 IP 随会话元数据和安全附件跨休眠恢复。
+- agent 侧 `DISABLE_EXEC=1` 可全局禁止命令执行（终端任务直接忽略）；上传、ZIP 预检及文件操作统一进入带超时、并发上限和熔断的 blocking 边界，避免异常挂载冻结 async 控制循环。
+- 文件列表按不可信 Agent 输入处理：前端白名单化条目类型并数值化大小/时间；文件会话使用代际守卫丢弃关闭后或乱序的创建响应，防止跨服务器串台。
+- 静态资源 CSP 将 `'unsafe-inline'` 仅限于 `style-src-attr`，脚本和 style 元素均不允许内联执行。
 - 终端/监控接口按权限收敛：JWT 管理员全量；PAT 按 scopes + server_ids 白名单收窄。
 
 ## 六、架构要点（多 DO 分片等）
 
 - **多 DO 分片**：终端 DO `SHARDS = 4`，streamId 带 `shard-序号` 前缀，浏览器/agent 的 WS 请求按前缀路由到对应 DO 实例，避免单点瓶颈。
 - **实时刷新 PanelDO**：单实例 DO，前端 `/ws/push` 连接后**首帧 sync 即订阅**，此后由监控上报驱动实时推送（服务器变化/新数据时回发列表）；DO 用 Hibernation API，空闲即休眠（不计时长），按用户权限过滤（在线状态秒级更新）。
-- **会话回收**：终端会话两端都断开超过 10 分钟，DO 惰性清理（每 60s 扫描一次）。
-- **监控时序（MetricsDO，默认开启归档）**：agent 上报先写内存滚动窗口（保留最近 720 分钟/机，前端查询秒回）；alarm 每 10 分钟把超过 1 小时的旧数据批量写入 `metrics_min` 表（写入量 ≈ 60 行/机/小时，免费额度内），并按 **30 天保留期**每日清理过期行（重启不丢历史）。`ARCHIVE_TO_D1=0` 可关闭归档（关闭后仅内存 12 小时）。
+- **会话回收**：终端会话两端都断开超过 10 分钟，DO alarm 清理；活跃会话也受 4 小时绝对上限约束。
+- **监控时序（MetricsDO，默认开启归档）**：agent 上报先写内存滚动窗口（保留最近 720 分钟/机，前端查询秒回）；alarm 每 10 分钟把超过 1 小时的旧数据批量写入 `metrics_min` 表（写入量 ≈ 60 行/机/小时，免费额度内），并按 **30 天保留期**每日清理过期行（重启不丢历史）。兜底归档按服务器隔离批次，只有 D1 全批次与持久水位成功后才删除对应热区源行；失败会在下个 alarm 幂等重试。`ARCHIVE_TO_D1=0` 可关闭归档（关闭后仅内存 12 小时）。
 - **已知限制**：
   - 终端 DO 会话状态在内存（僵尸会话按 10 分钟 TTL 回收，DO alarm 兜底保证零流量时也会清理；实例迁移会中断活跃终端；可后续迁 DO Storage）。
   - D1 归档默认开启（保留 30 天）；若关闭（`ARCHIVE_TO_D1=0`），DO 重启会丢失 12 小时外的历史。

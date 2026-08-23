@@ -102,7 +102,8 @@ DO 是整个设计的心脏，对应哪吒 Dashboard 里那两个 `io.Copy` 的�
 服务器列表不需要用户手动刷新：前端登录后建一条 WebSocket 到 `/ws/push`，**首帧 `sync` 即订阅，此后被动接收上报驱动推送**，单实例 **PanelDO** 在服务器数据变化（新上报/在线状态变化）时唤醒查 D1，按该连接的用户权限（admin 全量 / PAT 白名单 / member 归属）过滤后回发服务器列表（在线状态由 `last_seen` 宽限期推导）。
 
 - **Hibernation API + 事件驱动**：DO 空闲即休眠（不计时长），有数据变化才短暂唤醒回发——避免"服务端定时器"造成的实例常驻费用，开销趋近普通 Worker。
-- token 通过 `serializeAttachment` 随连接持久化，休眠唤醒后在 `webSocketMessage` 里 `deserializeAttachment` 取回，无需额外存储。
+- 首帧验证 bearer 后，`serializeAttachment` 只保存安全身份：PAT 的不可逆 HMAC，或 JWT 已验证身份及过期时间；不保存原始 token。休眠唤醒后 PAT 按 hash 反查 D1，JWT 校验附件中的过期时间。
+- 未鉴权连接须在 10 秒内发送 auth 首帧，超时由 DO alarm 关闭，并设置 128 条 pending 连接硬上限。
 - 单实例 DO（`idFromName('main')`）；D1 临时故障时跳过该周期，下个周期自动恢复。
 
 ### 3.4 外部 Agent
@@ -198,8 +199,8 @@ done
 - resize：控制 WS 收到 `{type:resize,...}` → `stty -F <slave路径>` 改 winsize → 内核发 `SIGWINCH`，`vim`/`top` 跟着变尺寸。
 - 监控上报：后台循环每 `REPORT_INTERVAL`（默认 120s）采集一次，JSON 写入 FIFO；控制通道 websocat 以 FIFO 为 stdin，数据自动经 WS 上行，服务端识别 `{type:"report"}` 落监控热区——**免 crontab、免独立脚本**。
 - 上报内容：固定列（CPU/内存/网络速率）+ `extra` JSON（Swap/磁盘/负载/温度/进程数/TCP-UDP 连接数，紧凑短 key 不压缩）+ `info`（OS/内核/IP，服务端比对变化才更新 `servers.info_json`）。网络速率由 agent 对 `/proc/net/dev` 累计值做差分，避免累计值当速率。
-- **省配额策略**：PanelDO 暴露 `/viewers` RPC（`state.getWebSockets().length` 统计在线前端）；TerminalDO 在 agent 控制通道建立与每次上报后查询它，通过 `{type:"set_report_interval", interval}` 下发间隔（仅变化时）：有观看者 5s 快采、无人 120s 低频采样——配额从"时刻满采"降到"只在有人看时满采"。首位观看者上线时 PanelDO 还会向各分片广播 `/rpc/set_viewers`，agent 立即切快采（免等下一次上报）。agent 端把下发的间隔写入 `$TMP_DIR/report-interval`，上报循环每次唤醒后读取。
-- **文件管理**：与终端同构的独立会话——面板 `POST /api/file/open` 创建会话并下发 `open_file` 指令，agent 连回 `/ws/agent/file` 处理（**Rust 版内置实现，无独立脚本**）。JSON 行协议：`list`（目录列表，支持通配符过滤）/`read`/`write`（**Binary 混合帧 = JSON 头 + `\n` + 原始字节，无 base64 膨胀**；分块 512KB、`write` 按确认推进、临时文件 + 原子 rename）+ `zip`（**目录打包**：agent 手写 STORED ZIP 到临时文件，返回路径/大小，前端分段拉取完成后发 `delete` 清理）/`rename`/`delete`（**系统路径保护**：`/proc` `/sys` `/etc` `/usr` `/var` `/root` 等目录的重命名/删除/打包一律拒绝，防误操作破坏系统）；浏览器经 `/ws/file/{sid}` 透传。服务端复用 TerminalDO 会话注册表/权限/清理，DO 只做双向透传。
+- **省配额策略**：PanelDO 暴露 `/viewers` RPC（只统计 attachment 角色为 `viewer` 的已鉴权前端）；TerminalDO 在 agent 控制通道建立与每次上报后查询它，通过 `{type:"set_report_interval", interval}` 下发间隔（仅变化时）：有观看者 5s 快采、无人 120s 低频采样——配额从"时刻满采"降到"只在有人看时满采"。首位观看者上线时 PanelDO 还会向各分片广播 `/rpc/set_viewers`，agent 立即切快采（免等下一次上报）。agent 端把下发的间隔写入 `$TMP_DIR/report-interval`，上报循环每次唤醒后读取。
+- **文件管理**：与终端同构的独立会话——面板 `POST /api/file/open` 创建会话并下发 `open_file` 指令，agent 连回 `/ws/agent/file` 处理（**Rust 版内置实现，无独立脚本**）。JSON 行协议：`list`（目录列表，支持通配符过滤）/`read`/`write`（**Binary 混合帧 = JSON 头 + `\n` + 原始字节，无 base64 膨胀**；分块 512KB、`write` 按确认推进、临时文件 + 原子 rename）+ `zip`（**目录打包**：agent 手写 STORED ZIP 到临时文件，返回路径/大小，前端分段拉取完成后发 `delete` 清理）/`rename`/`delete`。写、删、改名受系统路径保护；ZIP 属只读下载，仅拒绝打包文件系统根。所有文件系统预检/遍历/写入统一进入带超时、并发上限和熔断的 `file_blocking`。浏览器经 `/ws/file/{sid}` 透传；前端将列表条目视为不可信输入并白名单化类型/数值，`FileSession.open` 用代际守卫防乱序响应串台。服务端复用 TerminalDO 会话注册表/权限/清理，DO 只做双向透传。
 - 权衡：Shell 版零解释器依赖、部署极简；但并发弱、进程多、每终端 +9MB。已实现 **Rust 版（`agent/rust/`）替代**：实测内存 1.9MB（全静态 musl）、单进程、无外部二进制依赖，协议一致可无缝替换；Shell 版废弃保留参考。
 
 #### 3.5.1 内存占用对比（低内存设备选型）
@@ -260,13 +261,14 @@ Rust 版以 `#[cfg(unix)]` / `#[cfg(windows)]` 条件编译实现三平台（平
 | 信号 | SIGTERM/SIGINT | `tokio::signal::ctrl_c`（Ctrl+C/Break） |
 
 **系统指标按平台双实现**（`metrics/` 目录，同签名函数集，`collect_report` 零平台分支）：
-- `metrics/linux.rs`：原生 `/proc`、`/sys` 读取（与 Shell 版同口径，零额外依赖）；CPU/内存/负载/温度/TCP-UDP 连接数/磁盘(statvfs+挂载过滤)/网络差分/磁盘 IO 差分全量。
+- `metrics/linux.rs`：原生 `/proc`、`/sys` 读取（与 Shell 版同口径，零额外依赖）；CPU/内存/负载/温度/TCP-UDP 连接数/磁盘(statvfs+挂载过滤)/网络差分/磁盘 IO 差分全量。单挂载点 metadata/statvfs 失败仅跳过该项；全空刷新保留最近一次非空缓存。
 - `metrics/other.rs`（Windows/macOS 共用）：**sysinfo crate**（目标特定依赖，不进 Linux 依赖树）；CPU/内存/磁盘/网络为真实数据，`load_average`（macOS 有 / Windows 无→0）、温度（Windows 多数驱动不暴露→None）。
+- 自定义指标命令受 5 秒总超时约束，stdout 仅保留前 4KB 并继续排空管道；超时终止完整进程树，避免刷屏输出放大 Agent 内存。
 - **平台缺失项（如实上报空值，服务端白名单丢弃）**：磁盘 IO 差分与 TCP-UDP 连接数无跨平台 API（Windows/macOS 均为空）；macOS 系统信息 IP 为空（卡片展示走服务端 `wan_ip` 不受影响）。
 
 **路径模型**（文件管理协议从 Unix 绝对路径扩展）：
 - Unix：`/` 分隔 + FHS 系统目录黑名单（`/etc` `/usr` `/var` 等，fail closed）。
-- Windows：盘符路径（`C:\...`，统一大写盘符 + `\` 分隔，大小写不敏感），驱动器根一级目录黑名单（`Windows` / `Program Files` / `ProgramData` / `$Recycle.Bin` 等，任意盘符生效）；`C:\Users` 放行（等同 `/home`）；UNC、保留字符、越根 fail closed；`canonicalize` 的 `\\?\` verbatim 前缀剥离（真实路径层防 symlink/junction 写穿）。
+- Windows：盘符路径（`C:\...`，统一大写盘符 + `\` 分隔，大小写不敏感），驱动器根一级目录黑名单（`Windows` / `Program Files` / `ProgramData` / `$Recycle.Bin` 等，任意盘符生效）；`C:\Users` 放行（等同 `/home`）；UNC、保留字符、ADS、尾随点/空格及 `CON`/`NUL`/`COM1`/`LPT1` 等设备名均 fail closed；`canonicalize` 的 `\\?\` verbatim 前缀剥离（真实路径层防 symlink/junction 写穿）。
 - 前端 `utils.js` 的 `fileJoin` / `fileParent` / `fileBase` / `isSystemPath` 与 agent 端同步支持盘符路径（黑名单逐条对账）。
 
 **CI 与产物**：workflow 四 job 流水线（test → build-macos/build-windows → build-release），Release 提供 5 个产物（Linux x86_64 + UPX 压缩版 + aarch64、macOS ARM64、Windows x86_64）。Windows job 先跑 `cargo test`（真机验证：路径模型、NTFS 真实文件系统操作、Job Object FFI 生命周期）。

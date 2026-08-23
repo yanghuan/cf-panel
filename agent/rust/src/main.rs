@@ -123,6 +123,13 @@ fn validate_wss(wss: &str) -> Result<(), String> {
 // ---------------- 日志（mpsc + 专用写线程，async 侧零阻塞） ----------------
 // stdout 接管道且对端不消费时 write_all 会永久阻塞 worker 线程；改有界 mpsc 队列 +
 // 专用 OS 写线程，async 侧 try_send 失败（队列满）即丢弃降级，采集/会话路径永不因日志挂起。
+fn open_log_file(path: &str) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+}
+
 fn log_sender() -> &'static std::sync::mpsc::SyncSender<String> {
     static TX: OnceLock<std::sync::mpsc::SyncSender<String>> = OnceLock::new();
     TX.get_or_init(|| {
@@ -135,22 +142,43 @@ fn log_sender() -> &'static std::sync::mpsc::SyncSender<String> {
             .name("log-writer".to_string())
             .spawn(move || {
                 let cfg = CONFIG.get().unwrap();
-                let mut f = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&cfg.log_file)
-                    .unwrap_or_else(|_| std::fs::File::create(&cfg.log_file).unwrap());
-                // 轮转判定用自累计字节数（append-only 单写者），替代每行一次
-                // f.metadata() 的 fstat 系统调用
-                let mut written: u64 = 0;
-                while let Ok(line) = rx.recv() {
-                    if written > cfg.log_max {
-                        let _ = f.set_len(0);
-                        written = 0;
+                let mut file = match open_log_file(&cfg.log_file) {
+                    Ok(f) => Some(f),
+                    Err(e) => {
+                        // AGENT_LOG 不可写/指向目录时降级到 stdout；日志线程继续消费队列，
+                        // 不能 panic 导致 rx 被关闭、后续所有 log() 静默丢失。
+                        let _ = out_tx.try_send(format!(
+                            "[cf-panel] log file unavailable ({}): {e}; stdout only\n",
+                            cfg.log_file
+                        ));
+                        None
                     }
-                    let _ = f.write_all(line.as_bytes());
-                    written += line.len() as u64;
-                    // 满即丢弃（stdout 线程积压）：文件日志已落盘，stdout 尽力而为
+                };
+                // 轮转判定用自累计字节数（append-only 单写者），替代每行一次 fstat。
+                let mut written = file
+                    .as_ref()
+                    .and_then(|f| f.metadata().ok())
+                    .map(|m| m.len())
+                    .unwrap_or(0);
+                while let Ok(line) = rx.recv() {
+                    let mut disable_file = false;
+                    if let Some(f) = file.as_mut() {
+                        if written > cfg.log_max && f.set_len(0).is_ok() {
+                            written = 0;
+                        }
+                        if let Err(e) = f.write_all(line.as_bytes()) {
+                            let _ = out_tx.try_send(format!(
+                                "[cf-panel] log file write failed: {e}; stdout only\n"
+                            ));
+                            disable_file = true;
+                        } else {
+                            written += line.len() as u64;
+                        }
+                    }
+                    if disable_file {
+                        file = None;
+                    }
+                    // 满即丢弃（stdout 线程积压）：文件日志与 stdout 互不连坐。
                     let _ = out_tx.try_send(line);
                 }
             })
@@ -399,22 +427,26 @@ async fn handle_upload_frame(
         reject(write, session::SYSTEM_PATH_ERR);
         return Ok(());
     }
-    // 首帧（offset==0）：overwrite=false 且目标已存在 → 拒绝（防误覆盖）
-    if offset == 0 && !overwrite && std::path::Path::new(&path).exists() {
-        if let Ok(mut f) = failed.lock() {
-            f.insert(upload_id.clone());
-        }
-        reject(write, "target already exists (use overwrite=1)");
-        return Ok(());
-    }
     // 复用文件会话的原子写：临时文件 {path}.upload.{upload_id}，offset 严格校验，commit 时 fsync+rename。
-    // 统一走 blocking 封装（超时 + 信号量 + 文件操作熔断）——此前裸 spawn_blocking 无超时：
-    // 挂死挂载点上 write_bytes（canonicalize + 磁盘写）挂死会连坐控制读循环（超时作用域外
-    // await），心跳/半开检测/后续指令全部失效，agent 表现为「假活」只能重启
+    // 所有文件系统访问（包括首帧 exists 预检）都必须在 blocking 封装内：挂死 NFS/SMB 上
+    // stat/canonicalize/write 任一步都不能占死控制通道的 async 读循环。
     let created = created.clone();
     let failed = failed.clone();
+    let failed_timeout = failed.clone();
     let (upload_id_err, path_err) = (upload_id.clone(), path.clone());
+    let timeout_id = upload_id.clone();
     let r = match crate::blocking::file_blocking(30, move || {
+        // 首帧（offset==0）：overwrite=false 且目标已存在 → 拒绝（防误覆盖）。
+        // exists() 会触发 stat，必须与 write_bytes 一起受超时、信号量和文件熔断保护。
+        if offset == 0 && !overwrite && std::path::Path::new(&path).exists() {
+            if let Ok(mut f) = failed.lock() {
+                f.insert(upload_id.clone());
+            }
+            return serde_json::json!({
+                "type": "upload_result", "upload_id": upload_id, "path": path,
+                "ok": false, "error": "target already exists (use overwrite=1)",
+            });
+        }
         let res = session::write_bytes(&path, offset, &data, commit, &upload_id, &created);
         // 解析 write_bytes 回执（write_result / error），统一包装为 upload_result
         let v: serde_json::Value = serde_json::from_str(&res).unwrap_or(serde_json::Value::Null);
@@ -441,10 +473,15 @@ async fn handle_upload_frame(
     .await
     {
         Some(v) => v,
-        None => serde_json::json!({
-            "type": "upload_result", "upload_id": upload_id_err, "path": path_err,
-            "ok": false, "error": "write timeout",
-        }),
+        None => {
+            if let Ok(mut f) = failed_timeout.lock() {
+                f.insert(timeout_id);
+            }
+            serde_json::json!({
+                "type": "upload_result", "upload_id": upload_id_err, "path": path_err,
+                "ok": false, "error": "write timeout",
+            })
+        }
     };
     let mut w = write.lock().await;
     let _ = w.send(Message::Text(r.to_string().into())).await;
@@ -714,12 +751,17 @@ async fn dispatch(
                             false,
                         )
                     }
-                    Ok((o, _e, Err(w))) => (
-                        String::from_utf8_lossy(&o).into_owned(),
-                        format!("wait failed: {w}"),
-                        -1,
-                        false,
-                    ),
+                    Ok((o, _e, Err(w))) => {
+                        // wait 返回错误时子进程句柄已无法继续正常回收；Windows 仍须移除
+                        // JOBS 表项并关闭 Job handle，避免每次失败泄漏到 1024 上限。
+                        platform::detach_job(pid);
+                        (
+                            String::from_utf8_lossy(&o).into_owned(),
+                            format!("wait failed: {w}"),
+                            -1,
+                            false,
+                        )
+                    }
                     Err(_) => {
                         // 超时：终止整棵进程树（Unix SIGKILL 进程组 / Windows TerminateJobObject，
                         // 孙进程一并清理），再 wait 回收防僵尸。
@@ -776,7 +818,7 @@ fn truncate_utf8(s: &str, max_bytes: usize) -> String {
 // 整体超时，大输出命令（输出 > ~112KB = 限额 + 管道缓冲）一律被误报 timed out
 // + 丢掉已读输出且拖满超时窗口；drain 到真 EOF 让子进程自然退出，按截断语义上报
 //（持续输出的命令仍由外层超时兜底 kill 进程组）
-async fn read_limited(r: &mut (impl tokio::io::AsyncRead + Unpin), cap: u64) -> Vec<u8> {
+pub(crate) async fn read_limited(r: &mut (impl tokio::io::AsyncRead + Unpin), cap: u64) -> Vec<u8> {
     let mut buf = Vec::new();
     let mut limited = tokio::io::AsyncReadExt::take(&mut *r, cap);
     let _ = tokio::io::AsyncReadExt::read_to_end(&mut limited, &mut buf).await;
@@ -1043,6 +1085,12 @@ mod tests {
         assert!(validate_wss("http://example.com/ws/agent").is_err());
         assert!(validate_wss("").is_err());
         assert!(validate_wss("wss").is_err());
+    }
+
+    #[test]
+    fn log_file_open_failure_is_recoverable() {
+        // 目录不能作为追加日志文件打开；调用方应得到 Err 并切到 stdout，而不是 unwrap panic。
+        assert!(open_log_file(std::env::temp_dir().to_string_lossy().as_ref()).is_err());
     }
 
     // 限额读满后必须 drain——否则对端（子进程）写满管道缓冲后阻塞在

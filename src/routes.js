@@ -433,7 +433,7 @@ async function handleApiInner(request, env) {
     const resp = await stub.fetch('https://do.internal/rpc', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ op: 'create', streamId, serverId: server.id, creatorUserId: user.id, clientIp: clientIp(request) }),
+      body: JSON.stringify({ op: 'create', streamId, serverId: server.id, creatorUserId: user.id, creatorUser: user.username, clientIp: clientIp(request) }),
     });
     if (!resp.ok) return err(`agent not reachable: ${await resp.text()}`, 502);
     await auditSessionOpen(env, user, request, 'terminal.open', server.id);
@@ -451,7 +451,7 @@ async function handleApiInner(request, env) {
     const resp = await stub.fetch('https://do.internal/rpc', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ op: 'open_file', streamId, serverId: server.id, creatorUserId: user.id, clientIp: clientIp(request) }),
+      body: JSON.stringify({ op: 'open_file', streamId, serverId: server.id, creatorUserId: user.id, creatorUser: user.username, clientIp: clientIp(request) }),
     });
     if (!resp.ok) return err(`agent not reachable: ${await resp.text()}`, 502);
     await auditSessionOpen(env, user, request, 'file.open', server.id);
@@ -511,7 +511,8 @@ async function handleApiInner(request, env) {
   if (method === 'DELETE' && path.startsWith('/api/tokens/')) {
     if (!isAdmin(user)) return err('forbidden', 403);
     const id = Number(path.split('/')[3]) || 0;
-    await env.DB.prepare('DELETE FROM api_tokens WHERE id = ?').bind(id).run();
+    const res = await env.DB.prepare('DELETE FROM api_tokens WHERE id = ?').bind(id).run();
+    if (!res.meta.changes) return err(`token not found (id=${id})`, 404);
     // PAT 撤销即时生效：清 PanelDO 鉴权缓存，已建观看者连接下个推送（≤5s）内关闭
     try {
       await doPanel(env).fetch('https://do.internal/rpc/clear_auth_cache', { method: 'POST' });

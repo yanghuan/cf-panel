@@ -8,6 +8,7 @@ import nodeFs from 'node:fs';
 import nodePath from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { __internals as I } from '../src/index.js';
+import { makeEnv } from './helpers.js';
 
 const env = { JWT_SECRET: 'unit-secret' };
 
@@ -94,6 +95,25 @@ test('verifySecretHash 使用 HMAC verify 校验且拒绝畸形哈希', async ()
   assert.equal(await I.verifySecretHash('wrong-key', hash, env), false);
   assert.equal(await I.verifySecretHash('agent-key', 'not-hex', env), false);
   assert.equal(await I.verifySecretHash('agent-key', '00', env), false);
+});
+
+test('WebSocket 安全身份：PAT 只保留 HMAC，JWT 只保留已验证 claims', async () => {
+  const dbEnv = makeEnv();
+  const pat = 'cfp_' + 'a'.repeat(64);
+  const tokenHash = await I.hashSecret(pat, dbEnv);
+  await dbEnv.DB.prepare('INSERT INTO api_tokens (user_id, name, token_hash, scopes) VALUES (?,?,?,?)')
+    .bind(9, 'ws', tokenHash, JSON.stringify(['server:read'])).run();
+  const patAuth = await I.authIdentityByToken(pat, dbEnv);
+  assert.equal(patAuth.identity.kind, 'pat');
+  assert.equal(patAuth.identity.tokenHash, tokenHash);
+  assert.equal(JSON.stringify(patAuth.identity).includes(pat), false);
+  assert.equal((await I.authUserByIdentity(patAuth.identity, dbEnv)).id, 9);
+
+  const exp = Math.floor(Date.now() / 1000) + 60;
+  const jwt = await I.signJwt({ uid: 7, username: 'alice', exp }, dbEnv);
+  const jwtAuth = await I.authIdentityByToken(jwt, dbEnv);
+  assert.deepEqual(jwtAuth.identity, { kind: 'jwt', id: 7, username: 'alice', role: 1, exp });
+  assert.equal(JSON.stringify(jwtAuth.identity).includes(jwt), false);
 });
 
 test('上传签名使用 HMAC verify 并拒绝篡改', async () => {
@@ -238,6 +258,51 @@ function loadCfUtils() {
 }
 const CfUtils = loadCfUtils();
 
+function loadCfApi() {
+  const src = nodeFs.readFileSync(nodePath.join(nodePath.dirname(fileURLToPath(import.meta.url)), '../public/api.js'), 'utf8');
+  (0, eval)(src);
+  return globalThis.CfApi;
+}
+const CfApi = loadCfApi();
+
+test('FileSession.open 丢弃关闭后响应和并发乱序响应', async () => {
+  const originalFetch = globalThis.fetch;
+  const originalWebSocket = globalThis.WebSocket;
+  const originalLocation = globalThis.location;
+  const pending = [];
+  const sockets = [];
+  globalThis.fetch = () => new Promise((resolve) => pending.push(resolve));
+  globalThis.location = { protocol: 'https:', host: 'panel.test' };
+  globalThis.WebSocket = class MockWebSocket {
+    constructor(url) { this.url = url; this.readyState = 0; this.closed = false; sockets.push(this); }
+    close() { this.closed = true; this.readyState = 3; }
+    send() { }
+  };
+  const response = (sessionId) => ({ ok: true, json: async () => ({ session_id: sessionId }) });
+  try {
+    const session = new CfApi.FileSession();
+    const first = session.open(1, '/one');
+    const second = session.open(2, '/two');
+    pending[1](response('new-session'));
+    await second;
+    pending[0](response('stale-session'));
+    await first;
+    assert.equal(sockets.length, 1, '乱序旧响应不得创建 WebSocket');
+    assert.match(sockets[0].url, /\/ws\/file\/new-session$/);
+    assert.equal(session.serverId, 2);
+
+    const closedBeforeResponse = session.open(3, '/three');
+    session.close();
+    pending[2](response('closed-session'));
+    await closedBeforeResponse;
+    assert.equal(sockets.length, 1, '关闭后的迟到响应不得创建 WebSocket');
+  } finally {
+    globalThis.fetch = originalFetch;
+    globalThis.WebSocket = originalWebSocket;
+    globalThis.location = originalLocation;
+  }
+});
+
 test('isSystemPath 词法归一化与黑名单（与 agent 同规则）', () => {
   assert.equal(CfUtils.isSystemPath('/etc/passwd'), true);
   assert.equal(CfUtils.isSystemPath('//etc/passwd'), true);
@@ -246,6 +311,28 @@ test('isSystemPath 词法归一化与黑名单（与 agent 同规则）', () => 
   assert.equal(CfUtils.isSystemPath('/opt/app/bin'), false); // 部署目录放行
   assert.equal(CfUtils.isSystemPath('/srv/www'), false);
   assert.equal(CfUtils.isSystemPath('/home/u/dir'), false);
+});
+
+test('normalizeFileEntry 收口恶意 Agent 文件条目', () => {
+  assert.deepEqual(CfUtils.normalizeFileEntry({
+    name: 'x"><img src=x onerror=alert(1)>',
+    type: '\"><img src=x onerror=alert(1)>',
+    size: 'not-a-number',
+    mtime: -1,
+  }), {
+    name: 'x"><img src=x onerror=alert(1)>',
+    type: 'file',
+    size: 0,
+    mtime: 0,
+  });
+  assert.deepEqual(CfUtils.normalizeFileEntry({ name: 'dir', type: 'dir', size: '12', mtime: '34' }), {
+    name: 'dir', type: 'dir', size: 12, mtime: 34,
+  });
+  assert.equal(CfUtils.normalizeFileEntry({ name: 'x'.repeat(5000) }).name.length, 4096);
+  const root = nodePath.join(nodePath.dirname(fileURLToPath(import.meta.url)), '..');
+  const app = nodeFs.readFileSync(nodePath.join(root, 'public/app.js'), 'utf8');
+  assert.match(app, /\.map\(normalizeFileEntry\)/, '文件列表渲染前必须统一收口');
+  assert.doesNotMatch(app, /data-(?:type|size)="\$\{e\.(?:type|size)\}"/, '属性禁止直接插入 Agent 字段');
 });
 
 test('isBinaryExt 扩展名黑名单判定（集合带点，比较补点）', () => {
@@ -349,6 +436,9 @@ test('静态资源通过 _headers 下发完整 CSP', () => {
   assert.match(headers, /Content-Security-Policy:/);
   assert.match(headers, /frame-ancestors 'none'/);
   assert.match(headers, /object-src 'none'/);
+  assert.match(headers, /style-src 'self' https:\/\/cdnjs\.cloudflare\.com;/);
+  assert.match(headers, /style-src-attr 'unsafe-inline'/);
+  assert.doesNotMatch(headers, /style-src [^;]*'unsafe-inline'/, 'style 元素不允许 unsafe-inline');
   assert.match(headers, /X-Frame-Options: DENY/);
   assert.doesNotMatch(html, /http-equiv="Content-Security-Policy"/i, 'CSP 只维护一份响应头配置');
 });

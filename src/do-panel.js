@@ -7,14 +7,23 @@ import {
   ONLINE_GRACE_FAST_S, ONLINE_GRACE_SLOW_S, SHARDS, SCOPE_READ,
 } from './config.js';
 import { json, doForShard, doMetrics, safeJson } from './utils.js';
-import { authUserByToken, isAdmin } from './auth.js';
+import { authIdentityByToken, authUserByIdentity, isAdmin } from './auth.js';
 
 // 本模块专用常量（缓存 TTL / 频率下限 / 切快采过渡期，就近定义便于对照使用代码）
 const LIST_CACHE_TTL_MS = 4500; // 服务器列表缓存 TTL：> 前端 3s sync 间隔（错开同频，消除单观看者 miss）
 const LATEST_CACHE_TTL_MS = 4000; // MetricsDO /latest 共享缓存 TTL（多观看者 sync 共享，DO 事件 −50%）
 const SYNC_MIN_INTERVAL_MS = 2000; // sync 频率下限（<2s 忽略，防任意消息/高频触发全链路）
+const WS_AUTH_TIMEOUT_MS = 10 * 1000; // WS 建连后必须在 10s 内发送 auth 首帧
+const MAX_PENDING_WS = 128; // 单个 PanelDO 未鉴权连接上限，防耗尽 Hibernation WebSocket 配额
 const PANEL_SWITCH_GRACE_MS = 30 * 1000; // 观看者 0→1 后在线判定用慢宽限的过渡期：Agent 切快采并完成首帧上报前，
 // 用 15s 快宽限会把慢采周期中（120s 内无上报）的节点误判离线；30s 后快宽限正常生效
+
+function attachmentOf(ws) {
+  try { return ws.deserializeAttachment?.(); } catch { return null; }
+}
+function isViewerAttachment(att) {
+  return !!att && ((typeof att === 'object' && att.role === 'viewer') || typeof att === 'string');
+}
 
 export class PanelDO {
   constructor(state, env) {
@@ -23,23 +32,59 @@ export class PanelDO {
     this.listCache = null; // {rows, ts} 服务器列表缓存（TTL 4500ms，多观看者共享，降 D1 读）
     this.latestCache = null; // {data, ts} MetricsDO /latest 共享缓存（TTL 4s，sync 链 DO 事件 −50%）
     this.syncAt = new Map(); // ws -> 上次 sync 时间（频率下限 <2s 忽略，防刷）
-    this.authCache = new Map(); // token -> {user, ts} 鉴权缓存（30s TTL；PAT 撤销由 clear_auth_cache RPC 即时失效，TTL 仅兜底。
+    this.authCache = new Map(); // 身份键（PAT HMAC / JWT claims）→ {user, ts}，不缓存 bearer 明文
     // 此前 5s TTL 与 latest_push 5s 节拍精确同频 → 挂机 PAT 连接每拍必 miss api_tokens 点查
     //（17,280 行读/天/连接）；30s TTL 错开节拍（每 6 拍 1 次 miss，−83%），撤销时效靠 RPC 主路径保证秒级）
     this.fastSince = 0; // 最近一次 0→1 切快采时刻（毫秒）；过渡期内在线判定用慢宽限，避免首次显示离线
   }
 
-  // 鉴权缓存：JWT 本身是 HMAC（无 D1 读）；PAT 每次读 D1，缓存 TTL 降频（30s；撤销即时性由
-  // routes 的 clear_auth_cache RPC 保证，TTL 只兜 RPC 失败的极端场景）
-  async authUserCached(token) {
-    if (!token) return null;
+  authCacheKey(identity) {
+    if (!identity || typeof identity !== 'object') return '';
+    return identity.kind === 'pat'
+      ? `pat:${identity.tokenHash || ''}`
+      : `jwt:${identity.id || ''}:${identity.exp || 0}:${identity.username || ''}`;
+  }
+
+  cacheIdentity(identity, user) {
+    const key = this.authCacheKey(identity);
+    if (!key) return;
+    if (this.authCache.size > 1000) this.authCache.clear();
+    this.authCache.set(key, { user, ts: Date.now() });
+  }
+
+  // attachment 只携带不可逆 PAT HMAC 或已验证 JWT claims；PAT 每 30s 重新按 hash 查 D1。
+  async authUserCached(identity) {
+    const key = this.authCacheKey(identity);
+    if (!key) return null;
     const now = Date.now();
-    const c = this.authCache.get(token);
+    if (identity.kind === 'jwt' && identity.exp && identity.exp * 1000 < now) return null;
+    const c = this.authCache.get(key);
     if (c && now - c.ts < 30000) return c.user;
-    const user = await authUserByToken(token, this.env);
-    if (this.authCache.size > 1000) this.authCache.clear(); // 防 Map 无限增长
-    this.authCache.set(token, { user, ts: now });
+    const user = await authUserByIdentity(identity, this.env);
+    if (this.authCache.size > 1000) this.authCache.clear();
+    this.authCache.set(key, { user, ts: now });
     return user;
+  }
+
+  // 升级前版本可能有字符串 token 附件；首次活动时校验并原地迁移为无明文身份对象。
+  async userForSocket(ws, att = attachmentOf(ws)) {
+    if (typeof att === 'string') {
+      const authenticated = await authIdentityByToken(att, this.env);
+      if (!authenticated) return null;
+      const safe = { role: 'viewer', auth: authenticated.identity };
+      ws.serializeAttachment?.(safe);
+      this.cacheIdentity(safe.auth, authenticated.user);
+      return authenticated.user;
+    }
+    if (!att || att.role !== 'viewer') return null;
+    return this.authUserCached(att.auth);
+  }
+
+  async scheduleAuthAlarm(deadline) {
+    try {
+      const current = await this.state.storage.getAlarm();
+      if (current == null || current <= Date.now() || deadline < current) await this.state.storage.setAlarm(deadline);
+    } catch { /* alarm 不可用时仍受 pending 数量硬上限保护 */ }
   }
 
   // 服务器列表缓存 + 权限过滤（过滤在缓存之上执行，不缓存可越权结论）
@@ -69,7 +114,7 @@ export class PanelDO {
     // 同时返回 fastSince（0→1 切快采时刻），Worker 侧 REST/MCP 列表据此复用 30s 过渡期
     // 语义——否则首观者上线后 30s 内慢采 agent 会被 15s 快宽限误判离线
     if (url.pathname === '/viewers') {
-      const count = (this.state.getWebSockets?.() || []).filter((w) => w.deserializeAttachment?.()).length;
+      const count = (this.state.getWebSockets?.() || []).filter((w) => isViewerAttachment(attachmentOf(w))).length;
       return json({ count, fastSince: count > 0 ? this.fastSince : 0 });
     }
     // 内部 RPC：PAT 撤销后清鉴权缓存（已建观看者连接下个推送即失效关闭；清失败由 30s TTL 兜底）
@@ -89,11 +134,11 @@ export class PanelDO {
       const latest = pb.latest || {};
       const wss = this.state.getWebSockets?.() || [];
       await Promise.all(wss.map(async (w) => {
-        if (!w.deserializeAttachment?.()) return; // 未鉴权连接跳过
-        const token = String(w.deserializeAttachment() || '');
-        const user = await this.authUserCached(token);
+        const att = attachmentOf(w);
+        if (!isViewerAttachment(att)) return; // 未鉴权连接跳过
+        const user = await this.userForSocket(w, att);
         if (!user) {
-          // 已撤销：直接关闭连接（前端仅 onopen 发一次 sync，webSocketMessage 的
+          // 已撤销/过期：直接关闭连接（前端仅 onopen 发一次 sync，webSocketMessage 的
           // 关闭分支不会再触发——必须在此兜底，否则撤销连接残留计数导致 agent 持续快采）
           try { w.close(1008, 'unauthorized'); } catch { /* ignore */ }
           return;
@@ -104,10 +149,15 @@ export class PanelDO {
       return json({ ok: true });
     }
     if (url.pathname !== '/ws/push') return new Response('not found', { status: 404 });
+    const sockets = this.state.getWebSockets?.() || [];
+    const pending = sockets.filter((w) => attachmentOf(w)?.role === 'viewer-pending').length;
+    if (pending >= MAX_PENDING_WS) return new Response('too many pending connections', { status: 429 });
     const pair = new WebSocketPair();
     this.state.acceptWebSocket(pair[1]);
-    // 鉴权延迟到首条消息（{type:'auth', token}）：token 不进 URL（防访问日志/浏览器历史泄露）
-    pair[1].serializeAttachment(null);
+    // 鉴权延迟到首条消息；pending 附件不含 token，并由 alarm 在 10s 后强制回收。
+    const authDeadline = Date.now() + WS_AUTH_TIMEOUT_MS;
+    pair[1].serializeAttachment({ role: 'viewer-pending', authDeadline });
+    await this.scheduleAuthAlarm(authDeadline);
     return new Response(null, { status: 101, webSocket: pair[0] });
   }
 
@@ -127,19 +177,26 @@ export class PanelDO {
 
   // 客户端首帧鉴权（{type:'auth', token}）；通过后发一次 sync 拉初始列表，之后被动收推送
   async webSocketMessage(ws, message) {
-    // 未鉴权连接：首条消息必须是鉴权帧
-    if (!ws.deserializeAttachment?.()) {
+    const att = attachmentOf(ws);
+    // 未鉴权连接：首条消息必须是鉴权帧（null 兼容升级前已建立的 pending 连接）
+    if (!att || att.role === 'viewer-pending') {
+      if (att?.authDeadline && Date.now() > att.authDeadline) {
+        try { ws.close(1008, 'authentication timeout'); } catch { /* ignore */ }
+        return;
+      }
       let j = null;
       try { j = JSON.parse(typeof message === 'string' ? message : ''); } catch { /* 非 JSON 视为无效 */ }
       const token = j && j.type === 'auth' ? String(j.token || '') : '';
-      const user = await this.authUserCached(token);
-      if (!user) {
+      const authenticated = token ? await authIdentityByToken(token, this.env) : null;
+      if (!authenticated) {
         try { ws.close(1008, 'unauthorized'); } catch { /* ignore */ }
         return;
       }
-      ws.serializeAttachment(token);
+      const safe = { role: 'viewer', auth: authenticated.identity };
+      ws.serializeAttachment(safe);
+      this.cacheIdentity(safe.auth, authenticated.user);
       // 首位已鉴权观看者上线（0→1）→ 各分片 agent 立即切快采（事件驱动，免每次上报查 /viewers）
-      const authed = (this.state.getWebSockets?.() || []).filter((w) => w.deserializeAttachment?.());
+      const authed = (this.state.getWebSockets?.() || []).filter((w) => isViewerAttachment(attachmentOf(w)));
       if (authed.length === 1) {
         this.fastSince = Date.now(); // 过渡期内（30s）在线判定用慢宽限，防切快采前短暂误判离线
         this.broadcastViewers(1);
@@ -147,7 +204,6 @@ export class PanelDO {
       }
       return;
     }
-    const token = ws.deserializeAttachment() || '';
     // 仅响应 'sync'（任意其他消息不再触发全链路）；频率下限 <2s 忽略（防刷/异常放大）
     if (message !== 'sync') return;
     const syncNow = Date.now();
@@ -155,7 +211,7 @@ export class PanelDO {
     if (syncNow - lastSync < SYNC_MIN_INTERVAL_MS) return;
     this.syncAt.set(ws, syncNow);
     if (this.syncAt.size > 500) this.syncAt.clear(); // 防 Map 无限增长
-    const user = await this.authUserCached(token);
+    const user = await this.userForSocket(ws, att);
     if (!user) {
       // PAT/JWT 已失效（撤销/删除）：关闭连接而非静默忽略——撤销后观看者立即下线，
       // 其快采随之恢复慢采（与 webSocketClose 的广播逻辑衔接）
@@ -190,7 +246,7 @@ export class PanelDO {
     }
     const now = Math.floor(Date.now() / 1000);
     // 本 DO 内直接统计已鉴权观看者（无需额外 RPC）；切快采过渡期（0→1 后 30s 内）用慢宽限
-    const hasViewers = (this.state.getWebSockets?.() || []).filter((w) => w.deserializeAttachment?.()).length > 0;
+    const hasViewers = (this.state.getWebSockets?.() || []).some((w) => isViewerAttachment(attachmentOf(w)));
     const grace = (hasViewers && Date.now() - this.fastSince >= PANEL_SWITCH_GRACE_MS)
       ? ONLINE_GRACE_FAST_S : ONLINE_GRACE_SLOW_S;
     return serverRows.map((s) => ({
@@ -218,9 +274,28 @@ export class PanelDO {
     } catch { /* 通知失败：MetricsDO 保持旧状态（无人看时无上报 → 不推，无碍） */ }
   }
 
+  // Hibernation alarm：关闭超过首帧鉴权期限的匿名连接；尚未到期则续排最早 deadline。
+  async alarm() {
+    const now = Date.now();
+    let next = Infinity;
+    for (const ws of this.state.getWebSockets?.() || []) {
+      const att = attachmentOf(ws);
+      if (!att || att.role !== 'viewer-pending') continue;
+      const deadline = Number(att.authDeadline) || 0;
+      if (deadline <= now) {
+        try { ws.close(1008, 'authentication timeout'); } catch { /* ignore */ }
+      } else {
+        next = Math.min(next, deadline);
+      }
+    }
+    if (next !== Infinity) await this.scheduleAuthAlarm(next);
+  }
+
   // 观看者断开：最后一个已鉴权观看者下线（1→0）→ 广播慢采 + 关闭上报驱动推送（事件驱动省配额）
   async webSocketClose(ws) {
-    const authed = (this.state.getWebSockets?.() || []).filter((w) => w !== ws && w.deserializeAttachment?.());
+    if (!isViewerAttachment(attachmentOf(ws))) return; // pending 关闭不影响观看者状态
+    const authed = (this.state.getWebSockets?.() || [])
+      .filter((w) => w !== ws && isViewerAttachment(attachmentOf(w)));
     if (authed.length === 0) {
       this.fastSince = 0;
       this.broadcastViewers(0);

@@ -153,6 +153,17 @@ async fn disk_cache()
         .await
 }
 
+fn preserve_nonempty_disk_cache(
+    old: Option<Vec<serde_json::Value>>,
+    fresh: Vec<serde_json::Value>,
+) -> Vec<serde_json::Value> {
+    if fresh.is_empty() {
+        old.filter(|value| !value.is_empty()).unwrap_or_default()
+    } else {
+        fresh
+    }
+}
+
 // 磁盘：statvfs + /proc/mounts（无外部命令依赖，替代 df -Pkl——busybox 精简版/
 // 最小镜像无 df 或参数缺失）。保留 spawn_blocking + 5s 超时：挂死的 NFS 挂载点上
 // statvfs 同样会阻塞，与 df 行为等价；60s 缓存 + 失败真熔断逻辑不变。
@@ -168,9 +179,18 @@ pub async fn collect_disk(include: &[String]) -> Vec<serde_json::Value> {
     let include = include.to_vec(); // spawn_blocking 需 'static
     let out = crate::blocking::run_blocking(5, move || disk_usage_static(&include)).await;
     match out {
-        Some(Ok(disk)) => {
-            *disk_cache().await = Some((now, disk.clone())); // 成功：更新缓存
+        Some(Ok(disk)) if !disk.is_empty() => {
+            *disk_cache().await = Some((now, disk.clone())); // 成功且非空：更新缓存
             disk
+        }
+        Some(Ok(disk)) => {
+            // 全部挂载点瞬时不可读时不能用空结果覆盖曾经的非空成功值；刷新时间戳形成
+            // 60s 熔断，保留旧数据显示。确实从未采到磁盘时才缓存空值。
+            let mut c = disk_cache().await;
+            let old = c.as_ref().map(|(_, value)| value.clone());
+            let value = preserve_nonempty_disk_cache(old, disk);
+            *c = Some((now, value.clone()));
+            value
         }
         _ => {
             // 失败/超时：真熔断——刷新时间戳，后续 60s 内直接返回旧值/空值不重试；
@@ -178,10 +198,7 @@ pub async fn collect_disk(include: &[String]) -> Vec<serde_json::Value> {
             let mut c = disk_cache().await;
             let old = c.as_ref().map(|(_, v)| v.clone());
             *c = Some((now, old.clone().unwrap_or_default()));
-            if let Some(old) = old {
-                return old;
-            }
-            Vec::new()
+            old.unwrap_or_default()
         }
     }
 }
@@ -213,7 +230,7 @@ fn disk_usage_static(include: &[String]) -> Result<Vec<serde_json::Value>, ()> {
         } else {
             dev.to_string()
         };
-        if !seen.insert(key) {
+        if seen.contains(&key) {
             continue;
         }
         // 伪文件系统 / 虚拟内存盘 / 网络盘默认跳过；DISK_FSTYPE_INCLUDE 显式保留优先
@@ -223,7 +240,9 @@ fn disk_usage_static(include: &[String]) -> Result<Vec<serde_json::Value>, ()> {
         // 目录检查：容器会把 /etc/hosts、/etc/hostname、/etc/resolv.conf 等文件做成 bind mount，
         // 与根盘同 dev 同 fstype——设备去重拦不住，statvfs 对文件也成功（返回绑定源 FS 统计），
         // 会把它误当"数据盘挂载点"显示根盘容量。文件型 bind mount 直接跳过。
-        let md = std::fs::metadata(mount).map_err(|_| ())?;
+        let Ok(md) = std::fs::metadata(mount) else {
+            continue; // 单个过期 NFS/autofs/权限异常挂载点不应拖垮整份磁盘列表
+        };
         if !md.is_dir() {
             continue;
         }
@@ -241,6 +260,7 @@ fn disk_usage_static(include: &[String]) -> Result<Vec<serde_json::Value>, ()> {
         // 已用口径）；f_bavail 不含保留块，若 total = used + avail 会少算保留块（ext4 默认 5%）
         let total = st.f_blocks as u64 * frsize;
         let used = st.f_blocks.saturating_sub(st.f_bfree) as u64 * frsize;
+        seen.insert(key); // 只有成功采集后才去重，同设备后续挂载仍可作为失败兜底
         // 上报 used/total（字节），百分比由前端计算——信息无损的完备表示（u 为派生值不再传输）
         out.push(json!({ "m": mount, "used": used, "total": total }));
     }
@@ -634,6 +654,19 @@ mod tests {
         assert_eq!(
             disk_io_diff(&cur, &DiskIoState { ts: 1010, ..cur }),
             json!({})
+        );
+    }
+
+    #[test]
+    fn empty_disk_refresh_preserves_previous_nonempty_value() {
+        let old = vec![json!({ "m": "/", "used": 1, "total": 2 })];
+        assert_eq!(preserve_nonempty_disk_cache(Some(old.clone()), vec![]), old);
+        assert!(preserve_nonempty_disk_cache(None, vec![]).is_empty());
+        let fresh = vec![json!({ "m": "/data", "used": 3, "total": 4 })];
+        assert_eq!(
+            preserve_nonempty_disk_cache(Some(old), fresh.clone()),
+            fresh,
+            "非空新值正常替换旧缓存"
         );
     }
 

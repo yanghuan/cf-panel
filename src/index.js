@@ -17,7 +17,10 @@ import {
   renderTemplate, parseHeaders, validateWebhookUrl, sendWebhookRaw, sendWebhook,
   shardForServerId, makeStreamId, shardFromStreamId,
 } from './utils.js';
-import { isAdmin, canAccessServer, canExec, serverListCache, __clearGraceCache } from './auth.js';
+import {
+  authIdentityByToken, authUserByIdentity, authUserByPatHash,
+  isAdmin, canAccessServer, canExec, serverListCache, __clearGraceCache,
+} from './auth.js';
 import { SETTINGS_CACHE } from './db.js';
 import {
   handleReport, lastSeenWrite, LAST_SEEN_THROTTLE_S, customWritten,
@@ -48,6 +51,7 @@ export const __internals = {
   parseRangeHours, safeJson, sanitizeAlerts, hashSecret, verifySecretHash, signUploadToken, verifyUploadToken,
   renderTemplate, parseHeaders, validateWebhookUrl, sendWebhookRaw, sendWebhook, sanitizeReportPayload,
   shardForServerId, makeStreamId, shardFromStreamId,
+  authIdentityByToken, authUserByIdentity, authUserByPatHash,
   isAdmin, canAccessServer, canExec, handleReport,
   lastSeenWrite, LAST_SEEN_THROTTLE_S, customWritten, serverListCache, apiCounts, serverRowCache, reportBatch,
   // 重置模块级可变状态（设置缓存），保证测试间隔离

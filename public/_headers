@@ -3,4 +3,4 @@
   X-Frame-Options: DENY
   Referrer-Policy: no-referrer
   Permissions-Policy: camera=(), microphone=(), geolocation=(), payment=(), usb=()
-  Content-Security-Policy: default-src 'self'; script-src 'self' https://cdnjs.cloudflare.com; style-src 'self' 'unsafe-inline' https://cdnjs.cloudflare.com; img-src 'self' data: https://flagcdn.com https://cdn.simpleicons.org; font-src 'self' https://cdnjs.cloudflare.com; connect-src 'self' https://ipapi.co https://ipwho.is https://cdnjs.cloudflare.com; worker-src blob:; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'
+  Content-Security-Policy: default-src 'self'; script-src 'self' https://cdnjs.cloudflare.com; style-src 'self' https://cdnjs.cloudflare.com; style-src-attr 'unsafe-inline'; img-src 'self' data: https://flagcdn.com https://cdn.simpleicons.org; font-src 'self' https://cdnjs.cloudflare.com; connect-src 'self' https://ipapi.co https://ipwho.is https://cdnjs.cloudflare.com; worker-src blob:; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'

@@ -1196,6 +1196,15 @@ mod tests {
     }
 
     #[test]
+    fn rustls_crypto_provider_compiled_in() {
+        // 回归防护（2026-08-25 生产事故）：tungstenite 的 rustls feature 有意不带 crypto
+        // provider，漏配时编译通过、首个真实 wss 连接才 panic——单元/E2E 全走 ws:// 回环
+        // 无法暴露。ClientConfig::builder 与 connect_async 同路径：无 provider 时此处
+        // panic "Could not automatically determine the process-level CryptoProvider"。
+        let _cfg = rustls::ClientConfig::builder();
+    }
+
+    #[test]
     fn validate_wss_rejects_bad_scheme() {
         assert!(validate_wss("http://example.com/ws/agent").is_err());
         assert!(validate_wss("").is_err());

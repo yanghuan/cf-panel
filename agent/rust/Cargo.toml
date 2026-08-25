@@ -15,6 +15,14 @@ description = "cf-panel agent（Rust 版）：控制通道 + 监控上报 + 终�
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal", "process", "fs", "net", "io-util", "sync"] }
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "handshake", "rustls-tls-webpki-roots"] }
+# crypto provider 必须显式启用：tungstenite 对 rustls 声明 default-features=false 且有意
+# 不带任何 provider（provider-agnostic 设计）——漏配时编译通过、运行期首个真实 wss 连接
+# 才 panic "Could not automatically determine the process-level CryptoProvider"
+#（单元/E2E 全走 ws:// 回环无法暴露，2026-08-25 生产事故根因）。
+# 选 ring 而非 aws-lc-rs：aws-lc-sys 需 cmake/nasm（musl 交叉痛苦）；ring 纯 cc 构建，
+# 四个目标平台（musl x64/ARM64、macOS、Windows-MSVC）此前均已验证可行。
+# std/tls12 恢复升级前（rustls 0.22 时代默认开启）的兼容性。
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 futures-util = "0.3"
 serde_json = "1"
 portable-pty = "0.9"

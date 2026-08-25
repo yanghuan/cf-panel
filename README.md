@@ -117,6 +117,8 @@ wrangler deploy
 | `PANEL_USERS` | ✅（与 PANEL_PASSWORD 二选一） | 多用户列表：`用户名:密码,用户名:密码` |
 | `PANEL_PASSWORD` | 二选一 | 单管理员密码（未配置 PANEL_USERS 时使用） |
 
+Agent 更新相关的普通 Worker 变量（非密钥、可选）：`AGENT_RELEASE_REPO=owner/repo` 指定 Release 仓库（默认 `yanghuan/cf-panel`）；`AGENT_MANIFEST_URL=https://.../agent-manifest.json` 可指定清单镜像，但清单中的资产 URL 仍必须精确匹配 `AGENT_RELEASE_REPO` 对应的 GitHub Release，防任意下载源注入。
+
 **`JWT_SECRET`** —— 格式：任意字符串，建议 32 字节以上随机串。
 
 ```bash
@@ -240,6 +242,7 @@ wrangler secret put PANEL_USERS      # 回车后粘贴值，如 alice:pass1,bob:
    AGENT_WSS_URL=wss://<面板域名>/ws/agent
    AGENT_KEY=<你的 key>
    DISABLE_EXEC=0   # 设为 1 可全局禁止命令执行（终端不可用，仅保留监控）
+   ALLOW_SELF_UPDATE=1  # 可选：允许管理员从面板更新（systemd Restart=always 托管重启）
    EOF
    ```
    > 全部可配置环境变量及默认值：`/opt/cf-panel-agent/cf-panel-agent --help`
@@ -276,14 +279,11 @@ Rust 版 agent 三平台产物从 GitHub Releases 下载（`cf-panel-agent-windo
    $env:AGENT_WSS_URL = "wss://<面板域名>/ws/agent"
    $env:AGENT_KEY     = "<你的 key>"
    # 可选：DISABLE_EXEC=1 禁用终端/文件/exec；PROBES / CUSTOM_METRICS 同 Linux
+   $env:ALLOW_SELF_UPDATE = "1"
+   $env:AGENT_SELF_RESTART = "1"  # 未使用服务包装器时，更新后主动启动新版本
    .\cf-panel-agent-windows.exe
    ```
-3. 开机自启（管理员 PowerShell）：
-   ```powershell
-   sc.exe create cf-panel-agent binPath= "C:\cf-panel-agent\cf-panel-agent-windows.exe" start= auto
-   sc.exe start cf-panel-agent
-   # 停止：sc.exe stop cf-panel-agent
-   ```
+3. 开机自启：该 exe 是控制台程序，不可直接用 `sc.exe create` 注册为原生 Windows Service（会因未实现 ServiceMain 报 1053）。可用 WinSW/NSSM 包装为服务；仅需随系统启动时也可使用任务计划程序。无服务包装器时保留上面的 `AGENT_SELF_RESTART=1`，面板更新后由 Agent 自启新版本；使用 WinSW/NSSM 自动重启时改为 0，避免重复拉起。
 4. 差异与边界：
    - **终端走 ConPTY**（PowerShell 交互，portable-pty 内置）；exec/自定义指标走 `cmd /C`（命令写法按 Windows 习惯）。
    - **文件管理为盘符路径**（如 `C:\Users\me\app`）；`C:\Users` 可写，`C:\Windows`、`Program Files`、`ProgramData` 等系统目录受保护（写/删/改名拒绝，下载保留）；`CON`、`NUL`、`COM1`、`LPT1` 等 Win32 保留设备名及 ADS 路径同样拒绝。
@@ -308,6 +308,7 @@ Rust 版 agent 三平台产物从 GitHub Releases 下载（`cf-panel-agent-windo
      <key>EnvironmentVariables</key><dict>
        <key>AGENT_WSS_URL</key><string>wss://<面板域名>/ws/agent</string>
        <key>AGENT_KEY</key><string><你的 key></string>
+       <key>ALLOW_SELF_UPDATE</key><string>1</string>
      </dict>
      <key>RunAtLoad</key><true/>
      <key>KeepAlive</key><true/>
@@ -336,6 +337,7 @@ Rust 版 agent 三平台产物从 GitHub Releases 下载（`cf-panel-agent-windo
 - **服务探活**：agent 配置 `PROBES` 后，卡片显示每个服务的状态徽章（绿=正常/红=异常，悬停显示 HTTP 码）；探测失败持续超冷却会触发 Webhook（`event: probe_down`，恢复发 `probe_recovered`）。
 - **自定义监控项**：agent 配置 `CUSTOM_METRICS`（JSON：`name`+`cmd`）后，执行任意命令采集数值指标；监控图中以独立曲线展示（按 ts 对齐系统时间轴，共用右轴看趋势），数据直写 D1 `metrics_custom` 表（30 天保留）。
 - **实时列表**：登录后前端与 `/ws/push` 保持 WebSocket，连接建立发一次 sync 拉初始列表，此后由 MetricsDO 上报驱动推送（PanelDO，Hibernation 休眠态，费用趋近普通 Worker）按权限广播服务器列表（在线状态前端本地老化自动更新），无需手动刷新。
+- **Agent 自更新**：管理员登录时读取 GitHub Release `agent-manifest.json`（5 分钟缓存）；节点上报 `update_protocol=1` 且配置 `ALLOW_SELF_UPDATE=1` 时，卡片菜单按版本显示「更新 Agent」（不支持该协议的旧 Agent 需先手动升级一次）。二进制经 Worker→TerminalDO→控制 WS 流式中转，Agent 校验大小/SHA-256/候选 `--version`，保留 `.bak` 后用 `self-replace` 原子替换并由 supervisor 或 `AGENT_SELF_RESTART=1` 拉起。PAT 不允许触发更新，操作写入审计日志。Fork 部署请设置 Worker 变量 `AGENT_RELEASE_REPO=owner/repo`（默认 `yanghuan/cf-panel`）；也可用 `AGENT_MANIFEST_URL` 指向 HTTPS 镜像清单，资产 URL 仍须匹配该仓库 Release。
 - **终端**：面板服务器卡片点「终端」→ xterm.js 弹出 → 按键实时到达被控机 shell；窗口拉伸自动 resize（经控制通道 `stty` 下发）；断线自动重连（最多 3 次）。
 - **文件管理**：面板服务器卡片点「文件」→ 弹出文件管理器，可浏览目录（点击进入/上级/路径跳转）、**上传**（本地文件写入 agent）、**下载**（agent 文件回传浏览器）；文件经独立 WS 会话**分段传输**（512KB/段，Binary 混合帧 = JSON 头 + 原始字节，无 base64 膨胀），支持文件名通配符过滤（`*`/`?`，agent 端先过滤再截断），**单文件默认上限 100MB**（`UPLOAD_MAX_MB` 可调高，受 agent 端 500MB 硬上限约束）。每行最右侧 **⋯** 下拉菜单提供：下载（目录自动打包 ZIP 下载，文件名为 `目录名.zip`）、重命名（仅改名，不支持跨目录）、删除（目录递归删除）；系统目录（`/proc`、`/sys`、`/etc`、`/usr`、`/var`、`/root` 等）拒绝上传/重命名/删除等写操作，ZIP 属只读下载，仅拒绝打包文件系统根。
 - **监控**：点「监控」默认看近 12 小时分钟数据（内存 DO 热区，秒回）；可切 1小时/3天/7天/30天查看 D1 归档历史（分钟粒度，超长区间自动降采样）。指标：CPU / 内存 / Swap / 磁盘（根分区）/ 负载 / 温度 / 进程数；服务器卡片显示 OS / 内核 / IP 系统信息。
@@ -356,6 +358,8 @@ Rust 版 agent 三平台产物从 GitHub Releases 下载（`cf-panel-agent-windo
 | GET | `/api/servers` | 服务器列表（含分组、序号；按权限过滤） |
 | POST | `/api/servers` | 添加服务器（name + 可选 group/sort_order），返回 agent 配置 |
 | DELETE | `/api/servers/:id` | 删除服务器（仅管理员） |
+| GET | `/api/agent/latest` | 最新 Agent Release 清单摘要（仅管理员，5 分钟缓存） |
+| POST | `/api/servers/:id/agent-update` | 流式更新指定 Agent（仅管理员；需节点启用 `ALLOW_SELF_UPDATE=1`） |
 | POST | `/api/terminal` | 创建终端会话（exec 权限 + 归属校验），返回 session_id |
 | POST | `/api/file/open` | 创建文件管理会话（exec 权限 + 归属校验），返回 session_id |
 | GET | `/api/usage` | 用量观测（近 24h 上报帧 / DO 事件 / D1 写行估算，仅管理员） |

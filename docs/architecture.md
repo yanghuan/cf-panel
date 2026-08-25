@@ -275,6 +275,40 @@ Rust 版以 `#[cfg(unix)]` / `#[cfg(windows)]` 条件编译实现三平台（平
 
 > **跨平台验证边界（如实标注）**：`cargo check --all-targets` 三平台全绿 + Windows CI 真机测试；macOS 指标（sysinfo 数值/温度）与 ConPTY 交互体验建议发布后真机冒烟。
 
+#### 3.5.3 Agent 自更新（Worker 中转 + self-replace）
+
+设计目标：被控机只需访问面板、不要求能直连 GitHub；保持 Agent 无通用 HTTP 客户端的小体积；更新操作与普通文件上传完全隔离。
+
+```text
+管理员点击更新
+  → Worker GET 最新 agent-manifest.json（模块/边缘缓存）
+  → 校验平台/size/SHA/Release URL，审计 agent.update.request
+  → GitHub Release Response.body 流式传给对应 TerminalDO
+  → TerminalDO 切为 ≤48KB agent_update Binary 帧
+  → Agent 同目录 staging（严格 offset/总大小）
+  → fsync + SHA-256 + 候选 --version/build_id 复核
+  → 备份当前二进制为 .bak
+  → self-replace 跨平台替换
+  → agent_update_result → Agent 优雅清 PTY 后退出
+  → systemd/launchd/supervisor 或 AGENT_SELF_RESTART 拉起
+  → 新 Agent 首次 report 上报目标 build_id，前端确认成功
+```
+
+**Release 清单**：CI `prepare` job 从触发 commit 时间 + 8 位短 SHA 生成全平台统一 build id（`YYYY.MM.DD-HHMM-xxxxxxxx`），防独立 job 跨分钟版本不一致与同分钟 tag 碰撞；`agent-manifest.json` 包含 schema/Cargo 版本/build id/tag/commit/update protocol，以及四个平台资产的 name/size/SHA-256/固定 GitHub Release URL。
+
+**权限与开关**：
+- API 仅 JWT 管理员可调用，PAT 即使有 `server:exec` 也拒绝；请求、成功、失败均写审计日志。
+- Agent 默认 `ALLOW_SELF_UPDATE=0`；显式设 1 才上报 `self_update_enabled=true` 并显示按钮。
+- 使用 supervisor 时 `AGENT_SELF_RESTART=0`；无 supervisor 时可设 1，由旧进程清理会话后启动新版本，二者不可同时开启。
+- 更新与普通上传、另一个更新互斥；更新开始关闭现有终端/文件会话，并拒绝新会话/exec。
+
+**安全/资源边界**：
+- Worker 将仓库固定为 `AGENT_RELEASE_REPO`（默认官方仓库），manifest 内 asset URL 必须精确匹配该仓库/tag/name；清单与资产分别 5 分钟/24 小时缓存。
+- Worker 不整包缓冲；DO 直接切 fetch chunk；Agent 端 32MB 硬上限、平台匹配、逐帧元数据一致、offset/size/SHA/候选版本四层校验。
+- SHA-256 解决完整性，不等价于离线发布签名；GitHub 仓库/Release 发布权限仍是供应链信任根。后续若引入离线签名，可在 manifest 增 Ed25519 signature 并把公钥编入 Agent。
+- 约 2MB 更新包 ≈43 个出站 WS 帧（DO 出站免费）+ 1 个最终入站回执；人工低频更新对 Worker/DO 额度影响可忽略。
+- `self-replace` 负责 Unix 原子 rename 与 Windows 运行中 exe 的辅助替换；项目额外保留一个 `.bak` 供人工回滚。自动健康回滚未实现——前端 90s 未见目标 build id 时明确提示检查 supervisor/手工恢复。
+
 ### 3.6 PTY（伪终端）
 - 用 `creack/pty`（Go）或等价的 PTY 库（其它语言）在 slave 端启动 shell，`TERM=xterm`。
 - agent 持有 master 文件句柄：
@@ -288,7 +322,7 @@ Rust 版以 `#[cfg(unix)]` / `#[cfg(windows)]` 条件编译实现三平台（平
 
 > **实际实现（2026-08，Rust 版）**：采用下述简化协议，以下"magic 帧/多路复用"为初版设计参考（对齐哪吒），当前未使用。
 > - **鉴权**：agent 数据流（`/ws/agent/terminal|file`）用 `X-Agent-Key` 请求头（key 指纹 + 哈希校验）；浏览器流（`/ws/terminal|file`）用**首帧** `{type:"auth", token}`（token 不进 URL，防日志/历史泄露）。
-> - **控制通道**（agent 常驻 WS，JSON 文本帧）：`open_terminal` / `open_file` / `resize {stream_id,rows,cols}` / `set_report_interval {interval}` / `ping`（心跳）；agent 回执 `terminal_ready` / `file_ready` 停止 DO 的确认重发。
+> - **控制通道**（agent 常驻 WS）：JSON 文本帧 `open_terminal` / `open_file` / `resize {stream_id,rows,cols}` / `set_report_interval {interval}` / `ping`（心跳）；agent 回执 `terminal_ready` / `file_ready` 停止 DO 的确认重发。自更新使用 Binary 混合帧（`agent_update` JSON 头 + `\n` + ≤48KB 原始字节），最终回 `agent_update_result`。
 > - **终端数据流**：纯字节透传（输入/输出无帧头，单向直转）；resize 走控制通道（非数据流帧）。
 > - **心跳保活**：控制通道 `ping` + DO 侧 30s 限频心跳下行，防健康连接被误判半开。
 

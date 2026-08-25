@@ -931,6 +931,75 @@ test('Agent 控制通道只接受 X-Agent-Key 请求头，不接受 query key', 
   assert.equal(env.TERMINAL.calls.length, 1, 'header key 正常路由到所属分片');
 });
 
+test('Agent 更新：仅管理员、能力检查、Release 流式中转与审计', async () => {
+  const env = makeEnv();
+  const admin = await login(env);
+  await addServer(env, admin, { name: 'updatable' });
+  await env.DB.prepare('UPDATE servers SET info_json = ?, last_seen = ? WHERE id = 1')
+    .bind(JSON.stringify({
+      agent_version: '2026.08.20-1000', agent_platform: 'linux-x86_64',
+      update_protocol: 1, self_update_enabled: true,
+    }), Math.floor(Date.now() / 1000)).run();
+
+  const binary = new Uint8Array([1, 2, 3, 4]);
+  const manifest = {
+    schema: 1, version: '0.3.0', build_id: '2026.08.25-1200',
+    tag: 'cf-panel-agent-2026.08.25-1200', commit: 'abc', update_protocol: 1,
+    assets: {},
+  };
+  const names = {
+    'linux-x86_64': 'cf-panel-agent',
+    'linux-aarch64': 'cf-panel-agent-aarch64',
+    'macos-aarch64': 'cf-panel-agent-macos',
+    'windows-x86_64': 'cf-panel-agent-windows.exe',
+  };
+  for (const [platform, name] of Object.entries(names)) {
+    manifest.assets[platform] = {
+      name, size: binary.length, sha256: 'a'.repeat(64),
+      url: `https://github.com/yanghuan/cf-panel/releases/download/${manifest.tag}/${name}`,
+    };
+  }
+  const originalFetch = globalThis.fetch;
+  const fetched = [];
+  globalThis.fetch = async (url) => {
+    fetched.push(String(url));
+    if (String(url).endsWith('agent-manifest.json')) return new Response(JSON.stringify(manifest));
+    return new Response(binary, { headers: { 'content-length': String(binary.length) } });
+  };
+  try {
+    const latest = await call(env, { path: '/api/agent/latest', token: admin });
+    assert.equal(latest.status, 200);
+    assert.equal((await latest.json()).build_id, manifest.build_id);
+
+    const updated = await call(env, {
+      method: 'POST', path: '/api/servers/1/agent-update', token: admin,
+    });
+    assert.equal(updated.status, 200);
+    assert.equal((await updated.json()).build_id, manifest.build_id);
+    assert.equal(env.TERMINAL.calls.at(-1).path, '/rpc/agent_update');
+    const headers = env.TERMINAL.calls.at(-1).init.headers;
+    assert.equal(headers['x-agent-platform'], 'linux-x86_64');
+    assert.equal(headers['x-agent-size'], '4');
+    assert.equal(fetched.length, 2, 'manifest 一次 + asset 一次（latest 缓存复用）');
+    const audits = await env.DB.prepare("SELECT action FROM audit_logs WHERE action LIKE 'agent.update.%' ORDER BY id").all();
+    assert.deepEqual(audits.results.map((x) => x.action), [
+      'agent.update.request', 'agent.update.installed',
+    ]);
+
+    // PAT 即使有 exec 权限也不可更新 Agent
+    const patRes = await call(env, {
+      method: 'POST', path: '/api/tokens', token: admin,
+      body: { name: 'exec', scopes: ['server:exec'] },
+    });
+    const pat = (await patRes.json()).token;
+    assert.equal((await call(env, {
+      method: 'POST', path: '/api/servers/1/agent-update', token: pat,
+    })).status, 403);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test('终端与文件会话：需要 exec 权限 + 服务器归属', async () => {
   const env = makeEnv();
   const adminToken = await login(env);

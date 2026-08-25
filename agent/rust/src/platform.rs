@@ -72,6 +72,17 @@ pub mod imp {
     pub fn tmp_base() -> std::path::PathBuf {
         std::path::PathBuf::from("/tmp")
     }
+
+    /// 无 supervisor 时主动启动刚替换的新版本；新进程独立进程组，stdio 关闭（日志仍写 AGENT_LOG）。
+    pub fn restart_executable(exe: &std::path::Path) -> std::io::Result<()> {
+        use std::os::unix::process::CommandExt;
+        let mut cmd = Command::new(exe);
+        cmd.stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .process_group(0);
+        cmd.spawn().map(|_| ())
+    }
 }
 
 #[cfg(windows)]
@@ -230,6 +241,20 @@ pub mod imp {
     /// 临时目录与日志路径前缀（%TEMP% 通常为 C:\Users\<u>\AppData\Local\Temp）
     pub fn tmp_base() -> std::path::PathBuf {
         std::env::temp_dir()
+    }
+
+    /// 无 Windows 服务包装器时主动启动刚替换的新版本。DETACHED_PROCESS + 新进程组
+    /// 防新进程依赖旧控制台；环境变量继承，stdio 关闭（日志仍写 AGENT_LOG）。
+    pub fn restart_executable(exe: &std::path::Path) -> std::io::Result<()> {
+        use std::os::windows::process::CommandExt;
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        let mut cmd = Command::new(exe);
+        cmd.stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+        cmd.spawn().map(|_| ())
     }
 
     // ---- Win32 FFI（仅本模块使用；避免引 windows-rs 全家桶，六个函数足矣）----

@@ -171,6 +171,116 @@ import { queryMonitorRows, queryCustomMetrics, kvClearCache } from './db.js';
 import { authUser, isAdmin, canAccessServer, canExec, listServersWithState, serverListCache } from './auth.js';
 import { serverRowCache, lastSeenWrite, customWritten } from './report.js';
 
+// ---------------- Agent Release / 更新清单 ----------------
+const AGENT_MANIFEST_CACHE_MS = 5 * 60 * 1000;
+const AGENT_UPDATE_MAX_BYTES = 32 * 1024 * 1024;
+const DEFAULT_AGENT_RELEASE_REPO = 'yanghuan/cf-panel';
+let agentManifestCache = null; // { at, source, manifest }
+
+export function clearAgentManifestCache() {
+  agentManifestCache = null;
+}
+
+function agentReleaseRepo(env) {
+  const repo = String(env.AGENT_RELEASE_REPO || DEFAULT_AGENT_RELEASE_REPO).trim();
+  if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repo)) {
+    throw new Error('AGENT_RELEASE_REPO must be owner/repo');
+  }
+  return repo;
+}
+
+async function readJsonLimited(response, maxBytes) {
+  const declared = Number(response.headers.get('content-length'));
+  if (Number.isFinite(declared) && declared > maxBytes) throw new Error('agent manifest too large');
+  const reader = response.body && response.body.getReader();
+  if (!reader) throw new Error('manifest response has no body');
+  const chunks = [];
+  let total = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (!value || !value.length) continue;
+    total += value.length;
+    if (total > maxBytes) {
+      try { await reader.cancel(); } catch { /* ignore */ }
+      throw new Error('agent manifest too large');
+    }
+    chunks.push(value);
+  }
+  const all = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) { all.set(chunk, offset); offset += chunk.length; }
+  return JSON.parse(new TextDecoder().decode(all));
+}
+
+function validateAgentManifest(raw, repo) {
+  if (!raw || Number(raw.schema) !== 1 || Number(raw.update_protocol) !== 1) {
+    throw new Error('unsupported agent manifest');
+  }
+  const buildId = String(raw.build_id || '');
+  const tag = String(raw.tag || '');
+  if (!/^[A-Za-z0-9._-]{1,64}$/.test(buildId) || tag !== `cf-panel-agent-${buildId}`) {
+    throw new Error('invalid agent manifest version');
+  }
+  const base = `https://github.com/${repo}/releases/download/${tag}`;
+  const assets = {};
+  for (const platform of ['linux-x86_64', 'linux-aarch64', 'macos-aarch64', 'windows-x86_64']) {
+    const a = raw.assets && raw.assets[platform];
+    const name = String(a && a.name || '');
+    const size = Number(a && a.size);
+    const sha256 = String(a && a.sha256 || '').toLowerCase();
+    const url = String(a && a.url || '');
+    if (!/^[A-Za-z0-9._-]{1,128}$/.test(name)
+      || !Number.isSafeInteger(size) || size <= 0 || size > AGENT_UPDATE_MAX_BYTES
+      || !/^[0-9a-f]{64}$/.test(sha256)
+      || url !== `${base}/${encodeURIComponent(name)}`) {
+      throw new Error(`invalid agent manifest asset: ${platform}`);
+    }
+    assets[platform] = { name, size, sha256, url };
+  }
+  return {
+    schema: 1,
+    version: String(raw.version || '').slice(0, 64),
+    build_id: buildId,
+    tag,
+    commit: String(raw.commit || '').slice(0, 64),
+    update_protocol: 1,
+    assets,
+  };
+}
+
+function isNewerAgentBuild(current, latest) {
+  current = String(current || '');
+  latest = String(latest || '');
+  if (!current || !latest || current === latest) return false;
+  const re = /^\d{4}\.\d{2}\.\d{2}-\d{4}/;
+  if (re.test(current) && re.test(latest)) return current.slice(0, 16) <= latest.slice(0, 16);
+  return true; // Cargo semver/旧格式：允许首次进入统一 build id 体系
+}
+
+async function getAgentManifest(env, force = false) {
+  const repo = agentReleaseRepo(env);
+  const now = Date.now();
+  const url = String(env.AGENT_MANIFEST_URL
+    || `https://github.com/${repo}/releases/latest/download/agent-manifest.json`);
+  if (!force && agentManifestCache && agentManifestCache.source === url
+      && now - agentManifestCache.at < AGENT_MANIFEST_CACHE_MS) {
+    return agentManifestCache.manifest;
+  }
+  if (!url.startsWith('https://') && !url.startsWith('http://127.0.0.1')) {
+    throw new Error('AGENT_MANIFEST_URL must use https');
+  }
+  const resp = await fetch(url, {
+    headers: { accept: 'application/json', 'user-agent': 'cf-panel-agent-updater' },
+    redirect: 'follow',
+    cf: { cacheTtl: force ? 0 : 300, cacheEverything: !force }, // 多 isolate/边缘复用；refresh=1 绕过
+  });
+  if (!resp.ok) throw new Error(`agent manifest fetch failed (${resp.status})`);
+  const manifest = validateAgentManifest(await readJsonLimited(resp, 64 * 1024), repo);
+  agentManifestCache = { at: now, source: url, manifest };
+  return manifest;
+}
+
 // ---------------- 登录失败限流 ----------------
 // 登录失败限流（应用层纵深防御）。内存窗口按 IP 计数，缓解单 IP 爆破；
 // 注意多边缘实例间非全局一致，生产仍建议 Cloudflare Access / Rate Limiting。
@@ -322,6 +432,121 @@ async function handleApiInner(request, env) {
   // GET /api/servers —— 服务器列表（权限过滤由 queryServersForUser 在 SQL 层完成；列表短 TTL 缓存降读放大）
   if (method === 'GET' && path === '/api/servers') {
     return json(await listServersWithState(env, user));
+  }
+
+  // GET /api/agent/latest —— 最新 Agent 更新清单（仅管理员；5min 模块缓存，避免每卡查 GitHub）
+  if (method === 'GET' && path === '/api/agent/latest') {
+    if (!isAdmin(user)) return err('forbidden', 403);
+    try {
+      const manifest = await getAgentManifest(env, url.searchParams.get('refresh') === '1');
+      return json({
+        version: manifest.version,
+        build_id: manifest.build_id,
+        commit: manifest.commit,
+        update_protocol: manifest.update_protocol,
+        platforms: Object.keys(manifest.assets),
+      });
+    } catch (e) {
+      return err(`agent release unavailable: ${e.message}`, 502);
+    }
+  }
+
+  // POST /api/servers/:id/agent-update —— 管理员触发专用更新协议。
+  // Worker 流式中转 Release 资产，不物化整个二进制；Agent 做大小/SHA/版本复核后 self-replace。
+  const updateMatch = path.match(/^\/api\/servers\/(\d+)\/agent-update$/);
+  if (method === 'POST' && updateMatch) {
+    if (!isAdmin(user)) return err('forbidden', 403); // PAT（即使 server:exec）也不得升级 Agent
+    const id = Number(updateMatch[1]) || 0;
+    const server = await env.DB.prepare('SELECT * FROM servers WHERE id = ?').bind(id).first();
+    if (!server) return err('server not found', 404);
+    const info = safeJson(server.info_json) || {};
+    if (Number(info.update_protocol) < 1 || !info.self_update_enabled) {
+      return err('agent does not support self update or ALLOW_SELF_UPDATE is disabled', 409);
+    }
+    const platform = String(info.agent_platform || '');
+    let manifest;
+    try {
+      manifest = await getAgentManifest(env);
+    } catch (e) {
+      return err(`agent release unavailable: ${e.message}`, 502);
+    }
+    const asset = manifest.assets[platform];
+    if (!asset) return err(`no release asset for platform ${platform || 'unknown'}`, 409);
+    if (String(info.agent_version || '') === manifest.build_id) {
+      return json({ ok: true, already_latest: true, build_id: manifest.build_id });
+    }
+    if (!isNewerAgentBuild(info.agent_version, manifest.build_id)) {
+      return err(`current agent ${info.agent_version} is newer than latest release ${manifest.build_id}`, 409);
+    }
+
+    // 更新是高权限供应链操作：审计写失败则 fail closed，不执行远端替换。
+    await env.DB.prepare(
+      'INSERT INTO audit_logs (user_id, username, client_ip, action, target_server_id, detail) VALUES (?,?,?,?,?,?)'
+    ).bind(user.id, user.username, clientIp(request), 'agent.update.request', id,
+      `${info.agent_version || 'unknown'} → ${manifest.build_id} (${platform})`).run();
+    const auditUpdateResult = async (action, detail) => {
+      try {
+        await env.DB.prepare(
+          'INSERT INTO audit_logs (user_id, username, client_ip, action, target_server_id, detail) VALUES (?,?,?,?,?,?)'
+        ).bind(user.id, user.username, clientIp(request), action, id, String(detail).slice(0, 300)).run();
+      } catch { /* request 审计已存在，结果审计 best effort */ }
+    };
+
+    let assetResp;
+    try {
+      assetResp = await fetch(asset.url, {
+        headers: { accept: 'application/octet-stream', 'user-agent': 'cf-panel-agent-updater' },
+        redirect: 'follow',
+        cf: { cacheTtl: 86400, cacheEverything: true }, // 同版本多机更新复用边缘缓存
+      });
+    } catch (e) {
+      await auditUpdateResult('agent.update.failed', `asset download: ${e.message}`);
+      return err(`agent asset download failed: ${e.message}`, 502);
+    }
+    if (!assetResp.ok || !assetResp.body) {
+      await auditUpdateResult('agent.update.failed', `asset download HTTP ${assetResp.status}`);
+      return err(`agent asset download failed (${assetResp.status})`, 502);
+    }
+    const contentLength = Number(assetResp.headers.get('content-length'));
+    if (Number.isFinite(contentLength) && contentLength > 0 && contentLength !== asset.size) {
+      try { await assetResp.body.cancel(); } catch { /* ignore */ }
+      await auditUpdateResult('agent.update.failed', 'asset size differs from manifest');
+      return err('agent asset size differs from manifest', 502);
+    }
+
+    const stub = doForShard(env, shardForServerId(id));
+    let result;
+    try {
+      const resp = await stub.fetch(
+        `https://do.internal/rpc/agent_update?server_id=${id}`,
+        {
+          method: 'POST',
+          headers: {
+            'content-type': 'application/octet-stream',
+            'x-agent-build-id': manifest.build_id,
+            'x-agent-platform': platform,
+            'x-agent-size': String(asset.size),
+            'x-agent-sha256': asset.sha256,
+          },
+          body: assetResp.body,
+          duplex: 'half', // ReadableStream request body（Node 测试/标准 Fetch 要求；Workers 忽略或支持）
+        }
+      );
+      result = await resp.json().catch(() => ({ error: `update failed (${resp.status})` }));
+      if (!resp.ok) {
+        await auditUpdateResult('agent.update.failed', result.error || `HTTP ${resp.status}`);
+        return json({ error: result.error || 'agent update failed' }, resp.status);
+      }
+    } catch (e) {
+      await auditUpdateResult('agent.update.failed', `relay: ${e.message}`);
+      return err(`agent update relay failed: ${e.message}`, 502);
+    }
+    await auditUpdateResult(
+      'agent.update.installed',
+      `${info.agent_version || 'unknown'} → ${manifest.build_id}`
+    );
+    serverListCacheClear();
+    return json({ ...result, build_id: manifest.build_id });
   }
 
   // POST /api/servers —— 注册一台服务器（name + 可选 group + 可选序号；仅管理员）

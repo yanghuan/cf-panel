@@ -5,10 +5,11 @@ mod blocking;
 mod metrics;
 mod platform;
 mod session;
+mod update;
 
 use std::error::Error;
 use std::io::Write;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -35,9 +36,13 @@ pub struct Config {
     pub tmp_dir: String,
     pub log_file: String,
     pub log_max: u64,
+    pub allow_self_update: bool,
+    pub self_restart_after_update: bool,
+    pub executable: std::path::PathBuf,
 }
 
 pub static CONFIG: OnceLock<Config> = OnceLock::new();
+static RESTART_AFTER_UPDATE: AtomicBool = AtomicBool::new(false);
 
 fn read_config() -> Config {
     let key = std::env::var("AGENT_KEY").unwrap_or_default();
@@ -71,6 +76,15 @@ fn read_config() -> Config {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(262144),
+        // 自更新默认关闭：只有明确配置 supervisor 或 AGENT_SELF_RESTART、且安装目录
+        // 对运行用户可写时才开启。更新成功后 agent 清理会话并退出。
+        allow_self_update: std::env::var("ALLOW_SELF_UPDATE").unwrap_or_default() == "1",
+        // 无 systemd/launchd/服务包装器时可显式设 1：替换成功并清理会话后由旧进程
+        // 启动磁盘上的新版本。受 supervisor 托管时必须保持 0，防 supervisor 与自启重复拉起。
+        self_restart_after_update: std::env::var("AGENT_SELF_RESTART").unwrap_or_default() == "1",
+        // 更新前捕获安装路径：Unix self-replace 后 /proc/self/exe 可能变成 "... (deleted)"，
+        // 不能在退出前重新 current_exe 再启动新版本。
+        executable: std::env::current_exe().unwrap_or_default(),
     }
 }
 
@@ -216,11 +230,12 @@ async fn run_control(
     cfg: &Config,
     sessions: &Arc<Mutex<std::collections::HashMap<String, Arc<session::TermSession>>>>,
     file_sessions: &Arc<Mutex<std::collections::HashSet<String>>>,
+    shutdown: &Arc<Notify>,
 ) {
     let mut backoff = RETRY_INITIAL_SECS;
     loop {
         let started = std::time::Instant::now();
-        match control_conn(cfg, sessions, file_sessions).await {
+        match control_conn(cfg, sessions, file_sessions, shutdown).await {
             Ok(_) => {
                 log("control channel closed");
                 // 存活 <10s 的"成功连接"（服务端立即关闭/反代错误/服务端 bug）
@@ -269,6 +284,7 @@ async fn control_conn(
     cfg: &Config,
     sessions: &Arc<Mutex<std::collections::HashMap<String, Arc<session::TermSession>>>>,
     file_sessions: &Arc<Mutex<std::collections::HashSet<String>>>,
+    shutdown: &Arc<Notify>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let url = format!("{}/control", cfg.wss);
     let mut req = url.into_client_request()?;
@@ -302,6 +318,8 @@ async fn control_conn(
     let created: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
     let failed_uploads: Arc<std::sync::Mutex<std::collections::HashSet<String>>> =
         Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+    // 自更新状态仅属于当前控制连接；断连时 abort 清 staging，重连后从头开始（offset=0）。
+    let update_manager = Arc::new(update::UpdateManager::new());
     let result: Result<(), Box<dyn Error + Send + Sync>> = loop {
         let msg =
             match tokio::time::timeout(Duration::from_secs(CONTROL_READ_TIMEOUT_S), read.next())
@@ -328,11 +346,15 @@ async fn control_conn(
                     break Err(e);
                 }
             }
-            // Binary 混合帧：/api/file_upload 分片上传（JSON 头 + '\n' + 原始字节，与文件会话同构）
+            // Binary 混合帧：普通文件上传或专用 Agent 更新（JSON 头 type 区分）。
+            // 更新必须独立协议，禁止借普通 upload 任意覆盖当前可执行文件。
             Message::Binary(b) => {
-                if let Err(e) =
+                let handled = if update::is_update_frame(&b) {
+                    handle_update_frame(cfg, b.to_vec(), &update_manager, &write, shutdown).await
+                } else {
                     handle_upload_frame(cfg, &b, &created, &failed_uploads, &write).await
-                {
+                };
+                if let Err(e) = handled {
                     break Err(e);
                 }
             }
@@ -346,7 +368,86 @@ async fn control_conn(
             let _ = std::fs::remove_file(p);
         }
     }
+    update_manager.abort();
     result
+}
+
+// Agent 自更新帧：staging/校验/替换全部在线程池执行；commit 成功回执后通知主任务
+// 优雅清理 PTY 并退出，由 systemd/launchd/Windows supervisor 拉起磁盘上的新版本。
+async fn handle_update_frame(
+    cfg: &Config,
+    frame: Vec<u8>,
+    manager: &Arc<update::UpdateManager>,
+    write: &Arc<Mutex<Sink>>,
+    shutdown: &Arc<Notify>,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let update_id = update::frame_update_id(&frame);
+    let mgr = manager.clone();
+    let enabled = cfg.allow_self_update;
+    let result =
+        crate::blocking::file_blocking(120, move || mgr.handle_frame(&frame, enabled)).await;
+    let (response, ready) = match result {
+        Some(Ok(update::UpdateOutcome::Progress)) => return Ok(()),
+        Some(Ok(update::UpdateOutcome::Ready {
+            update_id,
+            build_id,
+            size,
+            backup,
+        })) => (
+            serde_json::json!({
+                "type": "agent_update_result", "update_id": update_id, "ok": true,
+                "build_id": build_id, "size": size, "backup": backup, "restarting": true,
+            }),
+            true,
+        ),
+        Some(Err(error)) => {
+            manager.abort(); // 任一失败终止本次状态，允许无需重连直接重试
+            (
+                serde_json::json!({
+                    "type": "agent_update_result", "update_id": update_id,
+                    "ok": false, "error": error,
+                }),
+                false,
+            )
+        }
+        None => {
+            manager.abort();
+            (
+                serde_json::json!({
+                    "type": "agent_update_result", "update_id": update_id,
+                    "ok": false, "error": "update operation timed out",
+                }),
+                false,
+            )
+        }
+    };
+    // 替换一旦成功就必须退出运行新版本，不能把退出依赖于回执发送成功：连接恰在此刻
+    // 断开时，磁盘已更新但旧进程若继续运行会永远不上新版本。
+    if ready {
+        RESTART_AFTER_UPDATE.store(cfg.self_restart_after_update, Ordering::SeqCst);
+    }
+    let send_result = async {
+        let mut w = write.lock().await;
+        w.send(Message::Text(response.to_string().into())).await?;
+        w.flush().await?;
+        Ok::<(), tokio_tungstenite::tungstenite::Error>(())
+    }
+    .await;
+    if ready {
+        log(if cfg.self_restart_after_update {
+            "agent update installed; shutting down and starting replacement"
+        } else {
+            "agent update installed; shutting down for supervisor restart"
+        });
+        // 回执成功时给帧短暂传输窗口；失败也继续退出（DO 会以断线失败，重连首报可确认版本）。
+        if send_result.is_ok() {
+            sleep(Duration::from_millis(200)).await;
+        }
+        shutdown.notify_waiters();
+        return Ok(());
+    }
+    send_result?;
+    Ok(())
 }
 
 // 控制通道上传帧处理：Binary 混合帧（JSON 头 + '\n' + 原始字节，复用文件会话的 write_bytes 原子写语义）
@@ -866,7 +967,7 @@ async fn report_loop(
 }
 
 // ---------------- 入口 ----------------
-// 版本号：优先取构建时注入的 AGENT_BUILD_TS（格式 2026.08.08-2000，CI 编译时传入），
+// 版本号：优先取构建时注入的 AGENT_BUILD_TS（格式 2026.08.08-2000-a1b2c3d4，CI 统一生成），
 // 未注入时回退 Cargo.toml 的 [package] version（本地调试可见）。
 // pub：metrics::collect_info 将其写入系统信息上报，前端节点 tooltip 展示
 pub const VERSION: &str = match option_env!("AGENT_BUILD_TS") {
@@ -897,6 +998,10 @@ fn print_help() {
     println!("  AGENT_TMPDIR      默认 /tmp/cfpanel-<key前8位>   临时目录");
     println!("  AGENT_LOG         默认 /tmp/cfpanel-<key前8位>-agent.log   日志文件");
     println!("  AGENT_LOG_MAX     默认 262144   日志轮转上限（字节）");
+    println!("  ALLOW_SELF_UPDATE 默认 0     设为 1 允许管理员从面板更新 Agent");
+    println!(
+        "  AGENT_SELF_RESTART 默认 0   无 supervisor 时设为 1，更新后主动启动新进程（与 systemd/launchd 二选一）"
+    );
 }
 
 #[tokio::main]
@@ -923,6 +1028,7 @@ async fn main() {
         std::process::exit(1);
     }
     let _ = CONFIG.set(cfg.clone());
+    update::cleanup_stale(); // 异常退出留下的同目录 .update-* staging（不删除人工回滚 .bak）
     // 保留 AGENT_TMPDIR 环境变量兼容（Rust 版不依赖临时目录，pty/文件均由进程内管理）
     let _ = std::fs::create_dir_all(&cfg.tmp_dir);
     log(format!("agent starting (wss={})", cfg.wss));
@@ -962,7 +1068,7 @@ async fn main() {
     }
 
     tokio::select! {
-        _ = run_control(&cfg, &sessions, &file_sessions) => {}
+        _ = run_control(&cfg, &sessions, &file_sessions, &shutdown) => {}
         _ = shutdown.notified() => {}
     }
 
@@ -970,6 +1076,15 @@ async fn main() {
     let guards = sessions.lock().await;
     for t in guards.values() {
         t.cleanup().await;
+    }
+    drop(guards);
+    if RESTART_AFTER_UPDATE.load(Ordering::SeqCst) {
+        match platform::restart_executable(&cfg.executable) {
+            Ok(()) => log("replacement agent started"),
+            Err(e) => log(format!(
+                "failed to start replacement agent: {e}; supervisor restart required"
+            )),
+        }
     }
     log("agent exiting");
 }

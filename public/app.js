@@ -37,6 +37,8 @@
   let canExec = true; // 当前用户是否有 exec 权限（PAT 按 scopes，admin 恒有；控制终端/文件菜单显隐）
   let isAdmin = true; // 当前用户是否面板管理员（JWT 登录；PAT 恒 false；控制修改/删除等管理菜单显隐）
   let serversCache = [];
+  let latestAgent = null; // {build_id,platforms}：管理员登录后一次获取，卡片按 agent capability 显示更新按钮
+  const updatingAgents = new Set(); // server id：防重复点击，更新期间按钮置禁用
   let groupOrder = []; // 分组显示顺序（组名数组，下标即顺序；管理员经 ↑↓ 调整，PUT /api/group-order 持久化）
   let pushTimer = null;    // 每 3 秒发一次 sync 请求的定时器（老化）
   let monitorState = null; // { serverId, serverName, range } 当前监控视图
@@ -88,7 +90,9 @@
       const m = btn.dataset.menu;
       btn.classList.toggle('hidden', !isAdmin && m && ADMIN_MENUS.has(m));
     });
-    loadServers(); // 先拉一次，WS 建立后每 3 秒由服务端推送覆盖
+    if (isAdmin) loadLatestAgent();
+    else latestAgent = null;
+    loadServers(); // 先拉一次，WS 建立后由服务端推送覆盖
     startPush();
     idleGuard.start(); // 空闲观看保护：登录后开始计时
   }
@@ -119,6 +123,67 @@
   }
 
   // ---------- 服务器 ----------
+  async function loadLatestAgent() {
+    try {
+      latestAgent = await api('/api/agent/latest');
+      renderServers(); // 清单可能晚于服务器列表返回，补一次按钮状态
+    } catch {
+      latestAgent = null; // GitHub/清单短暂不可用不影响监控主界面
+    }
+  }
+
+  function agentUpdateAvailable(s) {
+    const info = s && s.info;
+    if (!isAdmin || !s.online || !latestAgent || !info) return false;
+    if (Number(info.update_protocol) < 1 || !info.self_update_enabled) return false;
+    if (!(latestAgent.platforms || []).includes(info.agent_platform)) return false;
+    const current = String(info.agent_version || '');
+    const latest = String(latestAgent.build_id || '');
+    if (!current || !latest || current === latest) return false;
+    // CI build id 的前 16 字符（YYYY.MM.DD-HHMM）可字典序比较，后缀短 SHA 仅防同分钟
+    // tag 碰撞；本地 Cargo semver/旧格式无法比较时显示更新（首次手动升级后进入统一体系）。
+    const buildPrefix = /^\d{4}\.\d{2}\.\d{2}-\d{4}/;
+    if (buildPrefix.test(current) && buildPrefix.test(latest)) {
+      return current.slice(0, 16) <= latest.slice(0, 16); // 同分钟但 SHA 不同：latest 仍应更新
+    }
+    return true;
+  }
+
+  async function updateAgent(id, name) {
+    if (updatingAgents.has(id) || !latestAgent) return;
+    updatingAgents.add(id);
+    renderServers();
+    toast(`正在更新「${name}」Agent，请勿关闭页面...`, 180000);
+    try {
+      const result = await api(`/api/servers/${id}/agent-update`, { method: 'POST' });
+      if (result.already_latest) {
+        toast('Agent 已是最新版本');
+        return;
+      }
+      toast(`Agent 已安装 ${result.build_id || latestAgent.build_id}，等待服务重新上线...`, 15000);
+      // 推送通常会在重连首报时自动刷新；额外短轮询覆盖标签页刚恢复/推送重连窗口。
+      const target = result.build_id || latestAgent.build_id;
+      const deadline = Date.now() + 90000;
+      while (Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 2500));
+        const list = await api('/api/servers');
+        serversCache = Array.isArray(list) ? list : serversCache;
+        const server = serversCache.find((s) => s.id === id);
+        updateServerCards();
+        if (server && server.online && server.info && server.info.agent_version === target) {
+          toast(`「${name}」Agent 已更新到 ${target}`);
+          return;
+        }
+      }
+      toast('更新已安装，但 Agent 尚未重新上线；请检查 supervisor/service 日志', 10000);
+    } catch (e) {
+      toast(`Agent 更新失败：${e.message}`, 10000);
+    } finally {
+      updatingAgents.delete(id);
+      renderServers();
+    }
+  }
+
   async function loadServers() {
     try {
       const [list, ord] = await Promise.all([
@@ -255,6 +320,9 @@
     // IP 优先 wan_ip，回退 agent 上报的网卡 IP；私网与否不再这里过滤（<cf-ip> 内部 GEO_PRIVATE 守卫生效，私网仅显示 IP 不查归属地）
     const ip = (s.wan_ip || (s.info && s.info.ip4) || '').trim();
     const info = s.info ? [s.info.os, up].filter(Boolean).join(' · ') : up;
+    const updateBtn = agentUpdateAvailable(s)
+      ? `<button data-act="agent-update" data-id="${s.id}" data-name="${escapeHtml(s.name)}" title="目标版本 ${escapeHtml(latestAgent.build_id)}" ${updatingAgents.has(s.id) ? 'disabled' : ''}>${updatingAgents.has(s.id) ? '更新中...' : '更新 Agent'}</button>`
+      : '';
     return `
       <div class="card" data-id="${s.id}">
         <div class="card-head">
@@ -265,7 +333,7 @@
               ${canExec ? `<button data-act="term" data-id="${s.id}" data-name="${escapeHtml(s.name)}">终端</button>
               <button data-act="file" data-id="${s.id}" data-name="${escapeHtml(s.name)}">文件</button>` : ''}
               <button data-act="mon" data-id="${s.id}" data-name="${escapeHtml(s.name)}">监控</button>
-              ${isAdmin ? `<button data-act="edit" data-id="${s.id}" data-name="${escapeHtml(s.name)}" data-group="${escapeHtml(s.group || '')}" data-order="${s.display_index || 0}">修改</button>
+              ${isAdmin ? `${updateBtn}<button data-act="edit" data-id="${s.id}" data-name="${escapeHtml(s.name)}" data-group="${escapeHtml(s.group || '')}" data-order="${s.display_index || 0}">修改</button>
               <button data-act="del" data-id="${s.id}" data-name="${escapeHtml(s.name)}" class="dd-danger">删除</button>` : ''}
             </div>
           </div>
@@ -1676,6 +1744,9 @@
     'terminal.open': '打开终端', 'file.open': '文件管理', 'file.upload': '上传文件',
     'file.write': '写入文件', 'file.zip': '打包目录', 'file.rename': '重命名', 'file.delete': '删除文件',
     'exec.command': '执行命令',
+    'agent.update.request': '请求更新 Agent',
+    'agent.update.installed': 'Agent 更新已安装',
+    'agent.update.failed': 'Agent 更新失败',
   };
   const auditState = { limit: 100, offset: 0, action: '', user: '', serverId: '' };
   async function openAuditModal() {
@@ -1903,6 +1974,13 @@
     if (act === 'term') openTerminal(Number(id), name);
     else if (act === 'file') openFileManager(Number(id), name);
     else if (act === 'mon') showMonitor(Number(id), name);
+    else if (act === 'agent-update') {
+      const target = latestAgent && latestAgent.build_id;
+      confirmDialog(
+        `确认将「${name}」Agent 更新到 ${target}？\n\n更新会关闭该节点现有终端/文件会话，并短暂离线；成功后由 supervisor 自动重启。`,
+        () => updateAgent(Number(id), name)
+      );
+    }
     else if (act === 'edit') openEditModal(Number(id), name, btn.dataset.group, btn.dataset.order);
     else if (act === 'del') {
       confirmDialog(`确认删除服务器「${name}」？`, () => {

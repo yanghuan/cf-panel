@@ -5,6 +5,8 @@
 #   2. 创建 /etc/cf-panel-agent.env：
 #        AGENT_WSS_URL=wss://panel.example.com/ws/agent
 #        AGENT_KEY=<你的 key>
+#        ALLOW_SELF_UPDATE=1   # 可选：允许管理员从面板更新；Restart=always 会拉起新版本
+#        # 不要设置 AGENT_SELF_RESTART=1（会与 systemd Restart=always 重复拉起）
 #   3. 复制本文件到 /etc/systemd/system/cf-panel-agent.service
 #   4. systemctl daemon-reload && systemctl enable --now cf-panel-agent
 # 监控上报已内置（经控制 WS 上报，无需 crontab；间隔可改 REPORT_INTERVAL，默认 120s）

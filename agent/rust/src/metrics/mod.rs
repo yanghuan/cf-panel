@@ -332,6 +332,9 @@ mod tests {
             tmp_dir: String::new(),
             log_file: String::new(),
             log_max: 0,
+            allow_self_update: false,
+            self_restart_after_update: false,
+            executable: std::path::PathBuf::new(),
         };
         let values = collect_custom(&cfg).await;
         assert_eq!(values, vec![json!({ "name": "large", "value": 42.0 })]);
@@ -350,6 +353,9 @@ mod tests {
             tmp_dir: String::new(),
             log_file: String::new(),
             log_max: 0,
+            allow_self_update: false,
+            self_restart_after_update: false,
+            executable: std::path::PathBuf::new(),
         };
         assert_eq!(
             disk_include(&cfg),

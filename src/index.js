@@ -4,7 +4,9 @@
 // 功能模块：config（常量）、utils（工具）、db（数据访问）、auth（鉴权）、
 //           report（上报落库）、routes（REST/MCP/WS 路由）、do-*（三个 DO 类）
 // ============================================================
-import { handleApi, handleMcp, handleWs, loginFails, apiCounts } from './routes.js';
+import {
+  handleApi, handleMcp, handleWs, loginFails, apiCounts, clearAgentManifestCache,
+} from './routes.js';
 import { sanitizeReportPayload } from './report.js';
 import { TerminalDO } from './do-terminal.js';
 import { MetricsDO } from './do-metrics.js';
@@ -64,6 +66,7 @@ export const __internals = {
     customWritten.clear();
     serverListCache.clear();
     apiCounts.clear();
+    clearAgentManifestCache();
     serverRowCache.clear();
     reportBatch.clear();
     __clearGraceCache(); // 宽限期缓存（模块级静态，测试间 mock 不同需隔离）

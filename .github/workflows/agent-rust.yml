@@ -6,6 +6,11 @@
 #   metrics/ 平台指标采集）；三平台 cargo check --all-targets 全绿
 name: agent-rust
 
+# 同一分钟连续 push 时只允许最新 workflow 发布，防旧 commit 较晚完成反而成为 GitHub latest。
+concurrency:
+  group: agent-rust-release
+  cancel-in-progress: true
+
 on:
   push:
     paths:
@@ -14,6 +19,25 @@ on:
   workflow_dispatch:
 
 jobs:
+  # 所有平台共用同一 build_id：从触发提交时间生成，避免各 job 独立 date 跨分钟后
+  # 二进制上报版本不一致（Release tag 取 Linux 版本时 macOS/Windows 会持续误报可更新）
+  prepare:
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    outputs:
+      build_id: ${{ steps.version.outputs.build_id }}
+    steps:
+      - uses: actions/checkout@v4.2.2
+      - id: version
+        name: 生成统一构建 ID
+        run: |
+          TS=$(git show -s --format=%ct HEAD)
+          SHORT=$(git rev-parse --short=8 HEAD)
+          BUILD_DATE=$(date -u -d "@${TS}" +'%Y.%m.%d-%H%M')
+          # 分钟时间便于阅读，短 SHA 防同一分钟连续 push 发生 Release tag/版本碰撞
+          echo "build_id=${BUILD_DATE}-${SHORT}" >> "$GITHUB_OUTPUT"
+
   test:
     permissions:
       contents: read # 最小权限
@@ -37,9 +61,9 @@ jobs:
   # Intel Mac 已过时不再产出）。代码层 cargo check --target aarch64-apple-darwin 通过
   # （libc::statvfs、signal::unix、process_group 在 macOS 均可用）。UPX 不支持 mach-o——无压缩版。
   # 能力边界（如实标注到 Release）：终端 PTY / 文件管理 / exec / 探活可用；
-  # 系统指标（CPU/内存/磁盘/网络）依赖 /proc、/sys——macOS 无此路径，上报为 0/空。
+  # CPU/内存/磁盘/网络经 sysinfo 采集；磁盘 IO 差分与 TCP/UDP 连接数暂无跨平台 API。
   build-macos:
-    needs: test
+    needs: [test, prepare]
     permissions:
       contents: read
     runs-on: macos-latest
@@ -55,7 +79,7 @@ jobs:
       - name: 编译 aarch64-apple-darwin（Apple Silicon，原生）
         working-directory: agent/rust
         run: |
-          AGENT_BUILD_TS=$(date -u +'%Y.%m.%d-%H%M') cargo build --release --target aarch64-apple-darwin
+          AGENT_BUILD_TS=${{ needs.prepare.outputs.build_id }} cargo build --release --target aarch64-apple-darwin
           mkdir -p target/macos-out
           mv target/aarch64-apple-darwin/release/cf-panel-agent target/macos-out/cf-panel-agent-macos
           shasum -a 256 target/macos-out/cf-panel-agent-macos > target/macos-out/cf-panel-agent-macos.sha256
@@ -72,7 +96,7 @@ jobs:
   # 进程树终止走 Job Object（platform.rs）；指标走 sysinfo（磁盘 IO 差分与 TCP/UDP
   # 连接数无跨平台 API，为空——Release 说明已标注）。Windows 测试在本 job 先行执行。
   build-windows:
-    needs: test
+    needs: [test, prepare]
     permissions:
       contents: read
     runs-on: windows-latest
@@ -90,7 +114,7 @@ jobs:
         working-directory: agent/rust
         shell: bash
         run: |
-          export AGENT_BUILD_TS=$(date -u +'%Y.%m.%d-%H%M')
+          export AGENT_BUILD_TS=${{ needs.prepare.outputs.build_id }}
           cargo build --release
           mkdir -p target/win-out
           mv target/release/cf-panel-agent.exe target/win-out/cf-panel-agent-windows.exe
@@ -105,7 +129,7 @@ jobs:
           if-no-files-found: error
 
   build-release:
-    needs: [test, build-macos, build-windows]
+    needs: [test, prepare, build-macos, build-windows]
     permissions:
       contents: write # 仅发布 job 需要写权限（创建 Release）
     runs-on: ubuntu-latest
@@ -139,9 +163,9 @@ jobs:
         env:
           CC_x86_64_unknown_linux_musl: musl-gcc
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS: -C linker=musl-gcc -C strip=symbols
-        # AGENT_BUILD_TS：构建时间戳注入二进制（--version 输出 2026.08.08-2000 格式）
+        # AGENT_BUILD_TS：统一构建 ID 注入二进制（--version 输出 2026.08.08-2000-a1b2c3d4）
         run: |
-          AGENT_BUILD_TS=$(date -u +'%Y.%m.%d-%H%M') cargo build --release --target x86_64-unknown-linux-musl
+          AGENT_BUILD_TS=${{ needs.prepare.outputs.build_id }} cargo build --release --target x86_64-unknown-linux-musl
 
       # M8：aarch64（树莓派/ARM 小主机）——clang 交叉链接（ring 汇编交叉编译需要 clang；
       # -fuse-ld=aarch64-linux-gnu-ld：clang 默认调 x86 的 ld，不支持 aarch64 仿真）
@@ -153,7 +177,7 @@ jobs:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: clang
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_RUSTFLAGS: -C link-arg=--target=aarch64-unknown-linux-musl -C link-arg=-fuse-ld=/usr/bin/aarch64-linux-gnu-ld -C strip=symbols
         run: |
-          AGENT_BUILD_TS=$(date -u +'%Y.%m.%d-%H%M') cargo build --release --target aarch64-unknown-linux-musl
+          AGENT_BUILD_TS=${{ needs.prepare.outputs.build_id }} cargo build --release --target aarch64-unknown-linux-musl
           cd target/aarch64-unknown-linux-musl/release
           mv cf-panel-agent cf-panel-agent-aarch64
           sha256sum cf-panel-agent-aarch64 > cf-panel-agent-aarch64.sha256
@@ -173,10 +197,53 @@ jobs:
       - name: 生成 Release 标题（cf-panel-agent + 版本号）
         id: release
         run: |
-          # 版本号从可执行文件读取（./cf-panel-agent --version 输出 "cf-panel-agent 2026.08.08-2000"）
+          # 所有平台使用 prepare job 的同一 build_id；这里从 Linux 二进制复核注入值
           VER=$(./agent/rust/target/x86_64-unknown-linux-musl/release/cf-panel-agent --version | awk '{print $2}')
+          test "$VER" = "${{ needs.prepare.outputs.build_id }}"
           echo "title=cf-panel-agent ${VER}" >> "$GITHUB_OUTPUT"
           echo "tag=cf-panel-agent-${VER}" >> "$GITHUB_OUTPUT"
+
+      - name: 生成 Agent 更新清单
+        env:
+          BUILD_ID: ${{ needs.prepare.outputs.build_id }}
+          REPOSITORY: ${{ github.repository }}
+          COMMIT_SHA: ${{ github.sha }}
+        run: |
+          node --input-type=module <<'NODE'
+          import fs from 'node:fs';
+          import crypto from 'node:crypto';
+          const tag = `cf-panel-agent-${process.env.BUILD_ID}`;
+          const base = `https://github.com/${process.env.REPOSITORY}/releases/download/${tag}`;
+          const files = {
+            'linux-x86_64': 'agent/rust/target/x86_64-unknown-linux-musl/release/cf-panel-agent',
+            'linux-aarch64': 'agent/rust/target/aarch64-unknown-linux-musl/release/cf-panel-agent-aarch64',
+            'macos-aarch64': 'macos-artifacts/cf-panel-agent-macos',
+            'windows-x86_64': 'windows-artifacts/cf-panel-agent-windows.exe',
+          };
+          const assets = {};
+          for (const [platform, path] of Object.entries(files)) {
+            const data = fs.readFileSync(path);
+            const name = path.split('/').pop();
+            assets[platform] = {
+              name,
+              size: data.length,
+              sha256: crypto.createHash('sha256').update(data).digest('hex'),
+              url: `${base}/${encodeURIComponent(name)}`,
+            };
+          }
+          const cargo = fs.readFileSync('agent/rust/Cargo.toml', 'utf8');
+          const version = cargo.match(/^version\s*=\s*"([^"]+)"/m)?.[1] || '';
+          const manifest = {
+            schema: 1,
+            version,
+            build_id: process.env.BUILD_ID,
+            tag,
+            commit: process.env.COMMIT_SHA,
+            update_protocol: 1,
+            assets,
+          };
+          fs.writeFileSync('agent-manifest.json', JSON.stringify(manifest, null, 2) + '\n');
+          NODE
 
       - name: 组装 Release body（固定用法 + git 提交更新日志）
         run: |
@@ -186,6 +253,8 @@ jobs:
           cat > /tmp/release-body.md <<'EOF'
           Rust 版 cf-panel agent 二进制：Linux 为全静态（musl，仅依赖系统调用，任意发行版直跑）；macOS（Apple Silicon）与 Windows（x86_64）为原生构建。
 
+          更新清单：`agent-manifest.json`（全平台统一 build id + size/SHA-256，供面板流式自更新）。
+
           平台（校验和见同名 `.sha256` 文件）：
           - `cf-panel-agent`：x86_64 完整版（约 2MB），无启动额外开销
           - `cf-panel-agent.upx`：x86_64 UPX `--lzma` 压缩版（约 0.9MB，省磁盘 ~58%），启动约 +60ms、常驻内存 +0.5MB
@@ -193,8 +262,9 @@ jobs:
           - `cf-panel-agent-macos`：macOS Apple Silicon（M1/M2/M3…；Intel Mac 已过时不再提供）
           - `cf-panel-agent-windows.exe`：Windows x86_64（Windows 10+）
 
-          macOS 说明：终端 / 文件管理 / exec / 服务探活 / 自定义指标可用；**系统监控指标（CPU/内存/磁盘/网络）依赖 Linux 的 /proc、/sys，macOS 上报为 0/空**——如需 macOS 指标采集需另行移植（sysctl/IOKit 路径）。
+          macOS 说明：终端 / 文件管理 / exec / 服务探活 / 自定义指标可用；指标经 sysinfo（CPU/内存/磁盘/网络真实数据；磁盘 IO 差分与 TCP/UDP 连接数暂无跨平台 API，为空）。
           Windows 说明：终端（ConPTY）/ 文件管理（盘符路径，C:\Users 可写、系统目录受保护）/ exec（cmd /C）/ 服务探活 / 自定义指标（cmd 命令）可用；指标经 sysinfo（CPU/内存/磁盘/网络真实数据；磁盘 IO 差分与 TCP/UDP 连接数无跨平台 API，为空）。超时清理走 Job Object（整棵进程树）。
+          面板自更新：配置 `ALLOW_SELF_UPDATE=1` 后管理员可在节点菜单中更新；由 systemd/launchd/Windows supervisor 托管重启，或无 supervisor 时另设 `AGENT_SELF_RESTART=1`；更新前保留同目录 `.bak`。
 
           用法：
           ```
@@ -242,6 +312,7 @@ jobs:
             macos-artifacts/cf-panel-agent-macos.sha256
             windows-artifacts/cf-panel-agent-windows.exe
             windows-artifacts/cf-panel-agent-windows.exe.sha256
+            agent-manifest.json
           name: ${{ steps.release.outputs.title }}
           tag_name: ${{ steps.release.outputs.tag }}
           body_path: /tmp/release-body.md

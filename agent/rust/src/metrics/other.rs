@@ -259,6 +259,10 @@ pub async fn collect_info() -> serde_json::Value {
         "ip4": ip4,
         "ip6": ip6,
         "agent_version": crate::VERSION,
+        "agent_platform": crate::update::platform_key(),
+        "update_protocol": crate::update::UPDATE_PROTOCOL,
+        "self_update_enabled": crate::CONFIG.get().map(|c| c.allow_self_update).unwrap_or(false),
+        "self_update_mode": crate::CONFIG.get().map(|c| if !c.allow_self_update { "disabled" } else if c.self_restart_after_update { "self" } else { "supervisor" }).unwrap_or("disabled"),
     });
     // 全空（采集失败）不缓存：避免空结果被缓存 10 分钟
     if !kern.is_empty() || !ip4.is_empty() {

@@ -1350,6 +1350,58 @@ test('TerminalDO: /rpc/upload 仅 commit 帧回执才 resolve（多分片上传�
   }
 });
 
+test('TerminalDO: Agent 更新流式分片并等待最终替换回执', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  try {
+    const inst = new TerminalDO(mockState(), makeEnv());
+    const sent = [];
+    const agentWs = { send: (m) => sent.push(m), close() {}, readyState: 1 };
+    inst.agents.set(1, agentWs);
+    const bytes = new Uint8Array(96 * 1024).fill(0x5a);
+    const promise = inst.fetch(new Request('https://do.internal/rpc/agent_update?server_id=1', {
+      method: 'POST',
+      headers: {
+        'x-agent-build-id': '2026.08.25-1200',
+        'x-agent-platform': 'linux-x86_64',
+        'x-agent-size': String(bytes.length),
+        'x-agent-sha256': 'a'.repeat(64),
+      },
+      body: bytes,
+    }));
+    for (let i = 0; i < 100 && sent.length < 3; i++) await new Promise((r) => setImmediate(r));
+    assert.equal(sent.length, 3, '96KB → 两个数据帧 + commit');
+    const heads = sent.map((frame) => {
+      const u = new Uint8Array(frame);
+      const nl = u.indexOf(10);
+      return JSON.parse(new TextDecoder().decode(u.subarray(0, nl)));
+    });
+    assert.ok(heads.every((h) => h.type === 'agent_update'));
+    assert.ok(heads.every((h) => h.build_id === '2026.08.25-1200'));
+    assert.deepEqual(heads.map((h) => h.offset), [0, 49152, 98304]);
+    assert.deepEqual(heads.map((h) => h.commit), [false, false, true]);
+    const updateId = heads[0].update_id;
+    let resolved = false;
+    promise.then(() => { resolved = true; });
+    await new Promise((r) => setImmediate(r));
+    assert.equal(resolved, false, '发送完成后仍须等待 Agent SHA/替换结果');
+
+    await inst.webSocketMessage(agentWs, JSON.stringify({
+      type: 'agent_update_result', update_id: updateId, ok: true,
+      build_id: '2026.08.25-1200', size: bytes.length, restarting: true,
+    }));
+    const res = await promise;
+    assert.equal(res.status, 200);
+    const result = await res.json();
+    assert.equal(result.ok, true);
+    assert.equal(result.transferred, bytes.length);
+    assert.equal(result.restarting, true);
+    assert.equal(inst.pendingUpdate.size, 0);
+    assert.equal(inst.updating.size, 0);
+  } finally {
+    t.mock.timers.reset();
+  }
+});
+
 test('TerminalDO: 文件写操作指令写审计（delete/zip/rename Text 帧 + write 首块 Binary 混合帧）', async () => {
   const env = makeEnv();
   const inst = new TerminalDO(mockState(), env);

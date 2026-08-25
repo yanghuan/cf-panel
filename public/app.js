@@ -216,7 +216,8 @@
   }
 
   // 悬浮指标详情：展示 agent 上报的全部监控条目 + 系统信息
-  function metricTipHtml(m, info) {
+  // s（可空）为服务器上下文：Agent 行据此渲染"可更新"入口（与卡片菜单同一更新链路）
+  function metricTipHtml(m, info, s) {
     const e = m.extra || {};
     const rows = [];
     rows.push(['CPU', m.cpu != null ? m.cpu.toFixed(1) + '%' : '-']);
@@ -248,9 +249,18 @@
       const sys = [
         ['系统', info.os],
         ['内核', info.kern],
-        ['Agent', info.agent_version],
       ].filter(([, v]) => v);
       let sysRows = sys.map(([k, v]) => `<div class="mt-row"><span>${k}</span><b>${escapeHtml(v)}</b></div>`).join('');
+      // Agent 行：当前版本 + 有新版本时的可点击更新入口（点击走与卡片菜单一致的确认流程）
+      if (info.agent_version) {
+        let cell = escapeHtml(info.agent_version);
+        if (s && updatingAgents.has(s.id)) {
+          cell += ' <span class="mt-updating">更新中…</span>';
+        } else if (s && agentUpdateAvailable(s)) {
+          cell += ` <button class="mt-update" data-act="agent-update" data-id="${s.id}" data-name="${escapeHtml(s.name)}" title="当前 ${escapeHtml(info.agent_version)} → ${escapeHtml(latestAgent.build_id)}">↻ 可更新</button>`;
+        }
+        sysRows += `<div class="mt-row"><span>Agent</span><b>${cell}</b></div>`;
+      }
       if (info.ip4) sysRows += `<div class="mt-row"><span>IPv4</span><b><cf-ip ip="${escapeHtml(info.ip4)}"></cf-ip></b></div>`;
       if (info.ip6) sysRows += `<div class="mt-row"><span>IPv6</span><b><cf-ip ip="${escapeHtml(info.ip6)}"></cf-ip></b></div>`;
       if (sysRows) sysHtml = `<div class="mt-sub">系统信息</div>` + sysRows;
@@ -1855,9 +1865,22 @@
       const s = serversCache.find((x) => x.id === sid);
       if (!s || !s.metric) return;
       tipSource = metricEl;
-      metricTip.innerHTML = metricTipHtml(s.metric, s.info || null);
+      metricTip.innerHTML = metricTipHtml(s.metric, s.info || null, s);
       metricTip.classList.add('show');
       positionTipForMetric(metricTip, metricEl);
+      return;
+    }
+    // tooltip 内的「可更新」入口：关闭 tooltip 后走与卡片菜单一致的二次确认
+    const updBtn = e.target.closest('.m-tip [data-act="agent-update"]');
+    if (updBtn) {
+      metricTip.classList.remove('show');
+      tipSource = null;
+      const { id, name } = updBtn.dataset;
+      const target = latestAgent && latestAgent.build_id;
+      confirmDialog(
+        `确认将「${name}」Agent 更新到 ${target}？\n\n更新会关闭该节点现有终端/文件会话，并短暂离线；成功后由 supervisor 自动重启。`,
+        () => updateAgent(Number(id), name)
+      );
       return;
     }
     if (e.target.closest('.m-tip')) return; // 点击 tooltip 内部不关闭（可滚动）

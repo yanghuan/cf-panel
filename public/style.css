@@ -394,6 +394,14 @@ button.danger:hover { background: rgba(248, 113, 113, .12); }
 .mt-row span { color: var(--muted); white-space: nowrap; }
 .mt-row b { color: var(--text); font-weight: 600; }
 .mt-sub { margin-top: 8px; padding-top: 6px; border-top: 1px solid var(--border); font-size: 11px; color: var(--muted); }
+/* Agent 行更新入口：版本号旁的可点击提示（与卡片菜单同一更新链路） */
+.mt-row b .mt-update {
+  margin-left: 6px; padding: 1px 6px; font-size: 11px; font-weight: 600;
+  color: var(--accent); background: transparent; border: 1px solid var(--accent);
+  border-radius: 999px; cursor: pointer; white-space: nowrap;
+}
+.mt-row b .mt-update:hover { background: var(--accent); color: #fff; }
+.mt-updating { color: var(--muted); font-size: 11px; }
 /* 磁盘标题栏：左侧标题 + 右侧累计值（当前值 / 最大值 (百分比)） */
 .mt-disk-head { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
 .mt-disk-head b { color: var(--text); font-weight: 600; white-space: nowrap; }

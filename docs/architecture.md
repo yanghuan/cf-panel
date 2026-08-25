@@ -271,7 +271,7 @@ Rust 版以 `#[cfg(unix)]` / `#[cfg(windows)]` 条件编译实现三平台（平
 - Windows：盘符路径（`C:\...`，统一大写盘符 + `\` 分隔，大小写不敏感），驱动器根一级目录黑名单（`Windows` / `Program Files` / `ProgramData` / `$Recycle.Bin` 等，任意盘符生效）；`C:\Users` 放行（等同 `/home`）；UNC、保留字符、ADS、尾随点/空格及 `CON`/`NUL`/`COM1`/`LPT1` 等设备名均 fail closed；`canonicalize` 的 `\\?\` verbatim 前缀剥离（真实路径层防 symlink/junction 写穿）。
 - 前端 `utils.js` 的 `fileJoin` / `fileParent` / `fileBase` / `isSystemPath` 与 agent 端同步支持盘符路径（黑名单逐条对账）。
 
-**CI 与产物**：workflow 四 job 流水线（test → build-macos/build-windows → build-release），Release 提供 5 个产物（Linux x86_64 + UPX 压缩版 + aarch64、macOS ARM64、Windows x86_64）。Windows job 先跑 `cargo test`（真机验证：路径模型、NTFS 真实文件系统操作、Job Object FFI 生命周期）。
+**CI 与产物**：workflow 四 job 流水线（test → build-macos/build-windows → build-release），Release 提供 4 个平台产物（Linux x86_64 / aarch64、macOS ARM64、Windows x86_64）+ `agent-manifest.json` 更新清单。Windows job 先跑 `cargo test`（真机验证：路径模型、NTFS 真实文件系统操作、Job Object FFI 生命周期）。
 
 > **跨平台验证边界（如实标注）**：`cargo check --all-targets` 三平台全绿 + Windows CI 真机测试；macOS 指标（sysinfo 数值/温度）与 ConPTY 交互体验建议发布后真机冒烟。
 

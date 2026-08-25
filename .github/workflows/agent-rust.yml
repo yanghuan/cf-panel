@@ -59,7 +59,7 @@ jobs:
 
   # macOS 构建（仅 ARM64/Apple Silicon：macos-14+ runner 本身是 ARM，原生构建零交叉成本；
   # Intel Mac 已过时不再产出）。代码层 cargo check --target aarch64-apple-darwin 通过
-  # （libc::statvfs、signal::unix、process_group 在 macOS 均可用）。UPX 不支持 mach-o——无压缩版。
+  # （libc::statvfs、signal::unix、process_group 在 macOS 均可用）。
   # 能力边界（如实标注到 Release）：终端 PTY / 文件管理 / exec / 探活可用；
   # CPU/内存/磁盘/网络经 sysinfo 采集；磁盘 IO 差分与 TCP/UDP 连接数暂无跨平台 API。
   build-macos:
@@ -182,17 +182,10 @@ jobs:
           mv cf-panel-agent cf-panel-agent-aarch64
           sha256sum cf-panel-agent-aarch64 > cf-panel-agent-aarch64.sha256
 
-      - name: 生成 UPX --lzma 压缩版（省磁盘 ~58%，启动约 +60ms / RSS +0.5MB）
-        run: |
-          sudo apt-get install -y upx-ucl
-          cd agent/rust/target/x86_64-unknown-linux-musl/release
-          upx --lzma --force cf-panel-agent -o cf-panel-agent.upx
-
       - name: 生成 Release 校验和（sha256）
         run: |
           cd agent/rust/target/x86_64-unknown-linux-musl/release
           sha256sum cf-panel-agent > cf-panel-agent.sha256
-          sha256sum cf-panel-agent.upx > cf-panel-agent.upx.sha256
 
       - name: 生成 Release 标题（cf-panel-agent + 版本号）
         id: release
@@ -256,8 +249,7 @@ jobs:
           更新清单：`agent-manifest.json`（全平台统一 build id + size/SHA-256，供面板流式自更新）。
 
           平台（校验和见同名 `.sha256` 文件）：
-          - `cf-panel-agent`：x86_64 完整版（约 2MB），无启动额外开销
-          - `cf-panel-agent.upx`：x86_64 UPX `--lzma` 压缩版（约 0.9MB，省磁盘 ~58%），启动约 +60ms、常驻内存 +0.5MB
+          - `cf-panel-agent`：x86_64 完整版（约 2MB）
           - `cf-panel-agent-aarch64`：ARM64 Linux（树莓派 4/5、ARM 小主机等）
           - `cf-panel-agent-macos`：macOS Apple Silicon（M1/M2/M3…；Intel Mac 已过时不再提供）
           - `cf-panel-agent-windows.exe`：Windows x86_64（Windows 10+）
@@ -304,8 +296,6 @@ jobs:
           files: |
             agent/rust/target/x86_64-unknown-linux-musl/release/cf-panel-agent
             agent/rust/target/x86_64-unknown-linux-musl/release/cf-panel-agent.sha256
-            agent/rust/target/x86_64-unknown-linux-musl/release/cf-panel-agent.upx
-            agent/rust/target/x86_64-unknown-linux-musl/release/cf-panel-agent.upx.sha256
             agent/rust/target/aarch64-unknown-linux-musl/release/cf-panel-agent-aarch64
             agent/rust/target/aarch64-unknown-linux-musl/release/cf-panel-agent-aarch64.sha256
             macos-artifacts/cf-panel-agent-macos

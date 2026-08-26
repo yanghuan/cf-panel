@@ -697,6 +697,36 @@ test('PAT：scopes 白名单校验（非法值 400，混合值只留合法项）
   assert.deepEqual(JSON.parse(rows2.scopes), ['server:read']);
 });
 
+test('PAT：同名令牌拒绝（应用层查重 409 + 唯一索引兜底）', async () => {
+  const env = makeEnv();
+  const adminToken = await login(env);
+
+  // 首次创建成功
+  const first = await call(env, { method: 'POST', path: '/api/tokens', token: adminToken, body: { name: 'dup', scopes: ['server:read'] } });
+  assert.equal(first.status, 200);
+
+  // REST 同名 → 409（应用层前置查重）
+  const dup = await call(env, { method: 'POST', path: '/api/tokens', token: adminToken, body: { name: 'dup', scopes: ['server:read'] } });
+  assert.equal(dup.status, 409);
+  assert.match((await dup.json()).error, /already exists/);
+
+  // 数据库层唯一索引兜底：绕过应用层直接 INSERT 同名被拒（并发竞态时由 try-catch 转 409）
+  await assert.rejects(
+    env.DB.prepare('INSERT INTO api_tokens (user_id, name, token_hash, scopes) VALUES (?,?,?,?)')
+      .bind(1, 'dup', 'deadbeef', '["server:read"]').run(),
+    /UNIQUE constraint failed: api_tokens\.name/,
+  );
+
+  // MCP create_token 同名 → 工具错误（isError）
+  const mcp = await call(env, {
+    method: 'POST', path: '/mcp', token: adminToken,
+    body: { jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'create_token', arguments: { name: 'dup' } } },
+  });
+  const mcpBody = await mcp.json();
+  assert.equal(mcpBody.result.isError, true);
+  assert.match(mcpBody.result.content[0].text, /already exists/);
+});
+
 test('PAT：server_ids 语义 — 未提供=全量，空数组=空集', async () => {
   const env = makeEnv();
   const adminToken = await login(env);

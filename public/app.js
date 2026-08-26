@@ -1710,13 +1710,18 @@
     }
   }
 
+  let tokenCreateBusy = false;
   async function createToken() {
+    if (tokenCreateBusy) return; // 防重复提交：双击会创建出两个同名令牌（后端 name 无唯一约束）
     const scopes = [];
     if ($('#tok-read').checked) scopes.push('server:read');
     if ($('#tok-exec').checked) scopes.push('server:exec');
     if (!scopes.length) return toast('至少勾选一个权限');
     const serverIDs = $('#tok-servers').value.split(',').map((s) => Number(s.trim())).filter((n) => n > 0);
     const expDays = Number($('#tok-expires').value);
+    tokenCreateBusy = true;
+    const btn = $('#btn-create-token');
+    btn.disabled = true;
     try {
       const res = await api('/api/tokens', {
         method: 'POST',
@@ -1734,6 +1739,9 @@
       loadTokens();
     } catch (e) {
       toast(e.message);
+    } finally {
+      tokenCreateBusy = false;
+      btn.disabled = false;
     }
   }
 

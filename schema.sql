@@ -37,6 +37,9 @@ CREATE TABLE IF NOT EXISTS api_tokens (
 -- PAT 鉴权 `WHERE token_hash = ?` 走索引（迁移 0006；无索引时全表扫）
 CREATE INDEX IF NOT EXISTS idx_api_tokens_hash ON api_tokens(token_hash);
 
+-- PAT 名称唯一（迁移 0010；应用层创建前查重 + 唯一索引兜底并发竞态，同名创建返回 409）
+CREATE UNIQUE INDEX IF NOT EXISTS idx_api_tokens_name ON api_tokens(name);
+
 -- 审计日志
 CREATE TABLE IF NOT EXISTS audit_logs (
   id               INTEGER PRIMARY KEY AUTOINCREMENT,

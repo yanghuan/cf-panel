@@ -5,6 +5,7 @@ import {
 
 // 本模块专用常量（PAT scope 白名单 / MCP 协议与工具，就近定义便于对照使用代码）
 const ALLOWED_SCOPES = [SCOPE_READ, SCOPE_EXEC]; // PAT 合法 scope 白名单
+const TOKEN_NAME_UNIQUE_RE = /UNIQUE constraint failed: api_tokens\.name/; // D1 唯一索引（迁移 0010）约束冲突标识
 const MCP_VERSION = '2025-11-25'; // 服务器声明支持的协议版本（缺失头时客户端按 2025-03-26 兼容）
 const MCP_TOOLS = [
   {
@@ -100,7 +101,7 @@ const MCP_TOOLS = [
   },
   {
     name: 'create_token',
-    description: '创建访问令牌（PAT）。仅管理员。返回明文 token（只显示一次，请妥善保存）。scopes 合法值：server:read / server:exec（默认 server:read）；server_ids 为空=全部服务器；expires_in_days 为空=永久有效。',
+    description: '创建访问令牌（PAT）。仅管理员。返回明文 token（只显示一次，请妥善保存）。scopes 合法值：server:read / server:exec（默认 server:read）；server_ids 为空=全部服务器；expires_in_days 为空=永久有效。名称不可与现有令牌重复（同名返回错误）。',
     inputSchema: {
       type: 'object',
       properties: {
@@ -710,6 +711,9 @@ async function handleApiInner(request, env) {
       const body = await request.json().catch(() => ({}));
       const name = String(body.name || '').trim();
       if (!name) return err('name required');
+      // 同名令牌拒绝：前置查询快速失败 + 唯一索引（迁移 0010）兜底并发竞态；与 MCP create_token 一致
+      const dup = await env.DB.prepare('SELECT id FROM api_tokens WHERE name = ?').bind(name).first();
+      if (dup) return err('token name already exists', 409);
       // scopes 白名单校验：只允许 server:read / server:exec，非法值直接拒绝
       let scopes;
       if (Array.isArray(body.scopes) && body.scopes.length) {
@@ -726,9 +730,15 @@ async function handleApiInner(request, env) {
         : null;
       const token = PAT_PREFIX + randomHex(32);
       const hash = await hashSecret(token, env);
-      await env.DB.prepare('INSERT INTO api_tokens (user_id, name, token_hash, scopes, server_ids, expires_at) VALUES (?,?,?,?,?,?)')
-        .bind(user.id, name, hash, JSON.stringify(scopes), serverIDs ? JSON.stringify(serverIDs) : null, expiresAt)
-        .run();
+      try {
+        await env.DB.prepare('INSERT INTO api_tokens (user_id, name, token_hash, scopes, server_ids, expires_at) VALUES (?,?,?,?,?,?)')
+          .bind(user.id, name, hash, JSON.stringify(scopes), serverIDs ? JSON.stringify(serverIDs) : null, expiresAt)
+          .run();
+      } catch (e) {
+        // 并发竞态兜底：前置查重通过后被并发请求抢先插入（唯一索引迁移 0010 拒绝）
+        if (TOKEN_NAME_UNIQUE_RE.test(String(e && e.message))) return err('token name already exists', 409);
+        throw e;
+      }
       return json({ token, expires_at: expiresAt }); // 明文只返回一次
     }
     return err('method not allowed', 405);
@@ -1172,6 +1182,9 @@ async function mcpCreateToken(user, env, args) {
   requireAdmin(user);
   const name = String(args.name || '').trim();
   if (!name) throw new Error('name required');
+  // 同名令牌拒绝：前置查询快速失败 + 唯一索引（迁移 0010）兜底并发竞态；与 REST POST /api/tokens 一致
+  const dup = await env.DB.prepare('SELECT id FROM api_tokens WHERE name = ?').bind(name).first();
+  if (dup) throw new Error('token name already exists');
   let scopes;
   if (Array.isArray(args.scopes) && args.scopes.length) {
     scopes = [...new Set(args.scopes.filter((s) => ALLOWED_SCOPES.includes(s)))];
@@ -1186,9 +1199,15 @@ async function mcpCreateToken(user, env, args) {
     : null;
   const token = PAT_PREFIX + randomHex(32);
   const hash = await hashSecret(token, env);
-  await env.DB.prepare('INSERT INTO api_tokens (user_id, name, token_hash, scopes, server_ids, expires_at) VALUES (?,?,?,?,?,?)')
-    .bind(user.id, name, hash, JSON.stringify(scopes), serverIDs ? JSON.stringify(serverIDs) : null, expiresAt)
-    .run();
+  try {
+    await env.DB.prepare('INSERT INTO api_tokens (user_id, name, token_hash, scopes, server_ids, expires_at) VALUES (?,?,?,?,?,?)')
+      .bind(user.id, name, hash, JSON.stringify(scopes), serverIDs ? JSON.stringify(serverIDs) : null, expiresAt)
+      .run();
+  } catch (e) {
+    // 并发竞态兜底：前置查重通过后被并发请求抢先插入（唯一索引迁移 0010 拒绝）
+    if (TOKEN_NAME_UNIQUE_RE.test(String(e && e.message))) throw new Error('token name already exists');
+    throw e;
+  }
   return { token, expires_at: expiresAt }; // 明文只返回一次
 }
 

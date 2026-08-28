@@ -444,7 +444,15 @@ test('静态资源通过 _headers 下发完整 CSP', () => {
   // 拦截，终端丢失全部调色板色与字号/等宽字体；真彩色转义因走内联 style 属性仍能显示，
   // 症状易被误判为「只是没颜色」。nonce/hash 不可用：内容由主题在运行时拼出，静态资源
   // 也无法逐请求注入 nonce。
-  assert.match(headers, /style-src-elem 'unsafe-inline'/, 'style 元素需放开：xterm 运行时注入主题样式');
+  // style-src-elem 需放开 'unsafe-inline'，但必须连同 'self' + cdnjs 一起写全：
+  // 该指令一旦显式设置，就是 <style> 元素**与 <link rel=stylesheet>** 的权威来源列表，
+  // 不再回退 style-src——只写 'unsafe-inline' 会把 /style.css 等外部样式表一并拦掉
+  //（整站样式失效）。style-src-attr 只管辖 style="..." 属性、无外部来源概念，不受影响。
+  assert.match(
+    headers,
+    /style-src-elem 'self' https:\/\/cdnjs\.cloudflare\.com 'unsafe-inline'/,
+    'style-src-elem 放开内联且保留外部样式表来源',
+  );
   // 反向锁定：style-src 本身仍不得含 'unsafe-inline'（外部样式表来源仍限 'self' + cdnjs）。
   // 注意 style-src-elem/-attr 以连字符接续，不匹配下方 /style-src / 的空格形式。
   assert.doesNotMatch(headers, /style-src [^;]*'unsafe-inline'/, 'style-src 本身仍不含 unsafe-inline');

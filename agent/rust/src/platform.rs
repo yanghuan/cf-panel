@@ -38,6 +38,41 @@ pub mod imp {
         vec!["-i".to_string()]
     }
 
+    /// HOME 缺失时的兜底值（None = 环境已设置，不要覆盖）。
+    ///
+    /// 背景：systemd 服务在未指定 `User=` 时不会注入 HOME/SHELL（指定 User= 才会从
+    /// passwd 补全）。CommandBuilder 继承 agent 进程环境，于是终端 PTY 里的
+    /// `bash -i` 拿到空 HOME，把 `~/.bashrc` 解析成 `/.bashrc` → 交互 shell 拿不到
+    /// 任何 rc 配置：别名、提示符、LS_COLORS、umask 全部丢失，表现为终端无配色、
+    /// 提示符退化。实测 cf-panel 部署中确实存在 HOME=[] 的节点。
+    /// 仅在缺失时按当前 uid 查 passwd 补齐，已设置则原样保留（部署方显式配置优先）。
+    pub fn home_dir_if_missing() -> Option<String> {
+        // 已设置且非空 → 不覆盖
+        if std::env::var_os("HOME").is_some_and(|v| !v.is_empty()) {
+            return None;
+        }
+        // getpwuid_r 是线程安全版本（getpwuid 返回静态缓冲区，多线程不可用）
+        let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+        let mut buf = vec![0 as libc::c_char; 4096];
+        let mut result: *mut libc::passwd = std::ptr::null_mut();
+        let rc = unsafe {
+            libc::getpwuid_r(
+                libc::getuid(),
+                &mut pwd,
+                buf.as_mut_ptr(),
+                buf.len(),
+                &mut result,
+            )
+        };
+        if rc != 0 || result.is_null() || pwd.pw_dir.is_null() {
+            return None;
+        }
+        let home = unsafe { std::ffi::CStr::from_ptr(pwd.pw_dir) }
+            .to_string_lossy()
+            .into_owned();
+        if home.is_empty() { None } else { Some(home) }
+    }
+
     /// 子进程脱离父进程组（setsid 语义）：超时杀树的前提。
     /// tokio/std Command 的 process_group(0) 即 POSIX setpgid(0,0)
     pub fn set_new_process_group(cmd: &mut Command) {
@@ -83,6 +118,24 @@ pub mod imp {
             .process_group(0);
         cmd.spawn().map(|_| ())
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        // 语义锁定：HOME 已设置时绝不覆盖（部署方显式配置优先，兜底只在缺失时生效）。
+        // 环境无 HOME 时无法断言「不覆盖」，跳过。
+        #[test]
+        fn home_dir_if_missing_does_not_override_existing() {
+            if std::env::var_os("HOME").is_none_or(|v| v.is_empty()) {
+                return;
+            }
+            assert!(
+                home_dir_if_missing().is_none(),
+                "HOME 已设置时不应产生兜底值"
+            );
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -113,6 +166,12 @@ pub mod imp {
     /// 交互 shell 无额外参数（cmd/powershell 本身即交互模式）
     pub fn terminal_shell_args() -> Vec<String> {
         Vec::new()
+    }
+
+    /// Windows 无 HOME 兜底：PowerShell/cmd 不依赖 HOME 定位配置（用 USERPROFILE），
+    /// 且服务场景下该变量由 SCM 正常注入。与 Unix 版保持同名以便调用侧无分支。
+    pub fn home_dir_if_missing() -> Option<String> {
+        None
     }
 
     /// 子进程挂入新 Job Object（KILL_ON_JOB_CLOSE 兜底：agent 崩溃时整树随 job 句柄关闭被清理）。

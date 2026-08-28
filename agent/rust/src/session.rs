@@ -74,6 +74,14 @@ impl TermSession {
             cmd.arg(a);
         }
         cmd.env("TERM", "xterm-256color");
+        // HOME/SHELL 兜底：systemd 服务（未指定 User=）不注入这两个变量，PTY 子 shell
+        // 继承空 HOME 后交互 shell 拿不到任何 rc 配置（别名/提示符/LS_COLORS/umask 全丢，
+        // 表现为终端无配色且提示符退化）。仅在缺失时补齐，已设置不覆盖。
+        cmd.env("SHELL", &shell);
+        if let Some(home) = crate::platform::home_dir_if_missing() {
+            log(format!("terminal {sid}: HOME missing, fallback to {home}"));
+            cmd.env("HOME", &home);
+        }
         let child = pair.slave.spawn_command(cmd)?;
         let child_pid = child.process_id().unwrap_or(0);
         #[cfg(windows)]

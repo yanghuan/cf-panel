@@ -4,7 +4,14 @@ import { json, err, doPanel, sendWebhook, numOrNull } from './utils.js';
 import { getAlertCfg, SETTINGS_CACHE } from './db.js';
 
 // 本模块专用常量（热区/归档/家政/推送，就近定义便于对照使用代码）
-const METRICS_KEEP_MIN = 720; // 内存保留最近 12 小时（分钟粒度）
+// 内存热区保留分钟数（默认 240 = 4 小时）。
+// 依据：ARCHIVE_AFTER_MIN(60) 之后行即落 D1，且 db.js queryMonitorRows 对 >1h 的查询
+// 必然读 D1——热区超出归档线的部分对查询结果零贡献，只是同一批数据的第二份副本。
+// 原 720（12h）是 6 倍冗余，直接放大 DO storage 行数、fullSweep 全扫量与每帧 trim 成本。
+// 240 = 归档线 4 倍余量（覆盖增量归档滞后 + fullSweep 1h 兜底周期）。
+// ARCHIVE_TO_D1=0 时热区是唯一存储，回退 720 才能保住 12h 可查历史（既有行为不变）。
+const METRICS_KEEP_MIN = 240;
+const METRICS_KEEP_MIN_NO_ARCHIVE = 720;
 const ARCHIVE_INTERVAL_MS = 10 * 60 * 1000; // 归档周期
 const METRICS_RETENTION_DAYS = 30; // D1 历史保留期（天），过期行每日清理
 const AUDIT_RETENTION_DAYS = 90; // 审计日志保留期（天），过期行随每日清理删除
@@ -46,6 +53,7 @@ export class MetricsDO {
     this.lastPushAt = 0; // 上次推送 latest 给 PanelDO 的时刻（ms）；上报驱动节流，不引入定时器
     this.lastPushProbeAt = 0; // 上次反查 /viewers 的时刻（pushOn 因 evict 丢失时的自愈兜底）
     this.pendingArcRetry = new Set(); // serverId：首帧兜底 list 失败后待重试（正确性加固）
+    this.trimMin = new Map(); // serverId -> 上次裁剪所在的分钟（分钟滚动才 trim，见 processReportFrame）
   }
 
   // 家政状态（lastSweepAt/lastPruneAt）从 storage 惰性恢复（持久化跨实例 evict，
@@ -159,11 +167,11 @@ export class MetricsDO {
     // 起点不含 maxArchived+1：即使本次直接归档了跨线行（minTs>arcTs），区间仍从 arcTs+1 起扫
     // ——否则跨线补报会把水位直接跳到 minTs，而 (arcTs, minTs) 之间已由 /query 载入内存的
     // 历史行会被跳过（即使 hotLoaded 已置位，兜底分支也不会介入）。
-    // 防大区间空循环：只扫内存 Map 可覆盖的区间尾部（最近 METRICS_KEEP_MIN 分钟，至多 720 次/帧；
+    // 防大区间空循环：只扫内存 Map 可覆盖的区间尾部（最近 keepMin() 分钟，即窗口跨度；
     // 否则新服务器 arcTs=0 会从分钟 1 空循环到当前分钟约 4000 万次触发 CPU 尖峰），
     // 更早/未覆盖的部分由 fullSweep 兜底归档。
     if (arcTs < archiveCutoff) {
-      const start = Math.max(arcTs + 1, archiveCutoff - METRICS_KEEP_MIN + 1);
+      const start = Math.max(arcTs + 1, archiveCutoff - this.keepMin() + 1);
       for (let t = start; t <= archiveCutoff; t++) {
         const row = m.get(t);
         if (row) { stmts.push(mk(t, row)); maxArchived = t; }
@@ -223,7 +231,12 @@ export class MetricsDO {
         net_in: v.net_in, net_out: v.net_out, extra: v.extra,
         last_seen_s: Math.floor(Date.now() / 1000),
       });
-      this.trim(m);
+      // 分钟滚动时才裁剪：窗口边界每帧最多移动 1 分钟，逐帧全扫是纯浪费
+      //（快采 5s → 每机 12 帧/分钟 × O(窗口) 次迭代，其中 11 次必然无键可删）
+      if (this.trimMin.get(b.serverId) !== minTs) {
+        this.trimMin.set(b.serverId, minTs);
+        this.trim(m);
+      }
       // storage.put 按分钟去重——同分钟多帧只写 1 次；put 失败不更新 putMin，下帧自动重试
       if (this.putMin.get(b.serverId) !== minTs) {
         await this.state.storage.put(this.hotKey(b.serverId, minTs), JSON.stringify(v));
@@ -291,7 +304,7 @@ export class MetricsDO {
     if (url.pathname === '/query' && request.method === 'GET') {
       this.usage.query += 1; // 用量观测
       const serverId = Number(url.searchParams.get('server_id')) || 0;
-      const limit = Number(url.searchParams.get('limit')) || METRICS_KEEP_MIN;
+      const limit = Number(url.searchParams.get('limit')) || this.keepMin();
       // 从 storage 恢复（实例 evict 后 data 缓存为空），保证热区查询不丢数据
       const m = await this.ensureHot(serverId);
       const arr = [...m.entries()]
@@ -346,6 +359,7 @@ export class MetricsDO {
       this.latestByServer.delete(serverId);
       this.lastSeenSec.delete(serverId);
       this.pendingArcRetry.delete(serverId);
+      this.trimMin.delete(serverId);
       // 清理该服务器的告警冷却、探活、离线状态与归档水位（内存 + storage）。
       // 两类前缀 list 互相隔离；即使某次 list 失败，也仍尝试删除可精确定位的状态键。
       const stateKeys = [`alert:offline:${serverId}`, `arc:${serverId}`];
@@ -379,11 +393,31 @@ export class MetricsDO {
     return err('not found', 404);
   }
 
-  // 内存滚动窗口：只保留最近 METRICS_KEEP_MIN 分钟
+  // 热区保留分钟数：每次调用读 env（属性读取，开销可忽略），支持不重启调参。
+  keepMin() {
+    if (this.env.ARCHIVE_TO_D1 === '0') return METRICS_KEEP_MIN_NO_ARCHIVE;
+    const n = Number(this.env.METRICS_KEEP_MIN);
+    // 下限锚在归档线：低于归档线的热区会让增量归档扫不到「已上报但尚未归档」的行
+    return Number.isFinite(n) && n >= ARCHIVE_AFTER_MIN ? Math.floor(n) : METRICS_KEEP_MIN;
+  }
+
+  // 内存滚动窗口：只保留最近 keepMin() 分钟。
+  // 早退：m 的键为分钟时间戳且按升序插入——minTs 由服务端按接收时刻计算（单调递增），
+  // loadHot 从 storage 恢复时按 key 字典序（同机同位数 ⇒ 等价数值序）也是升序，
+  // 故遇到第一个未过期键即可停止：常态 O(1) 而非 O(720)。
   trim(m) {
-    const cutoff = Math.floor(Date.now() / 1000 / 60) - METRICS_KEEP_MIN;
+    const keep = this.keepMin();
+    const cutoff = Math.floor(Date.now() / 1000 / 60) - keep;
     for (const ts of m.keys()) {
-      if (ts < cutoff) m.delete(ts);
+      if (ts >= cutoff) break;
+      m.delete(ts);
+    }
+    // 不变式兜底：若将来出现乱序插入（早退漏删），条目数会超出窗口跨度；
+    // 仅在此时退回全扫（O(1) 判定 + 病态才付代价），避免 Map 无界增长。
+    if (m.size > keep + 1) {
+      for (const ts of m.keys()) {
+        if (ts < cutoff) m.delete(ts);
+      }
     }
   }
 
@@ -672,7 +706,7 @@ export class MetricsDO {
   // 常态归档由 /report 增量完成；此处仅兜底异常（水位滞后/实例 evict 后恢复）与执行 12h 上限清理。
   async fullSweep(archiveOn) {
     const archiveCutoff = Math.floor(Date.now() / 1000 / 60) - ARCHIVE_AFTER_MIN;
-    const keepCutoff = Math.floor(Date.now() / 1000 / 60) - METRICS_KEEP_MIN;
+    const keepCutoff = Math.floor(Date.now() / 1000 / 60) - this.keepMin();
     const rowsByServer = new Map();
     let keys;
     try {

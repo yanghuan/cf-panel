@@ -260,14 +260,44 @@ pub fn disk_include(cfg: &Config) -> Vec<String> {
         .collect()
 }
 
+// 温度采集：60s 缓存 + blocking 线程（与磁盘采集同口径）。
+// 此前 collect_temp() 在 json! 宏内同步调用：Linux 遍历 /sys/class/thermal、非 Linux
+// 刷新 sysinfo Components 都是阻塞调用——既直接占住 async worker（无超时、无限流），
+// 又排在 join! 之后串行拖尾，无法与其他采集项并行。
+type TempCache = tokio::sync::Mutex<Option<(Instant, Option<f64>)>>;
+static TEMP_CACHE: std::sync::OnceLock<TempCache> = std::sync::OnceLock::new();
+async fn temp_cache() -> tokio::sync::MutexGuard<'static, Option<(Instant, Option<f64>)>> {
+    TEMP_CACHE
+        .get_or_init(|| tokio::sync::Mutex::new(None))
+        .lock()
+        .await
+}
+
+async fn collect_temp_cached() -> Option<f64> {
+    let now = Instant::now();
+    if let Some((ts, v)) = temp_cache().await.as_ref()
+        && now.duration_since(*ts).as_secs() < 60
+    {
+        return *v; // 60s 缓存命中（快采 5s → 12 帧只读一次）
+    }
+    // 超时/信号量排队失败：本次上报温度记 null，下个 60s 窗口再试（与磁盘熔断同语义）
+    let v = crate::blocking::run_blocking(5, collect_temp)
+        .await
+        .unwrap_or(None);
+    *temp_cache().await = Some((now, v));
+    v
+}
+
 // ---- 汇总上报 ----
 pub async fn collect_report(cfg: &Config) -> Option<String> {
     // 无依赖采集项并行（join!），消除串行累积（cpu 200ms + df/uname/hostname 5s 上限 +
     // probes/custom 5s/个）对快采帧率的稀释。blocking 统一走 blocking.rs 信号量
     //（4 permits）：采集峰值 = info(2: uname+hostname) + disk(1) + conns(1) = 4，
-    // 与文件操作共享；超限排队而非泄漏（conns/disk 读取毫秒级，排队影响可忽略）
+    // 与文件操作共享；超限排队而非泄漏（conns/disk 读取毫秒级，排队影响可忽略）。
+    // 温度走 60s 缓存（见 collect_temp_cached）：仅缓存过期的那一帧才可能形成第 5 个
+    // blocking 任务短暂排队——若改为逐帧采集，会与上述 4 项常态争抢 permits。
     let disk_inc = disk_include(cfg);
-    let (cpu, mem, load, conns, net, info, probes, custom, disk, disk_io) = tokio::join!(
+    let (cpu, mem, load, conns, net, info, probes, custom, disk, disk_io, temp) = tokio::join!(
         collect_cpu(),
         async { collect_mem() },
         // 进程快照放 blocking（Windows CreateToolhelp32Snapshot 5-30ms、上千进程更久；
@@ -284,6 +314,7 @@ pub async fn collect_report(cfg: &Config) -> Option<String> {
         collect_custom(cfg),
         collect_disk(&disk_inc),
         collect_disk_io(),
+        collect_temp_cached(),
     );
     let (mem_used, mem_total, swap, swap_total) = mem;
     let (l1, l5, l15, procs, uptime) = load;
@@ -302,7 +333,7 @@ pub async fn collect_report(cfg: &Config) -> Option<String> {
             "disk": disk,
             "disk_io": disk_io,
             "load1": l1, "load5": l5, "load15": l15,
-            "temp": collect_temp(),
+            "temp": temp,
             "procs": procs, "tcp": tcp, "udp": udp,
             "uptime": uptime,
         },

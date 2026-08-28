@@ -322,7 +322,7 @@ test('MetricsDO: query limit 截断只返回最近 N 条', async () => {
   assert.deepEqual(q.map((x) => x.ts), [nowMin - 1, nowMin]);
 });
 
-test('MetricsDO: trim 只保留最近 720 分钟', async () => {
+test('MetricsDO: trim 归档关闭时保留 720 分钟（ARCHIVE_TO_D1=0 热区是唯一存储）', async () => {
   const env = makeEnv({ ARCHIVE_TO_D1: '0' });
   const { inst } = mkMetrics(env, mockState());
   const m = new Map();
@@ -332,6 +332,61 @@ test('MetricsDO: trim 只保留最近 720 分钟', async () => {
   inst.trim(m);
   assert.equal(m.size, 1);
   assert.equal([...m.keys()][0], nowMin - 10);
+});
+
+test('MetricsDO: keepMin() 默认 240，env 可覆盖，归档关闭回退 720', async () => {
+  const km = (env) => mkMetrics(env, mockState()).inst.keepMin();
+  // 默认（归档开启）：240 = 归档线(60) 的 4 倍余量；>1h 的查询必然走 D1，热区超出归档线是冗余副本
+  assert.equal(km(makeEnv()), 240, '默认 240');
+  assert.equal(km(makeEnv({ METRICS_KEEP_MIN: '120' })), 120, 'env 覆盖生效');
+  // 非法值与低于归档线的值都回退默认：低于归档线会让增量归档扫不到「已上报未归档」的行
+  assert.equal(km(makeEnv({ METRICS_KEEP_MIN: 'abc' })), 240, '非法值回退默认');
+  assert.equal(km(makeEnv({ METRICS_KEEP_MIN: '10' })), 240, '低于归档线回退默认');
+  // 归档关闭 → 热区是唯一存储，必须 720 才保得住 12h 可查历史（env 也不得缩短）
+  assert.equal(km(makeEnv({ ARCHIVE_TO_D1: '0' })), 720, '归档关闭回退 720');
+  assert.equal(km(makeEnv({ ARCHIVE_TO_D1: '0', METRICS_KEEP_MIN: '120' })), 720, '归档关闭时忽略 env 缩短');
+});
+
+test('MetricsDO: trim 升序早退（常态 O(1)）与乱序累积兜底全扫', async () => {
+  const env = makeEnv({ METRICS_KEEP_MIN: '100' });
+  const { inst } = mkMetrics(env, mockState());
+  const nowMin = Math.floor(Date.now() / 1000 / 60);
+  // 升序插入（真实路径：minTs 由服务端按接收时刻计算，单调递增）
+  const m = new Map();
+  for (let i = 400; i >= 0; i--) m.set(nowMin - i, { cpu: i }); // 最旧 → 最新
+  inst.trim(m);
+  assert.equal(m.has(nowMin - 400), false, '窗口外旧键已删');
+  assert.equal(m.has(nowMin - 150), false, '窗口外旧键已删');
+  assert.equal(m.has(nowMin - 10), true, '窗口内键保留');
+  assert.equal(m.has(nowMin), true, '当前分钟保留');
+  assert.ok(m.size <= 101, `条目数受窗口约束（实际 ${m.size}）`);
+
+  // 兜底：乱序插入把过期键追加到尾部，早退扫不到；累积到超出窗口跨度后由 size 判定触发全扫
+  const m2 = new Map();
+  for (let i = 100; i >= 0; i--) m2.set(nowMin - i, { cpu: i });
+  for (let i = 0; i < 20; i++) m2.set(nowMin - 400 - i, { cpu: -1 }); // 乱序追加 20 条
+  assert.equal(m2.size, 121);
+  inst.trim(m2);
+  assert.equal(m2.has(nowMin - 400), false, '乱序过期键被兜底全扫删除');
+  assert.equal(m2.has(nowMin - 10), true, '正常键未被误删');
+  assert.ok(m2.size <= 101, `乱序累积已清理（实际 ${m2.size}）`);
+});
+
+test('MetricsDO: trim 按分钟门控（快采同分钟多帧只裁一次）', async () => {
+  const env = makeEnv();
+  const { inst, call } = mkMetrics(env, mockState());
+  const nowMin = Math.floor(Date.now() / 1000 / 60);
+  let trimCalls = 0;
+  const origTrim = inst.trim.bind(inst);
+  inst.trim = (m) => { trimCalls++; return origTrim(m); };
+  // 同分钟 5 帧（快采 5s 下同机重复上报）
+  for (let i = 0; i < 5; i++) {
+    await call('/report', { method: 'POST', body: JSON.stringify({ serverId: 1, minTs: nowMin, cpu: i }) });
+  }
+  assert.equal(trimCalls, 1, '同分钟 5 帧只裁剪 1 次（原实现每帧 O(窗口) 全扫）');
+  // 跨分钟 → 窗口边界移动，再裁一次
+  await call('/report', { method: 'POST', body: JSON.stringify({ serverId: 1, minTs: nowMin - 1, cpu: 9 }) });
+  assert.equal(trimCalls, 2, '跨分钟再次裁剪');
 });
 
 test('MetricsDO: scheduleArchive 无条件注册 alarm（清理/保留期不依赖归档开关）', async () => {
@@ -349,7 +404,7 @@ test('MetricsDO: scheduleArchive 无条件注册 alarm（清理/保留期不依�
 });
 
 // ---------------- MetricsDO：归档 / 保留期 ----------------
-test('MetricsDO: alarm 归档超 1 小时数据到 D1；热区保留 12h，不重复归档', async () => {
+test('MetricsDO: alarm 归档超 1 小时数据到 D1；热区保留窗口内数据，不重复归档', async () => {
   const env = makeEnv();
   const st = mockState();
   const { inst, call } = mkMetrics(env, st);
@@ -367,7 +422,7 @@ test('MetricsDO: alarm 归档超 1 小时数据到 D1；热区保留 12h，不�
   assert.equal(rows.results[0].cpu, 5);
   assert.equal(rows.results[0].mem_total, 8000, '归档保留 mem_total');
 
-  // 热区保留 12h（60min 前的行仍在热区，≤12h 查询完整）
+  // 热区保留窗口内数据（90min 前的行仍在 240min 窗口内）
   const q = await (await call('/query?server_id=1&limit=100')).json();
   assert.deepEqual(q.map((x) => x.ts).sort((a, b) => a - b), [oldTs, recentTs], '热区保留归档前数据');
 

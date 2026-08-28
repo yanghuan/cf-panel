@@ -438,7 +438,16 @@ test('静态资源通过 _headers 下发完整 CSP', () => {
   assert.match(headers, /object-src 'none'/);
   assert.match(headers, /style-src 'self' https:\/\/cdnjs\.cloudflare\.com;/);
   assert.match(headers, /style-src-attr 'unsafe-inline'/);
-  assert.doesNotMatch(headers, /style-src [^;]*'unsafe-inline'/, 'style 元素不允许 unsafe-inline');
+  // style-src-elem 必须显式放开：xterm.js 在运行时把整张主题样式表注入 <style> 元素——
+  // ANSI 调色板类 .xterm-fg-N/.xterm-bg-N、font-size/font-family、光标配色与闪烁 keyframes
+  // 全在里面（静态 xterm.min.css 不含这些，仅布局）。仅放开 style-src-attr 时该元素被 CSP
+  // 拦截，终端丢失全部调色板色与字号/等宽字体；真彩色转义因走内联 style 属性仍能显示，
+  // 症状易被误判为「只是没颜色」。nonce/hash 不可用：内容由主题在运行时拼出，静态资源
+  // 也无法逐请求注入 nonce。
+  assert.match(headers, /style-src-elem 'unsafe-inline'/, 'style 元素需放开：xterm 运行时注入主题样式');
+  // 反向锁定：style-src 本身仍不得含 'unsafe-inline'（外部样式表来源仍限 'self' + cdnjs）。
+  // 注意 style-src-elem/-attr 以连字符接续，不匹配下方 /style-src / 的空格形式。
+  assert.doesNotMatch(headers, /style-src [^;]*'unsafe-inline'/, 'style-src 本身仍不含 unsafe-inline');
   assert.match(headers, /X-Frame-Options: DENY/);
   assert.doesNotMatch(html, /http-equiv="Content-Security-Policy"/i, 'CSP 只维护一份响应头配置');
 });

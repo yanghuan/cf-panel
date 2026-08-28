@@ -288,6 +288,55 @@ async fn collect_temp_cached() -> Option<f64> {
     v
 }
 
+// probes / custom 采集缓存：**与上报间隔解耦**。
+// 快采 5s 时逐帧跑探活与 spawn shell（各最长 5s 超时）会在每台被监控机上造成持续负载
+// ——500 台即每秒 100 次进程创建。而写入侧本就降频：custom 按降采样桶落库、probes
+// 仅在状态变化时落库，等于「采集 12 份只留 1 份」。
+// 按固定间隔采集并复用上次结果：慢采（120s）下缓存恒定过期、行为与改动前一致；
+// 只在快采时才真正削减，正是需要优化的场景。
+// 代价：故障发现延迟从 ≤5s 变成 ≤采集间隔（默认探活 15s / 自定义 60s）。
+type CollectCache = tokio::sync::Mutex<Option<(Instant, Vec<serde_json::Value>)>>;
+static PROBE_CACHE: std::sync::OnceLock<CollectCache> = std::sync::OnceLock::new();
+static CUSTOM_CACHE: std::sync::OnceLock<CollectCache> = std::sync::OnceLock::new();
+async fn probe_cache() -> tokio::sync::MutexGuard<'static, Option<(Instant, Vec<serde_json::Value>)>>
+{
+    PROBE_CACHE
+        .get_or_init(|| tokio::sync::Mutex::new(None))
+        .lock()
+        .await
+}
+async fn custom_cache()
+-> tokio::sync::MutexGuard<'static, Option<(Instant, Vec<serde_json::Value>)>> {
+    CUSTOM_CACHE
+        .get_or_init(|| tokio::sync::Mutex::new(None))
+        .lock()
+        .await
+}
+
+async fn collect_probes_cached(cfg: &Config) -> Vec<serde_json::Value> {
+    let now = Instant::now();
+    if let Some((ts, v)) = probe_cache().await.as_ref()
+        && now.duration_since(*ts).as_secs() < cfg.probe_interval_s
+    {
+        return v.clone();
+    }
+    let v = collect_probes(cfg).await;
+    *probe_cache().await = Some((now, v.clone()));
+    v
+}
+
+async fn collect_custom_cached(cfg: &Config) -> Vec<serde_json::Value> {
+    let now = Instant::now();
+    if let Some((ts, v)) = custom_cache().await.as_ref()
+        && now.duration_since(*ts).as_secs() < cfg.custom_interval_s
+    {
+        return v.clone();
+    }
+    let v = collect_custom(cfg).await;
+    *custom_cache().await = Some((now, v.clone()));
+    v
+}
+
 // ---- 汇总上报 ----
 pub async fn collect_report(cfg: &Config) -> Option<String> {
     // 无依赖采集项并行（join!），消除串行累积（cpu 200ms + df/uname/hostname 5s 上限 +
@@ -310,8 +359,8 @@ pub async fn collect_report(cfg: &Config) -> Option<String> {
         collect_conns(),
         collect_net(),
         collect_info(),
-        collect_probes(cfg),
-        collect_custom(cfg),
+        collect_probes_cached(cfg),
+        collect_custom_cached(cfg),
         collect_disk(&disk_inc),
         collect_disk_io(),
         collect_temp_cached(),
@@ -359,6 +408,8 @@ mod tests {
             probes: String::new(),
             custom_metrics: r#"[{"name":"large","cmd":"printf '42\\n'; yes x | head -c 1048576"}]"#
                 .to_string(),
+            probe_interval_s: 15,
+            custom_interval_s: 60,
             disk_fstype_include: String::new(),
             tmp_dir: String::new(),
             log_file: String::new(),
@@ -380,6 +431,8 @@ mod tests {
             disable_exec: false,
             probes: String::new(),
             custom_metrics: String::new(),
+            probe_interval_s: 15,
+            custom_interval_s: 60,
             disk_fstype_include: " fuse.rclone, tmpfs ,,".to_string(),
             tmp_dir: String::new(),
             log_file: String::new(),
@@ -392,5 +445,41 @@ mod tests {
             disk_include(&cfg),
             vec!["fuse.rclone".to_string(), "tmpfs".to_string()]
         );
+    }
+
+    // 缓存语义锁定：间隔内二次调用必须命中缓存、不再 spawn shell。
+    // 用计数器文件观测真实采集次数——这是本次降载的全部意义（快采 5s 下 12 帧只跑 1 次）。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn collect_custom_cached_hits_cache_within_interval() {
+        let path = std::env::temp_dir().join(format!("cfp-cache-test-{}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let cmd = format!("echo 1 >> {}; echo 42", path.display());
+        let cfg = crate::Config {
+            wss: String::new(),
+            key: String::new(),
+            report_interval: 120,
+            disable_exec: false,
+            probes: String::new(),
+            custom_metrics: format!(r#"[{{"name":"c","cmd":"{cmd}"}}]"#),
+            probe_interval_s: 15,
+            custom_interval_s: 3600, // 窗口远大于测试时长，保证第二次命中缓存
+            disk_fstype_include: String::new(),
+            tmp_dir: String::new(),
+            log_file: String::new(),
+            log_max: 0,
+            allow_self_update: false,
+            self_restart_after_update: false,
+            executable: std::path::PathBuf::new(),
+        };
+        let v1 = collect_custom_cached(&cfg).await;
+        let v2 = collect_custom_cached(&cfg).await;
+        assert_eq!(v1, vec![json!({ "name": "c", "value": 42.0 })]);
+        assert_eq!(v1, v2, "缓存命中返回值一致");
+        let runs = std::fs::read_to_string(&path)
+            .map(|s| s.lines().count())
+            .unwrap_or(0);
+        assert_eq!(runs, 1, "间隔内只应真实采集 1 次（第二次命中缓存）");
+        let _ = std::fs::remove_file(&path);
     }
 }

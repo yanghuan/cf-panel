@@ -1,5 +1,5 @@
 // cf-panel — D1 数据访问层：设置缓存、告警配置、监控历史查询
-import { ARCHIVE_AFTER_MIN } from './config.js';
+import { ARCHIVE_AFTER_MIN, metricsDownsampleMin } from './config.js';
 import { kvGet, safeJson, doMetrics } from './utils.js';
 
 // 设置缓存（避免告警检查每次上报读 D1），TTL 300s（> 慢采间隔 120s，慢采每帧不再必 miss），
@@ -61,7 +61,10 @@ export async function queryMonitorRows(env, serverId, hours) {
     const q = 'SELECT ts, cpu, mem_used, mem_total, net_in, net_out, extra FROM metrics_min WHERE server_id = ? AND ts >= ? AND ts < ?';
     let r;
     if (minutes > MONITOR_D1_MAX_ROWS) {
-      const step = Math.ceil(minutes / MONITOR_D1_MAX_ROWS);
+      // 步长必须对齐降采样粒度：老数据只保留 ts % down = 0 的行，若 step 与 down 互质
+      // （如 29 与 5）抽样会命中不到行，长区间图表出现空洞。向上取整到 down 的倍数。
+      const down = metricsDownsampleMin(env);
+      const step = Math.ceil(Math.ceil(minutes / MONITOR_D1_MAX_ROWS) / down) * down;
       r = await env.DB.prepare(`${q} AND ts % ? = 0 ORDER BY ts`).bind(serverId, sinceMin, archiveSince, step).all();
     } else {
       r = await env.DB.prepare(`${q} ORDER BY ts`).bind(serverId, sinceMin, archiveSince).all();
@@ -92,7 +95,9 @@ export async function queryCustomMetrics(env, serverId, hours) {
   const MAX = 1500;
   let r;
   if (minutes > MAX) {
-    const step = Math.ceil(minutes / MAX);
+    // 同上：custom 写入已按降采样桶对齐，查询步长必须同为降采样粒度的倍数
+    const down = metricsDownsampleMin(env);
+    const step = Math.ceil(Math.ceil(minutes / MAX) / down) * down;
     r = await env.DB.prepare('SELECT name, ts, value FROM metrics_custom WHERE server_id = ? AND ts >= ? AND ts % ? = 0 ORDER BY ts').bind(serverId, sinceMin, step).all();
   } else {
     r = await env.DB.prepare('SELECT name, ts, value FROM metrics_custom WHERE server_id = ? AND ts >= ? ORDER BY ts').bind(serverId, sinceMin).all();

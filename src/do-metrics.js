@@ -1,5 +1,5 @@
 // cf-panel — Durable Object：监控时序内存热区（MetricsDO）
-import { ARCHIVE_AFTER_MIN } from './config.js';
+import { ARCHIVE_AFTER_MIN, metricsDownsampleMin, metricsFineDays } from './config.js';
 import { json, err, doPanel, sendWebhook, numOrNull } from './utils.js';
 import { getAlertCfg, SETTINGS_CACHE } from './db.js';
 
@@ -667,13 +667,28 @@ export class MetricsDO {
       const retention = Number(this.env.METRICS_RETENTION_DAYS) > 0
         ? Number(this.env.METRICS_RETENTION_DAYS) : METRICS_RETENTION_DAYS;
       const minTs = Math.floor(now / 1000 / 60) - retention * 1440;
+      const stmts = [];
+      // 分层保留：细粒度窗口（默认 7 天）之后只保留降采样点（ts % down = 0）。
+      // 只删「非采样点」而非重写数据——无写放大，且采样点与查询步长同源
+      //（config.js metricsDownsampleMin），保证长区间 SQL 抽样仍能命中。
+      // 省的是 D1 存储与长区间读取：老数据行数约为 1/down（默认 −80%）。
+      const fineDays = metricsFineDays(this.env);
+      const down = metricsDownsampleMin(this.env);
+      if (retention > fineDays && down > 1) {
+        const fineMinTs = Math.floor(now / 1000 / 60) - fineDays * 1440;
+        stmts.push(
+          this.env.DB.prepare('DELETE FROM metrics_min WHERE ts < ? AND ts >= ? AND ts % ? != 0')
+            .bind(fineMinTs, minTs, down),
+        );
+      }
+      stmts.push(
+        this.env.DB.prepare('DELETE FROM metrics_min WHERE ts < ?').bind(minTs),
+        this.env.DB.prepare('DELETE FROM metrics_custom WHERE ts < ?').bind(minTs),
+        this.env.DB.prepare('DELETE FROM audit_logs WHERE created_at < datetime(\'now\', ?)')
+          .bind(`-${AUDIT_RETENTION_DAYS} days`),
+      );
       try {
-        await this.env.DB.batch([
-          this.env.DB.prepare('DELETE FROM metrics_min WHERE ts < ?').bind(minTs),
-          this.env.DB.prepare('DELETE FROM metrics_custom WHERE ts < ?').bind(minTs),
-          this.env.DB.prepare('DELETE FROM audit_logs WHERE created_at < datetime(\'now\', ?)')
-            .bind(`-${AUDIT_RETENTION_DAYS} days`),
-        ]);
+        await this.env.DB.batch(stmts);
         // 与归档一致：成功后才推进时间戳，失败由下个 alarm 重试而不是静默等待 24h。
         this.lastPruneAt = now;
         housekeepChanged = true;

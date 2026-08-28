@@ -11,6 +11,25 @@ export const SCOPE_EXEC = 'server:exec';
 // 监控时序：超过 1 小时的旧数据才归档/可淘汰（db 监控查询 + do-metrics 归档共用）
 export const ARCHIVE_AFTER_MIN = 60;
 
+// 监控时序降采样粒度（分钟）：**写入桶 / 保留点 / 查询步长三者共用同一常量**。
+// 必须同源——老数据只保留 `ts % 降采样 = 0` 的行，若长区间查询的抽样步长与它互质
+// （如 step=29 与 downsample=5），`ts % step = 0` 会命中不到行，图表出现空洞。
+// 收益：D1 写入 $1.00/百万行、读取 $0.001/百万行（差 1000 倍），自定义指标是
+// metrics_custom 的唯一写入源且多为慢变量（温度/业务计数），1 分钟分辨率收益极低。
+// 设 METRICS_DOWNSAMPLE_MIN=1 即恢复逐分钟行为（写入桶与保留粒度同时回到 1 分钟）。
+export const METRICS_DOWNSAMPLE_MIN = 5;
+// 分层保留：细粒度（1 分钟）窗口天数，超出后只保留降采样点，直到 METRICS_RETENTION_DAYS
+export const METRICS_FINE_DAYS = 7;
+
+export function metricsDownsampleMin(env) {
+  const n = Number(env.METRICS_DOWNSAMPLE_MIN);
+  return Number.isFinite(n) && n >= 1 ? Math.floor(n) : METRICS_DOWNSAMPLE_MIN;
+}
+export function metricsFineDays(env) {
+  const n = Number(env.METRICS_FINE_DAYS);
+  return Number.isFinite(n) && n >= 1 ? Math.floor(n) : METRICS_FINE_DAYS;
+}
+
 // 在线判定宽限期（秒）：按观看者状态动态选择（auth 服务器列表 + do-panel 推送共用）——
 // 无观看者：agent 慢采 120s，需约 1.5 倍间隔宽限（与离线告警阈值 offline_after_s=180 对齐）；
 // 有观看者：agent 快采 5s，3 次未上报（15s）即判定离线。15s = 3 个快采周期，

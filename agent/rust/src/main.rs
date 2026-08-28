@@ -32,6 +32,9 @@ pub struct Config {
     pub disable_exec: bool,
     pub probes: String,
     pub custom_metrics: String,
+    // 探活/自定义指标的采集间隔（秒）：与上报间隔解耦（见 metrics/mod.rs 缓存注释）。
+    pub probe_interval_s: u64,
+    pub custom_interval_s: u64,
     pub disk_fstype_include: String,
     pub tmp_dir: String,
     pub log_file: String,
@@ -55,6 +58,8 @@ fn read_config() -> Config {
         disable_exec: std::env::var("DISABLE_EXEC").unwrap_or_default() == "1",
         probes: std::env::var("PROBES").unwrap_or_default(),
         custom_metrics: std::env::var("CUSTOM_METRICS").unwrap_or_default(),
+        probe_interval_s: parse_collect_interval(std::env::var("PROBE_INTERVAL").ok(), 15),
+        custom_interval_s: parse_collect_interval(std::env::var("CUSTOM_INTERVAL").ok(), 60),
         // 磁盘统计强制保留的 fstype（逗号分隔）：默认排除虚拟/内存与网络文件系统，
         // 如挂载 OneDrive 的 fuse.rclone 想计入统计则配置 DISK_FSTYPE_INCLUDE=fuse.rclone
         disk_fstype_include: std::env::var("DISK_FSTYPE_INCLUDE").unwrap_or_default(),
@@ -599,6 +604,14 @@ fn parse_report_interval(raw: Option<String>) -> u64 {
     clamp_report_interval(raw.and_then(|v| v.parse().ok()).unwrap_or(120))
 }
 
+// 探活/自定义指标采集间隔解析：下限 5s（不低于快采间隔，再小只增加负载不提升新鲜度
+// ——上报最快 5s，采集更密也送不出去），上限 3600s（防数据过度陈旧）。
+fn parse_collect_interval(raw: Option<String>, default: u64) -> u64 {
+    raw.and_then(|v| v.trim().parse::<u64>().ok())
+        .map(|n| n.clamp(5, 3600))
+        .unwrap_or(default)
+}
+
 async fn dispatch(
     cfg: &Config,
     sessions: &Arc<Mutex<std::collections::HashMap<String, Arc<session::TermSession>>>>,
@@ -1127,6 +1140,37 @@ mod tests {
         assert_eq!(
             parse_report_interval(Some("abc".into())),
             120,
+            "非法值回退默认"
+        );
+    }
+
+    #[test]
+    fn parse_collect_interval_clamps_and_defaults() {
+        assert_eq!(parse_collect_interval(None, 60), 60, "缺省用传入的默认值");
+        assert_eq!(parse_collect_interval(None, 15), 15, "探活用另一默认值");
+        assert_eq!(
+            parse_collect_interval(Some("0".into()), 60),
+            5,
+            "误设 0 钳到下限 5s（不低于快采间隔）"
+        );
+        assert_eq!(
+            parse_collect_interval(Some("15".into()), 60),
+            15,
+            "正常值不变"
+        );
+        assert_eq!(
+            parse_collect_interval(Some("99999".into()), 60),
+            3600,
+            "超上限钳到 3600"
+        );
+        assert_eq!(
+            parse_collect_interval(Some(" 30 ".into()), 60),
+            30,
+            "容忍空白"
+        );
+        assert_eq!(
+            parse_collect_interval(Some("abc".into()), 60),
+            60,
             "非法值回退默认"
         );
     }

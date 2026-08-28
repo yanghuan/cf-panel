@@ -719,6 +719,30 @@ test('MetricsDO: alarm 按 30 天保留期清理过期行', async () => {
   assert.deepEqual(rows.results.map((r) => r.ts), [nowMin - 10]);
 });
 
+test('MetricsDO: alarm 按保留期分层——细粒度窗口（7 天）后只留降采样点', async () => {
+  const env = makeEnv();
+  const { inst } = mkMetrics(env, mockState());
+  const nowMin = Math.floor(Date.now() / 1000 / 60);
+  // 8 天前（超出 7 天细粒度窗口、在 30 天保留期内）：连续 6 分钟各插一行
+  // 桶对齐 unix 纪元，取 base 使 base % 5 === 0，故 base 与 base+5 是采样点
+  const raw = nowMin - 8 * 1440;
+  const base = raw - (raw % 5);
+  for (let i = 0; i <= 5; i++) {
+    await env.DB.prepare('INSERT OR IGNORE INTO metrics_min (server_id, ts, cpu) VALUES (?,?,?)').bind(1, base + i, i).run();
+  }
+  // 细粒度窗口内（3 天前）：不受降采样影响，整行保留
+  await env.DB.prepare('INSERT OR IGNORE INTO metrics_min (server_id, ts, cpu) VALUES (?,?,?)').bind(1, nowMin - 3 * 1440, 99).run();
+
+  await inst.alarm();
+
+  const rows = await env.DB.prepare('SELECT ts FROM metrics_min ORDER BY ts').all();
+  assert.deepEqual(
+    rows.results.map((r) => r.ts),
+    [base, base + 5, nowMin - 3 * 1440],
+    '窗口外仅保留 ts%5==0 的采样点，窗口内整行保留',
+  );
+});
+
 test('MetricsDO: alarm 清理超过 90 天的审计日志，保留近期', async () => {
   const env = makeEnv();
   const { inst } = mkMetrics(env, mockState());

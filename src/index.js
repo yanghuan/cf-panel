@@ -23,7 +23,7 @@ import {
   authIdentityByToken, authUserByIdentity, authUserByPatHash,
   isAdmin, canAccessServer, canExec, serverListCache, __clearGraceCache,
 } from './auth.js';
-import { SETTINGS_CACHE } from './db.js';
+import { SETTINGS_CACHE, queryMonitorRows, queryCustomMetrics } from './db.js';
 import {
   handleReport, lastSeenWrite, LAST_SEEN_THROTTLE_S, customWritten,
   serverRowCache, reportBatch, setReportFlushAt,
@@ -55,6 +55,7 @@ export const __internals = {
   shardForServerId, makeStreamId, shardFromStreamId,
   authIdentityByToken, authUserByIdentity, authUserByPatHash,
   isAdmin, canAccessServer, canExec, handleReport,
+  queryMonitorRows, queryCustomMetrics, // 监控查询（步长对齐降采样桶的回归测试用）
   lastSeenWrite, LAST_SEEN_THROTTLE_S, customWritten, serverListCache, apiCounts, serverRowCache, reportBatch,
   // 重置模块级可变状态（设置缓存），保证测试间隔离
   // 注：告警冷却/探活去重状态在 MetricsDO 实例内存，由各测试实例自行隔离

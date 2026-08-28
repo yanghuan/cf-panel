@@ -1,12 +1,13 @@
 // cf-panel — agent 监控上报落库（handleReport）与上报链路状态
 import { doMetrics, numOrNull } from './utils.js';
+import { metricsDownsampleMin } from './config.js';
 
 // last_seen D1 落盘节流（秒）：快采 5s 上报时，D1 写从 17,280 → ~1,440 行/天/机（−92%）。
 // 在线判定主用 MetricsDO 秒级 last_seen_s（零 D1 成本），不受本节流影响；D1 last_seen 仅
 // 冷启动兜底 + 离线告警（offline_after_s=180 远大于 60s，不受影响）。
 export const LAST_SEEN_THROTTLE_S = 60;
 export const lastSeenWrite = new Map(); // serverId -> 上次落盘秒（跨实例 evict 丢失后仅偶发多写一次，无害）
-// serverId -> { minTs, names: Set }：metrics_custom 分钟去重（同分钟同指标只写一次 D1；
+// serverId -> { bucketTs, names: Set }：metrics_custom 降采样桶去重（同桶同指标只写一次 D1；
 // 跨实例 evict 丢失后仅偶发多写一次，INSERT OR IGNORE 幂等无害）
 export const customWritten = new Map();
 // 服务器行缓存（handleReport 每帧 SELECT 1 行 → 60s TTL，快采 −28,800 D1 读/天/机）。
@@ -168,24 +169,28 @@ export async function handleReport(env, payload) {
       serverRowCache.set(payload.serverId, { ...server, probe_json: probeJson, ts: Date.now() });
     }
   }
-  // 自定义监控项：分钟粒度直写 D1；同分钟同指标只写一次（快采同分钟重复上报不再执行 INSERT，D1 写查询约 −95%）
+  // 自定义监控项：按降采样桶（默认 5 分钟）直写 D1；同桶同指标只写一次。
+  // 桶边界对齐 unix 纪元（minTs - minTs % N），各机一致——与保留期降采样点、
+  // 长区间查询步长同源（config.js metricsDownsampleMin），三者不对齐会让长区间
+  // SQL 抽样命中不到行（见 config.js 注释）。快采下 D1 写查询约 −95%（原 −95% × 桶 5 倍）。
   if (Array.isArray(payload.custom)) {
     const items = payload.custom.filter((c) => c && c.name && c.value != null);
+    const bucketTs = minTs - (minTs % metricsDownsampleMin(env));
     const rec = customWritten.get(payload.serverId);
-    const isNewMinute = !rec || rec.minTs !== minTs;
-    const fresh = isNewMinute ? items : items.filter((c) => !rec.names.has(String(c.name)));
+    const isNewBucket = !rec || rec.bucketTs !== bucketTs;
+    const fresh = isNewBucket ? items : items.filter((c) => !rec.names.has(String(c.name)));
     if (fresh.length) {
       const stmts = fresh.map((c) => env.DB.prepare(
         'INSERT OR IGNORE INTO metrics_custom (server_id, name, ts, value) VALUES (?,?,?,?)'
-      ).bind(payload.serverId, String(c.name), minTs, Number(c.value)));
+      ).bind(payload.serverId, String(c.name), bucketTs, Number(c.value)));
       await env.DB.batch(stmts);
-      if (isNewMinute) {
-        customWritten.set(payload.serverId, { minTs, names: new Set(fresh.map((c) => String(c.name))) });
+      if (isNewBucket) {
+        customWritten.set(payload.serverId, { bucketTs, names: new Set(fresh.map((c) => String(c.name))) });
       } else {
         for (const c of fresh) rec.names.add(String(c.name));
       }
-    } else if (isNewMinute) {
-      customWritten.set(payload.serverId, { minTs, names: new Set() }); // 推进分钟水位，避免下次视为新分钟
+    } else if (isNewBucket) {
+      customWritten.set(payload.serverId, { bucketTs, names: new Set() }); // 推进桶水位，避免下次视为新桶
     }
   }
   if (payload.info) {

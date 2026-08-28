@@ -298,9 +298,15 @@ function clientIp(request) {
   return request.headers.get('cf-connecting-ip') || 'unknown';
 }
 
-// agent 控制通道地址（展示给用户的部署信息）：协议跟随当前访问协议。
-// 生产（Workers 仅 https）恒为 wss；wrangler dev / 本地 http 下必须为 ws，
-// 否则用户照抄 wss:// 会让 agent 在明文端口上做 TLS 握手而连不上。
+// 面板对外基址 / agent 控制通道地址：协议必须跟随当前访问协议。
+// 生产（Workers 仅 https）恒为 https/wss；wrangler dev / 本地 http 下是 http/ws——
+// 硬编码安全协议会让照抄的 curl / agent 在明文端口上做 TLS 握手而连不上。
+// 两者与 host 同源自请求 URL：host 本就取自此处，协议同源派生才不会自相矛盾。
+// 注：上传签名载荷只含 serverId|path|overwrite|exp（utils.js signUploadToken），
+// 不含 host/协议，故基址协议变化不影响已签发 URL 的验签。
+function publicOrigin(url) {
+  return `${url.protocol === 'http:' ? 'http' : 'https'}://${url.host}`;
+}
 function agentWssBase(url) {
   return `${url.protocol === 'http:' ? 'ws' : 'wss'}://${url.host}/ws/agent`;
 }
@@ -1028,7 +1034,7 @@ async function mcpExecCommand(user, env, args, ip) {
 // 工具：创建一次性上传签名 URL（大文件上传通道，不经过 LLM 上下文）。
 // HMAC 签名无状态自验证（绑定 server_id/path/overwrite/exp，10 分钟过期）；
 // AI 把 upload_url 转给用户/程序执行（curl POST body 为原始字节），服务端自动分片写 agent。
-async function mcpCreateUpload(user, env, args, host, ip) {
+async function mcpCreateUpload(user, env, args, url, ip) {
   const serverId = Number(args.server_id) || 0;
   const path = String(args.path || '').trim();
   if (!path || !path.startsWith('/')) throw new Error('path is required (absolute)');
@@ -1051,7 +1057,7 @@ async function mcpCreateUpload(user, env, args, host, ip) {
   const { token, exp } = await signUploadToken(server.id, path, overwrite, env);
   const q = new URLSearchParams({ server_id: String(server.id), path, overwrite: overwrite ? '1' : '0', token });
   // 上传通道走 /mcp/file_upload（/mcp 前缀为 CF Access 放行区，签名 URL 供 curl 直传不受拦截）
-  const uploadUrl = `https://${host}/mcp/file_upload?${q.toString()}`;
+  const uploadUrl = `${publicOrigin(url)}/mcp/file_upload?${q.toString()}`;
   // 审计在签发时记录（实际 curl 上传经签名 URL 直传，不再重复记录）
   await env.DB.prepare('INSERT INTO audit_logs (user_id, username, client_ip, action, target_server_id, detail) VALUES (?,?,?,?,?,?)')
     .bind(user.id, user.username, ip, 'file.upload', server.id, path)
@@ -1401,7 +1407,7 @@ async function handleMcpInner(request, env) {
         if (params.name === 'list_servers') content = await mcpListServers(user, env);
         else if (params.name === 'get_monitor') content = await mcpGetMonitor(user, env, params.arguments || {});
         else if (params.name === 'exec_command') content = await mcpExecCommand(user, env, params.arguments || {}, clientIp(request));
-        else if (params.name === 'create_upload') content = await mcpCreateUpload(user, env, params.arguments || {}, url.host, clientIp(request));
+        else if (params.name === 'create_upload') content = await mcpCreateUpload(user, env, params.arguments || {}, url, clientIp(request));
         else if (params.name === 'add_server') content = await mcpAddServer(user, env, params.arguments || {}, clientIp(request), url);
         else if (params.name === 'delete_server') content = await mcpDeleteServer(user, env, params.arguments || {}, clientIp(request));
         else if (params.name === 'update_server') content = await mcpUpdateServer(user, env, params.arguments || {}, clientIp(request));

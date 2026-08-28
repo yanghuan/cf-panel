@@ -176,10 +176,10 @@ test('服务器：管理员添加/列表/删除 + 分组排序', async () => {
   assert.deepEqual(after.map((s) => s.name), ['web-01', 'db-01']);
 });
 
-// wss_base 是给 agent 抄写的部署地址：协议必须跟随访问协议。
-// 生产（Workers 仅 https）→ wss；wrangler dev / 本地 http → ws，否则 agent 在明文端口上
-// 做 TLS 握手必然连不上。此前两处硬编码 wss://，dev 下展示错误。
-test('wss_base 协议跟随访问协议（http→ws，https→wss）', async () => {
+// 面板生成给外部抄写的绝对 URL（agent 控制通道 wss_base、MCP 签名上传 URL）：
+// 协议必须跟随访问协议。生产（Workers 仅 https）→ https/wss；wrangler dev / 本地 http →
+// http/ws，否则照抄的 agent / curl 会在明文端口上做 TLS 握手而连不上。此前三处硬编码安全协议。
+test('对外绝对 URL 协议跟随访问协议（wss_base / upload_url，http↔https）', async () => {
   const env = makeEnv();
   const token = await login(env);
 
@@ -201,6 +201,19 @@ test('wss_base 协议跟随访问协议（http→ws，https→wss）', async () 
   assert.equal(mcpHttp.wss_base, 'ws://panel.local/ws/agent', 'MCP + http → ws://');
   const mcpHttps = JSON.parse((await (await mcpAdd('https://panel.local')).json()).result.content[0].text);
   assert.equal(mcpHttps.wss_base, 'wss://panel.local/ws/agent', 'MCP + https → wss://');
+
+  // MCP create_upload：签发给 curl 的上传 URL 同样派生
+  const mcpUpload = (base) => mcp(env, {
+    token, base,
+    body: { jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'create_upload', arguments: { server_id: 1, path: '/opt/app.tar.gz' } } },
+  });
+  const upHttp = JSON.parse((await (await mcpUpload('http://panel.local')).json()).result.content[0].text);
+  assert.match(upHttp.upload_url, /^http:\/\/panel\.local\/mcp\/file_upload\?/, 'create_upload + http → http://');
+  const upHttps = JSON.parse((await (await mcpUpload('https://panel.local')).json()).result.content[0].text);
+  assert.match(upHttps.upload_url, /^https:\/\/panel\.local\/mcp\/file_upload\?/, 'create_upload + https → https://');
+  // 协议不进签名载荷：http 入口签发的 URL 改写成 https 后仍验签通过（dev/prod 签名语义一致）
+  const rewrote = await worker.fetch(new Request(upHttp.upload_url.replace(/^http:/, 'https:'), { method: 'POST', body: 'x' }), env);
+  assert.equal(rewrote.status, 200, '改写协议不影响签名校验');
 });
 
 test('PATCH /api/servers/:id：部分字段更新（不再 500）', async () => {
@@ -1180,7 +1193,7 @@ test('MCP：tools/list 与 tools/call', async () => {
   assert.equal(cu.result.isError, false);
   const cuRes = JSON.parse(cu.result.content[0].text);
   assert.equal(cuRes.server_name, 'web-1');
-  assert.match(cuRes.upload_url, /^https:\/\/panel\.local\/mcp\/file_upload\?/);
+  assert.match(cuRes.upload_url, /^http:\/\/panel\.local\/mcp\/file_upload\?/); // 测试入口 http → http（见协议派生测试）
   assert.match(cuRes.upload_url, /token=/);
   assert.equal(cuRes.overwrite, false);
   assert.ok(cuRes.expires_in_seconds > 0 && cuRes.expires_in_seconds <= 600);

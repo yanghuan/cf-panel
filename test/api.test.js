@@ -161,7 +161,7 @@ test('服务器：管理员添加/列表/删除 + 分组排序', async () => {
   const r3 = await addServer(env, token, { name: 'home', sort_order: 0 });
   for (const r of [r1, r2, r3]) {
     assert.match(r.agent_key, /^[0-9a-f]{64}$/);
-    assert.equal(r.wss_base, 'wss://panel.local/ws/agent');
+    assert.equal(r.wss_base, 'ws://panel.local/ws/agent'); // 测试入口为 http → ws（见下方协议派生测试）
   }
 
   // 列表按 group/display_index 排序：空分组(home)按字典序在 prod 前，prod 组内按 display_index web-01(1) 在 db-01(2) 前
@@ -174,6 +174,33 @@ test('服务器：管理员添加/列表/删除 + 分组排序', async () => {
   assert.equal(del.status, 200);
   const after = await (await call(env, { path: '/api/servers', token })).json();
   assert.deepEqual(after.map((s) => s.name), ['web-01', 'db-01']);
+});
+
+// wss_base 是给 agent 抄写的部署地址：协议必须跟随访问协议。
+// 生产（Workers 仅 https）→ wss；wrangler dev / 本地 http → ws，否则 agent 在明文端口上
+// 做 TLS 握手必然连不上。此前两处硬编码 wss://，dev 下展示错误。
+test('wss_base 协议跟随访问协议（http→ws，https→wss）', async () => {
+  const env = makeEnv();
+  const token = await login(env);
+
+  // REST：默认 http 入口
+  const httpRest = await call(env, { method: 'POST', path: '/api/servers', token, body: { name: 'rest-http' } });
+  assert.equal((await httpRest.json()).wss_base, 'ws://panel.local/ws/agent', 'http 访问 → ws://');
+  // REST：https 入口
+  const httpsRest = await call(env, {
+    method: 'POST', path: '/api/servers', token, body: { name: 'rest-https' }, base: 'https://panel.local',
+  });
+  assert.equal((await httpsRest.json()).wss_base, 'wss://panel.local/ws/agent', 'https 访问 → wss://');
+
+  // MCP add_server：两条入口同样派生
+  const mcpAdd = (base) => mcp(env, {
+    token, base,
+    body: { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'add_server', arguments: { name: `mcp-${base.slice(0, 5)}` } } },
+  });
+  const mcpHttp = JSON.parse((await (await mcpAdd('http://panel.local')).json()).result.content[0].text);
+  assert.equal(mcpHttp.wss_base, 'ws://panel.local/ws/agent', 'MCP + http → ws://');
+  const mcpHttps = JSON.parse((await (await mcpAdd('https://panel.local')).json()).result.content[0].text);
+  assert.equal(mcpHttps.wss_base, 'wss://panel.local/ws/agent', 'MCP + https → wss://');
 });
 
 test('PATCH /api/servers/:id：部分字段更新（不再 500）', async () => {
@@ -1086,12 +1113,12 @@ test('终端与文件会话：审计写入失败仍返回已创建会话', async
 });
 
 // ---------------- MCP ----------------
-async function mcp(env, { token, body, version, origin, method = 'POST' }) {
+async function mcp(env, { token, body, version, origin, method = 'POST', base = 'http://panel.local' }) {
   const headers = { 'content-type': 'application/json' };
   if (token) headers.authorization = `Bearer ${token}`;
   if (version) headers['mcp-protocol-version'] = version;
   if (origin) headers.origin = origin;
-  const req = new Request('http://panel.local/mcp', {
+  const req = new Request(`${base}/mcp`, {
     method,
     headers,
     body: method === 'POST' ? JSON.stringify(body) : undefined,
@@ -1267,8 +1294,8 @@ test('MCP：tools/list 与 tools/call', async () => {
   assert.equal(asRes.name, 'mcp-new');
   assert.equal(asRes.server_id, 3);
   assert.ok(asRes.agent_key && asRes.agent_key.length === 64, 'agent_key 明文返回');
-  // 部署地址动态生成（host = panel.local，非占位符）
-  assert.equal(asRes.wss_base, 'wss://panel.local/ws/agent');
+  // 部署地址动态生成（host = panel.local，非占位符；测试入口 http → ws）
+  assert.equal(asRes.wss_base, 'ws://panel.local/ws/agent');
   // add_server：缺 name → isError
   const asBad = await (await mcp(env, { token, body: { jsonrpc: '2.0', id: 21, method: 'tools/call', params: { name: 'add_server', arguments: {} } } })).json();
   assert.equal(asBad.result.isError, true);

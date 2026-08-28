@@ -144,12 +144,13 @@ export function makeEnv(overrides = {}) {
 
 // 通用请求助手：调用 worker.fetch，可带 token / body / 客户端 IP
 export function requestBuilder(worker) {
-  return async function call(env, { method = 'GET', path, token, body, headers = {}, ip }) {
+  // base 可覆盖：协议随访问协议派生 wss_base 的断言需要在 http/https 两种入口下验证
+  return async function call(env, { method = 'GET', path, token, body, headers = {}, ip, base = 'http://panel.local' }) {
     const h = { ...headers };
     if (token) h.authorization = `Bearer ${token}`;
     if (body !== undefined) h['content-type'] = 'application/json';
     if (ip) h['cf-connecting-ip'] = ip;
-    const req = new Request(`http://panel.local${path}`, {
+    const req = new Request(`${base}${path}`, {
       method,
       headers: h,
       body: body !== undefined ? JSON.stringify(body) : undefined,

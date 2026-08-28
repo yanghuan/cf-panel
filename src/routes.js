@@ -298,6 +298,13 @@ function clientIp(request) {
   return request.headers.get('cf-connecting-ip') || 'unknown';
 }
 
+// agent 控制通道地址（展示给用户的部署信息）：协议跟随当前访问协议。
+// 生产（Workers 仅 https）恒为 wss；wrangler dev / 本地 http 下必须为 ws，
+// 否则用户照抄 wss:// 会让 agent 在明文端口上做 TLS 握手而连不上。
+function agentWssBase(url) {
+  return `${url.protocol === 'http:' ? 'ws' : 'wss'}://${url.host}/ws/agent`;
+}
+
 // DO 会话创建与 D1 不支持跨资源事务。会话已启动后审计失败时采用 best-effort：
 // 记录服务端错误但仍把可用 session 返回客户端，避免“API 500、远端 PTY 已启动”的孤儿会话。
 async function auditSessionOpen(env, user, request, action, serverId) {
@@ -571,7 +578,7 @@ async function handleApiInner(request, env) {
     serverListCacheClear();
     return json({
       agent_key: key,
-      wss_base: `wss://${url.host}/ws/agent`,
+      wss_base: agentWssBase(url),
     });
   }
 
@@ -1093,7 +1100,7 @@ function requireAdmin(user) {
   if (!isAdmin(user)) throw new Error('forbidden: admin only');
 }
 
-async function mcpAddServer(user, env, args, ip, host) {
+async function mcpAddServer(user, env, args, ip, url) {
   requireAdmin(user);
   const name = String(args.name || '').trim();
   if (!name) throw new Error('name required');
@@ -1117,7 +1124,7 @@ async function mcpAddServer(user, env, args, ip, host) {
     server_id: id,
     name,
     agent_key: key, // 明文只返回一次
-    wss_base: `wss://${host}/ws/agent`, // agent 部署地址（与 REST 版一致，动态生成）
+    wss_base: agentWssBase(url), // agent 部署地址（与 REST 版一致，协议跟随访问协议）
   };
 }
 
@@ -1395,7 +1402,7 @@ async function handleMcpInner(request, env) {
         else if (params.name === 'get_monitor') content = await mcpGetMonitor(user, env, params.arguments || {});
         else if (params.name === 'exec_command') content = await mcpExecCommand(user, env, params.arguments || {}, clientIp(request));
         else if (params.name === 'create_upload') content = await mcpCreateUpload(user, env, params.arguments || {}, url.host, clientIp(request));
-        else if (params.name === 'add_server') content = await mcpAddServer(user, env, params.arguments || {}, clientIp(request), url.host);
+        else if (params.name === 'add_server') content = await mcpAddServer(user, env, params.arguments || {}, clientIp(request), url);
         else if (params.name === 'delete_server') content = await mcpDeleteServer(user, env, params.arguments || {}, clientIp(request));
         else if (params.name === 'update_server') content = await mcpUpdateServer(user, env, params.arguments || {}, clientIp(request));
         else if (params.name === 'list_tokens') content = await mcpListTokens(user, env);

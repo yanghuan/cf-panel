@@ -388,5 +388,13 @@
   <script src="/utils.js?v=9"></script>
   <script src="/api.js?v=5"></script>
   <script src="/app.js?v=51"></script>
+
+  <!-- Cloudflare Web Analytics：手动嵌入（而非 Zone 级 Automatic Setup 自动注入）。
+       自动注入会在边缘改写 HTML 塞入内联启动代码，与严格 CSP 的 script-src 冲突
+      （放行内联只有 'unsafe-inline' 或会漂移的 hash，二者均不可接受）；
+       手动嵌入是纯外链 + data-cf-beacon 属性（属性不受 script-src 管辖），
+       CSP 只需按域放行 static.cloudflareinsights.com（脚本）与
+       cloudflareinsights.com（RUM 上报端点）。token 随页面发给每个访客，非机密。 -->
+  <script type='module' src='https://static.cloudflareinsights.com/beacon.min.js' data-cf-beacon='{"token": "7fa33ce656604ae7a4a3189f3e23be3c"}'></script>
 </body>
 </html>

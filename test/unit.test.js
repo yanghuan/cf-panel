@@ -456,7 +456,15 @@ test('静态资源通过 _headers 下发完整 CSP', () => {
   // 反向锁定：style-src 本身仍不得含 'unsafe-inline'（外部样式表来源仍限 'self' + cdnjs）。
   // 注意 style-src-elem/-attr 以连字符接续，不匹配下方 /style-src / 的空格形式。
   assert.doesNotMatch(headers, /style-src [^;]*'unsafe-inline'/, 'style-src 本身仍不含 unsafe-inline');
-  assert.match(headers, /X-Frame-Options: DENY/);
+  // Web Analytics（手动嵌入）：脚本域与 RUM 上报端点按域放行；token 走 data-cf-beacon
+  // 属性（不受 script-src 管辖），故无需 'unsafe-inline'/hash——这也是弃用 Automatic Setup
+  // 自动注入的原因（自动注入塞内联启动代码，与严格 script-src 天然冲突）。
+  assert.match(headers, /script-src 'self' https:\/\/cdnjs\.cloudflare\.com https:\/\/static\.cloudflareinsights\.com;/);
+  assert.match(headers, /connect-src [^;]*https:\/\/cloudflareinsights\.com/, 'RUM 上报端点已放行');
+  // 反向锁定：script-src 绝不带 'unsafe-inline'（XSS 第二层防线，任何内联脚本不得执行）。
+  assert.doesNotMatch(headers, /script-src [^;]*'unsafe-inline'/, 'script-src 不得含 unsafe-inline');
+  // 手动嵌入的 beacon 存在且为纯外链（无内联代码）
+  assert.match(html, /https:\/\/static\.cloudflareinsights\.com\/beacon\.min\.js/, 'beacon 已手动嵌入');
   assert.doesNotMatch(html, /http-equiv="Content-Security-Policy"/i, 'CSP 只维护一份响应头配置');
 });
 

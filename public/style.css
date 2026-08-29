@@ -241,6 +241,10 @@ button {
 }
 button:hover { filter: brightness(1.12); box-shadow: 0 4px 18px rgba(99, 102, 241, .4); }
 button:active { transform: translateY(1px); }
+/* 置灰按钮：不可交互就不该有 hover/active 反馈（亮度提升/阴影/位移会误导为可点） */
+button:disabled { opacity: .45; cursor: not-allowed; }
+button:disabled:hover { filter: none; box-shadow: none; }
+button:disabled:active { transform: none; }
 button.ghost {
   background: transparent;
   border: 1px solid var(--border);
@@ -702,6 +706,9 @@ button.danger:hover { background: rgba(248, 113, 113, .12); }
 }
 .file-toolbar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 12px; }
 .file-toolbar input { flex: 1; min-width: 180px; }
+/* 纯 emoji 工具按钮（⬆️/🔄）：emoji 字形比 CJK 文字小一号，放大字号才能与相邻
+   文字按钮视觉等大（文字按钮 13px）；line-height:1 + 对应内边距保持按钮同高 */
+#file-up, #file-refresh { font-size: 16px; line-height: 1; padding: 7px 11px; }
 .file-upload {
   background: var(--grad);
   color: #fff;
@@ -721,6 +728,11 @@ button.danger:hover { background: rgba(248, 113, 113, .12); }
 .f-dir { color: var(--accent-2); cursor: pointer; text-decoration: none; }
 .f-dir:hover { text-decoration: underline; }
 .f-file { color: var(--text); }
+/* 可编辑文件：指针光标 + 悬停提亮为主题色，提示可双击进入编辑器
+   （条件与 ⋯ 菜单的「编辑」一致：非目录/≤1MB/非二进制/非系统路径）。
+   不加下划线——整页几十行全画线视觉太吵，悬停变色已足够表达可点 */
+.f-file.f-editable { cursor: pointer; }
+.f-file.f-editable:hover { color: var(--accent-2); }
 /* 行操作下拉菜单（⋯）：菜单右对齐，按钮悬停高亮
    注意：必须用 .file-table td.f-ops 提高特异性，否则被 .file-table td 的 text-align:left 覆盖 */
 .file-table td.f-ops { text-align: right; white-space: nowrap; }

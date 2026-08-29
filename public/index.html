@@ -9,7 +9,7 @@
   <!-- CSP 与点击劫持防护由 public/_headers 以 HTTP 响应头下发；frame-ancestors 在 meta 中不会生效。 -->
   <!-- 依赖本地化（public/vendor，避免外部 CDN 不可达/供应链风险）；xterm/Chart.js 首次使用时由 JS 懒加载 -->
   <script src="/theme-init.js"></script>
-  <link rel="stylesheet" href="/style.css?v=34" />
+  <link rel="stylesheet" href="/style.css?v=37" />
 </head>
 <body>
   <div id="app" class="hidden">
@@ -105,9 +105,9 @@
     </div>
     <div class="file-body">
       <div class="file-toolbar">
-        <button id="file-up" class="ghost">上级</button>
+        <button id="file-up" class="ghost" title="上级目录">⬆️</button>
         <input id="file-path" type="text" placeholder="路径，如 /home/user" />
-        <button id="file-refresh" class="ghost">刷新</button>
+        <button id="file-refresh" class="ghost" title="刷新">🔄</button>
         <label class="file-upload"><input id="file-input" type="file" hidden />上传</label>
         <button id="btn-file-mkdir" class="ghost">新建目录</button>
         <button id="btn-file-touch" class="ghost">新建文件</button>
@@ -390,7 +390,7 @@
 
   <script src="/utils.js?v=9"></script>
   <script src="/api.js?v=5"></script>
-  <script src="/app.js?v=52"></script>
+  <script src="/app.js?v=53"></script>
 
   <!-- Cloudflare Web Analytics：手动嵌入（而非 Zone 级 Automatic Setup 自动注入）。
        自动注入会在边缘改写 HTML 塞入内联启动代码，与严格 CSP 的 script-src 冲突

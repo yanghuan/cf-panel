@@ -948,15 +948,15 @@
       const size = e.type === 'dir' ? '—' : fmtBytes(e.size);
       const time = e.mtime ? new Date(e.mtime * 1000).toLocaleString('zh-CN') : '—';
       const path = fileJoin(fileSess.cwd, e.name);
-      const nameCell = e.type === 'dir'
-        ? `<a class="f-dir" data-path="${escapeHtml(path)}">📁 ${escapeHtml(e.name)}</a>`
-        : `<span class="f-file">📄 ${escapeHtml(e.name)}</span>`;
-      // 行操作：⋯ 下拉菜单（下载/编辑/移动/重命名/删除）。目录下载 = 打包 zip。
       // 受保护系统路径（与 agent 黑名单同规则）：仅保留下载（读操作），隐藏全部写操作——
       // 系统目录的写操作请走终端 Shell；agent 端仍有最终防线，此处是 UX 层
       const prot = isSystemPath(path);
       // 在线编辑：非目录 + ≤1MB + 非系统路径 + 非二进制扩展名（空文件也放行，编辑器当空文本）
       const editable = !prot && e.type !== 'dir' && e.size <= 1024 * 1024 && !isBinaryExt(e.name);
+      // 可编辑文件带 data 属性：双击直接进入编辑器；悬停指针/提亮由 CSS 提供（条件与 ⋯ 菜单的「编辑」一致）
+      const nameCell = e.type === 'dir'
+        ? `<a class="f-dir" data-path="${escapeHtml(path)}">📁 ${escapeHtml(e.name)}</a>`
+        : `<span class="f-file${editable ? ' f-editable' : ''}"${editable ? ` data-path="${escapeHtml(path)}" data-size="${escapeHtml(e.size)}"` : ''}>📄 ${escapeHtml(e.name)}</span>`;
       const menu = `<div class="row-menu-wrap">
         <button class="row-menu" type="button" title="操作" aria-label="操作">⋯</button>
         <div class="row-menu-pop hidden">
@@ -1044,6 +1044,7 @@
   function setEditorDirty(dirty) {
     editorDirty = dirty;
     const btn = $('#btn-editor-save');
+    btn.disabled = !dirty; // 无改动置灰：内容与打开时一致，保存是无效动作
     btn.classList.toggle('dirty', dirty);
     btn.textContent = dirty ? '保存 ●' : '保存';
     // 有未保存改动时标题加标记
@@ -1108,6 +1109,8 @@
   }
 
   function saveFileEditor() {
+    // 无改动不保存：与置灰按钮同语义（Ctrl/Cmd+S 不经按钮，这里统一拦截）
+    if (!editorDirty) return;
     // 连接断开（文件弹窗被关/WS 掉线）时 upload 会静默丢弃发送帧——编辑内容丢失且零提示。
     // 先校验连接，断开则阻止保存（编辑器保持打开，重连后可重试）
     if (!fileSess.connected) {
@@ -2262,6 +2265,13 @@
       const isDir = del.dataset.type === 'dir';
       confirmDialog(`确认删除「${del.dataset.path}」${isDir ? '（目录将递归删除）' : ''}？\n此操作不可恢复！`, () => fileSess.delete(del.dataset.path));
     }
+  });
+  // 双击可编辑文件直接进入编辑器（下划线即视觉提示；触摸设备走 ⋯ 菜单的「编辑」）
+  $('#file-list').addEventListener('dblclick', (e) => {
+    const f = e.target.closest('.f-editable');
+    if (!f) return;
+    closeRowMenus();
+    fileSess.editText(f.dataset.path, Number(f.dataset.size) || 0);
   });
   // 点击表格外任意位置关闭已展开的菜单
   document.addEventListener('click', () => closeRowMenus());

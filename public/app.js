@@ -1785,6 +1785,24 @@
     const expired = exp * 1000 < Date.now();
     return `${new Date(exp * 1000).toLocaleString()}${expired ? '（已过期）' : ''}`;
   }
+  // 有效天数 → 截止时间实时预览：显示在输入框右端的字段标签槽位（含年份与时区），
+  // 与后端同式（now + days*86400，取整到秒）。留空时标签隐藏、placeholder 可见
+  function syncTokenExpiryPreview() {
+    const tag = $('#tok-exp-tag');
+    if (!tag) return;
+    const d = Number($('#tok-expires').value);
+    if (!Number.isFinite(d) || d <= 0) { tag.textContent = '天数'; return; } // 留空/0 → 永久
+    const at = new Date(Math.floor(Date.now() / 1000 + d * 86400) * 1000);
+    const p = (n) => String(n).padStart(2, '0');
+    // 时区偏移手工计算（不依赖 Intl timeZoneName，避免旧浏览器枚举值不支持时抛错）；
+    // 用本机时区，与面板其余时间显示口径一致
+    const offMin = -at.getTimezoneOffset();
+    const sign = offMin >= 0 ? '+' : '-';
+    const oh = Math.floor(Math.abs(offMin) / 60);
+    const om = Math.abs(offMin) % 60;
+    const tz = `UTC${sign}${oh}${om ? ':' + String(om).padStart(2, '0') : ''}`;
+    tag.textContent = `${at.getFullYear()}/${at.getMonth() + 1}/${at.getDate()} ${p(at.getHours())}:${p(at.getMinutes())} ${tz}`;
+  }
   async function loadTokens() {
     try {
       const rows = await api('/api/tokens');
@@ -1824,6 +1842,7 @@
       $('#tok-name').value = '';
       $('#tok-servers').value = '';
       $('#tok-expires').value = '';
+      syncTokenExpiryPreview(); // 清空输入后预览复位
       loadTokens();
     } catch (e) {
       toast(e.message);
@@ -2036,6 +2055,7 @@
   // 访问令牌弹窗
   $('#btn-tokens-close').onclick = () => { $('#tokens-modal').classList.add('hidden'); unlockScroll(); };
   $('#btn-create-token').onclick = createToken;
+  $('#tok-expires').addEventListener('input', syncTokenExpiryPreview);
 
   // 审计日志弹窗
   $('#btn-audit-close').onclick = () => { $('#audit-modal').classList.add('hidden'); unlockScroll(); };

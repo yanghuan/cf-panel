@@ -863,6 +863,25 @@ test('PAT：有效期 — 到期后鉴权拒绝，不设置=永久有效', async
   assert.equal(permRow.expires_at, null);
 });
 
+test('PAT：有效期支持小数天（0.5 = 12 小时），expires_at 为整数秒', async () => {
+  const env = makeEnv();
+  const adminToken = await login(env);
+  const now = Math.floor(Date.now() / 1000);
+  const r = await (await call(env, {
+    method: 'POST', path: '/api/tokens', token: adminToken,
+    body: { name: 'half-day', scopes: ['server:read'], expires_in_days: 0.5 },
+  })).json();
+  // 取整放最外层：任意小数都产出整数秒（D1 整数列不落 REAL）
+  assert.ok(Number.isInteger(r.expires_at), 'expires_at 为整数秒');
+  assert.ok(
+    Math.abs(r.expires_at - (now + 43200)) <= 2,
+    `0.5 天 ≈ now+43200s（实际偏差 ${r.expires_at - (now + 43200)}s）`
+  );
+  assert.equal((await call(env, { path: '/api/me', token: r.token })).status, 200, '12 小时内可用');
+  const row = await env.DB.prepare("SELECT expires_at FROM api_tokens WHERE name = 'half-day'").first();
+  assert.equal(row.expires_at, r.expires_at, '落库一致（整数）');
+});
+
 test('审计日志：管理员可查（倒序 + limit），非管理员 403', async () => {
   const env = makeEnv();
   const adminToken = await login(env);
@@ -1394,6 +1413,13 @@ test('MCP：tools/list 与 tools/call', async () => {
   const gu = await (await mcp(env, { token, body: { jsonrpc: '2.0', id: 30, method: 'tools/call', params: { name: 'get_usage', arguments: {} } } })).json();
   const guRes = JSON.parse(gu.result.content[0].text);
   assert.ok('estimates_per_day' in guRes && 'metrics_do' in guRes);
+
+  // MCP 同样支持小数天：schema 已声明 type:number，锁定服务端对 0.5 的处理
+  const ctHalf = await (await mcp(env, { token, body: { jsonrpc: '2.0', id: 31, method: 'tools/call', params: { name: 'create_token', arguments: { name: 'mcp-half', scopes: ['server:read'], expires_in_days: 0.5 } } } })).json();
+  assert.equal(ctHalf.result.isError, false, 'MCP 支持小数天（0.5=12 小时）');
+  const ctHalfRes = JSON.parse(ctHalf.result.content[0].text);
+  assert.ok(ctHalfRes.expires_at > Math.floor(Date.now() / 1000), '将来到期时间');
+  assert.ok(Number.isInteger(ctHalfRes.expires_at), 'expires_at 为整数秒');
 
   // PAT 不能使用管理工具（仅管理员）
   const pat = await requestBuilder(worker)(env, { method: 'POST', path: '/api/tokens', token, body: { name: 'pat-x', scopes: ['server:read'] } });

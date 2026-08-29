@@ -664,6 +664,15 @@ button.danger:hover { background: rgba(248, 113, 113, .12); }
   white-space: nowrap;
 }
 .field input:placeholder-shown ~ .field-tag { display: none; }
+/* PAT 有效天数：右侧常驻「截止时间」标签（复用 field-tag 槽位，见 app.js
+   syncTokenExpiryPreview）。预留出标签宽度防止盖住输入的数字，并隐藏 number
+   输入自带的步进按钮（与标签叠放；键盘 ↑↓ 仍可增减） */
+#tok-expires { padding-right: 128px; }
+/* 截止时间含年份与时区（约 120px），放开 field-tag 的 55% 限宽避免省略号截断 */
+#tok-exp-tag { max-width: none; }
+#tok-expires::-webkit-outer-spin-button,
+#tok-expires::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+#tok-expires { -moz-appearance: textfield; appearance: textfield; }
 /* checkbox 例外：不被 flex:1 拉伸成长条，固定尺寸 + 主题色 */
 .settings-row input[type="checkbox"] {
   flex: 0 0 auto;

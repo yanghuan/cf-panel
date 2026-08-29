@@ -108,7 +108,7 @@ const MCP_TOOLS = [
         name: { type: 'string', description: '令牌名称（必填）' },
         scopes: { type: 'array', items: { type: 'string' }, description: '权限 scope，如 ["server:read"] 或 ["server:read","server:exec"]' },
         server_ids: { type: 'array', items: { type: 'integer' }, description: '服务器白名单（空=全部）' },
-        expires_in_days: { type: 'integer', description: '有效期天数（正整数，可选；缺省=永久有效）' },
+        expires_in_days: { type: 'number', description: '有效天数（可小数，0.5=12 小时；可选；缺省=永久有效）' },
       },
       required: ['name'],
     },
@@ -736,10 +736,11 @@ async function handleApiInner(request, env) {
         scopes = [SCOPE_READ];
       }
       const serverIDs = Array.isArray(body.server_ids) ? body.server_ids.map(Number).filter((n) => n > 0) : null;
-      // 有效期：expires_in_days 正整数（可选；缺省/0/非法 → 永久有效）
+      // 有效期：expires_in_days 可为小数（0.5=12 小时；可选；缺省/0/非法 → 永久有效）。
+      // 取整放最外层：days*86400 对任意小数都产出整数秒时间戳（避免 D1 整数列存 REAL）
       const days = Number(body.expires_in_days);
       const expiresAt = Number.isFinite(days) && days > 0
-        ? Math.floor(Date.now() / 1000) + days * 86400
+        ? Math.floor(Date.now() / 1000 + days * 86400)
         : null;
       const token = PAT_PREFIX + randomHex(32);
       const hash = await hashSecret(token, env);
@@ -1206,9 +1207,10 @@ async function mcpCreateToken(user, env, args) {
     scopes = [SCOPE_READ];
   }
   const serverIDs = Array.isArray(args.server_ids) ? args.server_ids.map(Number).filter((n) => n > 0) : null;
+  // 与 REST 版同语义：支持小数天（0.5=12 小时），取整放最外层保证时间戳为整数秒
   const days = Number(args.expires_in_days);
   const expiresAt = Number.isFinite(days) && days > 0
-    ? Math.floor(Date.now() / 1000) + days * 86400
+    ? Math.floor(Date.now() / 1000 + days * 86400)
     : null;
   const token = PAT_PREFIX + randomHex(32);
   const hash = await hashSecret(token, env);

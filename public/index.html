@@ -9,7 +9,7 @@
   <!-- CSP 与点击劫持防护由 public/_headers 以 HTTP 响应头下发；frame-ancestors 在 meta 中不会生效。 -->
   <!-- 依赖本地化（public/vendor，避免外部 CDN 不可达/供应链风险）；xterm/Chart.js 首次使用时由 JS 懒加载 -->
   <script src="/theme-init.js"></script>
-  <link rel="stylesheet" href="/style.css?v=37" />
+  <link rel="stylesheet" href="/style.css?v=40" />
 </head>
 <body>
   <div id="app" class="hidden">
@@ -284,7 +284,10 @@
       </div>
       <div class="settings-row">
         <input id="tok-servers" type="text" placeholder="server_ids（逗号分隔，空=全部服务器）" />
-        <input id="tok-expires" type="number" min="1" placeholder="有效期（天，留空=永久）" style="width:130px" />
+        <div class="field" style="flex:0 0 220px">
+          <input id="tok-expires" type="number" min="0.01" step="any" placeholder="天数，可小数" title="单位：天，可输入小数（0.5=12 小时）；留空=永久" />
+          <span class="field-tag" id="tok-exp-tag">天数</span>
+        </div>
         <button id="btn-create-token">创建令牌</button>
       </div>
       <p id="tok-hint" class="muted" style="font-size:12px"></p>
@@ -390,7 +393,7 @@
 
   <script src="/utils.js?v=9"></script>
   <script src="/api.js?v=5"></script>
-  <script src="/app.js?v=53"></script>
+  <script src="/app.js?v=55"></script>
 
   <!-- Cloudflare Web Analytics：手动嵌入（而非 Zone 级 Automatic Setup 自动注入）。
        自动注入会在边缘改写 HTML 塞入内联启动代码，与严格 CSP 的 script-src 冲突

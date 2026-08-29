@@ -565,6 +565,11 @@ button.danger:hover { background: rgba(248, 113, 113, .12); }
 .modal-head span { font-weight: 600; }
 .term { flex: 1; background: var(--term-bg); border: 1px solid var(--border); border-radius: 12px; padding: 8px; overflow: hidden; box-shadow: 0 0 40px rgba(99, 102, 241, .08); }
 .term .xterm { height: 100%; }
+/* 终端标题栏：标题与渲染器切换按钮成组靠左（否则 .modal-head 的 space-between
+   会把第三个子元素分到正中间），关闭按钮独占右侧 */
+.term-head-group { display: flex; align-items: center; gap: 10px; }
+/* 终端渲染器切换（WebGL/DOM）：定宽避免两种文案宽度不同导致标题栏按钮跳动 */
+#btn-term-renderer { min-width: 58px; text-align: center; font-weight: 600; letter-spacing: .3px; }
 
 /* ---------- 通用对话框 ---------- */
 .dialog-body { max-width: 560px; }

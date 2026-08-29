@@ -10,17 +10,20 @@
 
   // ---------- 主题（dark / light） ----------
   let theme = localStorage.getItem('cfpanel_theme') === 'light' ? 'light' : 'dark';
-  let activeTerm = null; // 打开中的 xterm 实例（主题切换热更新；关闭时置 null）
   // 终端渲染器（WebGL 优先 / DOM 兜底 + 标题栏手动切换）：
   // - WebGL：GPU 加速，高吞吐输出（刷日志/构建）更流畅
   // - DOM：xterm 自带基线渲染器，兼容兜底（原生文本选区/读屏/缩放清晰）
-  // activeWebglAddon 为 null 即处于 DOM 模式；termRenderer 记录「实际」生效的渲染器
-  //（WebGL 尝试失败会自动回退 DOM，可能与用户偏好不一致）
-  let activeTermFit = null;    // 渲染器切换后重新 fit（不同渲染器字形度量可能不同）
-  let activeWebglAddon = null; // 当前挂载的 WebglAddon 实例
-  let termRenderer = 'dom';
+  // 多标签下**每个标签独立记录**实际生效的渲染器（session.renderer）；
+  // termRendererPref 只是"新开标签时的默认偏好"——WebGL 尝试失败会自动回退 DOM，
+  // 故实际渲染器可能与偏好不一致。
   const RENDERER_KEY = 'cfpanel_term_renderer'; // 偏好持久化：下次开终端沿用，避免每次手动切
   let termRendererPref = localStorage.getItem(RENDERER_KEY) === 'dom' ? 'dom' : 'webgl';
+  // 终端多标签：id -> 会话。后端 TerminalDO 每服务器并发上限 8 个会话；
+  // 前端上限受浏览器每页 WebGL 上下文数（约 8~16 个）约束，取 8 留一半余量。
+  const TERM_MAX_TABS = 8;
+  const termSessions = new Map(); // id -> { id, serverId, serverName, term, fit, sess, addon, renderer, pane, tab, onResize }
+  let termSeq = 0;
+  let activeTermId = null;
   const cssVar = (name) => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
   // 终端配色：从 CSS 变量取（与 .term 容器底色一致）；xterm 需显式前景/光标色
   const termTheme = () => ({
@@ -37,7 +40,8 @@
     const btn = $('#btn-theme');
     if (btn) btn.textContent = t === 'light' ? '🌙' : '☀️'; // 显示"将切换到"的目标图标
     if (window.monaco) window.monaco.editor.setTheme(t === 'light' ? 'vs' : 'vs-dark');
-    if (activeTerm) activeTerm.options.theme = termTheme(); // 终端开着 → 热更新配色
+    // 所有终端标签热更新配色（多标签：逐个设置，不能只管"当前"那一个）
+    for (const s of termSessions.values()) s.term.options.theme = termTheme();
     // 监控弹窗开着 → 用缓存数据重建图表（轴/文字/tooltip 颜色随主题）
     if (monitorLast && !$('#monitor-modal').classList.contains('hidden')) {
       renderMonitorChart(monitorLast.rows, monitorLast.custom, monitorLast.downsampled);
@@ -796,77 +800,114 @@
     setTimeout(() => promptInputEl.focus(), 0);
   }
 
-  // ---------- 终端渲染器（WebGL 优先 / DOM 兜底 + 手动切换） ----------
+  // ---------- 终端多标签（可同时连接多台机器） ----------
+  // 切换标签只做显隐，不销毁重建——销毁会丢掉滚动缓冲区与已建立的 PTY 连接。
+  // 每个标签独立持有：xterm 实例、fit 插件、WebGL addon（若有）、WS 会话。
+
+  function activeTermSession() {
+    return activeTermId != null ? termSessions.get(activeTermId) || null : null;
+  }
+
   function syncRendererBtn() {
     const btn = $('#btn-term-renderer');
     if (!btn) return;
-    btn.textContent = termRenderer === 'webgl' ? 'WebGL' : 'DOM';
-    btn.title = termRenderer === 'webgl'
-      ? '当前渲染器：WebGL（GPU 加速，刷日志更流畅）——点击切换为 DOM'
-      : '当前渲染器：DOM（兼容兜底）——点击切换为 WebGL';
+    // 按钮反映「当前活动标签」的渲染器（各标签独立，切标签时随之变化）
+    const cur = activeTermSession();
+    const mode = cur ? cur.renderer : 'dom';
+    btn.textContent = mode === 'webgl' ? 'WebGL' : 'DOM';
+    btn.title = mode === 'webgl'
+      ? '当前标签渲染器：WebGL（GPU 加速，刷日志更流畅）——点击切换为 DOM'
+      : '当前标签渲染器：DOM（兼容兜底）——点击切换为 WebGL';
+    btn.disabled = !cur;
   }
 
   function refitTerm() {
     // 渲染器切换后重新测量：不同渲染器的字形度量与画布尺寸可能不同
-    if (activeTermFit) { try { activeTermFit.fit(); } catch { /* ignore */ } }
+    const cur = activeTermSession();
+    if (cur) { try { cur.fit.fit(); } catch { /* ignore */ } }
   }
 
-  function detachWebglAddon() {
-    if (!activeWebglAddon) return;
-    try { activeWebglAddon.dispose(); } catch { /* ignore */ }
-    activeWebglAddon = null;
+  // 释放指定标签的 WebGL 上下文（不再是全局单例：每个标签有自己的 addon）
+  function detachWebglAddonOf(s) {
+    if (!s || !s.addon) return;
+    try { s.addon.dispose(); } catch { /* ignore */ }
+    s.addon = null;
+    s.renderer = 'dom';
+  }
+
+  // WebGL 上下文是每页稀缺资源（约 8~16 个）。已达上限时不再尝试 GPU 渲染——
+  // 否则新建标签会静默丢掉渲染能力（不报错，只是不加速），排查起来很费劲。
+  function webglAddonCount() {
+    let n = 0;
+    for (const s of termSessions.values()) if (s.addon) n += 1;
+    return n;
   }
 
   // mode = 'webgl' | 'dom'；silent 用于开终端时的自动尝试（失败不弹 toast，
   // 按钮显示 DOM 即可；手动切换失败才提示，因为那是用户主动发起的动作）
   async function setTermRenderer(mode, { silent = false } = {}) {
-    const term = activeTerm;
-    if (!term) return;
+    const s = activeTermSession();
+    if (!s) return;
     termRendererPref = mode;
     localStorage.setItem(RENDERER_KEY, mode);
     if (mode === 'dom') {
-      detachWebglAddon();
-      termRenderer = 'dom';
+      detachWebglAddonOf(s);
       syncRendererBtn();
       refitTerm();
+      return;
+    }
+    if (webglAddonCount() >= TERM_MAX_TABS) {
+      if (!silent) toast(`WebGL 上下文已达上限（${TERM_MAX_TABS} 个），该标签保持 DOM 渲染`);
+      s.renderer = 'dom';
+      syncRendererBtn();
       return;
     }
     try {
       // WebGL 插件约 100KB，懒加载：仅首次尝试 WebGL 时拉取（此后走浏览器缓存）
       await loadScript('/vendor/addon-webgl.min.js');
-      if (activeTerm !== term) return; // 加载期间终端已关闭（与上方「加载期间已关闭」同语义）
+      if (!termSessions.has(s.id)) return; // 加载期间该标签已关闭
       const W = window.WebglAddon;
       const Ctor = W && (W.WebglAddon || W); // UMD 导出对象上挂类，兼容直接挂类的形态
       if (!Ctor) throw new Error('WebGL 渲染器插件加载异常');
-      detachWebglAddon();
+      detachWebglAddonOf(s);
       const addon = new Ctor();
       // GPU 上下文丢失（驱动重置/切虚拟桌面/省电策略/远程桌面禁加速）→ 自动回退 DOM
       addon.onContextLoss(() => {
-        if (activeWebglAddon !== addon) return;
-        activeWebglAddon = null;
-        termRenderer = 'dom';
+        if (s.addon !== addon) return;
+        s.addon = null;
+        s.renderer = 'dom';
         try { addon.dispose(); } catch { /* ignore */ }
         syncRendererBtn();
       });
-      term.loadAddon(addon);
-      activeWebglAddon = addon;
-      termRenderer = 'webgl';
+      s.term.loadAddon(addon);
+      s.addon = addon;
+      s.renderer = 'webgl';
     } catch (e) {
       // 无 WebGL2 / 显卡黑名单 / 上下文创建失败 → 保持 DOM
-      termRenderer = 'dom';
+      s.renderer = 'dom';
       if (!silent) toast('WebGL 渲染不可用，已使用 DOM：' + (e && e.message ? e.message : ''));
     }
     syncRendererBtn();
     refitTerm();
   }
 
-  // ---------- 终端（断线自动重连） ----------
+  // 打开/激活终端：同一服务器已开过则**切到既有标签**（避免误开一堆同机终端），
+  // 需要同机多终端时用标题栏 ＋ 显式新建。
   async function openTerminal(serverId, serverName) {
-    $('#term-title').textContent = `终端 · ${serverName}`;
+    for (const s of termSessions.values()) {
+      if (s.serverId === Number(serverId)) { activateTerm(s.id); return; }
+    }
+    await createTerminal(Number(serverId), serverName);
+  }
+
+  async function createTerminal(serverId, serverName) {
+    if (termSessions.size >= TERM_MAX_TABS) {
+      toast(`最多同时打开 ${TERM_MAX_TABS} 个终端，请先关闭一个`);
+      return;
+    }
     $('#term-modal').classList.remove('hidden');
     lockScroll();
-    $('#term').innerHTML = '<p class="muted" style="padding:24px">终端组件加载中...</p>';
-    // xterm + fit 首次使用才加载（缓存后零开销）；失败提示并关闭弹窗
+    // xterm + fit 首次使用才加载（缓存后零开销）
     try {
       await Promise.all([
         loadCss('/vendor/xterm.min.css'),
@@ -875,50 +916,114 @@
       ]);
     } catch (e) {
       toast(e.message || '终端组件加载失败');
-      $('#term-modal').classList.add('hidden'); // 此时尚未建会话/挂事件，直接收起弹窗即可
-      unlockScroll();
+      // 已有标签时不收起弹窗（只是新标签失败）；首个标签失败才收起
+      if (!termSessions.size) { $('#term-modal').classList.add('hidden'); unlockScroll(); }
       return;
     }
-    if ($('#term-modal').classList.contains('hidden')) return; // 加载期间已关闭
-    $('#term').innerHTML = '';
+    if ($('#term-modal').classList.contains('hidden')) return; // 加载期间已被关闭
 
+    const id = ++termSeq;
     const Term = window.Terminal;
     const Fit = (window.FitAddon && window.FitAddon.FitAddon) || window.FitAddon;
     const term = new Term({ cursorBlink: true, fontSize: 13, theme: termTheme() });
     const fit = new Fit();
-    activeTerm = term;    // 主题切换时热更新 options.theme（applyTheme 引用）
-    activeTermFit = fit;  // 渲染器切换后重新 fit
     term.loadAddon(fit);
-    term.open($('#term')); // WebGL 插件必须在 open 之后加载（需要已就绪的终端容器）
+
+    // 每个会话一个 pane（绝对定位铺满宿主页）：切换标签只切显隐
+    const pane = document.createElement('div');
+    pane.className = 'term-pane';
+    const termDiv = document.createElement('div');
+    termDiv.className = 'term';
+    pane.appendChild(termDiv);
+    $('#term-host').appendChild(pane);
+    term.open(termDiv); // WebGL 插件必须在 open 之后加载（需要已就绪的终端容器）
 
     // 终端会话（连接/重连/自愈状态机在 api.js 的 TermSession，渲染走注入的 xterm）
     const sess = new TermSession(term, fit, {
       onAuthFail: () => { token = ''; localStorage.removeItem('cfpanel_token'); showAuth(); },
     });
-    // 键盘输入 → WS；窗口变化 → resize 帧（走 DO → 控制 WS → stty）
     term.onData((data) => sess.send(data));
     term.onResize(({ cols, rows }) => sess.resize(cols, rows));
-    const onResize = () => { if (!sess.closed) { try { fit.fit(); } catch { /* ignore */ } } };
+    // 窗口尺寸变化：隐藏的 pane 尺寸为 0，xterm 对 0 尺寸安全（activateTerm 会再 fit）
+    const onResize = () => { try { fit.fit(); } catch { /* ignore */ } };
     window.addEventListener('resize', onResize);
-    // 渲染器切换按钮：WebGL ↔ DOM（偏好持久化到 localStorage，下次开终端沿用）
-    $('#btn-term-renderer').onclick = () => setTermRenderer(termRenderer === 'webgl' ? 'dom' : 'webgl');
-    $('#btn-term-close').onclick = () => {
-      sess.close(); // 内部 dispose + 关 WS + 清定时器
-      window.removeEventListener('resize', onResize); // 防多次开关终端累积内存泄漏
-      // 显式释放 WebGL 上下文：浏览器对每页 WebGL context 数量有上限（约 8~16 个），
-      // 不释放的话反复开关终端会耗尽配额，后续终端拿不到 GPU 渲染器
-      detachWebglAddon();
-      termRenderer = 'dom';
-      activeTerm = null;
-      activeTermFit = null;
-      syncRendererBtn();
-      $('#term-modal').classList.add('hidden');
-      unlockScroll();
+
+    const s = {
+      id, serverId, serverName, term, fit, sess,
+      addon: null, renderer: 'dom', pane, tab: null, onResize,
     };
+    termSessions.set(id, s);
+    buildTermTab(s);
+    activateTerm(id);
 
     // WebGL 优先，失败自动回退 DOM（silent：自动兜底不弹 toast，按钮显示 DOM 即可）
     setTermRenderer(termRendererPref, { silent: true });
     sess.open(serverId); // 建会话 + WS + auth + fit + 重连/自愈
+  }
+
+  function buildTermTab(s) {
+    const tab = document.createElement('div');
+    tab.className = 'term-tab';
+    tab.dataset.id = String(s.id);
+    tab.innerHTML = `<span class="tab-name">${escapeHtml(s.serverName)}</span>`
+      + '<button class="tab-close" type="button" aria-label="关闭该终端" title="关闭">✕</button>';
+    tab.addEventListener('click', (e) => {
+      // ✕ 只关这一个标签；点标签其余区域 = 切过去
+      if (e.target.closest('.tab-close')) { closeTerm(s.id); return; }
+      activateTerm(s.id);
+    });
+    s.tab = tab;
+    $('#term-tabs').appendChild(tab);
+  }
+
+  function activateTerm(id) {
+    for (const s of termSessions.values()) {
+      const on = s.id === id;
+      s.pane.classList.toggle('hidden', !on);
+      s.tab.classList.toggle('active', on);
+    }
+    activeTermId = id;
+    const cur = activeTermSession();
+    if (cur) {
+      // 切回来必须重新测量：隐藏期间 pane 尺寸为 0，行列数不会自动更新——
+      // 不 fit 的话终端会保持"隐藏时"的错误行列数（表现为内容错位/不换行）
+      try { cur.fit.fit(); } catch { /* ignore */ }
+      cur.term.focus();
+      $('#term-title').textContent = `终端 · ${cur.serverName}`;
+    }
+    syncRendererBtn();
+  }
+
+  function closeTerm(id) {
+    const s = termSessions.get(id);
+    if (!s) return;
+    s.sess.close();                                   // dispose + 关 WS + 清定时器
+    window.removeEventListener('resize', s.onResize);  // 防多次开关累积内存泄漏
+    // 显式释放 WebGL 上下文：浏览器对每页 WebGL context 数量有上限（约 8~16 个），
+    // 不释放的话反复开关终端会耗尽配额，后续标签拿不到 GPU 渲染器
+    detachWebglAddonOf(s);
+    s.pane.remove();
+    s.tab.remove();
+    termSessions.delete(id);
+    if (activeTermId === id) {
+      // 关掉的是活动标签 → 落到剩余任意一个；无剩余则收起弹窗
+      const next = termSessions.keys().next();
+      if (next.done) { closeAllTerms(); return; }
+      activateTerm(next.value);
+      return;
+    }
+    syncRendererBtn();
+  }
+
+  // 关闭全部（标题栏 ✕）：先清空 activeTermId，避免逐个关闭时触发"切到下一个"的中间态
+  function closeAllTerms() {
+    activeTermId = null;
+    for (const id of [...termSessions.keys()]) closeTerm(id);
+    $('#term-tabs').innerHTML = '';
+    $('#term-host').innerHTML = '';
+    $('#term-modal').classList.add('hidden');
+    unlockScroll();
+    syncRendererBtn();
   }
 
   // ---------- 文件管理（目录浏览 / 上传 / 下载；连接/协议/状态机在 api.js 的 FileSession） ----------
@@ -2769,6 +2874,17 @@
     toast(`已填入「${p.name}」模板，请填写 Token`);
   });
 
+  // 终端：渲染器切换作用于「当前活动标签」；＋ 为当前服务器再开一个；✕ 关闭全部
+  $('#btn-term-renderer').onclick = () => {
+    const cur = activeTermSession();
+    setTermRenderer(cur && cur.renderer === 'webgl' ? 'dom' : 'webgl');
+  };
+  $('#btn-term-new').onclick = () => {
+    const cur = activeTermSession();
+    if (cur) createTerminal(cur.serverId, cur.serverName);
+  };
+  $('#btn-term-close').onclick = closeAllTerms;
+
   // 文件管理操作
   $('#btn-file-close').onclick = closeFileModal;
   $('#btn-file-cancel').onclick = cancelUpload;
@@ -2976,7 +3092,11 @@
       if (e.key !== 'Escape') return;
       const open = [...modals].reverse().find((m) => !m.classList.contains('hidden'));
       if (!open) return;
-      const closeBtn = open.querySelector('.modal-head button.icon');
+      // 关闭按钮只认 ✕：按 title/aria-label 含「关闭」筛选，而不是取第一个 button.icon。
+      // 终端 head 里渲染器切换与「＋」也是 button.icon 且排在 ✕ 之前——取第一个会把
+      // Esc 变成"切换渲染器"，弹窗关不掉（多标签后这几个按钮都在，误匹配更容易发生）。
+      const closeBtn = [...open.querySelectorAll('.modal-head button.icon')]
+        .find((b) => /关闭/.test(b.title || '') || /关闭/.test(b.getAttribute('aria-label') || ''));
       if (closeBtn) { closeBtn.click(); return; }
       // 无 ✕ 按钮的弹窗分派到各自的关闭入口（保持 dirty 确认/状态清理等既有逻辑）
       if (open.id === 'file-editor-modal') { $('#btn-editor-close').click(); return; }

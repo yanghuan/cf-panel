@@ -118,16 +118,20 @@
     </form>
   </div>
 
-  <!-- 终端弹窗 -->
+  <!-- 终端弹窗（多标签：可同时连接多台机器；后端每服务器并发上限 8 个会话） -->
   <div id="term-modal" class="modal hidden">
     <div class="modal-head">
       <div class="term-head-group">
         <span id="term-title">终端</span>
         <button id="btn-term-renderer" class="ghost icon" aria-label="切换渲染器" title="切换渲染器">DOM</button>
+        <button id="btn-term-new" class="ghost icon" aria-label="新标签" title="为当前服务器再开一个终端">＋</button>
       </div>
-      <button id="btn-term-close" class="ghost icon" aria-label="关闭" title="关闭">✕</button>
+      <button id="btn-term-close" class="ghost icon" aria-label="关闭全部终端" title="关闭全部">✕</button>
     </div>
-    <div id="term" class="term"></div>
+    <!-- 标签栏：一个标签 = 一个终端会话（✕ 只关该标签）；标签多时横向滚动 -->
+    <div id="term-tabs" class="term-tabs"></div>
+    <!-- 会话宿主页：每个会话一个 .term-pane，切换只动显隐——销毁重建会丢滚动缓冲区与 PTY 连接 -->
+    <div id="term-host" class="term-host"></div>
   </div>
 
   <!-- 文件管理弹窗 -->

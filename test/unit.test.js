@@ -576,6 +576,37 @@ test('按天统计时间工具：天序号与起始时间戳可互相还原', ()
   }
 });
 
+test('终端多标签：会话表取代单例，关闭时三类资源都要释放（静态断言）', () => {
+  const root = nodePath.join(nodePath.dirname(fileURLToPath(import.meta.url)), '..');
+  const app = nodeFs.readFileSync(nodePath.join(root, 'public/app.js'), 'utf8');
+  // 单例残留会让主题切换/渲染器切换只作用于某一个标签（多标签下必现的错乱）
+  assert.doesNotMatch(app, /\bactiveTerm\b/, 'activeTerm 单例须由 termSessions 会话表取代');
+  assert.doesNotMatch(app, /\bactiveWebglAddon\b/, 'WebGL addon 改为每标签独立持有');
+  assert.doesNotMatch(app, /\bactiveTermFit\b/);
+  // 会话表与并发上限（浏览器每页 WebGL 上下文约 8~16 个）
+  assert.match(app, /const termSessions = new Map\(\)/);
+  assert.match(app, /TERM_MAX_TABS/);
+  // 关闭标签要释放三样东西，漏一个都会累积泄漏
+  assert.match(app, /s\.sess\.close\(\)/, '关闭 WS 会话（含 dispose 与定时器清理）');
+  assert.match(app, /window\.removeEventListener\('resize', s\.onResize\)/, '移除 resize 监听');
+  assert.match(app, /detachWebglAddonOf\(s\)/, '显式释放 WebGL 上下文（每页数量有硬上限）');
+  // 切回标签必须重新测量：隐藏期间 pane 尺寸为 0，行列数不会自动更新
+  assert.match(app, /cur\.fit\.fit\(\)/);
+  // 同服务器复用既有标签：否则每次点「终端」都会新开一个，误开一堆同机终端
+  assert.match(app, /s\.serverId === Number\(serverId\)/, '同服务器复用既有标签');
+  // 主题切换要覆盖所有标签，不能只管当前那个
+  assert.match(app, /for \(const s of termSessions\.values\(\)\) s\.term\.options\.theme/);
+});
+
+test('Esc 关闭弹窗：按「关闭」语义筛选按钮，不得直接取第一个 button.icon', () => {
+  const root = nodePath.join(nodePath.dirname(fileURLToPath(import.meta.url)), '..');
+  const app = nodeFs.readFileSync(nodePath.join(root, 'public/app.js'), 'utf8');
+  // 终端 head 的渲染器切换与「＋」都是 button.icon 且排在 ✕ 之前——
+  // 取第一个会把 Esc 变成"切换渲染器"，弹窗关不掉（多标签后按钮更多，更易误匹配）
+  assert.doesNotMatch(app, /open\.querySelector\('\.modal-head button\.icon'\)/);
+  assert.match(app, /关闭\/\.test\(b\.title/, '按 title/aria-label 含「关闭」筛选');
+});
+
 test('PWA：manifest 声明与图标文件齐备（支持"添加到主屏幕"）', () => {
   const root = nodePath.join(nodePath.dirname(fileURLToPath(import.meta.url)), '..');
   const html = nodeFs.readFileSync(nodePath.join(root, 'public/index.html'), 'utf8');

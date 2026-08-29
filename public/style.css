@@ -667,9 +667,21 @@ button.danger:hover { background: rgba(248, 113, 113, .12); }
 /* PAT 有效天数：右侧常驻「截止时间」标签（复用 field-tag 槽位，见 app.js
    syncTokenExpiryPreview）。预留出标签宽度防止盖住输入的数字，并隐藏 number
    输入自带的步进按钮（与标签叠放；键盘 ↑↓ 仍可增减） */
-#tok-expires { padding-right: 128px; }
-/* 截止时间含年份与时区（约 120px），放开 field-tag 的 55% 限宽避免省略号截断 */
-#tok-exp-tag { max-width: none; }
+/* PAT 有效天数：单输入框混用两种语义——纯数字=相对天数，日期字符串=绝对截止。
+   右端内嵌 📅 按钮（原生 datetime 控件 showPicker 弹出，零第三方库）；
+   field-tag 槽位显示换算出的截止时间（数字模式）/ 隐藏（日期模式，输入框自身即截止时间） */
+#tok-expires { padding-right: 44px; }
+.tok-cal-btn {
+  position: absolute; right: 6px; top: 50%; transform: translateY(-50%);
+  padding: 1px 5px; font-size: 14px; line-height: 1;
+  background: transparent; border: none; box-shadow: none; cursor: pointer; color: var(--muted);
+}
+.tok-cal-btn:hover { color: var(--accent-2); background: transparent; box-shadow: none; filter: none; transform: translateY(-50%); }
+.tok-cal-btn:active { transform: translateY(-50%); }
+#tok-exp-tag { right: 38px; max-width: none; }
+/* 原生 datetime 控件：仅作为 showPicker 的锚点（弹出的选择器锚定到它），
+   1px 透明保持「可见」以满足 showPicker 的前提，tabindex=-1 移出焦点链 */
+.tok-picker-input { position: absolute; right: 8px; top: 50%; width: 1px; height: 1px; opacity: 0; border: 0; padding: 0; }
 #tok-expires::-webkit-outer-spin-button,
 #tok-expires::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
 #tok-expires { -moz-appearance: textfield; appearance: textfield; }

@@ -101,7 +101,7 @@ const MCP_TOOLS = [
   },
   {
     name: 'create_token',
-    description: '创建访问令牌（PAT）。仅管理员。返回明文 token（只显示一次，请妥善保存）。scopes 合法值：server:read / server:exec（默认 server:read）；server_ids 为空=全部服务器；expires_in_days 为空=永久有效。名称不可与现有令牌重复（同名返回错误）。',
+    description: '创建访问令牌（PAT）。仅管理员。返回明文 token（只显示一次，请妥善保存）。scopes 合法值：server:read / server:exec（默认 server:read）；server_ids 为空=全部服务器；有效期二选一：expires_in_days（可小数天）或 expires_at（unix 秒，须在未来），均空=永久有效。名称不可与现有令牌重复（同名返回错误）。',
     inputSchema: {
       type: 'object',
       properties: {
@@ -109,6 +109,7 @@ const MCP_TOOLS = [
         scopes: { type: 'array', items: { type: 'string' }, description: '权限 scope，如 ["server:read"] 或 ["server:read","server:exec"]' },
         server_ids: { type: 'array', items: { type: 'integer' }, description: '服务器白名单（空=全部）' },
         expires_in_days: { type: 'number', description: '有效天数（可小数，0.5=12 小时；可选；缺省=永久有效）' },
+        expires_at: { type: 'integer', description: '截止时间 unix 秒（须在未来；与 expires_in_days 二选一，优先）' },
       },
       required: ['name'],
     },
@@ -736,12 +737,16 @@ async function handleApiInner(request, env) {
         scopes = [SCOPE_READ];
       }
       const serverIDs = Array.isArray(body.server_ids) ? body.server_ids.map(Number).filter((n) => n > 0) : null;
-      // 有效期：expires_in_days 可为小数（0.5=12 小时；可选；缺省/0/非法 → 永久有效）。
-      // 取整放最外层：days*86400 对任意小数都产出整数秒时间戳（避免 D1 整数列存 REAL）
+      // 有效期二选一：expires_at（unix 秒绝对截止，须在未来，优先）或 expires_in_days
+      // （可小数天，0.5=12 小时）；都缺省/0/非法 → 永久有效。取整放最外层避免整数列落 REAL
+      const nowSec = Math.floor(Date.now() / 1000);
       const days = Number(body.expires_in_days);
-      const expiresAt = Number.isFinite(days) && days > 0
-        ? Math.floor(Date.now() / 1000 + days * 86400)
-        : null;
+      let expiresAt = Number.isFinite(days) && days > 0 ? Math.floor(nowSec + days * 86400) : null;
+      if (body.expires_at !== undefined && body.expires_at !== null && body.expires_at !== '') {
+        const at = Number(body.expires_at);
+        if (!Number.isFinite(at) || at <= nowSec) return err('expires_at must be a future unix timestamp', 400);
+        expiresAt = Math.floor(at);
+      }
       const token = PAT_PREFIX + randomHex(32);
       const hash = await hashSecret(token, env);
       try {
@@ -1207,11 +1212,15 @@ async function mcpCreateToken(user, env, args) {
     scopes = [SCOPE_READ];
   }
   const serverIDs = Array.isArray(args.server_ids) ? args.server_ids.map(Number).filter((n) => n > 0) : null;
-  // 与 REST 版同语义：支持小数天（0.5=12 小时），取整放最外层保证时间戳为整数秒
+  // 与 REST 版同语义：expires_at（unix 秒，须在未来，优先）或 expires_in_days（可小数天）
+  const nowSec = Math.floor(Date.now() / 1000);
   const days = Number(args.expires_in_days);
-  const expiresAt = Number.isFinite(days) && days > 0
-    ? Math.floor(Date.now() / 1000 + days * 86400)
-    : null;
+  let expiresAt = Number.isFinite(days) && days > 0 ? Math.floor(nowSec + days * 86400) : null;
+  if (args.expires_at !== undefined && args.expires_at !== null && args.expires_at !== '') {
+    const at = Number(args.expires_at);
+    if (!Number.isFinite(at) || at <= nowSec) throw new Error('expires_at must be a future unix timestamp');
+    expiresAt = Math.floor(at);
+  }
   const token = PAT_PREFIX + randomHex(32);
   const hash = await hashSecret(token, env);
   try {

@@ -882,6 +882,34 @@ test('PAT：有效期支持小数天（0.5 = 12 小时），expires_at 为整数
   assert.equal(row.expires_at, r.expires_at, '落库一致（整数）');
 });
 
+test('PAT：expires_at 绝对截止时间（unix 秒）——优先于天数、过去时间拒绝', async () => {
+  const env = makeEnv();
+  const adminToken = await login(env);
+  const now = Math.floor(Date.now() / 1000);
+
+  // 未来时间：原样落库（取整）、可用
+  const r = await (await call(env, {
+    method: 'POST', path: '/api/tokens', token: adminToken,
+    body: { name: 'abs', scopes: ['server:read'], expires_at: now + 3600 },
+  })).json();
+  assert.equal(r.expires_at, now + 3600, 'expires_at 原样落库');
+  assert.equal((await call(env, { path: '/api/me', token: r.token })).status, 200, '未到期可用');
+
+  // 与 expires_in_days 并存 → expires_at 优先（绝对时间语义明确）
+  const both = await (await call(env, {
+    method: 'POST', path: '/api/tokens', token: adminToken,
+    body: { name: 'both', scopes: ['server:read'], expires_in_days: 30, expires_at: now + 60 },
+  })).json();
+  assert.ok(both.expires_at - now <= 120, 'expires_at 优先于 expires_in_days');
+
+  // 过去时间 → 400（明确报错优于建成一个立即过期的死令牌）
+  const past = await call(env, {
+    method: 'POST', path: '/api/tokens', token: adminToken,
+    body: { name: 'past', scopes: ['server:read'], expires_at: now - 100 },
+  });
+  assert.equal(past.status, 400, '过去的截止时间拒绝');
+});
+
 test('审计日志：管理员可查（倒序 + limit），非管理员 403', async () => {
   const env = makeEnv();
   const adminToken = await login(env);

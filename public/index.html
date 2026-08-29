@@ -284,8 +284,10 @@
       </div>
       <div class="settings-row">
         <input id="tok-servers" type="text" placeholder="server_ids（逗号分隔，空=全部服务器）" />
-        <div class="field" style="flex:0 0 220px">
-          <input id="tok-expires" type="number" min="0.01" step="any" placeholder="天数，可小数" title="单位：天，可输入小数（0.5=12 小时）；留空=永久" />
+        <div class="field" style="flex:0 0 230px">
+          <input id="tok-expires" type="text" placeholder="天数或截止日期" title="数字=有效天数（支持小数，0.5=12 小时）；日期=精确截止（如 2026/9/5 14:00）；留空=永久。也可点 📅 选择" />
+          <input id="tok-expires-picker" class="tok-picker-input" type="datetime-local" step="60" tabindex="-1" aria-hidden="true" />
+          <button id="tok-exp-btn" type="button" class="tok-cal-btn" title="选择截止时间">📅</button>
           <span class="field-tag" id="tok-exp-tag">天数</span>
         </div>
         <button id="btn-create-token">创建令牌</button>
@@ -393,7 +395,7 @@
 
   <script src="/utils.js?v=9"></script>
   <script src="/api.js?v=5"></script>
-  <script src="/app.js?v=55"></script>
+  <script src="/app.js?v=56"></script>
 
   <!-- Cloudflare Web Analytics：手动嵌入（而非 Zone 级 Automatic Setup 自动注入）。
        自动注入会在边缘改写 HTML 塞入内联启动代码，与严格 CSP 的 script-src 冲突

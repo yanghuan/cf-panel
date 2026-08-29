@@ -1785,14 +1785,16 @@
     const expired = exp * 1000 < Date.now();
     return `${new Date(exp * 1000).toLocaleString()}${expired ? '（已过期）' : ''}`;
   }
-  // 有效天数 → 截止时间实时预览：显示在输入框右端的字段标签槽位（含年份与时区），
-  // 与后端同式（now + days*86400，取整到秒）。留空时标签隐藏、placeholder 可见
+  // 有效期右端标签：仅数字（天数）模式显示——天数本身不是时间，需要换算提示
+  //（含年份/时区）；日期字符串模式下输入框自身即截止时间，标签隐藏（再显示一遍
+  // 会与输入文字重叠，实测反馈）。空/无法解析 → 同样隐藏
   function syncTokenExpiryPreview() {
     const tag = $('#tok-exp-tag');
     if (!tag) return;
-    const d = Number($('#tok-expires').value);
-    if (!Number.isFinite(d) || d <= 0) { tag.textContent = '天数'; return; } // 留空/0 → 永久
-    const at = new Date(Math.floor(Date.now() / 1000 + d * 86400) * 1000);
+    const v = $('#tok-expires').value.trim();
+    const asNum = Number(v);
+    if (!v || !Number.isFinite(asNum) || asNum <= 0) { tag.style.display = 'none'; return; }
+    const at = new Date(Math.floor(Date.now() / 1000 + asNum * 86400) * 1000);
     const p = (n) => String(n).padStart(2, '0');
     // 时区偏移手工计算（不依赖 Intl timeZoneName，避免旧浏览器枚举值不支持时抛错）；
     // 用本机时区，与面板其余时间显示口径一致
@@ -1800,8 +1802,21 @@
     const sign = offMin >= 0 ? '+' : '-';
     const oh = Math.floor(Math.abs(offMin) / 60);
     const om = Math.abs(offMin) % 60;
-    const tz = `UTC${sign}${oh}${om ? ':' + String(om).padStart(2, '0') : ''}`;
-    tag.textContent = `${at.getFullYear()}/${at.getMonth() + 1}/${at.getDate()} ${p(at.getHours())}:${p(at.getMinutes())} ${tz}`;
+    tag.textContent = `${at.getFullYear()}/${at.getMonth() + 1}/${at.getDate()} ${p(at.getHours())}:${p(at.getMinutes())} UTC${sign}${oh}${om ? ':' + String(om).padStart(2, '0') : ''}`;
+    tag.style.display = '';
+  }
+  // 有效期解析：纯数字=相对天数；日期时间字符串=绝对截止（本地时区）。返回 payload 片段；
+  // 无法识别/已过期时抛错（createToken 的 try/catch 转 toast）。留空 → 永久（空对象）
+  function parseTokenExpiry() {
+    const v = $('#tok-expires').value.trim();
+    if (!v) return {};
+    const asNum = Number(v);
+    if (Number.isFinite(asNum) && asNum > 0) return { expires_in_days: asNum };
+    const ts = Date.parse(v);
+    if (!Number.isFinite(ts)) throw new Error('无法识别的有效期：请输入天数（如 30）或截止日期（如 2026/9/5 14:00）');
+    const at = Math.floor(ts / 1000);
+    if (at <= Math.floor(Date.now() / 1000)) throw new Error('截止时间已过去，请重新选择');
+    return { expires_at: at };
   }
   async function loadTokens() {
     try {
@@ -1835,13 +1850,14 @@
           name: $('#tok-name').value.trim(),
           scopes,
           server_ids: serverIDs.length ? serverIDs : null,
-          expires_in_days: expDays > 0 ? expDays : undefined,
+          ...parseTokenExpiry(),
         }),
       });
       infoDialog('令牌已创建（仅显示一次）', `令牌：\n${res.token}\n\n用法：Authorization: Bearer ${res.token}\n\n有效期：${res.expires_at ? new Date(res.expires_at * 1000).toLocaleString() : '永久有效'}`);
       $('#tok-name').value = '';
       $('#tok-servers').value = '';
       $('#tok-expires').value = '';
+      $('#tok-expires-picker').value = '';
       syncTokenExpiryPreview(); // 清空输入后预览复位
       loadTokens();
     } catch (e) {
@@ -2055,7 +2071,28 @@
   // 访问令牌弹窗
   $('#btn-tokens-close').onclick = () => { $('#tokens-modal').classList.add('hidden'); unlockScroll(); };
   $('#btn-create-token').onclick = createToken;
+  // 有效期输入（数字/日期双语义）预览；📅 按钮经原生 showPicker() 弹出日历
   $('#tok-expires').addEventListener('input', syncTokenExpiryPreview);
+  $('#tok-exp-btn').onclick = () => {
+    const picker = $('#tok-expires-picker');
+    try {
+      if (!picker.showPicker) throw new Error('unsupported');
+      picker.showPicker();
+    } catch {
+      // 旧浏览器无 showPicker：输入框仍可直接敲日期字符串，功能不缺失
+      toast('当前浏览器不支持弹出日历，请直接输入截止日期（如 2026/9/5 14:00）');
+    }
+  };
+  // 选中 → 把截止时间写回输入框（人读格式），预览与提交统一走字符串解析
+  $('#tok-expires-picker').addEventListener('change', () => {
+    const picker = $('#tok-expires-picker');
+    if (!picker.value) return;
+    const d = new Date(picker.value);
+    if (Number.isNaN(d.getTime())) return;
+    const p = (n) => String(n).padStart(2, '0');
+    $('#tok-expires').value = `${d.getFullYear()}/${d.getMonth() + 1}/${d.getDate()} ${p(d.getHours())}:${p(d.getMinutes())}`;
+    syncTokenExpiryPreview();
+  });
 
   // 审计日志弹窗
   $('#btn-audit-close').onclick = () => { $('#audit-modal').classList.add('hidden'); unlockScroll(); };

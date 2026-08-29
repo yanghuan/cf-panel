@@ -319,20 +319,46 @@ test('normalizeFileEntry 收口恶意 Agent 文件条目', () => {
     type: '\"><img src=x onerror=alert(1)>',
     size: 'not-a-number',
     mtime: -1,
+    mode: 'not-a-number', // 权限位同样来自 Agent，必须走数值收口
+    path: { evil: 'object' }, // find 结果才有的字段：非字符串必须被收口为空串，不得进 HTML 属性
   }), {
     name: 'x"><img src=x onerror=alert(1)>',
+    path: '',
     type: 'file',
     size: 0,
     mtime: 0,
+    mode: 0,
   });
-  assert.deepEqual(CfUtils.normalizeFileEntry({ name: 'dir', type: 'dir', size: '12', mtime: '34' }), {
-    name: 'dir', type: 'dir', size: 12, mtime: 34,
+  assert.deepEqual(CfUtils.normalizeFileEntry({ name: 'dir', type: 'dir', size: '12', mtime: '34', mode: 0o755 }), {
+    name: 'dir', path: '', type: 'dir', size: 12, mtime: 34, mode: 0o755,
   });
+  // 递归搜索返回绝对路径：原样保留（渲染时再转相对路径 + escapeHtml）
+  assert.equal(CfUtils.normalizeFileEntry({ name: 'a.log', path: '/var/log/a.log' }).path, '/var/log/a.log');
+  // 数组/对象的 toString 会把内容拼出来——若用 String(v) 强转，下面这条会把
+  // 完整 <img onerror> 原样带进收口结果（下游 escapeHtml 之外就再也拦不住了）
+  assert.equal(
+    CfUtils.normalizeFileEntry({ name: ['<img src=x onerror=alert(1)>'], path: ['<img src=x onerror=alert(1)>'] }).name,
+    '',
+    '非字符串字段必须收口为空串，不得 String() 强转',
+  );
+  assert.equal(CfUtils.normalizeFileEntry({ name: 123, path: 456 }).name, '');
   assert.equal(CfUtils.normalizeFileEntry({ name: 'x'.repeat(5000) }).name.length, 4096);
   const root = nodePath.join(nodePath.dirname(fileURLToPath(import.meta.url)), '..');
   const app = nodeFs.readFileSync(nodePath.join(root, 'public/app.js'), 'utf8');
   assert.match(app, /\.map\(normalizeFileEntry\)/, '文件列表渲染前必须统一收口');
   assert.doesNotMatch(app, /data-(?:type|size)="\$\{e\.(?:type|size)\}"/, '属性禁止直接插入 Agent 字段');
+  // 权限位同样来自 Agent：必须走收口后的数值，不得原样插进属性
+  assert.doesNotMatch(app, /data-mode="\$\{e\.mode\}"/, '权限位禁止直接插入 Agent 字段');
+});
+
+test('modeText：权限位格式化（rwxr-xr-x + 八进制）', () => {
+  assert.equal(CfUtils.modeText(0o755), 'rwxr-xr-x (755)');
+  assert.equal(CfUtils.modeText(0o644), 'rw-r--r-- (644)');
+  assert.equal(CfUtils.modeText(0o600), 'rw------- (600)');
+  assert.equal(CfUtils.modeText(0), '', '未知权限不显示，避免误导');
+  assert.equal(CfUtils.modeText(undefined), '');
+  // Windows 由 agent 把只读位折算为 0444/0666 上报，此处按 Unix 口径展示（近似）
+  assert.equal(CfUtils.modeText(0o444), 'r--r--r-- (444)');
 });
 
 test('isBinaryExt 扩展名黑名单判定（集合带点，比较补点）', () => {
@@ -518,3 +544,53 @@ test('isAdmin / canAccessServer / canExec', () => {
 
 // 注：告警触发/冷却/探活用例已随状态迁移至 MetricsDO（见 test/do.test.js），
 // 通过 /report 顺风车路径验证，覆盖"单实例全局去重"。
+
+test('sanitizeAlertOverride：只保留合法维度，load 允许 0（关闭该维度）', () => {
+  // mem_pct:0 无意义（阈值 0 = 永远告警）→ 丢弃；load:0 是"关闭负载告警"的显式值 → 保留
+  assert.deepEqual(I.sanitizeAlertOverride({ cpu_pct: 80, mem_pct: 0, load: 0, bogus: 1 }),
+    { cpu_pct: 80, load: 0 });
+  assert.deepEqual(I.sanitizeAlertOverride({ cpu_pct: 95, mem_pct: 90, disk_pct: 85, offline_after_s: 600 }),
+    { cpu_pct: 95, mem_pct: 90, disk_pct: 85, offline_after_s: 600 });
+  // 全非法 → null（不存噪音，走全局阈值）
+  assert.equal(I.sanitizeAlertOverride({ cpu_pct: -5 }), null);
+  assert.equal(I.sanitizeAlertOverride({}), null);
+  assert.equal(I.sanitizeAlertOverride(null), null);
+  assert.equal(I.sanitizeAlertOverride([]), null, '数组不接受（typeof [] === "object"）');
+});
+
+test('sanitizeAlerts：mute_until 仅接受正数（0/负数/非法不落库）', () => {
+  const future = Math.floor(Date.now() / 1000) + 3600;
+  assert.equal(I.sanitizeAlerts({ mute_until: future }).mute_until, future);
+  assert.equal(I.sanitizeAlerts({ mute_until: 0 }).mute_until, undefined);
+  assert.equal(I.sanitizeAlerts({ mute_until: -1 }).mute_until, undefined);
+  assert.equal(I.sanitizeAlerts({ mute_until: 'abc' }).mute_until, undefined);
+});
+
+test('按天统计时间工具：天序号与起始时间戳可互相还原', () => {
+  const ts = 1767225600; // 任意 UTC 时刻
+  for (const offset of [0, 8 * 3600, -5 * 3600]) {
+    const day = I.dayIndexOf(ts, offset);
+    const start = I.dayStartTs(day, offset);
+    assert.ok(start <= ts && ts - start < 86400, '天起始时间应落在同一天内');
+    assert.equal(I.dayIndexOf(start, offset), day, '起始时间的天序号应还原为同一天');
+  }
+});
+
+test('PWA：manifest 声明与图标文件齐备（支持"添加到主屏幕"）', () => {
+  const root = nodePath.join(nodePath.dirname(fileURLToPath(import.meta.url)), '..');
+  const html = nodeFs.readFileSync(nodePath.join(root, 'public/index.html'), 'utf8');
+  assert.match(html, /rel="manifest"/, 'index.html 必须声明 manifest 才具备可安装性');
+  assert.match(html, /name="theme-color"/);
+
+  const mf = JSON.parse(nodeFs.readFileSync(nodePath.join(root, 'public/manifest.webmanifest'), 'utf8'));
+  assert.equal(mf.display, 'standalone');
+  assert.ok(mf.icons && mf.icons.length >= 1);
+  for (const ic of mf.icons) {
+    // 图标必须是同源真实文件：data URI 在部分平台（尤其 iOS）不被识别为可安装图标
+    assert.match(ic.src, /^\//, `图标 ${ic.src} 应为同源绝对路径`);
+    assert.ok(nodeFs.existsSync(nodePath.join(root, 'public', ic.src)), `图标文件缺失：${ic.src}`);
+  }
+  // CSP 未显式声明 manifest-src → 回落 default-src 'self'，同源 manifest 与图标不受阻
+  const headers = nodeFs.readFileSync(nodePath.join(root, 'public/_headers'), 'utf8');
+  assert.doesNotMatch(headers, /manifest-src/, '未设 manifest-src 时回落 default-src（self 已覆盖同源）');
+});

@@ -37,6 +37,26 @@ export function metricsFineDays(env) {
 export const ONLINE_GRACE_SLOW_S = 180;
 export const ONLINE_GRACE_FAST_S = 15;
 
+// ---- 按天统计（流量累计 / 可用率）----
+// 天序号 = floor((unix 秒 + 时区偏移) / 86400)。
+// 时区偏移来自 STATS_TZ_OFFSET_MINUTES（默认 0 = UTC）：让"月度流量"按本地时区结算。
+// 若固定 UTC，则 UTC+8 用户每月 1 号 00:00~08:00 的流量会被算进上个月，月底对不上账。
+export const DAY_SECONDS = 86400;
+export function statsTzOffsetSec(env) {
+  const m = Number(env && env.STATS_TZ_OFFSET_MINUTES);
+  return Number.isFinite(m) ? Math.floor(m * 60) : 0;
+}
+export function dayIndexOf(tsSec, offsetSec = 0) {
+  return Math.floor((Number(tsSec) + offsetSec) / DAY_SECONDS);
+}
+export function dayStartTs(day, offsetSec = 0) {
+  return Number(day) * DAY_SECONDS - offsetSec;
+}
+// 按天累加时"仍视为在线"的最大上报间隔（秒）：慢采 120s × 2.5 倍余量。
+// 超过它说明中间存在离线——离线段只补可用率分母（total_min），不补分子，
+// 否则"离线 3 天后一帧上报"会把整段离线时间算成在线，可用率永远显示 100%。
+export const DAY_ONLINE_GAP_S = 300;
+
 // 解析面板用户：PANEL_USERS="alice:pass1,bob:pass2"；未设置时回退 PANEL_PASSWORD 单管理员
 //（routes 登录用；__internals 测试导出用）
 // 硬约束：逗号是用户分隔符，密码/用户名均不得含逗号；含逗号会静默拆成多个条目

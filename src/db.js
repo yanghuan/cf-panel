@@ -1,5 +1,5 @@
 // cf-panel — D1 数据访问层：设置缓存、告警配置、监控历史查询
-import { ARCHIVE_AFTER_MIN, metricsDownsampleMin } from './config.js';
+import { ARCHIVE_AFTER_MIN, metricsDownsampleMin, dayIndexOf, dayStartTs } from './config.js';
 import { kvGet, safeJson, doMetrics } from './utils.js';
 
 // 设置缓存（避免告警检查每次上报读 D1），TTL 300s（> 慢采间隔 120s，慢采每帧不再必 miss），
@@ -37,6 +37,29 @@ export async function getAlertCfg(env) {
     load: Number(a.load) || 0,
     cooldown_min: Number(a.cooldown_min) || 30,
     offline_after_s: Number(a.offline_after_s) || 180,
+    // 免打扰：计划内重启/割接前设置，到期自动恢复（不落库清理，判定时按当前时间比较）
+    mute_until: Number(a.mute_until) || 0,
+    muted: Number(a.mute_until) > 0 && Date.now() / 1000 < Number(a.mute_until),
+  };
+}
+
+// 最终生效的告警配置：全局 settings.alerts 为基线，逐机 alert_override 覆盖其上。
+// 只覆盖「阈值类」维度——webhook 渠道/模板/冷却是全局基础设施与防刷保护，
+// 逐机化会让告警状态（冷却水位、离线状态机）按机器分裂，收益不抵复杂度。
+// overrideRaw 是 servers.alert_override 原始 JSON 字符串，随上报帧一起送来
+// （见 report.js）：告警判定因此无需每帧回查 D1。
+export function resolveAlertCfg(base, overrideRaw) {
+  const ov = safeJson(overrideRaw);
+  if (!ov || typeof ov !== 'object') return base;
+  const posNum = (v) => (Number.isFinite(Number(v)) && Number(v) > 0 ? Number(v) : null);
+  const nonNeg = (v) => (Number.isFinite(Number(v)) && Number(v) >= 0 ? Number(v) : null);
+  return {
+    ...base,
+    cpu_pct: posNum(ov.cpu_pct) ?? base.cpu_pct,
+    mem_pct: posNum(ov.mem_pct) ?? base.mem_pct,
+    disk_pct: posNum(ov.disk_pct) ?? base.disk_pct,
+    load: nonNeg(ov.load) ?? base.load, // 显式 0 = 关闭该维度告警
+    offline_after_s: posNum(ov.offline_after_s) ?? base.offline_after_s,
   };
 }
 
@@ -106,4 +129,21 @@ export async function queryCustomMetrics(env, serverId, hours) {
     (custom[row.name] = custom[row.name] || []).push({ ts: row.ts, value: row.value });
   }
   return custom;
+}
+
+// 按天统计查询（流量累计 / 可用率 / 重启）：读 metrics_day（1 行/机/天，保留 3 年）。
+// 与 queryMonitorRows（分钟级、30 天、7 天后降采样）是两个量级的账：
+// 月度流量和可用率必须查天账——分钟表跨不了月，且离线期间无行、反推不出可用率。
+// ts 为当天起始 unix 秒，供前端直接 new Date(ts*1000) 格式化。
+export async function queryDayStats(env, serverId, days, offsetSec = 0) {
+  const sinceDay = dayIndexOf(Math.floor(Date.now() / 1000), offsetSec) - (days - 1);
+  const r = await env.DB.prepare(
+    'SELECT day, bytes_in, bytes_out, online_min, total_min, uptime_min, restarts FROM metrics_day WHERE server_id = ? AND day >= ? ORDER BY day'
+  ).bind(serverId, sinceDay).all();
+  return r.results.map((x) => ({
+    ...x,
+    ts: dayStartTs(x.day, offsetSec),
+    // 可用率 = 在线分钟 / 纳入统计分钟；分母为 0（当天无数据）时返回 null，前端显示 '-'
+    availability: x.total_min > 0 ? (x.online_min / x.total_min) * 100 : null,
+  }));
 }

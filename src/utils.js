@@ -149,7 +149,28 @@ export function sanitizeAlerts(a) {
   if (a.load !== undefined) out.load = num(a.load, 0);
   if (a.cooldown_min !== undefined) out.cooldown_min = num(a.cooldown_min, 30);
   if (a.offline_after_s !== undefined) out.offline_after_s = num(a.offline_after_s, 180);
+  // 免打扰截止时间（unix 秒）：计划内重启/割接时设置，到期自动恢复。
+  // 仅接受未来时刻——过去的截止时间无意义，落库即静默失效，不如不存。
+  if (a.mute_until !== undefined) {
+    const mu = Number(a.mute_until);
+    if (Number.isFinite(mu) && mu > 0) out.mute_until = Math.floor(mu);
+  }
   return out;
+}
+
+// 逐机告警阈值覆盖（servers.alert_override）：只保留允许覆盖的维度，
+// 非法值直接丢弃（等价于"继承全局"），避免把 {"cpu_pct":null} 之类的噪音写进库。
+// 与全局阈值的差异：load 允许显式 0（= 关闭该维度告警），其余维度必须 > 0 才有意义。
+const ALERT_OVERRIDE_KEYS = ['cpu_pct', 'mem_pct', 'disk_pct', 'load', 'offline_after_s'];
+export function sanitizeAlertOverride(raw) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const out = {};
+  for (const k of ALERT_OVERRIDE_KEYS) {
+    const v = Number(raw[k]);
+    if (!Number.isFinite(v)) continue;
+    if (k === 'load' ? v >= 0 : v > 0) out[k] = v;
+  }
+  return Object.keys(out).length ? out : null; // 全非法 → null（不存，走全局）
 }
 // 任何秘密（agent key / PAT token）统一用 HMAC 哈希后落库
 // 哈希密钥与 JWT 签名密钥隔离（纵深防御）：优先 HASH_SECRET，未配置时回退 JWT_SECRET（平滑迁移）。

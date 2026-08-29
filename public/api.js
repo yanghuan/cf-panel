@@ -97,6 +97,10 @@
       this.send(body);
     }
 
+    // 递归搜索（find）：从 path 起下钻匹配文件名通配符，结果经 onFindDone 回调。
+    // 与 list 的差别：list 只看当前目录，find 递归——大目录树里定位文件靠它。
+    find(path, pattern) { this.send({ type: 'find', path, pattern: String(pattern || '').trim() }); }
+
     _onMessage(ev) {
       if (typeof ev.data !== 'string') {
         // Binary 混合帧：read_result（JSON 头\n + 原始字节）
@@ -126,6 +130,12 @@
         if (this.h.onTouchDone) this.h.onTouchDone();
       } else if (j.type === 'move_result' && j.ok) {
         if (this.h.onMoveDone) this.h.onMoveDone(j.path);
+      } else if (j.type === 'copy_result' && j.ok) {
+        if (this.h.onCopyDone) this.h.onCopyDone(j.path);
+      } else if (j.type === 'chmod_result' && j.ok) {
+        if (this.h.onChmodDone) this.h.onChmodDone(j.mode);
+      } else if (j.type === 'find_result' && j.ok) {
+        if (this.h.onFindDone) this.h.onFindDone(j.hits, !!j.truncated, j.scanned);
       } else if (j.type === 'delete_result' && j.ok) {
         // zip 下载完成的临时文件清理（silent 标志，不触发 UI 刷新）
         if (this._zipCleanup) this._zipCleanup = false;
@@ -231,6 +241,10 @@
     touch(path) { this.send({ type: 'touch', path }); }
     // 移动（跨目录，同分区原子 rename；跨分区仅文件回退 copy+delete；目标已存在拒绝）
     move(path, dest) { this.send({ type: 'move', path, dest }); }
+    // 复制（文件 / 目录递归，保留原件；目标已存在由 agent 拒绝，复制到自身子目录同样拒绝）
+    copy(path, dest) { this.send({ type: 'copy', path, dest }); }
+    // 权限修改：Unix 传 mode（如 0o755），Windows 传 readonly 布尔（无 POSIX mode）
+    chmod(path, mode, readonly) { this.send({ type: 'chmod', path, mode, readonly }); }
     // 在线编辑：分段拉取全文（≤1MB 由调用方限制），onEditLoaded(path, text) 回调。
     // 已有读取进行中：同文件视为重复点击静默忽略；不同文件顶替重开（旧读取的迟到响应
     // 会因 editState.path 不匹配而落到下载分支被丢弃，无副作用）

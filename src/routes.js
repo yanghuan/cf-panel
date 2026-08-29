@@ -1,6 +1,6 @@
 // cf-panel — 路由层：REST API（handleApi）+ MCP（handleMcp）+ WebSocket 路由（handleWs）
 import {
-  SCOPE_READ, SCOPE_EXEC, PAT_PREFIX, SHARDS, parsePanelUsers,
+  SCOPE_READ, SCOPE_EXEC, PAT_PREFIX, SHARDS, parsePanelUsers, statsTzOffsetSec,
 } from './config.js';
 
 // 本模块专用常量（PAT scope 白名单 / MCP 协议与工具，就近定义便于对照使用代码）
@@ -81,7 +81,7 @@ const MCP_TOOLS = [
   },
   {
     name: 'update_server',
-    description: '修改服务器名称/分组/排序。仅管理员。提供 server_id 或 server_name 之一（重名时须用 server_id）；只需传要修改的字段。',
+    description: '修改服务器名称/分组/排序/告警阈值覆盖。仅管理员。提供 server_id 或 server_name 之一（重名时须用 server_id）；只需传要修改的字段。alert_override 用于逐机覆盖告警阈值（不传=保持不变，传 null=清除覆盖回退全局）。',
     inputSchema: {
       type: 'object',
       properties: {
@@ -90,6 +90,22 @@ const MCP_TOOLS = [
         name: { type: 'string', description: '新名称（可选）' },
         group: { type: 'string', description: '新分组（可选）' },
         sort_order: { type: 'integer', description: '新排序序号（可选）' },
+        alert_override: {
+          type: 'object',
+          description: '逐机告警阈值覆盖（可选）：cpu_pct/mem_pct/disk_pct/offline_after_s 需 >0，load 可设 0 关闭该维度；未出现的键继承全局。传 null 或空对象 = 清除覆盖',
+        },
+      },
+      required: [],
+    },
+  },
+  {
+    name: 'rotate_agent_key',
+    description: '轮换某台服务器的 agent key（仅管理员）：旧 key 立即失效并断开其现有连接，监控历史与审计记录全部保留——用于 key 泄露或误发后的处置（此前只能删除服务器重建，会清空历史）。返回新 agent_key（明文只返回一次）与 wss_base 部署地址。注意：key 是 agent 侧配置的静态凭据，服务端无法推送，须人工到目标机更新 AGENT_KEY 并重启 agent 后才会重新上线。提供 server_id 或 server_name 之一（重名时须用 server_id）。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        server_id: { type: 'integer', description: '服务器 ID' },
+        server_name: { type: 'string', description: '服务器名称（重名时拒绝，须用 server_id）' },
       },
       required: [],
     },
@@ -157,7 +173,7 @@ const MCP_TOOLS = [
         site_name: { type: 'string', description: '站点名称（留空用默认）' },
         notice: { type: 'string', description: '公告（留空隐藏）' },
         geo_lookup: { type: 'boolean', description: 'IP 归属地查询（将公网 IP 发送到第三方地理服务）' },
-        alerts: { type: 'object', description: '告警配置对象（enabled/method/url/token/body/content_type/headers/cpu/mem/disk/load/cooldown_min/offline_after_s）' },
+        alerts: { type: 'object', description: '告警配置对象（enabled/method/url/token/body/content_type/headers/cpu/mem/disk/load/cooldown_min/offline_after_s/mute_until）。mute_until 为免打扰截止的 unix 秒（计划内重启/割接前设置，到期自动恢复）；阈值类维度还支持逐机覆盖，见 update_server 的 alert_override' },
       },
       required: [],
     },
@@ -165,11 +181,11 @@ const MCP_TOOLS = [
 ];
 import {
   json, err, requireJwtSecret, signJwt, randomHex, sha256Hex, hashSecret, safeJson,
-  kvGet, kvPut, sanitizeAlerts, parseRangeHours, sendWebhookRaw,
+  kvGet, kvPut, sanitizeAlerts, sanitizeAlertOverride, parseRangeHours, sendWebhookRaw,
   doMetrics, doForShard, doPanel, shardForServerId, makeStreamId, shardFromStreamId,
   signUploadToken, verifyUploadToken,
 } from './utils.js';
-import { queryMonitorRows, queryCustomMetrics, kvClearCache } from './db.js';
+import { queryMonitorRows, queryCustomMetrics, queryDayStats, kvClearCache } from './db.js';
 import { authUser, isAdmin, canAccessServer, canExec, listServersWithState, serverListCache } from './auth.js';
 import { serverRowCache, lastSeenWrite, customWritten } from './report.js';
 
@@ -312,8 +328,40 @@ function agentWssBase(url) {
   return `${url.protocol === 'http:' ? 'ws' : 'wss'}://${url.host}/ws/agent`;
 }
 
+// 通用审计写入（best-effort）：审计是旁路留痕，写入失败绝不得改变主流程结果——
+// 否则一次 D1 抖动会让登录/鉴权跟着失败，可用性被旁路系统绑架。
+async function auditLog(env, { userId = 0, username = '', ip = '', action, serverId = null, detail = null }) {
+  try {
+    await env.DB.prepare(
+      'INSERT INTO audit_logs (user_id, username, client_ip, action, target_server_id, detail) VALUES (?,?,?,?,?,?)'
+    ).bind(userId, username, ip, action, serverId, detail).run();
+    return true;
+  } catch (e) {
+    console.error(`audit failed (${action}):`, e);
+    return false;
+  }
+}
+
+// 审计写入节流（按 key，60s 一窗口）：失败路径（密码爆破、无效 token 扫描）由外部
+// 反复触发，逐次写一行会把审计表本身变成写放大源——登录接口有限流，但其他鉴权失败
+// 入口没有。节流后同一来源同一动作每窗口只留一条，量级足够做安全研判。
+const AUDIT_THROTTLE_S = 60;
+const auditThrottle = new Map(); // key -> 上次写入秒（实例内存；evict 后仅偶发多写一行）
+// 测试隔离：模块级静态状态，跨测试需清空（见 index.js __internals.__reset）
+export function __clearAuditThrottle() {
+  auditThrottle.clear();
+}
+async function auditLogThrottled(env, key, fields) {
+  const now = Math.floor(Date.now() / 1000);
+  const last = auditThrottle.get(key) || 0;
+  if (now - last < AUDIT_THROTTLE_S) return false;
+  if (auditThrottle.size > 10000) auditThrottle.clear(); // 防 Map 无限增长
+  auditThrottle.set(key, now);
+  return auditLog(env, fields);
+}
+
 // DO 会话创建与 D1 不支持跨资源事务。会话已启动后审计失败时采用 best-effort：
-// 记录服务端错误但仍把可用 session 返回客户端，避免“API 500、远端 PTY 已启动”的孤儿会话。
+// 记录服务端错误但仍把可用 session 返回客户端，避免"API 500、远端 PTY 已启动"的孤儿会话。
 async function auditSessionOpen(env, user, request, action, serverId) {
   try {
     await env.DB.prepare('INSERT INTO audit_logs (user_id, username, client_ip, action, target_server_id) VALUES (?,?,?,?,?)')
@@ -322,6 +370,53 @@ async function auditSessionOpen(env, user, request, action, serverId) {
   } catch (e) {
     console.error(`${action} audit failed for server ${serverId}:`, e);
   }
+}
+
+// 删除服务器的级联清理（D1 数据 → 上报侧内存状态 → 各 DO 残留）。
+// 单删（DELETE /api/servers/:id）与批量删（POST /api/servers/batch op=delete）共用，
+// 避免两处级联逻辑漂移——漏掉任何一步都会留下"数据已删但 agent 还连着"的幽灵状态。
+// 返回被删服务器名；不存在返回 null（调用方据此区分 404）。
+async function deleteServerCascade(env, user, ip, id) {
+  const server = await env.DB.prepare('SELECT name FROM servers WHERE id = ?').bind(id).first();
+  if (!server) return null;
+  // 1) 清历史数据 + 删服务器 + 审计同一事务（D1 batch 原子：任一失败整体回滚，
+  // 不再出现"服务器已删但返回 500"或"服务器残留但提示成功"的中间态）
+  await env.DB.batch([
+    env.DB.prepare('DELETE FROM metrics_min WHERE server_id = ?').bind(id),
+    env.DB.prepare('DELETE FROM metrics_custom WHERE server_id = ?').bind(id),
+    env.DB.prepare('DELETE FROM metrics_day WHERE server_id = ?').bind(id),
+    env.DB.prepare('DELETE FROM servers WHERE id = ?').bind(id),
+    env.DB.prepare('INSERT INTO audit_logs (user_id, username, client_ip, action, target_server_id, detail) VALUES (?,?,?,?,?,?)')
+      .bind(user.id, user.username, ip, 'server.delete', id, server.name),
+  ]);
+  serverListCacheClear();
+  // 2) 清理上报侧残留状态（防内存 Map 随服务器删除无限增长；残留条目本身无害）
+  lastSeenWrite.delete(id);
+  customWritten.delete(id);
+  serverRowCache.delete(id);
+  // 3) MetricsDO 清内存热区（避免残留数据被 alarm 重新归档回 D1）
+  try {
+    await doMetrics(env).fetch('https://do.internal/drop', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ server_id: id }),
+    });
+  } catch { /* 热区清理失败不影响删除 */ }
+  // 4) 通知各分片 DO 断开该 agent 的常驻控制通道与活跃会话
+  for (let i = 0; i < SHARDS; i++) {
+    try {
+      await doForShard(env, i).fetch('https://do.internal/rpc/drop_server', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ serverId: id }),
+      });
+    } catch { /* 分片暂不可达；agent 重连会因 key 失效被拒 */ }
+  }
+  // 5) 清 PanelDO 列表缓存（避免已删服务器最多 4.5s 内仍出现在观看者推送列表）
+  try {
+    await doPanel(env).fetch('https://do.internal/rpc/clear_list_cache', { method: 'POST' });
+  } catch { /* 清缓存失败由 listCache TTL 兜底 */ }
+  return server.name;
 }
 
 // 返回剩余锁定秒数；未锁定返回 null（并惰性清理过期窗口）
@@ -395,6 +490,14 @@ async function handleApiInner(request, env) {
   const method = request.method;
   countApi(method, path);
 
+  // GET /api/healthz —— 存活探针：不鉴权、不查 D1、不碰 DO。
+  // 刻意不接触任何依赖：探针的语义是"这个 Worker 是否在正常响应"，
+  // 若把 DB/DO 健康度卷进来，一次 D1 抖动会把"面板活着但库慢"误报成"面板挂了"——
+  // 后者该由 /api/usage、/api/me 或外部监控分别观测。
+  if (method === 'GET' && path === '/api/healthz') {
+    return json({ ok: true, ts: Math.floor(Date.now() / 1000) });
+  }
+
   // POST /api/login —— 面板登录（PANEL_USERS 多用户 或 PANEL_PASSWORD 单管理员）
   // 暴力破解防护：应用层按 IP 失败限流（纵深防御，默认生效）；
   // 生产仍强烈建议前置 Cloudflare Access / Rate Limiting（跨边缘实例更一致）。
@@ -404,6 +507,10 @@ async function handleApiInner(request, env) {
     const ip = clientIp(request);
     const lockRemain = loginLockRemaining(ip);
     if (lockRemain != null) {
+      // 锁定期间不读请求体（保持既有 DoS 面：超限请求不解析 body），故只留 IP 痕迹
+      await auditLogThrottled(env, `login.locked:${ip}`, {
+        ip, action: 'login.locked', detail: `retry in ${lockRemain}s`,
+      });
       return json({ error: `too many failed logins, retry in ${lockRemain}s` }, 429, { 'retry-after': String(lockRemain) });
     }
     const body = await request.json().catch(() => ({}));
@@ -417,12 +524,18 @@ async function handleApiInner(request, env) {
       : users.findIndex((u) => u.password === password);
     if (userIdx < 0) {
       recordLoginFail(ip);
+      // 记尝试的用户名（绝不记密码）：区分"撞库特定账号"与"泛扫密码"的关键信号
+      await auditLogThrottled(env, `login.failed:${ip}`, {
+        username: inputUsername || '(空)', ip, action: 'login.failed',
+      });
       return err('bad password', 401);
     }
     loginFails.delete(ip); // 登录成功：清零该 IP 失败计数
     const uid = userIdx + 1;
     const username = users[userIdx].username;
     const token = await signJwt({ uid, username, role: 1, exp: Math.floor(Date.now() / 1000) + 86400 }, env);
+    // 成功不节流：登录成功是低频事件，且每次成功都应有完整留痕（谁在何时从哪登录）
+    await auditLog(env, { userId: uid, username, ip, action: 'login.success' });
     return json({ token, user: { id: uid, username, role: 1 } });
   }
 
@@ -436,8 +549,16 @@ async function handleApiInner(request, env) {
   // JWT_SECRET 是整个面板鉴权的必需安全边界；缺失时 PAT 也不得绕过配置错误继续访问。
   const configError = requireJwtSecret(env);
   if (configError) return configError;
+  const ip = clientIp(request);
   const user = await authUser(request, env);
-  if (!user) return err('unauthorized', 401);
+  if (!user) {
+    // 无效/过期/已撤销凭据的探测此前完全无痕。路径经归一化（动态 id → :id），
+    // 既保留"在扫哪个接口"的情报，又不把实体 id 写进审计。
+    await auditLogThrottled(env, `auth.failed:${ip}`, {
+      ip, action: 'auth.failed', detail: `${method} ${normalizeApiPath(path)}`,
+    });
+    return err('unauthorized', 401);
+  }
 
   // GET /api/me —— 当前用户
   if (method === 'GET' && path === '/api/me') {
@@ -589,57 +710,85 @@ async function handleApiInner(request, env) {
     });
   }
 
-  // PATCH /api/servers/:id —— 仅管理员；修改名称/分组/序号（不动 agent key，在线状态不受影响）
-  if (method === 'PATCH' && path.startsWith('/api/servers/')) {
+  // POST /api/servers/batch —— 批量操作（仅管理员）：机器规模上来后的高频运维动作。
+  // 支持 update-group（批量归入分组）/ delete（批量下线）。
+  // 刻意不收 agent-update：更新是"关会话 + 传二进制 + 远端自替换"的高危串行操作，
+  // 前端逐台串行调用单接口更可控（能看到每台进度与失败原因、天然互斥），
+  // 塞进批量只会让"部分失败"的语义变模糊。
+  // 返回逐项结果而非整体成败：批量天然允许部分失败（某台已被删/不存在），
+  // 前端需要知道"哪几台成了"，而不是一个笼统的 500。
+  if (method === 'POST' && path === '/api/servers/batch') {
     if (!isAdmin(user)) return err('forbidden', 403);
-    const id = Number(path.split('/')[3]) || 0;
-    const server = await env.DB.prepare('SELECT name, "group", display_index FROM servers WHERE id = ?').bind(id).first();
-    if (!server) return err('not found', 404);
     const body = await request.json().catch(() => ({}));
-    const name = body.name !== undefined ? String(body.name).trim() : server.name;
-    if (!name) return err('name required');
-    const group = body.group !== undefined ? String(body.group).trim() : server.group;
-    const displayIndex = body.sort_order !== undefined ? Number(body.sort_order) || 0 : server.display_index;
-    // 更新 + 审计同一事务（D1 batch 原子）
-    await env.DB.batch([
-      env.DB.prepare('UPDATE servers SET name = ?, "group" = ?, display_index = ? WHERE id = ?')
-        .bind(name, group, displayIndex, id),
-      env.DB.prepare('INSERT INTO audit_logs (user_id, username, client_ip, action, target_server_id, detail) VALUES (?,?,?,?,?,?)')
-        .bind(user.id, user.username, clientIp(request), 'server.update', id, `${server.name} → ${name}`),
-    ]);
-    serverListCacheClear();
-    return json({ ok: true, id, name, group, display_index: displayIndex });
+    const op = String(body.op || '');
+    const ids = Array.isArray(body.ids)
+      ? [...new Set(body.ids.map(Number).filter((n) => Number.isInteger(n) && n > 0))]
+      : [];
+    if (!['update-group', 'delete'].includes(op)) return err('invalid op (update-group | delete)', 400);
+    if (!ids.length) return err('ids required', 400);
+    if (ids.length > 100) return err('too many ids (max 100)', 400);
+
+    const results = [];
+    if (op === 'update-group') {
+      const group = String(body.group || '').trim();
+      if (group.length > 100) return err('group too long', 400);
+      // 单事务：全成功或全回滚。分组是列表的展示维度，部分生效会让列表呈现撕裂态
+      const stmts = ids.map((id) => env.DB.prepare('UPDATE servers SET "group" = ? WHERE id = ?').bind(group, id));
+      stmts.push(
+        env.DB.prepare('INSERT INTO audit_logs (user_id, username, client_ip, action, detail) VALUES (?,?,?,?,?)')
+          .bind(user.id, user.username, ip, 'server.batch_update_group', `${ids.length} 台 → ${group || '未分组'}（ids=${ids.join(',')}）`),
+      );
+      await env.DB.batch(stmts);
+      serverListCacheClear();
+      results.push(...ids.map((id) => ({ id, ok: true })));
+    } else if (op === 'delete') {
+      // 逐台串行：级联清理含多次 DO 调用，并发会让分片 drop_server 互相踩踏；
+      // 删除是低频人工操作，串行开销可忽略，换取清晰的错误归因
+      for (const id of ids) {
+        try {
+          const name = await deleteServerCascade(env, user, ip, id);
+          results.push(name === null ? { id, ok: false, error: 'not found' } : { id, ok: true, name });
+        } catch (e) {
+          results.push({ id, ok: false, error: String((e && e.message) || e).slice(0, 200) });
+        }
+      }
+    }
+    const failed = results.filter((r) => !r.ok).length;
+    return json({
+      ok: failed === 0,
+      op,
+      results,
+      summary: { total: results.length, success: results.length - failed, failed },
+    });
   }
 
-  // DELETE /api/servers/:id —— 仅管理员；清理历史数据 + 审计 + 通知 DO 断开 agent
-  if (method === 'DELETE' && path.startsWith('/api/servers/')) {
+  // POST /api/servers/:id/rotate-key —— 轮换 agent key（仅管理员）。
+  // 用途：key 泄露/误发后的处置路径。此前唯一手段是删服务器重建，会连带清空
+  // metrics_min / metrics_custom 全部监控历史与在线账；轮换只替换身份凭证，
+  // 历史数据、分组、序号、审计记录全部保留。
+  // 旧 key 立即失效：agent_key_id（key 指纹）变更 → 反查不到服务器 → 401；
+  // 已建立的旧控制通道由 drop_server 主动断开（与删除路径同一机制，但不删任何数据）。
+  // 注意：轮换后须人工到目标机更新 AGENT_KEY 并重启 agent——key 是 agent 侧配置的静态凭据，
+  // 服务端无法推送新 key 给未连接的 agent。
+  const rotateMatch = path.match(/^\/api\/servers\/(\d+)\/rotate-key$/);
+  if (method === 'POST' && rotateMatch) {
     if (!isAdmin(user)) return err('forbidden', 403);
-    const id = Number(path.split('/')[3]) || 0;
-    const server = await env.DB.prepare('SELECT name FROM servers WHERE id = ?').bind(id).first();
+    const id = Number(rotateMatch[1]) || 0;
+    const server = await env.DB.prepare('SELECT id, name FROM servers WHERE id = ?').bind(id).first();
     if (!server) return err('not found', 404);
-    // 1+2+3) 清历史数据 + 删服务器 + 审计同一事务（D1 batch 原子：任一失败整体回滚，
-    // 不再出现"服务器已删但返回 500"或"服务器残留但提示成功"的中间态）
+    const key = randomHex(32);
+    const keyId = await sha256Hex(key);
+    const hash = await hashSecret(key, env);
+    // 更新 + 审计同一事务（D1 batch 原子）：轮换是安全处置动作，
+    // 绝不允许出现"key 已换但没有审计留痕"的取证空白
     await env.DB.batch([
-      env.DB.prepare('DELETE FROM metrics_min WHERE server_id = ?').bind(id),
-      env.DB.prepare('DELETE FROM metrics_custom WHERE server_id = ?').bind(id),
-      env.DB.prepare('DELETE FROM servers WHERE id = ?').bind(id),
+      env.DB.prepare('UPDATE servers SET agent_key_id = ?, agent_key_hash = ? WHERE id = ?')
+        .bind(keyId, hash, id),
       env.DB.prepare('INSERT INTO audit_logs (user_id, username, client_ip, action, target_server_id, detail) VALUES (?,?,?,?,?,?)')
-        .bind(user.id, user.username, clientIp(request), 'server.delete', id, server.name),
+        .bind(user.id, user.username, ip, 'server.rotate_key', id, server.name),
     ]);
     serverListCacheClear();
-    // 清理上报侧残留状态（防内存 Map 随服务器删除无限增长；残留条目本身无害）
-    lastSeenWrite.delete(id);
-    customWritten.delete(id);
-    serverRowCache.delete(id);
-    // 4) MetricsDO 清内存热区（避免残留数据被 alarm 重新归档回 D1）
-    try {
-      await doMetrics(env).fetch('https://do.internal/drop', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ server_id: id }),
-      });
-    } catch { /* 热区清理失败不影响删除 */ }
-    // 5) 通知各分片 DO 断开该 agent 的常驻控制通道与活跃会话
+    serverRowCache.delete(id); // 行缓存不含 key，但节点身份已变，避免陈旧行影响上报路径
     for (let i = 0; i < SHARDS; i++) {
       try {
         await doForShard(env, i).fetch('https://do.internal/rpc/drop_server', {
@@ -647,12 +796,50 @@ async function handleApiInner(request, env) {
           headers: { 'content-type': 'application/json' },
           body: JSON.stringify({ serverId: id }),
         });
-      } catch { /* 分片暂不可达；agent 重连会因 key 失效被拒 */ }
+      } catch { /* 分片暂不可达；旧 key 重连会因指纹不存在被 401 拒绝 */ }
     }
-    // 6) 清 PanelDO 列表缓存（避免已删服务器最多 4.5s 内仍出现在观看者推送列表）
-    try {
-      await doPanel(env).fetch('https://do.internal/rpc/clear_list_cache', { method: 'POST' });
-    } catch { /* 清缓存失败由 listCache TTL 兜底 */ }
+    return json({ agent_key: key, wss_base: agentWssBase(url) });
+  }
+
+  // PATCH /api/servers/:id —— 仅管理员；修改名称/分组/序号/告警覆盖（不动 agent key，在线状态不受影响）
+  if (method === 'PATCH' && path.startsWith('/api/servers/')) {
+    if (!isAdmin(user)) return err('forbidden', 403);
+    const id = Number(path.split('/')[3]) || 0;
+    const server = await env.DB.prepare('SELECT name, "group", display_index, alert_override FROM servers WHERE id = ?').bind(id).first();
+    if (!server) return err('not found', 404);
+    const body = await request.json().catch(() => ({}));
+    const name = body.name !== undefined ? String(body.name).trim() : server.name;
+    if (!name) return err('name required');
+    const group = body.group !== undefined ? String(body.group).trim() : server.group;
+    const displayIndex = body.sort_order !== undefined ? Number(body.sort_order) || 0 : server.display_index;
+    // alert_override：传 null/空对象 = 清除覆盖回退全局；不传该字段 = 保持原值不变。
+    // 清洗后全非法 → null（不存噪音，按全局阈值判定）
+    let overrideJson = server.alert_override;
+    if (body.alert_override !== undefined) {
+      const cleaned = sanitizeAlertOverride(body.alert_override);
+      overrideJson = cleaned ? JSON.stringify(cleaned) : null;
+    }
+    // 更新 + 审计同一事务（D1 batch 原子）
+    await env.DB.batch([
+      env.DB.prepare('UPDATE servers SET name = ?, "group" = ?, display_index = ?, alert_override = ? WHERE id = ?')
+        .bind(name, group, displayIndex, overrideJson, id),
+      env.DB.prepare('INSERT INTO audit_logs (user_id, username, client_ip, action, target_server_id, detail) VALUES (?,?,?,?,?,?)')
+        .bind(user.id, user.username, clientIp(request), 'server.update', id, `${server.name} → ${name}`),
+    ]);
+    serverListCacheClear();
+    // 覆盖值随上报帧下发（report.js 行缓存），显式清缓存使它立即生效而非等 60s TTL
+    serverRowCache.delete(id);
+    return json({
+      ok: true, id, name, group, display_index: displayIndex, alert_override: safeJson(overrideJson),
+    });
+  }
+
+  // DELETE /api/servers/:id —— 仅管理员；级联清理（D1 历史数据 + 各 DO 残留 + 审计）
+  if (method === 'DELETE' && path.startsWith('/api/servers/')) {
+    if (!isAdmin(user)) return err('forbidden', 403);
+    const id = Number(path.split('/')[3]) || 0;
+    const name = await deleteServerCascade(env, user, ip, id);
+    if (name === null) return err('not found', 404);
     return json({ ok: true });
   }
 
@@ -714,11 +901,43 @@ async function handleApiInner(request, env) {
     return json({ system, custom });
   }
 
+  // GET /api/stats?server_id=&days= —— 按天统计（流量累计 / 可用率 / 重启次数）
+  // 数据源 metrics_day（1 行/机/天，保留 3 年），与 /api/monitor（分钟级、30 天、7 天后降采样）
+  // 是两个量级的账：月度流量与可用率必须查天账——分钟表跨不了月，且离线期间无行。
+  // days 默认 30，上限 1095（= 天账保留期 3 年），防超大区间拖慢查询
+  if (method === 'GET' && path === '/api/stats') {
+    const serverId = Number(url.searchParams.get('server_id')) || 0;
+    const days = Math.min(Math.max(Math.floor(Number(url.searchParams.get('days'))) || 30, 1), 1095);
+    const s = await env.DB.prepare('SELECT * FROM servers WHERE id = ?').bind(serverId).first();
+    if (!s) return err('not found', 404);
+    if (!canAccessServer(user, s)) return err('forbidden', 403);
+    const offset = statsTzOffsetSec(env);
+    const rows = await queryDayStats(env, serverId, days, offset);
+    const total = rows.reduce((acc, r) => {
+      acc.bytes_in += r.bytes_in || 0;
+      acc.bytes_out += r.bytes_out || 0;
+      acc.online_min += r.online_min || 0;
+      acc.total_min += r.total_min || 0;
+      acc.restarts += r.restarts || 0;
+      return acc;
+    }, { bytes_in: 0, bytes_out: 0, online_min: 0, total_min: 0, restarts: 0 });
+    return json({
+      server: { id: s.id, name: s.name },
+      days,
+      tz_offset_s: offset, // 前端据此还原"天"的本地日期边界
+      rows,
+      summary: {
+        ...total,
+        availability: total.total_min > 0 ? (total.online_min / total.total_min) * 100 : null,
+      },
+    });
+  }
+
   // ---- PAT 管理（仅管理员）----
   if (path === '/api/tokens') {
     if (!isAdmin(user)) return err('forbidden', 403);
     if (method === 'GET') {
-      const rows = await env.DB.prepare('SELECT id, name, scopes, server_ids, expires_at, created_at FROM api_tokens ORDER BY id').all();
+      const rows = await env.DB.prepare('SELECT id, name, scopes, server_ids, expires_at, last_used_at, created_at FROM api_tokens ORDER BY id').all();
       return json(rows.results);
     }
     if (method === 'POST') {
@@ -1143,35 +1362,11 @@ async function mcpAddServer(user, env, args, ip, url) {
 async function mcpDeleteServer(user, env, args, ip) {
   requireAdmin(user);
   const server = await mcpFindServer(env, args);
-  const id = server.id;
-  // 清历史数据 + 删服务器 + 审计同一事务（与 REST DELETE /api/servers/:id 完全一致）
-  await env.DB.batch([
-    env.DB.prepare('DELETE FROM metrics_min WHERE server_id = ?').bind(id),
-    env.DB.prepare('DELETE FROM metrics_custom WHERE server_id = ?').bind(id),
-    env.DB.prepare('DELETE FROM servers WHERE id = ?').bind(id),
-    env.DB.prepare('INSERT INTO audit_logs (user_id, username, client_ip, action, target_server_id, detail) VALUES (?,?,?,?,?,?)')
-      .bind(user.id, user.username, ip, 'server.delete', id, server.name),
-  ]);
-  serverListCacheClear();
-  lastSeenWrite.delete(id);
-  customWritten.delete(id);
-  serverRowCache.delete(id);
-  try {
-    await doMetrics(env).fetch('https://do.internal/drop', {
-      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ server_id: id }),
-    });
-  } catch { /* 热区清理失败不影响删除 */ }
-  for (let i = 0; i < SHARDS; i++) {
-    try {
-      await doForShard(env, i).fetch('https://do.internal/rpc/drop_server', {
-        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ serverId: id }),
-      });
-    } catch { /* 分片暂不可达；agent 重连会因 key 失效被拒 */ }
-  }
-  try {
-    await doPanel(env).fetch('https://do.internal/rpc/clear_list_cache', { method: 'POST' });
-  } catch { /* 清缓存失败由 listCache TTL 兜底 */ }
-  return { ok: true, server_id: id, name: server.name };
+  // 级联清理与 REST 单删共用同一实现：此前是两份会各自漂移的副本
+  //（MCP 版就漏过 metrics_day 之类的新增表清理）
+  const name = await deleteServerCascade(env, user, ip, server.id);
+  if (name === null) throw new Error('server not found'); // mcpFindServer 刚查到，理论不可达
+  return { ok: true, server_id: server.id, name };
 }
 
 async function mcpUpdateServer(user, env, args, ip) {
@@ -1181,19 +1376,63 @@ async function mcpUpdateServer(user, env, args, ip) {
   if (!name) throw new Error('name required');
   const group = args.group !== undefined ? String(args.group).trim() : server.group;
   const displayIndex = args.sort_order !== undefined ? Number(args.sort_order) || 0 : server.display_index;
+  // alert_override：null/空对象 = 清除覆盖回退全局；不传 = 保持原值（与 REST PATCH 同语义）
+  let overrideJson = server.alert_override;
+  if (args.alert_override !== undefined) {
+    const cleaned = sanitizeAlertOverride(args.alert_override);
+    overrideJson = cleaned ? JSON.stringify(cleaned) : null;
+  }
   await env.DB.batch([
-    env.DB.prepare('UPDATE servers SET name = ?, "group" = ?, display_index = ? WHERE id = ?')
-      .bind(name, group, displayIndex, server.id),
+    env.DB.prepare('UPDATE servers SET name = ?, "group" = ?, display_index = ?, alert_override = ? WHERE id = ?')
+      .bind(name, group, displayIndex, overrideJson, server.id),
     env.DB.prepare('INSERT INTO audit_logs (user_id, username, client_ip, action, target_server_id, detail) VALUES (?,?,?,?,?,?)')
       .bind(user.id, user.username, ip, 'server.update', server.id, `${server.name} → ${name}`),
   ]);
   serverListCacheClear();
-  return { ok: true, server_id: server.id, name, group, display_index: displayIndex };
+  serverRowCache.delete(server.id); // 覆盖值随上报帧下发，清缓存立即生效
+  return {
+    ok: true, server_id: server.id, name, group, display_index: displayIndex, alert_override: safeJson(overrideJson),
+  };
+}
+
+// 轮换 agent key（与 REST POST /api/servers/:id/rotate-key 完全一致）：
+// 破坏性介于 update 与 delete 之间——不删任何数据，但会让远端 agent 立即掉线，
+// 故同样要求 server_id/server_name 显式定位（重名拒绝）。
+async function mcpRotateAgentKey(user, env, args, ip, url) {
+  requireAdmin(user);
+  const server = await mcpFindServer(env, args);
+  const key = randomHex(32);
+  const keyId = await sha256Hex(key);
+  const hash = await hashSecret(key, env);
+  await env.DB.batch([
+    env.DB.prepare('UPDATE servers SET agent_key_id = ?, agent_key_hash = ? WHERE id = ?')
+      .bind(keyId, hash, server.id),
+    env.DB.prepare('INSERT INTO audit_logs (user_id, username, client_ip, action, target_server_id, detail) VALUES (?,?,?,?,?,?)')
+      .bind(user.id, user.username, ip, 'server.rotate_key', server.id, server.name),
+  ]);
+  serverListCacheClear();
+  serverRowCache.delete(server.id);
+  for (let i = 0; i < SHARDS; i++) {
+    try {
+      await doForShard(env, i).fetch('https://do.internal/rpc/drop_server', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ serverId: server.id }),
+      });
+    } catch { /* 分片暂不可达；旧 key 重连会因指纹不存在被 401 拒绝 */ }
+  }
+  return {
+    server_id: server.id,
+    server_name: server.name,
+    agent_key: key, // 明文只返回一次
+    wss_base: agentWssBase(url),
+    note: '旧 key 已失效并已断开现有连接；监控历史保留，须人工到目标机更新 AGENT_KEY 并重启 agent 后才会重新上线',
+  };
 }
 
 async function mcpListTokens(user, env) {
   requireAdmin(user);
-  const rows = await env.DB.prepare('SELECT id, name, scopes, server_ids, expires_at, created_at FROM api_tokens ORDER BY id').all();
+  const rows = await env.DB.prepare('SELECT id, name, scopes, server_ids, expires_at, last_used_at, created_at FROM api_tokens ORDER BY id').all();
   return rows.results.map((t) => ({ ...t, scopes: safeJson(t.scopes) || t.scopes, server_ids: safeJson(t.server_ids) || t.server_ids }));
 }
 
@@ -1422,6 +1661,7 @@ async function handleMcpInner(request, env) {
         else if (params.name === 'add_server') content = await mcpAddServer(user, env, params.arguments || {}, clientIp(request), url);
         else if (params.name === 'delete_server') content = await mcpDeleteServer(user, env, params.arguments || {}, clientIp(request));
         else if (params.name === 'update_server') content = await mcpUpdateServer(user, env, params.arguments || {}, clientIp(request));
+        else if (params.name === 'rotate_agent_key') content = await mcpRotateAgentKey(user, env, params.arguments || {}, clientIp(request), url);
         else if (params.name === 'list_tokens') content = await mcpListTokens(user, env);
         else if (params.name === 'create_token') content = await mcpCreateToken(user, env, params.arguments || {});
         else if (params.name === 'revoke_token') content = await mcpRevokeToken(user, env, params.arguments || {});

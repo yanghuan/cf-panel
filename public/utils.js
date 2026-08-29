@@ -26,11 +26,19 @@
       const n = Number(value);
       return Number.isFinite(n) && n >= 0 ? Math.min(n, Number.MAX_SAFE_INTEGER) : 0;
     };
+    // 文本字段只接受字符串本身，绝不 String(...) 强转：
+    // String(['<img src=x onerror=...>']) 会得到原样的 '<img ...>'，数组/对象的
+    // toString 会把危险内容拼进来，收口层形同虚设（下游虽有 escapeHtml 兜底，
+    // 但收口就应当是第一道也是最后一道防线）。
+    const str = (v, max) => (typeof v === 'string' ? v.slice(0, max) : '');
     return {
-      name: String(raw.name ?? '').slice(0, 4096),
+      name: str(raw.name, 4096),
+      // path 仅递归搜索（find）返回：绝对路径；目录浏览条目为空串
+      path: str(raw.path, 4096),
       type: raw.type === 'dir' ? 'dir' : 'file',
       size: numberOrZero(raw.size),
       mtime: numberOrZero(raw.mtime),
+      mode: numberOrZero(raw.mode), // 权限位（Unix 真实值；Windows 由只读位折算）
     };
   }
 
@@ -61,6 +69,22 @@
     const s = String(p || '');
     const i = Math.max(s.lastIndexOf('/'), s.lastIndexOf('\\'));
     return i < 0 ? s : s.slice(i + 1);
+  }
+
+  // 权限位 → "rwxr-xr-x (0755)"。仅 Unix 口径：Windows 无 POSIX mode，agent 端把
+  // 只读位折算为 0o444/0o666 上报，故 Windows 上这里的字符串是"近似展示"，
+  // 修改权限时也只提供只读开关（不给出假的 POSIX 等价物）。
+  function modeText(mode) {
+    const n = Number(mode);
+    if (!Number.isFinite(n) || n <= 0) return '';
+    const bit = (shift) => (n & (0o400 >> shift)) ? 'r' : '-';
+    const tri = (t) => {
+      const w = (n & (0o200 >> t * 3)) ? 'w' : '-';
+      const x = (n & (0o100 >> t * 3)) ? 'x' : '-';
+      return bit(t * 3) + w + x;
+    };
+    const oct = (n & 0o777).toString(8).padStart(3, '0');
+    return `${tri(0)}${tri(1)}${tri(2)} (${oct})`;
   }
 
   // 滚动锁计数栈：嵌套弹窗（文件弹窗内开新建目录 promptDialog）关闭内层时外层仍锁——
@@ -497,7 +521,7 @@
 
   // 导出（app.js 开头解构）
   window.CfUtils = {
-    $, escapeHtml, fmtBytes, normalizeFileEntry, fileJoin, fileParent, fileBase, downsample,
+    $, escapeHtml, fmtBytes, normalizeFileEntry, fileJoin, fileParent, fileBase, downsample, modeText,
     lockScroll, unlockScroll,
     MONITOR_STEP_MAX, MONITOR_RANGE_LABEL, MONITOR_COLORS,
     GEO_PRIVATE, geoLookup, flagHtml, osIconHtml, isSystemPath, isBinaryExt, loadScript, loadCss, loadMonaco, loadMarkdown, setGeoEnabled, IdleGuard,

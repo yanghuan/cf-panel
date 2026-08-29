@@ -259,6 +259,8 @@ export class PanelDO {
       wan_ip: s.wan_ip || '',
       info: safeJson(s.info_json),
       probes: safeJson(s.probe_json),
+      // 逐机告警阈值覆盖：与 REST /api/servers 同构，前端编辑弹窗据此回填
+      alert_override: safeJson(s.alert_override),
       metric: latest[s.id] || null,
     }));
   }

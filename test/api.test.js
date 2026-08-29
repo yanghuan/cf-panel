@@ -382,6 +382,7 @@ test('handleReport 落库：系统信息/探活/custom 写入 + MetricsDO 转发
     net_out: 2000,
     extra: { load1: 0.5 },
     probes: [{ name: 'web', ok: true, ms: 5 }],
+    alertOverride: null, // 随帧下发供 MetricsDO 逐机告警阈值判定（未配置覆盖时为 null）
   });
 
   // 上报后列表显示在线 + 指标（列表短 TTL 缓存：上报后显式失效再断言）
@@ -1263,7 +1264,7 @@ test('MCP：tools/list 与 tools/call', async () => {
   const list = await (await mcp(env, { token, body: { jsonrpc: '2.0', id: 1, method: 'tools/list' } })).json();
   assert.deepEqual(list.result.tools.map((t) => t.name), [
     'list_servers', 'get_monitor', 'exec_command', 'create_upload',
-    'add_server', 'delete_server', 'update_server',
+    'add_server', 'delete_server', 'update_server', 'rotate_agent_key',
     'list_tokens', 'create_token', 'revoke_token',
     'get_audit_logs', 'get_usage', 'get_settings', 'update_settings',
   ]);
@@ -1466,6 +1467,222 @@ test('MCP：tools/list 与 tools/call', async () => {
   const noArg = await (await mcp(env, { token, body: { jsonrpc: '2.0', id: 33, method: 'tools/call', params: { name: 'delete_server', arguments: {} } } })).json();
   assert.equal(noArg.result.isError, true);
   assert.match(noArg.result.content[0].text, /必须提供其一/);
+});
+
+// ---------------- 存活探针 ----------------
+test('GET /api/healthz：不鉴权、不查 D1 的存活探针', async () => {
+  // 即使 JWT_SECRET 未配置（所有受保护入口都 503），探针仍应可用——
+  // 它回答的是"Worker 是否在正常响应"，不是"配置是否正确"
+  const env = makeEnv({ JWT_SECRET: undefined });
+  const res = await call(env, { path: '/api/healthz' });
+  assert.equal(res.status, 200);
+  const body = await res.json();
+  assert.equal(body.ok, true);
+  assert.ok(body.ts > 0);
+
+  // 有密钥时同样可用（不因鉴权状态改变行为）
+  const env2 = makeEnv();
+  const res2 = await call(env2, { path: '/api/healthz' });
+  assert.equal(res2.status, 200);
+});
+
+// ---------------- 登录与鉴权审计（此前这类事件完全无痕） ----------------
+test('登录成功/失败写入审计，且审计不含密码', async () => {
+  const env = makeEnv();
+  const ip = '5.5.5.5';
+  const bad = await call(env, { method: 'POST', path: '/api/login', body: { password: 'nope' }, ip });
+  assert.equal(bad.status, 401);
+
+  let logs = await env.DB.prepare('SELECT * FROM audit_logs WHERE action = ?').bind('login.failed').all();
+  assert.equal(logs.results.length, 1, '失败应留痕');
+  assert.equal(logs.results[0].client_ip, ip);
+  assert.ok(!JSON.stringify(logs.results[0]).includes('nope'), '审计绝不记录密码');
+
+  const ok = await call(env, { method: 'POST', path: '/api/login', body: { password: 'admin123' }, ip });
+  assert.equal(ok.status, 200);
+  logs = await env.DB.prepare('SELECT * FROM audit_logs WHERE action = ?').bind('login.success').all();
+  assert.equal(logs.results.length, 1);
+  assert.equal(logs.results[0].username, 'admin');
+});
+
+test('登录被锁定的请求写入 login.locked 审计', async () => {
+  const env = makeEnv();
+  const ip = '6.6.6.6';
+  for (let i = 0; i < 5; i++) {
+    await call(env, { method: 'POST', path: '/api/login', body: { password: 'bad' }, ip });
+  }
+  const locked = await call(env, { method: 'POST', path: '/api/login', body: { password: 'admin123' }, ip });
+  assert.equal(locked.status, 429);
+  const logs = await env.DB.prepare('SELECT * FROM audit_logs WHERE action = ?').bind('login.locked').all();
+  assert.equal(logs.results.length, 1, '锁定期间的尝试应留痕');
+});
+
+test('无效凭据访问受保护接口写入 auth.failed 审计（路径经归一化）', async () => {
+  const env = makeEnv();
+  const res = await call(env, { path: '/api/me', token: 'not-a-real-token', ip: '7.7.7.7' });
+  assert.equal(res.status, 401);
+  const logs = await env.DB.prepare('SELECT * FROM audit_logs WHERE action = ?').bind('auth.failed').all();
+  assert.equal(logs.results.length, 1);
+  assert.match(logs.results[0].detail, /GET \/api\/me/);
+});
+
+// ---------------- PAT 最近使用时间 ----------------
+test('PAT 鉴权成功回写 last_used_at（新建时为 null）', async () => {
+  const env = makeEnv();
+  const admin = await login(env);
+  const created = await (await call(env, {
+    method: 'POST', path: '/api/tokens', token: admin, body: { name: 'probe', scopes: ['server:read'] },
+  })).json();
+
+  const before = await env.DB.prepare('SELECT id, last_used_at FROM api_tokens WHERE name = ?').bind('probe').first();
+  assert.equal(before.last_used_at, null, '新建令牌未使用过');
+
+  const me = await call(env, { path: '/api/me', token: created.token });
+  assert.equal(me.status, 200);
+  const after = await env.DB.prepare('SELECT last_used_at FROM api_tokens WHERE id = ?').bind(before.id).first();
+  assert.ok(after.last_used_at > 0, '使用后应回写时间戳');
+});
+
+// ---------------- Agent Key 轮换 ----------------
+test('轮换 Agent Key：旧 key 指纹失效，监控历史与审计保留', async () => {
+  const env = makeEnv();
+  const token = await login(env);
+  const added = await addServer(env, token, { name: 'rot-1' });
+  const oldKey = added.agent_key;
+  const list = await (await call(env, { path: '/api/servers', token })).json();
+  const id = list[0].id;
+  await env.DB.prepare('INSERT INTO metrics_min (server_id, ts, cpu) VALUES (?,?,?)')
+    .bind(id, Math.floor(Date.now() / 1000 / 60), 5).run();
+
+  const rot = await (await call(env, { method: 'POST', path: `/api/servers/${id}/rotate-key`, token })).json();
+  assert.ok(rot.agent_key, '应返回新 key');
+  assert.notEqual(rot.agent_key, oldKey);
+
+  // 旧 key 的指纹已从库中移除 → agent 用旧 key 建连会因查不到服务器被 401
+  const server = await env.DB.prepare('SELECT agent_key_id FROM servers WHERE id = ?').bind(id).first();
+  assert.notEqual(server.agent_key_id, await I.sha256Hex(oldKey), '旧 key 指纹不再有效');
+
+  const hist = await env.DB.prepare('SELECT * FROM metrics_min WHERE server_id = ?').bind(id).all();
+  assert.equal(hist.results.length, 1, '轮换不应清空监控历史（这是它优于"删了重建"的地方）');
+
+  const logs = await env.DB.prepare('SELECT * FROM audit_logs WHERE action = ?').bind('server.rotate_key').all();
+  assert.equal(logs.results.length, 1, '轮换是安全处置动作，必须留痕');
+});
+
+test('轮换 Agent Key：仅管理员，不存在的服务器 404', async () => {
+  const env = makeEnv();
+  const token = await login(env);
+  const missing = await call(env, { method: 'POST', path: '/api/servers/99999/rotate-key', token });
+  assert.equal(missing.status, 404);
+});
+
+// ---------------- 批量操作 ----------------
+test('批量操作：update-group 生效；delete 返回逐项结果（部分失败可见）', async () => {
+  const env = makeEnv();
+  const token = await login(env);
+  await addServer(env, token, { name: 'b-1' });
+  await addServer(env, token, { name: 'b-2' });
+  const list = await (await call(env, { path: '/api/servers', token })).json();
+  const ids = list.map((s) => s.id);
+
+  const g = await (await call(env, {
+    method: 'POST', path: '/api/servers/batch', token, body: { op: 'update-group', ids, group: 'prod' },
+  })).json();
+  assert.equal(g.summary.success, 2);
+  const after = await (await call(env, { path: '/api/servers', token })).json();
+  assert.ok(after.every((s) => s.group === 'prod'));
+
+  // 混入一个不存在的 id：成功的照常成功，失败的单独标记，而不是整体 500
+  const d = await (await call(env, {
+    method: 'POST', path: '/api/servers/batch', token, body: { op: 'delete', ids: [ids[0], 999999] },
+  })).json();
+  assert.equal(d.summary.success, 1);
+  assert.equal(d.summary.failed, 1);
+  assert.equal(d.results.find((r) => r.id === 999999).error, 'not found');
+
+  const left = await (await call(env, { path: '/api/servers', token })).json();
+  assert.equal(left.length, 1);
+});
+
+test('批量操作：非法 op / 空 ids / 超量 被拒', async () => {
+  const env = makeEnv();
+  const token = await login(env);
+  assert.equal((await call(env, { method: 'POST', path: '/api/servers/batch', token, body: { op: 'nope', ids: [1] } })).status, 400);
+  assert.equal((await call(env, { method: 'POST', path: '/api/servers/batch', token, body: { op: 'delete', ids: [] } })).status, 400);
+  assert.equal((await call(env, { method: 'POST', path: '/api/servers/batch', token, body: { op: 'delete', ids: Array.from({ length: 101 }, (_, i) => i + 1) } })).status, 400);
+});
+
+// ---------------- 按天统计 API ----------------
+test('GET /api/stats：按天账汇总（流量合计 + 可用率）', async () => {
+  const env = makeEnv();
+  const token = await login(env);
+  await addServer(env, token, { name: 's-1' });
+  const list = await (await call(env, { path: '/api/servers', token })).json();
+  const id = list[0].id;
+  const day = Math.floor(Date.now() / 1000 / 86400);
+  await env.DB.prepare(
+    'INSERT INTO metrics_day (server_id, day, bytes_in, bytes_out, online_min, total_min, restarts) VALUES (?,?,?,?,?,?,?)'
+  ).bind(id, day, 1024, 2048, 1400, 1440, 1).run();
+
+  const st = await (await call(env, { path: `/api/stats?server_id=${id}&days=30`, token })).json();
+  assert.equal(st.rows.length, 1);
+  assert.equal(st.summary.bytes_in, 1024);
+  assert.equal(st.summary.bytes_out, 2048);
+  assert.equal(st.summary.restarts, 1);
+  // 可用率 = 在线分钟 / 纳入统计分钟
+  assert.ok(Math.abs(st.summary.availability - (1400 / 1440) * 100) < 1e-6);
+  assert.ok(Math.abs(st.rows[0].availability - st.summary.availability) < 1e-6);
+  assert.equal(st.rows[0].ts, day * 86400, '返回当天起始 unix 秒供前端格式化');
+});
+
+test('GET /api/stats：无数据区间返回空数组，可用率为 null（非 0/NaN）', async () => {
+  const env = makeEnv();
+  const token = await login(env);
+  await addServer(env, token, { name: 's-2' });
+  const list = await (await call(env, { path: '/api/servers', token })).json();
+  const st = await (await call(env, { path: `/api/stats?server_id=${list[0].id}&days=7`, token })).json();
+  assert.deepEqual(st.rows, []);
+  assert.equal(st.summary.availability, null, '无数据时不可用率应为 null（前端显示 -）');
+});
+
+// ---------------- 逐机告警覆盖 + 免打扰 ----------------
+test('逐机告警阈值覆盖：设置/清除，并随列表返回供回填', async () => {
+  const env = makeEnv();
+  const token = await login(env);
+  await addServer(env, token, { name: 'a-1' });
+  const list = await (await call(env, { path: '/api/servers', token })).json();
+  const id = list[0].id;
+
+  const patched = await (await call(env, {
+    method: 'PATCH', path: `/api/servers/${id}`, token, body: { alert_override: { cpu_pct: 42 } },
+  })).json();
+  assert.deepEqual(patched.alert_override, { cpu_pct: 42 });
+
+  const list2 = await (await call(env, { path: '/api/servers', token })).json();
+  assert.deepEqual(list2[0].alert_override, { cpu_pct: 42 }, '列表需带回覆盖值，前端编辑弹窗才能回填');
+
+  const cleared = await (await call(env, {
+    method: 'PATCH', path: `/api/servers/${id}`, token, body: { alert_override: null },
+  })).json();
+  assert.equal(cleared.alert_override, null, '传 null 清除覆盖回退全局');
+});
+
+test('免打扰：未来时间落库，非法/0 不落库', async () => {
+  const env = makeEnv();
+  const token = await login(env);
+  const future = Math.floor(Date.now() / 1000) + 3600;
+  const saved = await (await call(env, {
+    method: 'PUT', path: '/api/settings', token,
+    body: { alerts: { webhook_url: 'https://example.com/hook', mute_until: future } },
+  })).json();
+  assert.equal(saved.alerts.mute_until, future);
+
+  // 0/负数/非法不落库：存一个永不起效的值只会让配置看起来可疑
+  const bogus = await (await call(env, {
+    method: 'PUT', path: '/api/settings', token,
+    body: { alerts: { webhook_url: 'https://example.com/hook', mute_until: 0 } },
+  })).json();
+  assert.equal(bogus.alerts.mute_until, undefined);
 });
 
 test('MCP：坏 JSON → Parse error；协议版本不一致 → HeaderMismatch', async () => {

@@ -13,12 +13,14 @@ export const customWritten = new Map();
 // 服务器行缓存（handleReport 每帧 SELECT 1 行 → 60s TTL，快采 −28,800 D1 读/天/机）。
 // 按隔离实例分布（Worker HTTP 上报 / TerminalDO 控制通道上报各自一份）；删除路径清 Worker 侧，
 // TerminalDO 侧 60s 自动过期，缓存窗口内的孤儿写无害（INSERT OR IGNORE / 条件写）
-export const serverRowCache = new Map(); // serverId -> {info_json, probe_json, name, ts}
+export const serverRowCache = new Map(); // serverId -> {info_json, probe_json, name, alert_override, ts}
 const SERVER_ROW_TTL_MS = 60 * 1000;
 async function getServerRow(env, serverId) {
   const c = serverRowCache.get(serverId);
   if (c && Date.now() - c.ts < SERVER_ROW_TTL_MS) return c;
-  const row = await env.DB.prepare('SELECT info_json, probe_json, name FROM servers WHERE id = ?').bind(serverId).first();
+  // alert_override 随行取出并随上报帧下发：告警判定因此不必每帧回查 D1。
+  // 改动它会显式清该服务器的行缓存（routes.js），最坏滞后即本 TTL（60s）
+  const row = await env.DB.prepare('SELECT info_json, probe_json, name, alert_override FROM servers WHERE id = ?').bind(serverId).first();
   if (row) serverRowCache.set(serverId, { ...row, ts: Date.now() });
   return row;
 }
@@ -221,6 +223,9 @@ export async function handleReport(env, payload) {
     net_out: payload.net_out ?? null,
     extra: payload.extra ?? null,     // 扩展监控项对象 → 序列化存入 extra 列
     probes: payload.probes ?? null,
+    // 逐机告警阈值覆盖（servers.alert_override 原始 JSON），随帧下发供 MetricsDO 判定，
+    // 免得告警路径每帧多一次 D1 查询（行缓存已承担读取成本）
+    alertOverride: server.alert_override ?? null,
   });
   const flushNow = Date.now();
   if (flushNow - reportFlushAt >= REPORT_FWD_THROTTLE_S * 1000) {

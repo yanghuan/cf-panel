@@ -2,6 +2,26 @@
 import { PAT_PREFIX, SCOPE_READ, SCOPE_EXEC, ONLINE_GRACE_FAST_S, ONLINE_GRACE_SLOW_S } from './config.js';
 import { hashSecret, verifyJwt, safeJson, doPanel, doMetrics } from './utils.js';
 
+// PAT 最后使用时间回写节流（秒）：鉴权是每请求/每 WS 心跳级热路径，逐次 UPDATE 会把
+// D1 写放大到请求量级；PAT 列表只需"最近用过吗"的量级信息，60s 精度足够。
+// 节流状态在实例内存：跨 isolate evict 丢失后仅偶发多写一次，无害。
+const PAT_USED_THROTTLE_S = 60;
+const patUsedAt = new Map(); // tokenId -> 上次回写秒
+// 测试隔离：模块级静态状态，跨测试需清空（见 index.js __internals.__reset）
+export function __clearTokenUsedCache() {
+  patUsedAt.clear();
+}
+async function touchTokenUsed(tokenId, env) {
+  const now = Math.floor(Date.now() / 1000);
+  const last = patUsedAt.get(tokenId) || 0;
+  if (now - last < PAT_USED_THROTTLE_S) return;
+  if (patUsedAt.size > 5000) patUsedAt.clear(); // 防 Map 无限增长
+  patUsedAt.set(tokenId, now);
+  try {
+    await env.DB.prepare('UPDATE api_tokens SET last_used_at = ? WHERE id = ?').bind(now, tokenId).run();
+  } catch { /* 回写失败不影响鉴权本身 */ }
+}
+
 function userFromPatRow(row) {
   if (!row) return null;
   // 有效期：expires_at 为 unix 秒，NULL=永久；已过期拒绝（token 本身不删除，列表可见）
@@ -18,7 +38,10 @@ function userFromPatRow(row) {
 export async function authUserByPatHash(tokenHash, env) {
   if (!tokenHash) return null;
   const row = await env.DB.prepare('SELECT * FROM api_tokens WHERE token_hash = ?').bind(tokenHash).first();
-  return userFromPatRow(row);
+  const user = userFromPatRow(row);
+  // 仅鉴权成功才回写 last_used_at（过期/撤销的令牌不刷新，避免"僵尸令牌"看起来在用）
+  if (user && row && row.id != null) await touchTokenUsed(row.id, env);
+  return user;
 }
 
 // WebSocket 首帧校验后只把不可逆 PAT HMAC 或已验证 JWT 身份放入 hibernation attachment，
@@ -172,6 +195,8 @@ export async function listServersWithState(env, user) {
     wan_ip: s.wan_ip || '',
     info: safeJson(s.info_json),
     probes: safeJson(s.probe_json),
+    // 逐机告警阈值覆盖：随列表下发供前端「修改」弹窗回填（避免为编辑再单开一个详情接口）
+    alert_override: safeJson(s.alert_override),
     metric: latest[s.id] || null,
   }));
   if (serverListCache.size > 500) serverListCache.clear(); // 防 Map 无限增长

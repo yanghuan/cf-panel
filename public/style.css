@@ -746,6 +746,51 @@ button.danger:hover { background: rgba(248, 113, 113, .12); }
 .file-table th, .file-table td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); }
 .file-table th { color: var(--muted); font-weight: 600; font-size: 12px; }
 .file-table td.muted { color: var(--muted); text-align: center; }
+/* 权限列：等宽字体对齐 rwxr-xr-x 的位模式（比例字体下字母宽度不齐，看不出缺哪一位） */
+.file-table td.f-perm {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+/* 过滤与递归搜索并排：前者只看当前目录，后者下钻子目录（窄屏自动换行） */
+.file-filter-row { display: flex; gap: 8px; flex-wrap: wrap; }
+.file-filter, .file-find { flex: 1 1 200px; min-width: 0; }
+
+/* 拖拽上传：拖文件进入文件管理弹窗时高亮（提示可放置） */
+#file-modal.drag-over { outline: 2px dashed var(--accent); outline-offset: -6px; }
+#file-modal.drag-over::after {
+  content: '松开即可上传（可多选，逐个串行上传）';
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(11, 14, 23, .55);
+  color: var(--accent-2);
+  font-size: 14px;
+  font-weight: 600;
+  border-radius: 14px;
+  pointer-events: none; /* 不拦截 drop 事件本身 */
+}
+
+/* ---------- 权限修改弹窗（九宫格：属主/组/其他 × 读/写/执行） ---------- */
+.chmod-grid {
+  display: grid;
+  grid-template-columns: auto repeat(3, 1fr);
+  gap: 8px 10px;
+  align-items: center;
+  margin: 8px 0;
+}
+.chmod-grid > span { font-size: 12px; color: var(--muted); }
+.chmod-grid input {
+  width: 16px;
+  height: 16px;
+  accent-color: var(--accent);
+  cursor: pointer;
+  justify-self: center;
+}
 .f-dir { color: var(--accent-2); cursor: pointer; text-decoration: none; }
 .f-dir:hover { text-decoration: underline; }
 .f-file { color: var(--text); }
@@ -922,6 +967,82 @@ a.f-dir.f-prot { opacity: .55; }
 }
 #monitor-chart { width: 100% !important; height: 100% !important; }
 
+/* ---------- 服务器搜索框（纯前端过滤，列表已全量推送到客户端） ---------- */
+.server-search {
+  min-width: 220px;
+  padding: 7px 12px;
+  border-radius: 10px;
+  background: rgba(20, 25, 40, .6);
+  border: 1px solid var(--border);
+  color: var(--text);
+  font-size: 13px;
+}
+.server-search:focus { outline: none; border-color: var(--accent); }
+.server-search::placeholder { color: var(--muted); }
+
+/* ---------- 批量操作栏（选中卡片后出现，仅管理员） ---------- */
+.batch-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 14px;
+  padding: 10px 14px;
+  background: var(--panel);
+  border: 1px solid var(--accent);
+  border-radius: 12px;
+}
+.batch-count { font-size: 13px; font-weight: 600; margin-right: 4px; }
+/* 选中态：描边高亮，与批量栏呼应（.card 已 position:relative，复选框可绝对定位） */
+.card.selected { border-color: var(--accent); box-shadow: 0 0 0 1px rgba(99, 102, 241, .25); }
+/* 复选框随 card-head 的 flex 排在徽章之后（不用绝对定位：右上角已被在线徽章占用） */
+.card-sel {
+  width: 15px;
+  height: 15px;
+  flex-shrink: 0;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+
+/* ---------- 告警阈值覆盖 / 免打扰 ---------- */
+.ao-box {
+  margin: 10px 0 4px;
+  padding: 12px;
+  border: 1px dashed var(--border);
+  border-radius: 12px;
+}
+.ao-title { font-size: 13px; font-weight: 600; color: var(--text); margin-bottom: 8px; }
+.ao-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); gap: 8px; }
+
+/* ---------- 流量 / 可用率（按天账） ---------- */
+.stats-summary {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+  gap: 10px;
+  margin: 10px 0;
+}
+.stats-item {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 10px 12px;
+  background: var(--inset-bg);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+}
+.stats-num { font-size: 16px; font-weight: 700; font-variant-numeric: tabular-nums; }
+.stats-label { font-size: 11px; color: var(--muted); }
+.stats-table { max-height: 240px; overflow: auto; margin-top: 10px; }
+.stats-table table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.stats-table th,
+.stats-table td {
+  padding: 6px 10px;
+  text-align: left;
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+}
+.stats-table th { color: var(--muted); font-weight: 600; }
+
 /* ---------- 中等屏幕：监控图表改 2 列（3 列过挤） ---------- */
 @media (max-width: 900px) {
   .monitor-modal .chart-wrap { grid-template-columns: repeat(2, 1fr); }
@@ -957,9 +1078,11 @@ a.f-dir.f-prot { opacity: .55; }
   .file-body { padding: 12px; }
   .file-toolbar { gap: 6px; }
   .file-toolbar input { flex: 1; min-width: 0; }
-  /* 文件表：隐藏"修改时间"列，省横向空间 */
+  /* 文件表：隐藏"修改时间"与"权限"列，省横向空间（操作仍可从 ⋯ 菜单进行） */
   .file-table th:nth-child(3),
-  .file-table td:nth-child(3) { display: none; }
+  .file-table td:nth-child(3),
+  .file-table th:nth-child(4),
+  .file-table td:nth-child(4) { display: none; }
 
   .chart-wrap { height: 240px; padding: 8px; }
 

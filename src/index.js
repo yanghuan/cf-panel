@@ -5,23 +5,23 @@
 //           report（上报落库）、routes（REST/MCP/WS 路由）、do-*（三个 DO 类）
 // ============================================================
 import {
-  handleApi, handleMcp, handleWs, loginFails, apiCounts, clearAgentManifestCache,
+  handleApi, handleMcp, handleWs, loginFails, apiCounts, clearAgentManifestCache, __clearAuditThrottle,
 } from './routes.js';
 import { sanitizeReportPayload } from './report.js';
 import { TerminalDO } from './do-terminal.js';
 import { MetricsDO } from './do-metrics.js';
 import { PanelDO } from './do-panel.js';
-import { parsePanelUsers } from './config.js';
+import { parsePanelUsers, dayIndexOf, dayStartTs, statsTzOffsetSec } from './config.js';
 import {
   json, err, secret, b64u, b64uDecode, bytesToHex, hexToBytes, hmacSha256, verifyHmacSha256,
   signJwt, verifyJwt, randomHex, sha256Hex, parseRangeHours, safeJson,
-  sanitizeAlerts, hashSecret, verifySecretHash, signUploadToken, verifyUploadToken,
+  sanitizeAlerts, sanitizeAlertOverride, hashSecret, verifySecretHash, signUploadToken, verifyUploadToken,
   renderTemplate, parseHeaders, validateWebhookUrl, sendWebhookRaw, sendWebhook,
   shardForServerId, makeStreamId, shardFromStreamId,
 } from './utils.js';
 import {
   authIdentityByToken, authUserByIdentity, authUserByPatHash,
-  isAdmin, canAccessServer, canExec, serverListCache, __clearGraceCache,
+  isAdmin, canAccessServer, canExec, serverListCache, __clearGraceCache, __clearTokenUsedCache,
 } from './auth.js';
 import { SETTINGS_CACHE, queryMonitorRows, queryCustomMetrics } from './db.js';
 import {
@@ -47,10 +47,10 @@ export { TerminalDO, MetricsDO, PanelDO };
 // 测试辅助导出（不参与线上路由，仅供 test/ 目录单元测试使用）
 // ============================================================
 export const __internals = {
-  parsePanelUsers, json, err, secret,
+  parsePanelUsers, dayIndexOf, dayStartTs, statsTzOffsetSec, json, err, secret,
   b64u, b64uDecode, bytesToHex, hexToBytes, hmacSha256, verifyHmacSha256,
   signJwt, verifyJwt, randomHex, sha256Hex,
-  parseRangeHours, safeJson, sanitizeAlerts, hashSecret, verifySecretHash, signUploadToken, verifyUploadToken,
+  parseRangeHours, safeJson, sanitizeAlerts, sanitizeAlertOverride, hashSecret, verifySecretHash, signUploadToken, verifyUploadToken,
   renderTemplate, parseHeaders, validateWebhookUrl, sendWebhookRaw, sendWebhook, sanitizeReportPayload,
   shardForServerId, makeStreamId, shardFromStreamId,
   authIdentityByToken, authUserByIdentity, authUserByPatHash,
@@ -71,6 +71,8 @@ export const __internals = {
     serverRowCache.clear();
     reportBatch.clear();
     __clearGraceCache(); // 宽限期缓存（模块级静态，测试间 mock 不同需隔离）
+    __clearAuditThrottle(); // 审计节流表（登录失败/鉴权失败按 IP 的 60s 节流，跨测试需隔离）
+    __clearTokenUsedCache(); // PAT last_used_at 回写节流
     setReportFlushAt(0);
   },
 };

@@ -1,7 +1,10 @@
 // cf-panel — Durable Object：监控时序内存热区（MetricsDO）
-import { ARCHIVE_AFTER_MIN, metricsDownsampleMin, metricsFineDays } from './config.js';
+import {
+  ARCHIVE_AFTER_MIN, metricsDownsampleMin, metricsFineDays,
+  statsTzOffsetSec, dayIndexOf, dayStartTs, DAY_ONLINE_GAP_S,
+} from './config.js';
 import { json, err, doPanel, sendWebhook, numOrNull } from './utils.js';
-import { getAlertCfg, SETTINGS_CACHE } from './db.js';
+import { getAlertCfg, resolveAlertCfg, SETTINGS_CACHE } from './db.js';
 
 // 本模块专用常量（热区/归档/家政/推送，就近定义便于对照使用代码）
 // 内存热区保留分钟数（默认 240 = 4 小时）。
@@ -15,6 +18,12 @@ const METRICS_KEEP_MIN_NO_ARCHIVE = 720;
 const ARCHIVE_INTERVAL_MS = 10 * 60 * 1000; // 归档周期
 const METRICS_RETENTION_DAYS = 30; // D1 历史保留期（天），过期行每日清理
 const AUDIT_RETENTION_DAYS = 90; // 审计日志保留期（天），过期行随每日清理删除
+// 按天账保留期（天，默认 3 年 = 1095）。
+// 3 年足以覆盖月度/年度流量与可用率的对账需求（合规留存通常要求 1~7 年）；
+// 容量上更无压力——约 100B/行/机/天，100 台机器满 3 年仅约 11MB。
+// 保留上限而非永久：数据只增不减时缺少回收出口。需要更长/更短用
+// METRICS_DAY_RETENTION_DAYS 覆盖（正数=天数，未配置/非法=本默认值）。
+const METRICS_DAY_RETENTION_DAYS = 1095;
 const PRUNE_INTERVAL_MS = 24 * 60 * 60 * 1000; // 保留期清理周期
 const ARCHIVE_IDLE_INTERVAL_MS = 60 * 60 * 1000; // 闲置（无数据且告警关闭）时 alarm 退避间隔（1h）
 const LATEST_PUSH_INTERVAL_MS = 5000; // 上报驱动聚合推送间隔（有观看者时 ≥5s 推一次全部 latest 给 PanelDO；
@@ -54,6 +63,12 @@ export class MetricsDO {
     this.lastPushProbeAt = 0; // 上次反查 /viewers 的时刻（pushOn 因 evict 丢失时的自愈兜底）
     this.pendingArcRetry = new Set(); // serverId：首帧兜底 list 失败后待重试（正确性加固）
     this.trimMin = new Map(); // serverId -> 上次裁剪所在的分钟（分钟滚动才 trim，见 processReportFrame）
+    // 按天统计（流量累计 / 可用率 / 重启检测）：
+    // dayPending = 待落 D1 的增量（flush 后清空，D1 侧用 UPSERT 累加，故幂等）；
+    // dayAccum = 每机的累加游标（lastSec 上次累加时刻、uptimeMin 上次开机时长）。
+    // 两者都是实例内存：evict 后最多丢一个 flush 周期（10 分钟）的增量，已落库的天账不受影响。
+    this.dayPending = new Map(); // `${serverId}:${day}` -> { serverId, day, bytesIn, bytesOut, onlineMin, totalMin, uptimeMin, restarts }
+    this.dayAccum = new Map(); // serverId -> { lastSec, uptimeMin }
   }
 
   // 家政状态（lastSweepAt/lastPruneAt）从 storage 惰性恢复（持久化跨实例 evict，
@@ -214,6 +229,121 @@ export class MetricsDO {
     }
   }
 
+  // ---------------- 按天统计（流量累计 / 可用率 / 重启检测）----------------
+  // 为何必须实时累加、不能事后查 metrics_min：
+  //   1) metrics_min 只保留 30 天，且 7 天后按 ts%5 降采样只剩 1/5 采样点；
+  //   2) 更关键——"离线时长"在 metrics_min 里根本没有行，离线期间无上报，事后无从反推。
+  // 因此每个观测区间在发生的当下就结算进 metrics_day（1 行/机/天，保留期远长于 30 天）。
+
+  // 取（或创建）某机某天的待落库增量记录（统一入口，避免多处重复拼 key）
+  dayRec(serverId, day) {
+    const key = `${serverId}:${day}`;
+    let rec = this.dayPending.get(key);
+    if (!rec) {
+      rec = {
+        serverId, day, bytesIn: 0, bytesOut: 0, onlineMin: 0, totalMin: 0, uptimeMin: null, restarts: 0,
+      };
+      this.dayPending.set(key, rec);
+    }
+    return rec;
+  }
+
+  // 把一段时间区间记入天账，跨天时按天拆分。
+  // online=true：记入可用率分子+分母并累计流量；false：只记分母（离线时间，无流量）。
+  addDaySpan(serverId, startSec, spanSec, online, netIn, netOut) {
+    if (!(spanSec > 0)) return;
+    const offset = statsTzOffsetSec(this.env);
+    let cursor = startSec;
+    let left = spanSec;
+    // 跨天循环：每次只推进到当天末尾，保证一天的账不会被整体记到相邻天。
+    // guard 上限：极端时钟回拨或异常 span 时最多切 400 段（约 400 天），防死循环拖垮 alarm。
+    for (let guard = 0; guard < 400 && left > 0; guard++) {
+      const day = dayIndexOf(cursor, offset);
+      const seg = Math.min(left, dayStartTs(day + 1, offset) - cursor);
+      const rec = this.dayRec(serverId, day);
+      const minutes = seg / 60;
+      rec.totalMin += minutes;
+      if (online) {
+        rec.onlineMin += minutes;
+        // 流量 = 速率 × 时长（后向矩形法：用本次上报的瞬时速率代表该区间）。
+        // 快采 5s 精度很高；慢采 120s 是区间均值近似，误差取决于速率波动，量级判断足够。
+        if (netIn != null) rec.bytesIn += Math.max(0, Number(netIn) || 0) * seg;
+        if (netOut != null) rec.bytesOut += Math.max(0, Number(netOut) || 0) * seg;
+      }
+      cursor += seg;
+      left -= seg;
+    }
+  }
+
+  // 单帧上报的按天结算：把「上次累加 → 本次上报」这段区间记入天账。
+  // 区间内超出 DAY_ONLINE_GAP_S 的部分判为离线（只补分母、不补分子），
+  // 否则"离线 3 天后恢复上报"的那一帧会把整段离线时间算成在线，可用率恒显示 100%。
+  accumulateDay(serverId, nowSec, netIn, netOut, uptimeSec) {
+    const st = this.dayAccum.get(serverId) || { lastSec: nowSec, uptimeMin: null };
+    const dt = nowSec - st.lastSec;
+    if (dt > 0) {
+      const onlineSec = Math.min(dt, DAY_ONLINE_GAP_S);
+      const offlineSec = dt - onlineSec;
+      if (offlineSec > 0) this.addDaySpan(serverId, st.lastSec, offlineSec, false, 0, 0);
+      if (onlineSec > 0) this.addDaySpan(serverId, st.lastSec + offlineSec, onlineSec, true, netIn, netOut);
+    }
+    st.lastSec = nowSec;
+    // 重启检测：开机时长出现下降沿即判为重启（容差 1 分钟，吸收上报抖动与取整误差）。
+    // uptime 是"机器视角的连续性"，与可用率（"网络视角的可达性"）互补——
+    // 每天定时重启的机器可用率仍可能 99.9%；反之从不重启的机器也可能断过网。
+    const uptimeMin = Number.isFinite(Number(uptimeSec)) ? Number(uptimeSec) / 60 : null;
+    if (uptimeMin != null) {
+      const rec = this.dayRec(serverId, dayIndexOf(nowSec, statsTzOffsetSec(this.env)));
+      if (st.uptimeMin != null && uptimeMin < st.uptimeMin - 1) rec.restarts += 1;
+      rec.uptimeMin = uptimeMin; // 当天最后观测到的开机时长
+      st.uptimeMin = uptimeMin;
+    }
+    this.dayAccum.set(serverId, st);
+  }
+
+  // 离线补账（alarm 调用）：彻底掉线的机器不再上报 → accumulateDay 不触发 →
+  // 可用率分母停止增长，长时间离线反而显示 100%（分子分母同时不涨）。
+  // 此处为每台已知机器补记「上次累加 → 离线确认点」的离线时长（只补分母）。
+  sweepOfflineDaySpans(nowSec) {
+    for (const [serverId, lastSeen] of this.lastSeenSec) {
+      const st = this.dayAccum.get(serverId);
+      const since = st ? st.lastSec : lastSeen;
+      const dt = nowSec - since;
+      if (dt <= DAY_ONLINE_GAP_S) continue;
+      // 尾部 DAY_ONLINE_GAP_S 仍可能是正常上报间隙（慢采 120s + 抖动），不判离线
+      const offlineSec = dt - DAY_ONLINE_GAP_S;
+      this.addDaySpan(serverId, since, offlineSec, false, 0, 0);
+      if (st) st.lastSec = since + offlineSec;
+    }
+  }
+
+  // 把内存增量落 D1（UPSERT 累加），alarm 每 10 分钟一次。
+  // 先清空 pending 再写：即使写入失败也不重复累加（宁可少记，不可多记）。
+  // 代价是实例 evict 会丢失最多一个 flush 周期（≤10 分钟）的增量，已落库天账不受影响。
+  async flushDayPending() {
+    if (!this.dayPending.size) return;
+    const rows = [...this.dayPending.values()];
+    this.dayPending.clear();
+    for (let i = 0; i < rows.length; i += 100) {
+      const batch = rows.slice(i, i + 100).map((r) => this.env.DB.prepare(
+        `INSERT INTO metrics_day (server_id, day, bytes_in, bytes_out, online_min, total_min, uptime_min, restarts)
+         VALUES (?,?,?,?,?,?,?,?)
+         ON CONFLICT(server_id, day) DO UPDATE SET
+           bytes_in = bytes_in + excluded.bytes_in,
+           bytes_out = bytes_out + excluded.bytes_out,
+           online_min = online_min + excluded.online_min,
+           total_min = total_min + excluded.total_min,
+           uptime_min = COALESCE(excluded.uptime_min, uptime_min),
+           restarts = restarts + excluded.restarts`
+      ).bind(r.serverId, r.day, r.bytesIn, r.bytesOut, r.onlineMin, r.totalMin, r.uptimeMin, r.restarts));
+      try {
+        await this.env.DB.batch(batch);
+      } catch (e) {
+        console.error('metrics_day flush failed:', e);
+      }
+    }
+  }
+
   // 处理单帧上报（/report 批量接口每帧调用）：热写 + 增量归档 + 告警/探活 + 推送
   async processReportFrame(b) {
     const minTs = Number(b.minTs);
@@ -243,7 +373,15 @@ export class MetricsDO {
         this.putMin.set(b.serverId, minTs);
       }
       // 秒级最后上报时间（内存，/latest 在线判定用，比 D1 last_seen 节流更实时）
-      this.lastSeenSec.set(b.serverId, Math.floor(Date.now() / 1000));
+      const nowSec = Math.floor(Date.now() / 1000);
+      this.lastSeenSec.set(b.serverId, nowSec);
+      // 按天统计（流量累计 / 可用率）：单独 try——它只是旁路账本，
+      // 任何失败都不得影响监控存储主链路（热写/归档）
+      try {
+        this.accumulateDay(b.serverId, nowSec, b.net_in, b.net_out, b.extra && b.extra.uptime);
+      } catch (e) {
+        console.error('accumulateDay failed:', e);
+      }
       // 增量归档：依赖内存历史行；evict 后空 Map 时水位区间无行可归档，由 fullSweep（≈1h）兜底
       await this.archiveIncrement(b.serverId, m, minTs, fresh);
     } catch { /* storage 不可用时降级为纯内存（仅当前实例生命周期） */ }
@@ -251,7 +389,7 @@ export class MetricsDO {
     // 告警/探活去重判定搭本次 /report 调用顺风车（零额外请求）；失败不影响监控存储
     try {
       if (b.serverName) await this.checkAlerts(b);
-      if (Array.isArray(b.probes)) await this.checkProbeAlerts(b.serverId, b.serverName, b.probes);
+      if (Array.isArray(b.probes)) await this.checkProbeAlerts(b.serverId, b.serverName, b.probes, b.alertOverride);
     } catch { /* 告警失败不影响监控存储 */ }
     // 上报驱动聚合推送——有观看者且距上次 ≥5s 时，把全部 latest 一次推给 PanelDO 广播。
     // 上报驱动不引入定时器（MetricsDO 休眠不受影响）；PanelDO → 前端为出站消息不计费
@@ -442,8 +580,9 @@ export class MetricsDO {
   // 状态在本 DO 实例内存（单实例全局一致，避免多 Worker 隔离实例重复告警）；
   // 由 /report 处理顺带调用，不增加额外 DO 请求。
   async checkAlerts(b) {
-    const cfg = await getAlertCfg(this.env);
-    if (!cfg.enabled) return;
+    // 逐机阈值覆盖：16 核与 1 核小机用同一阈值必然误报或漏报，故允许按机覆盖
+    const cfg = resolveAlertCfg(await getAlertCfg(this.env), b.alertOverride);
+    if (!cfg.enabled || cfg.muted) return; // 免打扰期内不做阈值判定
     await this.ensureAlertLoaded(); // 恢复持久化冷却状态
     const now = Date.now();
     const cooldown = cfg.cooldown_min * 60 * 1000;
@@ -506,9 +645,9 @@ export class MetricsDO {
   }
 
   // 服务探活告警：失败持续超冷却 → probe_down；恢复 → probe_recovered（状态同在本 DO 实例）
-  async checkProbeAlerts(serverId, serverName, probes) {
-    const cfg = await getAlertCfg(this.env);
-    if (!cfg.enabled || !Array.isArray(probes)) return;
+  async checkProbeAlerts(serverId, serverName, probes, override) {
+    const cfg = resolveAlertCfg(await getAlertCfg(this.env), override);
+    if (!cfg.enabled || cfg.muted || !Array.isArray(probes)) return;
     await this.ensureProbeLoaded(); // 恢复持久化探活状态
     const now = Date.now();
     const cooldown = cfg.cooldown_min * 60 * 1000;
@@ -575,9 +714,12 @@ export class MetricsDO {
     if (!cfg.enabled || !cfg.webhook_url) return; // 未配置 webhook 时离线告警无法送达，跳过扫描
     await this.ensureOfflineLoaded();
     const now = Math.floor(Date.now() / 1000);
-    const offlineAfter = cfg.offline_after_s;
-    const rows = await this.env.DB.prepare('SELECT id, name, last_seen FROM servers').all();
+    const rows = await this.env.DB.prepare('SELECT id, name, last_seen, alert_override FROM servers').all();
     for (const s of rows.results) {
+      // 离线阈值支持逐机覆盖（弱网/长心跳节点可放宽）；免打扰期内整机跳过（计划内重启的场景）
+      const scfg = resolveAlertCfg(cfg, s.alert_override);
+      if (scfg.muted) continue;
+      const offlineAfter = scfg.offline_after_s;
       // 在线判定优先用 MetricsDO 秒级 last_seen_s（与列表判定一致）；D1 last_seen 仅冷启动兜底
       const lastSeen = this.latestByServer.get(s.id)?.last_seen_s || s.last_seen || 0;
       const isOnline = lastSeen > now - offlineAfter;
@@ -643,6 +785,14 @@ export class MetricsDO {
     if (alertOn) await this.checkOfflineAlerts();
     const now = Date.now();
     let housekeepChanged = false;
+    // 按天统计结算（流量/可用率）：先补记离线机器的可用率分母，再把内存增量落 D1。
+    // 独立于归档开关（ARCHIVE_TO_D1）：天账是长期账本，不应因关闭分钟归档而停摆。
+    try {
+      this.sweepOfflineDaySpans(Math.floor(now / 1000));
+      await this.flushDayPending();
+    } catch (e) {
+      console.error('metrics_day settlement failed:', e);
+    }
     // 全量 sweep：按时间差判定（每 6×10min ≈ 1 小时一次），时间戳持久化跨 evict——
     // 慢采/空闲下 MetricsDO 无 WS、两次 alarm 间实例常被 evict，旧内存计数（sweepCount）
     // 会停在 1 导致 fullSweep 永不执行（>12h 热区无限增长 + 兜底归档停摆）
@@ -681,9 +831,15 @@ export class MetricsDO {
             .bind(fineMinTs, minTs, down),
         );
       }
+      // 按天账保留期清理（默认 3 年）：与 metrics_min 的 30 天解耦——
+      // 月度/年度流量与可用率账必须跨月可查，这正是 metrics_day 存在的理由
+      const dayRetention = Number(this.env.METRICS_DAY_RETENTION_DAYS) > 0
+        ? Number(this.env.METRICS_DAY_RETENTION_DAYS) : METRICS_DAY_RETENTION_DAYS;
       stmts.push(
         this.env.DB.prepare('DELETE FROM metrics_min WHERE ts < ?').bind(minTs),
         this.env.DB.prepare('DELETE FROM metrics_custom WHERE ts < ?').bind(minTs),
+        this.env.DB.prepare('DELETE FROM metrics_day WHERE day < ?')
+          .bind(dayIndexOf(Math.floor(now / 1000), statsTzOffsetSec(this.env)) - dayRetention),
         this.env.DB.prepare('DELETE FROM audit_logs WHERE created_at < datetime(\'now\', ?)')
           .bind(`-${AUDIT_RETENTION_DAYS} days`),
       );

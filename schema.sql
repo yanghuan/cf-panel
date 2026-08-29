@@ -16,6 +16,7 @@ CREATE TABLE IF NOT EXISTS servers (
   wan_ip         TEXT,                      -- 节点公网出口 IP（agent 控制 WS 的 CF-Connecting-IP）
   info_json      TEXT,                      -- 系统信息 JSON（OS/内核/IP，变更时更新）
   probe_json     TEXT,                      -- 服务探活结果 JSON（[{name,ok,code,ms}]，变更时更新）
+  alert_override TEXT,                      -- 逐机告警阈值覆盖 JSON（迁移 0012；缺省继承全局 settings.alerts）
   created_at     TEXT    NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -31,6 +32,7 @@ CREATE TABLE IF NOT EXISTS api_tokens (
   scopes     TEXT    NOT NULL,               -- JSON 数组，如 ["server:read","server:exec"]
   server_ids TEXT,                           -- NULL=全部，否则 JSON 白名单
   expires_at INTEGER,                        -- unix 秒，NULL=永久有效（迁移 0007；鉴权时校验过期）
+  last_used_at INTEGER,                      -- unix 秒，最后一次鉴权成功时间（迁移 0011；节流回写）
   created_at TEXT    NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -85,6 +87,24 @@ CREATE TABLE IF NOT EXISTS metrics_custom (
 
 -- 保留期清理（DELETE ... WHERE ts < ?）走 ts 范围扫描，避免全表扫（迁移 0003）
 CREATE INDEX IF NOT EXISTS idx_metrics_custom_ts ON metrics_custom(ts);
+
+-- 按天汇总（迁移 0013）：流量累计 / 可用率 / 重启检测。
+-- 为何不能查 metrics_min：后者仅保留 30 天、且 7 天后按 ts%5 降采样只剩 1/5 采样点；
+-- 更关键的是可用率要的是"离线时长"，而离线期间 metrics_min 一行都没有，无法事后反推。
+-- 1 行/机/天（约 metrics_min 的 1/118），保留期远长于 30 天。
+CREATE TABLE IF NOT EXISTS metrics_day (
+  server_id  INTEGER NOT NULL,
+  day        INTEGER NOT NULL,                -- 天序号：floor((unix秒 + 时区偏移) / 86400)
+  bytes_in   REAL    NOT NULL DEFAULT 0,      -- 当日入站累计字节（速率对时间积分）
+  bytes_out  REAL    NOT NULL DEFAULT 0,      -- 当日出站累计字节
+  online_min REAL    NOT NULL DEFAULT 0,      -- 当日在线分钟数（可用率分子）
+  total_min  REAL    NOT NULL DEFAULT 0,      -- 当日纳入统计分钟数（可用率分母）
+  uptime_min REAL,                            -- 当日最后观测到的开机分钟数（重启检测基线）
+  restarts   INTEGER NOT NULL DEFAULT 0,      -- 当日检测到的重启次数（uptime 下降沿）
+  PRIMARY KEY (server_id, day)
+) WITHOUT ROWID;
+
+CREATE INDEX IF NOT EXISTS idx_metrics_day_day ON metrics_day(day);
 
 -- 通用键值表（替代 Workers KV，value 直接存 JSON 字符串）
 -- 用途：站点设置/公告等低频键值（key = 'settings'）

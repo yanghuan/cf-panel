@@ -1,0 +1,8 @@
+<!-- maskable：图形收进中心安全区（约 80%），四周留白供系统按任意形状裁剪 -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="cf-panel">
+  <rect width="512" height="512" fill="#8b5cf6"/>
+  <g transform="translate(256 256) scale(0.58) translate(-256 -256)">
+    <rect x="16" y="16" width="480" height="480" rx="112" fill="#8b5cf6"/>
+    <path d="M144 176h224M144 256h224M144 336h160" fill="none" stroke="#ffffff" stroke-width="40" stroke-linecap="round"/>
+  </g>
+</svg>

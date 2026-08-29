@@ -4,8 +4,12 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>cf-panel · 监控面板</title>
-  <!-- favicon：程序内联 SVG（data URI，零资源文件；圆角方块 + 三横线 = 服务器/仪表盘） -->
-  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2032%2032'%3E%3Crect%20width='32'%20height='32'%20rx='7'%20fill='%238b5cf6'/%3E%3Cpath%20d='M9%2011h14M9%2016h14M9%2021h8'%20stroke='white'%20stroke-width='2.5'%20stroke-linecap='round'/%3E%3C/svg%3E">
+  <!-- favicon / PWA 图标：同源 SVG 文件（与 manifest 共用，避免 data URI 重复内联） -->
+  <link rel="icon" type="image/svg+xml" href="/icon.svg" />
+  <link rel="manifest" href="/manifest.webmanifest" />
+  <meta name="theme-color" content="#8b5cf6" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
   <!-- CSP 与点击劫持防护由 public/_headers 以 HTTP 响应头下发；frame-ancestors 在 meta 中不会生效。 -->
   <!-- 依赖本地化（public/vendor，避免外部 CDN 不可达/供应链风险）；xterm/Chart.js 首次使用时由 JS 懒加载 -->
   <script src="/theme-init.js"></script>
@@ -46,6 +50,18 @@
           <h2>服务器</h2>
           <button id="btn-add-server-plus" class="toolbar-add" title="添加服务器" aria-label="添加服务器">＋</button>
         </div>
+        <!-- 搜索：纯前端过滤（列表已全量推送到客户端），无后端请求 -->
+        <div class="toolbar-actions">
+          <input id="server-search" class="server-search" type="search" placeholder="搜索名称 / IP / 分组" aria-label="搜索服务器" />
+        </div>
+      </section>
+      <!-- 批量操作栏：选中卡片后出现（仅管理员可见） -->
+      <section id="batch-bar" class="batch-bar hidden">
+        <span id="batch-count" class="batch-count">已选 0 台</span>
+        <button id="batch-update-agent" class="ghost">更新 Agent</button>
+        <button id="batch-group" class="ghost">修改分组</button>
+        <button id="batch-delete" class="danger">删除</button>
+        <button id="batch-clear" class="ghost">取消选择</button>
       </section>
       <section id="servers" class="servers-list"></section>
     </main>
@@ -71,6 +87,23 @@
       <button class="ghost range-btn" data-range="30d">30天</button>
     </div>
     <div class="chart-wrap"></div>
+  </div>
+
+  <!-- 流量 / 可用率弹窗（按天账 metrics_day，最长 3 年） -->
+  <div id="stats-modal" class="monitor-modal hidden">
+    <div class="modal-head">
+      <span id="stats-title">流量 / 可用率</span>
+      <button id="btn-stats-close" class="ghost icon" aria-label="关闭" title="关闭">✕</button>
+    </div>
+    <div class="range-btns">
+      <button class="ghost range-btn" data-days="7">7天</button>
+      <button class="ghost range-btn" data-days="30">30天</button>
+      <button class="ghost range-btn" data-days="90">90天</button>
+      <button class="ghost range-btn" data-days="365">1年</button>
+    </div>
+    <div id="stats-summary" class="stats-summary"></div>
+    <div class="chart-wrap"><canvas id="stats-chart"></canvas></div>
+    <div id="stats-table" class="stats-table"></div>
   </div>
 
   <!-- 登录/注册 -->
@@ -108,18 +141,56 @@
         <button id="file-up" class="ghost" title="上级目录">⬆️</button>
         <input id="file-path" type="text" placeholder="路径，如 /home/user" />
         <button id="file-refresh" class="ghost" title="刷新">🔄</button>
-        <label class="file-upload"><input id="file-input" type="file" hidden />上传</label>
+        <label class="file-upload"><input id="file-input" type="file" hidden multiple />上传</label>
         <button id="btn-file-mkdir" class="ghost">新建目录</button>
         <button id="btn-file-touch" class="ghost">新建文件</button>
         <button id="btn-file-cancel" class="ghost hidden">取消上传</button>
         <button id="btn-dl-cancel" class="ghost hidden">取消下载</button>
       </div>
-      <input id="file-filter" class="file-filter" type="text" placeholder="过滤文件名（支持 * 和 ? 通配符）" />
+      <div class="file-filter-row">
+        <input id="file-filter" class="file-filter" type="text" placeholder="过滤当前目录（支持 * 和 ? 通配符）" />
+        <input id="file-find" class="file-find" type="text" placeholder="递归搜索（含子目录，如 *.log）" />
+        <button id="btn-find-clear" class="ghost hidden">清除</button>
+      </div>
       <p id="file-msg" class="msg"></p>
       <table class="file-table">
-        <thead><tr><th>名称</th><th>大小</th><th>修改时间</th><th></th></tr></thead>
+        <thead><tr><th>名称</th><th>大小</th><th>修改时间</th><th>权限</th><th></th></tr></thead>
         <tbody id="file-list"></tbody>
       </table>
+    </div>
+  </div>
+
+  <!-- 权限修改（Unix：POSIX mode 九宫格 + 八进制；Windows：仅只读开关） -->
+  <div id="chmod-modal" class="modal hidden">
+    <div class="modal-head">
+      <span>权限</span>
+      <button id="btn-chmod-close" class="ghost icon" aria-label="关闭" title="关闭">✕</button>
+    </div>
+    <div class="settings-body">
+      <p class="muted" id="chmod-path" style="font-size:12px;word-break:break-all"></p>
+      <div class="chmod-grid">
+        <span></span><span>读</span><span>写</span><span>执行</span>
+        <span>属主</span>
+        <input type="checkbox" id="cm-ur" aria-label="属主读" /><input type="checkbox" id="cm-uw" aria-label="属主写" /><input type="checkbox" id="cm-ux" aria-label="属主执行" />
+        <span>组</span>
+        <input type="checkbox" id="cm-gr" aria-label="组读" /><input type="checkbox" id="cm-gw" aria-label="组写" /><input type="checkbox" id="cm-gx" aria-label="组执行" />
+        <span>其他</span>
+        <input type="checkbox" id="cm-or" aria-label="其他读" /><input type="checkbox" id="cm-ow" aria-label="其他写" /><input type="checkbox" id="cm-ox" aria-label="其他执行" />
+      </div>
+      <div class="settings-row">
+        <input id="chmod-oct" type="text" placeholder="八进制，如 755" maxlength="4" />
+        <button id="btn-chmod-apply">应用</button>
+      </div>
+      <p class="muted" style="font-size:12px;margin:4px 0 0">
+        勾选与八进制联动。<b>Windows 无 POSIX 权限</b>，请用下方「只读」开关（填八进制会被拒绝）。
+      </p>
+      <div class="settings-row">
+        <label style="display:flex;align-items:center;gap:8px;font-size:13px">
+          <input id="chmod-readonly" type="checkbox" style="width:auto" /> 只读
+        </label>
+        <button id="btn-chmod-ro-apply" class="ghost">应用只读设置</button>
+      </div>
+      <p class="muted" style="font-size:12px;margin:0" id="chmod-hint"></p>
     </div>
   </div>
 
@@ -193,6 +264,35 @@
           <span class="field-tag">序号</span>
         </div>
       </div>
+      <!-- 逐机告警阈值覆盖（仅编辑模式显示；留空 = 继承全局阈值） -->
+      <div id="alert-override-box" class="ao-box hidden">
+        <div class="ao-title">告警阈值覆盖（留空继承全局）</div>
+        <div class="ao-grid">
+          <div class="field">
+            <input id="ao-cpu" type="number" placeholder="继承" />
+            <span class="field-tag">CPU %</span>
+          </div>
+          <div class="field">
+            <input id="ao-mem" type="number" placeholder="继承" />
+            <span class="field-tag">内存 %</span>
+          </div>
+          <div class="field">
+            <input id="ao-disk" type="number" placeholder="继承" />
+            <span class="field-tag">磁盘 %</span>
+          </div>
+          <div class="field">
+            <input id="ao-load" type="number" placeholder="继承" />
+            <span class="field-tag">负载</span>
+          </div>
+          <div class="field">
+            <input id="ao-offline" type="number" placeholder="继承" />
+            <span class="field-tag">离线(秒)</span>
+          </div>
+        </div>
+        <p class="muted" style="font-size:12px;margin:6px 0 0">
+          负载填 0 = 关闭该维度告警；全部留空 = 清除覆盖，回退全局阈值
+        </p>
+      </div>
       <div class="settings-row">
         <button id="btn-add-server">添加服务器</button>
       </div>
@@ -257,6 +357,14 @@
         <input id="set-alert-cooldown" type="number" placeholder="冷却(分钟)" />
         <input id="set-alert-offline" type="number" placeholder="离线(秒)" />
       </div>
+      <!-- 免打扰：计划内重启/割接前设置，暂停全部告警（阈值/探活/离线），到期自动恢复 -->
+      <div class="ao-title">免打扰（计划内重启 / 割接）</div>
+      <div class="settings-row">
+        <input id="set-alert-mute" type="datetime-local" aria-label="免打扰截止时间" />
+        <button id="btn-mute-clear" class="ghost">清除</button>
+        <span id="mute-hint" class="muted" style="font-size:12px"></span>
+      </div>
+      <p class="muted" style="font-size:12px">到期前暂停全部告警，到期自动恢复；留空并保存即不启用</p>
       <p class="muted" style="font-size:12px">占位符：{event} {title} {message} {server_name} {server_id} {details_json} {time} {token}</p>
       <details class="alert-presets">
         <summary>常见渠道示例（点击「使用」自动填入，再填 Token 即可）</summary>

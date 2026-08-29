@@ -2013,3 +2013,106 @@ test('TerminalDO: cleanup 按归属清理 pendingOpen，跨服务器/会话隔�
   assert.equal(inst.agents.size, 0);
   assert.equal(inst.pendingOpen.size, 0, 'server2 断开后 pendingOpen 清空');
 });
+
+// ---------------- MetricsDO：按天统计（流量累计 / 可用率 / 重启检测） ----------------
+// 存在理由：metrics_min 只留 30 天、7 天后降采样，且离线期间根本没有行——
+// 月度流量与可用率无法事后反推，只能实时累加。以下锁定四条核心不变式。
+
+test('MetricsDO: 按天统计累加在线时长与流量（速率 × 时长）', async () => {
+  const env = makeEnv({ ARCHIVE_TO_D1: '0' });
+  const { inst } = mkMetrics(env, mockState());
+  const base = Math.floor(Date.now() / 1000);
+  inst.accumulateDay(7, base, 100, 200, 3600);        // 首帧：建立游标，无区间
+  inst.accumulateDay(7, base + 60, 100, 200, 3600);   // 间隔 60s → 记 60s 在线
+  await inst.flushDayPending();
+
+  const rows = await env.DB.prepare('SELECT * FROM metrics_day WHERE server_id = 7').all();
+  assert.equal(rows.results.length, 1);
+  const r = rows.results[0];
+  assert.ok(Math.abs(r.total_min - 1) < 1e-6, `分母应为 1 分钟，实际 ${r.total_min}`);
+  assert.ok(Math.abs(r.online_min - 1) < 1e-6, '全程在线：分子等于分母');
+  assert.equal(r.bytes_in, 6000, '入站 = 100 B/s × 60s');
+  assert.equal(r.bytes_out, 12000, '出站 = 200 B/s × 60s');
+  assert.equal(r.restarts, 0);
+});
+
+test('MetricsDO: 跨天区间按天拆分，不整体记入某一天', async () => {
+  const env = makeEnv({ ARCHIVE_TO_D1: '0' });
+  const { inst } = mkMetrics(env, mockState());
+  const day = Math.floor(Date.now() / 1000 / 86400);
+  const midnight = (day + 1) * 86400; // 次日 0 点（UTC），即当天的真实结束边界
+  // 从午夜前 30s 跨到午夜后 30s：总 60s，两边各 30s
+  inst.accumulateDay(8, midnight - 30, 10, 10, null);
+  inst.accumulateDay(8, midnight + 30, 10, 10, null);
+  await inst.flushDayPending();
+
+  const rows = await env.DB.prepare('SELECT * FROM metrics_day WHERE server_id = 8 ORDER BY day').all();
+  assert.equal(rows.results.length, 2, '跨天必须拆成两天的账');
+  assert.equal(rows.results[0].day, day);
+  assert.equal(rows.results[1].day, day + 1);
+  assert.ok(Math.abs(rows.results[0].total_min - 0.5) < 1e-6, '当天 30s');
+  assert.ok(Math.abs(rows.results[1].total_min - 0.5) < 1e-6, '次日 30s');
+});
+
+test('MetricsDO: 长时间离线只补可用率分母——可用率不得虚高', async () => {
+  const env = makeEnv({ ARCHIVE_TO_D1: '0' });
+  const { inst } = mkMetrics(env, mockState());
+  const base = Math.floor(Date.now() / 1000);
+  inst.accumulateDay(9, base, 0, 0, 100);
+  // 间隔 3 小时（远超 DAY_ONLINE_GAP_S=300s）：仅尾部 300s 视为在线
+  inst.accumulateDay(9, base + 3 * 3600, 0, 0, 100);
+  await inst.flushDayPending();
+
+  const r = await env.DB.prepare('SELECT * FROM metrics_day WHERE server_id = 9').first();
+  assert.ok(Math.abs(r.total_min - 180) < 1e-6, `分母应为 180 分钟，实际 ${r.total_min}`);
+  assert.ok(Math.abs(r.online_min - 5) < 1e-6, `分子应只有 5 分钟，实际 ${r.online_min}`);
+  // 这是本表存在的意义：若把离线段也算在线，可用率会恒为 100% 而完全失真
+  assert.ok(r.online_min / r.total_min < 0.04, '可用率必须显著低于 100%');
+});
+
+test('MetricsDO: 离线机器由 alarm 补记分母（不再上报也不虚高）', async () => {
+  const env = makeEnv({ ARCHIVE_TO_D1: '0' });
+  const { inst } = mkMetrics(env, mockState());
+  const base = Math.floor(Date.now() / 1000);
+  inst.accumulateDay(11, base, 0, 0, 100);
+  inst.lastSeenSec.set(11, base);
+  await inst.flushDayPending(); // 先落一次在线段
+
+  // 模拟 2 小时后 alarm：该机再无上报 → 补记离线时长（只补分母）
+  inst.sweepOfflineDaySpans(base + 2 * 3600);
+  await inst.flushDayPending();
+
+  const r = await env.DB.prepare('SELECT * FROM metrics_day WHERE server_id = 11').first();
+  assert.ok(r.total_min > 100, `离线 2 小时应补约 120 分钟分母，实际 ${r.total_min}`);
+  assert.ok(r.online_min < 6, `分子不得随分母增长，实际 ${r.online_min}`);
+});
+
+test('MetricsDO: uptime 下降沿计为重启（与可用率互补）', async () => {
+  const env = makeEnv({ ARCHIVE_TO_D1: '0' });
+  const { inst } = mkMetrics(env, mockState());
+  const base = Math.floor(Date.now() / 1000);
+  inst.accumulateDay(10, base, 0, 0, 86400 * 10);         // 开机 10 天
+  inst.accumulateDay(10, base + 60, 0, 0, 86400 * 10 + 60); // 正常增长 → 不计
+  inst.accumulateDay(10, base + 120, 0, 0, 120);          // 骤降 → 重启
+  await inst.flushDayPending();
+
+  const r = await env.DB.prepare('SELECT * FROM metrics_day WHERE server_id = 10').first();
+  assert.equal(r.restarts, 1, '仅一次下降沿');
+  // 可用率视角这台机器全程在线（100%），但 uptime 暴露了它重启过——两者互补
+  assert.ok(Math.abs(r.online_min - r.total_min) < 1e-6);
+});
+
+test('MetricsDO: flush 采用增量 UPSERT，多次 flush 累加而非覆盖', async () => {
+  const env = makeEnv({ ARCHIVE_TO_D1: '0' });
+  const { inst } = mkMetrics(env, mockState());
+  const base = Math.floor(Date.now() / 1000);
+  inst.accumulateDay(12, base, 0, 0, null);
+  inst.accumulateDay(12, base + 60, 100, 0, null);
+  await inst.flushDayPending();
+  inst.accumulateDay(12, base + 120, 100, 0, null);
+  await inst.flushDayPending();
+
+  const r = await env.DB.prepare('SELECT * FROM metrics_day WHERE server_id = 12').first();
+  assert.ok(Math.abs(r.total_min - 2) < 1e-6, '两次 flush 的分母应累加为 2 分钟');
+  assert.equal(r.bytes_in, 12000, '流量累加而非被第二次 flush 覆盖');
+});

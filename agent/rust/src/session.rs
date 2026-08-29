@@ -1043,6 +1043,271 @@ async fn file_move(path: &str, dest: &str) -> String {
     }
 }
 
+// 递归搜索：从 path 起下钻，按通配符匹配文件名，带深度/结果数/扫描条目三重上限。
+// 与 list 的差异：list 只看当前目录（过滤先于截断），大目录树里找文件只能靠 find。
+// 三重上限的意义——阻塞线程上跑，任一失控都会卡住整个文件会话：
+//   max_depth 防深目录树、limit 防巨型结果帧、MAX_ENTRIES 防超大目录长时间占用。
+async fn file_find(path: &str, pattern: &str, max_depth: u32, limit: usize) -> String {
+    if is_system_path(path) {
+        return err_json(SYSTEM_PATH_ERR);
+    }
+    let path = path.to_string();
+    let pattern = pattern.to_string();
+    let r = crate::blocking::file_blocking(30, move || -> Result<serde_json::Value, String> {
+        if is_system_path_resolved(&path) {
+            return Err(SYSTEM_PATH_ERR.into());
+        }
+        const MAX_ENTRIES: usize = 50_000; // 扫描条目硬上限（非结果数）
+        let limit = limit.clamp(1, 1000);
+        let max_depth = max_depth.min(16);
+        let matcher = if pattern.is_empty() {
+            None
+        } else {
+            Some(pattern.to_ascii_lowercase())
+        };
+        let mut hits: Vec<serde_json::Value> = Vec::new();
+        let mut scanned: usize = 0;
+        let mut truncated = false;
+        // 显式栈 DFS：(目录, 当前深度)。目录即使不匹配也要下钻——匹配项可能在其子目录里
+        let mut stack: Vec<(std::path::PathBuf, u32)> =
+            vec![(std::path::PathBuf::from(&path), 0)];
+        while let Some((dir, depth)) = stack.pop() {
+            if hits.len() >= limit || scanned >= MAX_ENTRIES {
+                truncated = true;
+                break;
+            }
+            // 无权限/中途消失的目录：跳过而非中断整个搜索（与 file_list 的容错一致）
+            let rd = match std::fs::read_dir(&dir) {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+            for e in rd.flatten() {
+                if scanned >= MAX_ENTRIES || hits.len() >= limit {
+                    truncated = true;
+                    break;
+                }
+                scanned += 1;
+                let name = e.file_name().to_string_lossy().into_owned();
+                let ft = match e.file_type() {
+                    Ok(t) => t,
+                    Err(_) => continue,
+                };
+                let is_dir = ft.is_dir();
+                let matched = match &matcher {
+                    Some(m) => wildcard_match(m, &name.to_ascii_lowercase()),
+                    None => true,
+                };
+                if matched {
+                    let full = e.path().to_string_lossy().into_owned();
+                    let meta = e.metadata().ok();
+                    hits.push(serde_json::json!({
+                        "path": full,
+                        "name": name,
+                        "type": if is_dir { "dir" } else { "file" },
+                        "size": if is_dir { 0 } else { meta.as_ref().map(|m| m.len()).unwrap_or(0) },
+                        "mtime": if is_dir { 0 } else { meta.as_ref()
+                            .and_then(|m| m.modified().ok())
+                            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0) },
+                        "mode": permission_bits(meta.as_ref()),
+                    }));
+                }
+                if is_dir && depth < max_depth {
+                    stack.push((e.path(), depth + 1));
+                }
+            }
+        }
+        Ok(serde_json::json!({
+            "hits": hits,
+            "truncated": truncated,
+            "scanned": scanned,
+        }))
+    })
+    .await;
+    match r {
+        Some(Ok(v)) => serde_json::json!({
+            "type": "find_result",
+            "ok": true,
+            "hits": v["hits"],
+            "truncated": v["truncated"],
+            "scanned": v["scanned"],
+        })
+        .to_string(),
+        Some(Err(e)) => err_json(&e),
+        None => err_json("find timeout"),
+    }
+}
+
+// 权限位（list_result 展示 + chmod 弹窗回填基线）：
+// Unix 取 POSIX mode 低 12 位（含 setuid/setgid/sticky）；Windows 无 POSIX mode，
+// 用只读位折算为 0o444 / 0o666——仅为展示近似，Windows 上 chmod 也只接受 readonly 维度。
+fn permission_bits(meta: Option<&std::fs::Metadata>) -> u32 {
+    let Some(m) = meta else { return 0 };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        m.permissions().mode() & 0o7777
+    }
+    #[cfg(windows)]
+    {
+        if m.permissions().readonly() {
+            0o444
+        } else {
+            0o666
+        }
+    }
+}
+
+// 目录递归复制（显式栈，避免深目录递归爆栈；带累计体积上限防误操作撑爆磁盘）。
+// std::fs::copy 只处理单文件，目录复制必须自行遍历。
+fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> Result<(), String> {
+    std::fs::create_dir_all(dst).map_err(|e| format!("create dir: {e}"))?;
+    let mut total: u64 = 0;
+    let mut stack: Vec<(std::path::PathBuf, std::path::PathBuf)> =
+        vec![(src.to_path_buf(), dst.to_path_buf())];
+    while let Some((from, to)) = stack.pop() {
+        let entries =
+            std::fs::read_dir(&from).map_err(|e| format!("read dir {}: {e}", from.display()))?;
+        for entry in entries {
+            let entry = entry.map_err(|e| format!("read entry: {e}"))?;
+            let target = to.join(entry.file_name());
+            // symlink 不跟随：metadata() 取链接自身属性，避免通过软链接复制出目标树之外的内容
+            let meta = entry.metadata().map_err(|e| format!("metadata: {e}"))?;
+            if meta.is_dir() {
+                std::fs::create_dir_all(&target).map_err(|e| format!("create dir: {e}"))?;
+                stack.push((entry.path(), target));
+            } else {
+                total += meta.len();
+                if total > FILE_LIMIT {
+                    return Err(format!(
+                        "directory too large (> {:.1} MB limit)",
+                        FILE_LIMIT as f64 / 1_048_576.0
+                    ));
+                }
+                std::fs::copy(entry.path(), &target)
+                    .map_err(|e| format!("copy {}: {e}", target.display()))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+// 复制（文件 / 目录递归）：源与目标都必须在允许区域，目标已存在拒绝（不覆盖）。
+// 与 move 的差异：移动在跨分区时内部就用到了 copy，但作为独立指令暴露后，
+// "保留原件再出一份" 才是常见诉求（改配置前备份、复制模板目录等）。
+async fn file_copy(path: &str, dest: &str) -> String {
+    if is_system_path(path) || is_system_path(dest) {
+        return err_json(SYSTEM_PATH_ERR);
+    }
+    let path = path.to_string();
+    let dest = dest.to_string();
+    let r = crate::blocking::file_blocking(120, move || -> Result<String, String> {
+        if is_system_path_resolved(&path) || is_system_path_resolved(&dest) {
+            return Err(SYSTEM_PATH_ERR.into());
+        }
+        let meta = std::fs::metadata(&path).map_err(|_| "path not found")?;
+        if std::path::Path::new(&dest).exists() {
+            return Err("target already exists".into());
+        }
+        // 自复制 / 复制到自身子目录：递归会无限膨胀直到撑爆磁盘，必须前置拦截
+        if dest == path
+            || dest.starts_with(&format!("{path}/"))
+            || dest.starts_with(&format!("{path}\\"))
+        {
+            return Err("cannot copy into itself".into());
+        }
+        if let Some(parent) = std::path::Path::new(&dest).parent() {
+            std::fs::create_dir_all(parent).map_err(|e| format!("create target parent: {e}"))?;
+        }
+        if meta.is_dir() {
+            copy_dir_recursive(std::path::Path::new(&path), std::path::Path::new(&dest))?;
+        } else {
+            if meta.len() > FILE_LIMIT {
+                return Err(format!(
+                    "file too large ({:.1} MB > {:.1} MB limit)",
+                    meta.len() as f64 / 1_048_576.0,
+                    FILE_LIMIT as f64 / 1_048_576.0
+                ));
+            }
+            std::fs::copy(&path, &dest).map_err(|e| format!("copy: {e}"))?;
+        }
+        Ok(dest.clone())
+    })
+    .await;
+    match r {
+        Some(Ok(t)) => {
+            serde_json::json!({ "type": "copy_result", "ok": true, "path": t }).to_string()
+        }
+        Some(Err(e)) => err_json(&e),
+        None => err_json("copy timeout"),
+    }
+}
+
+// 权限修改：Unix 按 POSIX mode 位（如 0o755）设置；Windows 无 POSIX mode，
+// 仅支持只读开关（完整 ACL/属主跨平台语义差异过大，不做，避免给出假的等价物）。
+// 回读实际生效值返回，供前端刷新显示（umask 等因素可能导致实际值与请求值不同）。
+async fn file_chmod(path: &str, mode: Option<u32>, readonly: Option<bool>) -> String {
+    if is_system_path(path) {
+        return err_json(SYSTEM_PATH_ERR);
+    }
+    let path = path.to_string();
+    let r = crate::blocking::file_blocking(10, move || -> Result<u32, String> {
+        if is_system_path_resolved(&path) {
+            return Err(SYSTEM_PATH_ERR.into());
+        }
+        let meta = std::fs::metadata(&path).map_err(|_| "path not found")?;
+        let mut perms = meta.permissions();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Some(m) = mode {
+                // 上限 0o7777：含 setuid/setgid/sticky 位；越界值直接拒绝
+                if m > 0o7777 {
+                    return Err("invalid mode".into());
+                }
+                perms.set_mode(m);
+            }
+            // Unix 上 readonly 映射为"去掉所有写位" / "补回属主写位"
+            if readonly == Some(true) {
+                perms.set_mode(perms.mode() & !0o222);
+            } else if readonly == Some(false) {
+                perms.set_mode(perms.mode() | 0o200);
+            }
+        }
+        #[cfg(windows)]
+        {
+            if mode.is_some() {
+                return Err("chmod mode not supported on Windows (use readonly)".into());
+            }
+            if let Some(ro) = readonly {
+                perms.set_readonly(ro);
+            }
+        }
+        std::fs::set_permissions(&path, perms).map_err(|e| format!("chmod failed: {e}"))?;
+        let now = std::fs::metadata(&path)
+            .map_err(|e| e.to_string())?
+            .permissions();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            Ok(now.mode())
+        }
+        #[cfg(windows)]
+        {
+            Ok(if now.readonly() { 0o444 } else { 0o666 })
+        }
+    })
+    .await;
+    match r {
+        Some(Ok(m)) => {
+            serde_json::json!({ "type": "chmod_result", "ok": true, "mode": m }).to_string()
+        }
+        Some(Err(e)) => err_json(&e),
+        None => err_json("chmod timeout"),
+    }
+}
+
 // 文件命令响应：Text（list_result/write_result/error 等无数据）或 Binary（read_result 混合帧）
 enum FileReply {
     Text(String),
@@ -1101,6 +1366,24 @@ async fn handle_file_cmd(line: &str, sid: &str, tmp_dir: &str) -> FileReply {
         "move" => {
             let dest = v.get("dest").and_then(|x| x.as_str()).unwrap_or("");
             FileReply::Text(file_move(&path, dest).await)
+        }
+        "copy" => {
+            let dest = v.get("dest").and_then(|x| x.as_str()).unwrap_or("");
+            FileReply::Text(file_copy(&path, dest).await)
+        }
+        "chmod" => {
+            // mode：POSIX 权限位（Unix，如 0o755；Windows 不支持）；
+            // readonly：布尔，跨平台（Windows 唯一可用维度）
+            let mode = v.get("mode").and_then(|x| x.as_u64()).map(|n| n as u32);
+            let readonly = v.get("readonly").and_then(|x| x.as_bool());
+            FileReply::Text(file_chmod(&path, mode, readonly).await)
+        }
+        "find" => {
+            // 递归搜索：pattern 为文件名通配符（空 = 匹配全部），max_depth 默认 6，limit 默认 200
+            let pattern = v.get("pattern").and_then(|x| x.as_str()).unwrap_or("");
+            let max_depth = v.get("max_depth").and_then(|x| x.as_u64()).unwrap_or(6) as u32;
+            let limit = v.get("limit").and_then(|x| x.as_u64()).unwrap_or(200) as usize;
+            FileReply::Text(file_find(&path, pattern, max_depth, limit).await)
         }
         _ => FileReply::Text(err_json("unknown cmd")),
     }
@@ -1225,16 +1508,18 @@ async fn file_list(path: String, pattern: Option<String>) -> String {
                     Err(_) => continue,
                 };
                 let is_dir = ft.is_dir();
+                // 单次 metadata：原实现 size 与 mtime 各 stat 一次（目录为 0 时白取两次），
+                // 加入 mode 后更需要合并，避免每条目三次系统调用
+                let meta = e.metadata().ok();
                 let size = if is_dir {
                     0
                 } else {
-                    e.metadata().map(|m| m.len()).unwrap_or(0)
+                    meta.as_ref().map(|m| m.len()).unwrap_or(0)
                 };
                 let mtime = if is_dir {
                     0
                 } else {
-                    e.metadata()
-                        .ok()
+                    meta.as_ref()
                         .and_then(|m| m.modified().ok())
                         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                         .map(|d| d.as_secs())
@@ -1245,6 +1530,7 @@ async fn file_list(path: String, pattern: Option<String>) -> String {
                     "type": if is_dir { "dir" } else { "file" },
                     "size": size,
                     "mtime": mtime,
+                    "mode": permission_bits(meta.as_ref()),
                 }));
             }
         }

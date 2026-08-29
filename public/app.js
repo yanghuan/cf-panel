@@ -4,7 +4,7 @@
   // 工具函数与 <cf-ip> 组件从 utils.js 解构；api 层从 api.js 解构（index.html 中均须先加载）
   const { $, escapeHtml, fmtBytes, normalizeFileEntry, fileJoin, fileParent, fileBase, downsample, lockScroll, unlockScroll,
           MONITOR_STEP_MAX, MONITOR_RANGE_LABEL, MONITOR_COLORS,
-          GEO_PRIVATE, setGeoEnabled, flagHtml, osIconHtml, isSystemPath, isBinaryExt, loadScript, loadCss, loadMonaco, loadMarkdown, geoLookup, IdleGuard } = CfUtils;
+          GEO_PRIVATE, setGeoEnabled, flagHtml, osIconHtml, isSystemPath, isBinaryExt, modeText, loadScript, loadCss, loadMonaco, loadMarkdown, geoLookup, IdleGuard } = CfUtils;
   const { api, setTokenGetter, FileSession, TermSession, PushSession } = CfApi;
   let token = localStorage.getItem('cfpanel_token') || '';
 
@@ -50,6 +50,9 @@
   let latestAgent = null; // {build_id,platforms}：管理员登录后一次获取，卡片按 agent capability 显示更新按钮
   const updatingAgents = new Set(); // server id：防重复点击，更新期间按钮置禁用
   let groupOrder = []; // 分组显示顺序（组名数组，下标即顺序；管理员经 ↑↓ 调整，PUT /api/group-order 持久化）
+  const selectedServers = new Set(); // 批量操作选中的服务器 id（仅管理员可见复选框）
+  let searchQuery = '';              // 服务器列表搜索词（纯前端过滤，不触发请求）
+  let searchTimer = null;            // 搜索输入 debounce 定时器
   let pushTimer = null;    // 每 3 秒发一次 sync 请求的定时器（老化）
   let monitorState = null; // { serverId, serverName, range } 当前监控视图
   let monitorCharts = []; // Chart.js 实例数组（每指标一张图，切换范围时全部销毁重建）
@@ -83,6 +86,7 @@
   // ---------- 鉴权视图 ----------
   function showAuth() {
     stopPush();
+    clearSelection(); // 登出清批量选中（避免下次登录残留上一位用户的选中态）
     $('#auth').classList.remove('hidden');
     $('#app').classList.add('hidden');
   }
@@ -102,6 +106,8 @@
     });
     if (isAdmin) loadLatestAgent();
     else latestAgent = null;
+    // PAT 用户没有批量操作权限：切到 PAT 时清空选中并隐藏批量栏
+    if (!isAdmin) clearSelection();
     loadServers(); // 先拉一次，WS 建立后由服务端推送覆盖
     startPush();
     idleGuard.start(); // 空闲观看保护：登录后开始计时
@@ -343,8 +349,9 @@
     const updateBtn = agentUpdateAvailable(s)
       ? `<button data-act="agent-update" data-id="${s.id}" data-name="${escapeHtml(s.name)}" title="目标版本 ${escapeHtml(latestAgent.build_id)}" ${updatingAgents.has(s.id) ? 'disabled' : ''}>${updatingAgents.has(s.id) ? '更新中...' : '更新 Agent'}</button>`
       : '';
+    const sel = selectedServers.has(s.id);
     return `
-      <div class="card" data-id="${s.id}">
+      <div class="card${sel ? ' selected' : ''}" data-id="${s.id}">
         <div class="card-head">
           <div class="card-title">
             <span class="name"><span class="flag" data-flag="${escapeHtml(ip)}"></span>${osIconHtml(s.info && s.info.os)}${escapeHtml(s.name)}</span>
@@ -353,11 +360,14 @@
               ${canExec ? `<button data-act="term" data-id="${s.id}" data-name="${escapeHtml(s.name)}">终端</button>
               <button data-act="file" data-id="${s.id}" data-name="${escapeHtml(s.name)}">文件</button>` : ''}
               <button data-act="mon" data-id="${s.id}" data-name="${escapeHtml(s.name)}">监控</button>
-              ${isAdmin ? `${updateBtn}<button data-act="edit" data-id="${s.id}" data-name="${escapeHtml(s.name)}" data-group="${escapeHtml(s.group || '')}" data-order="${s.display_index || 0}">修改</button>
+              <button data-act="stats" data-id="${s.id}" data-name="${escapeHtml(s.name)}">流量/可用率</button>
+              ${isAdmin ? `${updateBtn}<button data-act="rotate" data-id="${s.id}" data-name="${escapeHtml(s.name)}">轮换 Key</button>
+              <button data-act="edit" data-id="${s.id}" data-name="${escapeHtml(s.name)}" data-group="${escapeHtml(s.group || '')}" data-order="${s.display_index || 0}">修改</button>
               <button data-act="del" data-id="${s.id}" data-name="${escapeHtml(s.name)}" class="dd-danger">删除</button>` : ''}
             </div>
           </div>
           <span class="badge ${s.online ? 'on' : 'off'}"><i class="dot"></i>${s.online ? '在线' : '离线'}</span>
+          ${isAdmin ? `<input type="checkbox" class="card-sel" data-sel="${s.id}" ${sel ? 'checked' : ''} aria-label="选择 ${escapeHtml(s.name)}" title="选择（批量操作）">` : ''}
         </div>
         ${metricBlockHtml(s)}
         ${probesBlockHtml(s)}
@@ -403,10 +413,23 @@
       }
     }
   }
+  // 搜索过滤（纯前端）：列表已由推送全量送到客户端，无需后端请求。
+  // 匹配名称 / 分组 / IP（wan_ip 优先，回退 agent 上报的网卡 IP），大小写不敏感。
+  function visibleServers() {
+    const q = searchQuery.trim().toLowerCase();
+    if (!q) return serversCache;
+    return serversCache.filter((s) => {
+      const ip = String(s.wan_ip || (s.info && s.info.ip4) || '').trim().toLowerCase();
+      return String(s.name || '').toLowerCase().includes(q)
+        || String(s.group || '').toLowerCase().includes(q)
+        || ip.includes(q);
+    });
+  }
+
   // 分组标题序列（用于判断分组结构是否变化）
   function groupList() {
     const groups = {};
-    for (const s of serversCache) {
+    for (const s of visibleServers()) {
       const g = s.group || '未分组';
       (groups[g] = groups[g] || []).push(s);
     }
@@ -419,8 +442,11 @@
   }
   function renderServers() {
     const box = $('#servers');
+    pruneSelection(); // 清理已被删除的选中项（批量栏计数随之修正）
     agingServers();
     renderOverview();
+    updateBatchBar();
+    // "没有服务器"与"搜索无结果"要区分：前者引导添加，后者引导换词
     if (!serversCache.length) {
       box.innerHTML = '<div class="empty"><p>还没有服务器</p><p class="muted">点<a href="#" class="empty-add" id="empty-add">「添加服务器」</a>生成 agent 配置后开始监控</p></div>';
       // 事件绑定：内嵌链接点击直接打开添加服务器弹窗（与 toolbar「＋」同入口）
@@ -428,8 +454,13 @@
       if (emptyAdd) emptyAdd.onclick = (e) => { e.preventDefault(); openAddModal(); };
       return;
     }
+    const visible = visibleServers();
+    if (!visible.length) {
+      box.innerHTML = `<div class="empty"><p>没有匹配的服务器</p><p class="muted">没有名称/分组/IP 包含「${escapeHtml(searchQuery.trim())}」的节点</p></div>`;
+      return;
+    }
     const groups = groupList();
-    const byGroup = (g) => serversCache
+    const byGroup = (g) => visible
       .filter((s) => (s.group || '未分组') === g)
       .sort((a, b) => (a.display_index || 0) - (b.display_index || 0));
     // 组标题：名称 + 计数 + 管理员可见的 ↑↓ 排序按钮（未分组固定最后，不给按钮；
@@ -472,7 +503,8 @@
     tipSource = null;
     // 服务器增删或分组结构变化 → 低频全量重建
     const domIds = new Set([...box.querySelectorAll('.card')].map((c) => Number(c.dataset.id)));
-    const wantIds = new Set(serversCache.map((s) => s.id));
+    // 用过滤后列表比对：否则搜索期间 dom 数恒小于全量，每次推送都触发全量重建（抖动 + 无谓开销）
+    const wantIds = new Set(visibleServers().map((s) => s.id));
     if (domIds.size !== wantIds.size || [...domIds].some((id) => !wantIds.has(id))) {
       renderServers();
       return;
@@ -557,6 +589,7 @@
   }
 
   // 修改服务器（菜单「修改」）：预填当前值，提交 PATCH；不动 agent key，在线状态不受影响
+  // 告警覆盖值从 serversCache 取（列表已随推送下发 alert_override），避免为编辑再单开详情接口
   function openEditModal(id, name, group, order) {
     editServerId = id;
     $('#add-modal-title').textContent = '修改服务器';
@@ -564,9 +597,38 @@
     $('#inp-name').value = name || '';
     $('#inp-group').value = group || '';
     $('#inp-order').value = order != null ? String(order) : '';
+    const ov = (serversCache.find((x) => x.id === id) || {}).alert_override || {};
+    // 未设置/继承全局的输入框留空（placeholder "继承"）；load=0 是"关闭该维度"的显式值，要显示 0
+    $('#ao-cpu').value = ov.cpu_pct != null ? ov.cpu_pct : '';
+    $('#ao-mem').value = ov.mem_pct != null ? ov.mem_pct : '';
+    $('#ao-disk').value = ov.disk_pct != null ? ov.disk_pct : '';
+    $('#ao-load').value = ov.load != null ? ov.load : '';
+    $('#ao-offline').value = ov.offline_after_s != null ? ov.offline_after_s : '';
+    $('#alert-override-box').classList.remove('hidden'); // 仅修改模式显示（新增时无覆盖可言）
     $('#add-modal').classList.remove('hidden');
     lockScroll();
     setTimeout(() => $('#inp-name').focus(), 50);
+  }
+
+  // 收集告警覆盖表单：全空 → null（清除覆盖回退全局）；部分填写 → 只提交填写的维度。
+  // 空字符串必须转 null 而非 0——0 对 cpu/mem/disk 是"永远告警"，与"继承"语义相反。
+  function collectAlertOverride() {
+    const numOrNull = (sel) => {
+      const v = String($(sel).value).trim();
+      if (v === '') return null;
+      const n = Number(v);
+      return Number.isFinite(n) ? n : null;
+    };
+    const out = {
+      cpu_pct: numOrNull('#ao-cpu'),
+      mem_pct: numOrNull('#ao-mem'),
+      disk_pct: numOrNull('#ao-disk'),
+      load: numOrNull('#ao-load'),
+      offline_after_s: numOrNull('#ao-offline'),
+    };
+    const kept = {};
+    for (const [k, v] of Object.entries(out)) if (v != null) kept[k] = v;
+    return Object.keys(kept).length ? kept : null;
   }
 
   async function saveEditServer() {
@@ -577,7 +639,7 @@
     try {
       await api(`/api/servers/${editServerId}`, {
         method: 'PATCH',
-        body: JSON.stringify({ name, group, sort_order: sortOrder }),
+        body: JSON.stringify({ name, group, sort_order: sortOrder, alert_override: collectAlertOverride() }),
       });
       $('#add-modal').classList.add('hidden');
       unlockScroll();
@@ -881,7 +943,22 @@
       }
     },
     onUploadProgress: (pct) => { $('#file-msg').textContent = `上传中：${pct}%`; },
-    onUploadDone: (path) => { $('#btn-file-cancel').classList.add('hidden'); $('#file-msg').textContent = ''; toast(`已上传：${path}`); reloadFileList(); },
+    onUploadDone: (path) => {
+      uploadStat.ok += 1;
+      reloadFileList();
+      // 单文件（整批只有这一个且未失败）保持既有行为；批量则显示进度并推进队列
+      const batched = uploadStat.ok + uploadStat.failed.length + uploadQueue.length > 1;
+      if (!batched) {
+        $('#btn-file-cancel').classList.add('hidden');
+        $('#file-msg').textContent = '';
+        toast(`已上传：${path}`);
+        return;
+      }
+      $('#file-msg').textContent = uploadQueue.length
+        ? `已上传 ${uploadStat.ok} 个，还剩 ${uploadQueue.length} 个（当前：${path}）`
+        : `已上传 ${uploadStat.ok} 个（最后：${path}）`;
+      nextUpload();
+    },
     onUploadCanceled: () => { $('#btn-file-cancel').classList.add('hidden'); $('#file-msg').textContent = '已取消上传'; },
     onDownloadProgress: (pct) => { $('#file-msg').textContent = `下载中：${pct}%`; },
     onDownloadDone: (path, parts, dlName) => {
@@ -905,16 +982,79 @@
     onMkdirDone: () => { reloadFileList(); toast('目录已创建'); },
     onTouchDone: () => { reloadFileList(); toast('文件已创建'); },
     onMoveDone: (path) => { reloadFileList(); toast(`已移动到：${path}`); },
+    onCopyDone: (path) => { reloadFileList(); toast(`已复制为：${path}`); },
+    onChmodDone: (mode) => { reloadFileList(); toast(`权限已更新：${modeText(mode) || mode}`); },
+    onFindDone: (hits, truncated, scanned) => {
+      // 迟到的搜索响应（期间已清除搜索或切了目录）：丢弃，不覆盖当前视图
+      if (!fileFindState) return;
+      fileFindState.truncated = truncated;
+      fileFindState.scanned = scanned;
+      renderFindResults(hits);
+    },
     onEditLoaded: (path, text) => openFileEditor(path, text),
     // 错误同时 toast：编辑器保存后弹窗已关闭、文件弹窗可能未开——仅写 file-msg 会零提示
-    onError: (msg) => { $('#file-msg').textContent = `错误：${msg}`; toast(`文件操作错误：${msg}`); },
+    onError: (msg) => {
+      $('#file-msg').textContent = `错误：${msg}`;
+      toast(`文件操作错误：${msg}`);
+      // 批量上传中途失败：记录并推进队列，否则剩余文件会一直卡在队列里
+      if (uploadQueue.length) {
+        uploadStat.failed.push(`（中断：${msg}）`);
+        nextUpload();
+      }
+    },
     onDisconnected: () => { if (!$('#file-modal').classList.contains('hidden')) $('#file-msg').textContent = '连接断开，点击「刷新」重连'; },
   });
 
   // 重新拉取列表（带当前过滤规则）。过滤在 agent 端完成（先过滤再截断 1000 条），
   // 避免大目录下前端只拿到截断区间子集而遗漏匹配文件
   function reloadFileList() {
+    // 搜索模式下"刷新"要重跑搜索——否则 list 结果会把搜索结果覆盖掉
+    if (fileFindState) { doFind(); return; }
     fileSess.list(fileSess.cwd, $('#file-filter').value);
+  }
+
+  // ---------- 递归搜索（find）：从当前目录下钻子目录匹配文件名 ----------
+  // 与「过滤」的分工：过滤只看当前目录（agent 端先过滤再截断 1000 条），
+  // 搜索递归下钻——大目录树里定位文件只能靠它。有搜索词时忽略过滤词（两者互斥）。
+  let fileFindState = null; // { pattern, truncated, scanned }；null = 正常目录浏览
+  let fileFindTimer = null;
+
+  function doFind() {
+    const kw = String($('#file-find').value || '').trim();
+    if (!kw) { clearFind(); return; }
+    if (isSystemPath(fileSess.cwd)) return toast('系统目录受保护，不支持递归搜索');
+    fileFindState = { pattern: kw, truncated: false, scanned: 0 };
+    $('#btn-find-clear').classList.remove('hidden');
+    $('#file-msg').textContent = `搜索中：${kw}`;
+    fileSess.find(fileSess.cwd, kw);
+  }
+
+  function clearFind() {
+    fileFindState = null;
+    $('#file-find').value = '';
+    $('#btn-find-clear').classList.add('hidden');
+    reloadFileList(); // 回到正常目录浏览
+  }
+
+  function renderFindResults(hits) {
+    const root = fileSess.cwd;
+    const safe = (Array.isArray(hits) ? hits : []).map(normalizeFileEntry);
+    const rows = safe.map((e) => {
+      const full = String(e.path || '');
+      // 相对搜索根显示（完整路径放 title），否则深路径会挤爆名称列
+      const rel = full.startsWith(root) ? full.slice(root.length).replace(/^[\\/]/, '') : full;
+      const editable = !isSystemPath(full) && e.type !== 'dir' && e.size <= 1024 * 1024 && !isBinaryExt(e.name);
+      const size = e.type === 'dir' ? '—' : fmtBytes(e.size);
+      const perm = e.mode ? escapeHtml(modeText(e.mode)) : '—';
+      const icon = e.type === 'dir' ? '📁' : '📄';
+      return `<tr><td><span class="f-find-path" title="${escapeHtml(full)}">${icon} ${escapeHtml(rel || e.name)}</span></td>`
+        + `<td>${size}</td><td>—</td><td class="f-perm">${perm}</td>`
+        + `<td class="f-ops">${rowOpsMenu(full, e.type, e.size, e.mode, editable)}</td></tr>`;
+    });
+    $('#file-list').innerHTML = rows.join('') || '<tr><td colspan="5" class="muted">无匹配结果</td></tr>';
+    const st = fileFindState || {};
+    $('#file-msg').textContent = `递归搜索「${st.pattern || ''}」：${safe.length} 条`
+      + (st.truncated ? `（已达上限，仅显示部分；共扫描 ${st.scanned} 项）` : `（扫描 ${st.scanned} 项）`);
   }
 
   async function openFileManager(serverId, serverName) {
@@ -928,8 +1068,12 @@
     const cwd = saved && /^(?:[/]|[A-Za-z]:[\\/])/.test(saved) ? saved : '/';
     $('#file-path').value = cwd;
     $('#file-filter').value = '';
+    // 新会话不保留上次的搜索态（直接重置，不调 clearFind——它会触发尚未建立连接的 reload）
+    fileFindState = null;
+    $('#file-find').value = '';
+    $('#btn-find-clear').classList.add('hidden');
     $('#file-msg').textContent = '';
-    $('#file-list').innerHTML = '<tr><td colspan="4" class="muted">连接中...</td></tr>';
+    $('#file-list').innerHTML = '<tr><td colspan="5" class="muted">连接中...</td></tr>';
     $('#file-modal').classList.remove('hidden');
     lockScroll();
     fileSess.open(serverId, cwd); // 建会话 + WS + auth + 初始列表
@@ -939,6 +1083,25 @@
     fileSess.close();
     $('#file-modal').classList.add('hidden');
     unlockScroll();
+  }
+
+  // 行操作菜单（目录浏览与递归搜索共用）：full 为绝对路径，受保护系统路径只保留下载。
+  // 所有值都经数值收口与 escapeHtml——Agent 返回的文件名/路径一律视为不可信输入。
+  function rowOpsMenu(full, type, size, mode, editable) {
+    const prot = isSystemPath(full);
+    const e = escapeHtml;
+    return `<div class="row-menu-wrap">
+      <button class="row-menu" type="button" title="操作" aria-label="操作">⋯</button>
+      <div class="row-menu-pop hidden">
+        <button class="f-act-dl" type="button" data-path="${e(full)}" data-type="${e(type)}" data-size="${e(size)}">下载</button>
+        ${editable ? `<button class="f-act-edit" type="button" data-path="${e(full)}" data-size="${e(size)}">编辑</button>` : ''}
+        ${prot ? '' : `<button class="f-act-mv" type="button" data-path="${e(full)}">移动</button>
+        <button class="f-act-cp" type="button" data-path="${e(full)}">复制</button>
+        <button class="f-act-perm" type="button" data-path="${e(full)}" data-mode="${e(mode)}">权限</button>
+        <button class="f-act-ren" type="button" data-path="${e(full)}">重命名</button>
+        <button class="f-act-del danger" type="button" data-path="${e(full)}" data-type="${e(type)}">删除</button>`}
+      </div>
+    </div>`;
   }
 
   function renderFileList(entries) {
@@ -957,19 +1120,11 @@
       const nameCell = e.type === 'dir'
         ? `<a class="f-dir" data-path="${escapeHtml(path)}">📁 ${escapeHtml(e.name)}</a>`
         : `<span class="f-file${editable ? ' f-editable' : ''}"${editable ? ` data-path="${escapeHtml(path)}" data-size="${escapeHtml(e.size)}"` : ''}>📄 ${escapeHtml(e.name)}</span>`;
-      const menu = `<div class="row-menu-wrap">
-        <button class="row-menu" type="button" title="操作" aria-label="操作">⋯</button>
-        <div class="row-menu-pop hidden">
-          <button class="f-act-dl" type="button" data-path="${escapeHtml(path)}" data-type="${escapeHtml(e.type)}" data-size="${escapeHtml(e.size)}">下载</button>
-          ${editable ? `<button class="f-act-edit" type="button" data-path="${escapeHtml(path)}" data-size="${escapeHtml(e.size)}">编辑</button>` : ''}
-          ${prot ? '' : `<button class="f-act-mv" type="button" data-path="${escapeHtml(path)}">移动</button>
-          <button class="f-act-ren" type="button" data-path="${escapeHtml(path)}">重命名</button>
-          <button class="f-act-del danger" type="button" data-path="${escapeHtml(path)}" data-type="${escapeHtml(e.type)}">删除</button>`}
-        </div>
-      </div>`;
-      return `<tr><td>${nameCell}</td><td>${size}</td><td>${escapeHtml(time)}</td><td class="f-ops">${menu}</td></tr>`;
+      const menu = rowOpsMenu(path, e.type, e.size, e.mode, editable);
+      const perm = e.mode ? escapeHtml(modeText(e.mode)) : '—';
+      return `<tr><td>${nameCell}</td><td>${size}</td><td>${escapeHtml(time)}</td><td class="f-perm">${perm}</td><td class="f-ops">${menu}</td></tr>`;
     });
-    $('#file-list').innerHTML = rows.join('') || '<tr><td colspan="4" class="muted">空目录</td></tr>';
+    $('#file-list').innerHTML = rows.join('') || '<tr><td colspan="5" class="muted">空目录</td></tr>';
     // cwd 为受保护系统目录时禁用上传与新建（写操作会被 agent 拒；特殊需求走终端 Shell）
     const cwdProt = isSystemPath(fileSess.cwd);
     const upBtn = document.querySelector('label.file-upload');
@@ -994,6 +1149,70 @@
       if (!name || name.includes('/')) return toast('文件名不能包含 /');
       fileSess.touch(fileJoin(fileSess.cwd, name));
     });
+  }
+
+  // ---------- 权限修改（Unix：POSIX 九宫格 ⇄ 八进制；Windows：仅只读开关） ----------
+  // 平台差异在 agent 侧：Windows 无 POSIX mode，传 mode 会被明确拒绝，
+  // 故前端把"只读"做成独立的一条提交路径，而不是伪装成 0444/0666 的 POSIX 等价物。
+  let chmodPath = '';
+  const CHMOD_BITS = [
+    ['ur', 0o400], ['uw', 0o200], ['ux', 0o100],
+    ['gr', 0o040], ['gw', 0o020], ['gx', 0o010],
+    ['or', 0o004], ['ow', 0o002], ['ox', 0o001],
+  ];
+  function fillChmodForm(mode) {
+    const n = Number(mode) || 0;
+    for (const [k, bit] of CHMOD_BITS) {
+      const el = $(`#cm-${k}`);
+      if (el) el.checked = (n & bit) !== 0;
+    }
+    $('#chmod-oct').value = (n & 0o777).toString(8).padStart(3, '0');
+    // 只读 = 所有写位都被清掉（Unix 口径）；Windows 上报的 0444/0666 折算值同样适用
+    $('#chmod-readonly').checked = n !== 0 && (n & 0o222) === 0;
+    $('#chmod-hint').textContent = modeText(n) ? `当前：${modeText(n)}` : '';
+  }
+  // 九宫格 ⇄ 八进制双向联动（改任一侧即同步另一侧，避免两处输入不一致）
+  function syncChmodOct() {
+    let n = 0;
+    for (const [k, bit] of CHMOD_BITS) {
+      const el = $(`#cm-${k}`);
+      if (el && el.checked) n |= bit;
+    }
+    $('#chmod-oct').value = n.toString(8).padStart(3, '0');
+  }
+  function syncChmodBits() {
+    const raw = String($('#chmod-oct').value || '').trim();
+    if (!/^[0-7]{1,4}$/.test(raw)) return; // 输入中途（如空串/非法字符）不回写勾选
+    const n = Number.parseInt(raw, 8);
+    for (const [k, bit] of CHMOD_BITS) {
+      const el = $(`#cm-${k}`);
+      if (el) el.checked = (n & bit) !== 0;
+    }
+  }
+  function openChmod(path, mode) {
+    chmodPath = path;
+    $('#chmod-path').textContent = path;
+    fillChmodForm(mode);
+    $('#chmod-modal').classList.remove('hidden');
+    lockScroll();
+  }
+  function closeChmod() {
+    $('#chmod-modal').classList.add('hidden');
+    unlockScroll();
+  }
+  function applyChmod() {
+    const raw = String($('#chmod-oct').value || '').trim();
+    if (!/^[0-7]{1,4}$/.test(raw)) return toast('请输入合法的八进制权限（如 755）');
+    const n = Number.parseInt(raw, 8);
+    fileSess.chmod(chmodPath, n); // 不传 readonly：Unix 路径
+    closeChmod();
+    $('#file-msg').textContent = `修改权限中：${chmodPath}`;
+  }
+  function applyChmodReadonly() {
+    const ro = $('#chmod-readonly').checked;
+    fileSess.chmod(chmodPath, undefined, ro); // 不传 mode：跨平台只读路径（Windows 唯一可用维度）
+    closeChmod();
+    $('#file-msg').textContent = `${ro ? '设为只读' : '取消只读'}：${chmodPath}`;
   }
 
   // ---------- 在线编辑器：Monaco（CDN 懒加载，失败回退 textarea）----------
@@ -1176,9 +1395,11 @@
   }
 
   // ---------- 移动路径选择器（浏览目录选目标 + 文件名输入；复用主 WS 的 list 指令） ----------
-  function openFileSelector(srcPath, srcName, srcIsDir) {
-    fileSelector = { cwd: fileParent(srcPath), srcPath, srcName, srcIsDir, entries: [] };
-    $('#sel-title').textContent = `移动：${srcPath}`;
+  // op: 'move' | 'copy' —— 两者共用目录选择器（选目标目录 + 目标名），仅最终指令不同
+  function openFileSelector(srcPath, srcName, srcIsDir, op = 'move') {
+    fileSelector = { cwd: fileParent(srcPath), srcPath, srcName, srcIsDir, entries: [], op };
+    $('#sel-title').textContent = `${op === 'copy' ? '复制到' : '移动'}：${srcPath}`;
+    $('#btn-sel-ok').textContent = op === 'copy' ? '复制到此处' : '移动到此处';
     $('#sel-name').value = srcName;
     $('#file-selector-modal').classList.remove('hidden');
     lockScroll();
@@ -1213,7 +1434,7 @@
     const conflict = name && fileSelector.entries.some((e) => e.name === name);
     const sameSrc = name === fileSelector.srcName && fileSelector.cwd === fileParent(fileSelector.srcPath);
     $('#btn-sel-ok').disabled = isSystemPath(fileSelector.cwd) || !name || sameSrc;
-    if (sameSrc) $('#sel-msg').textContent = '与源位置相同，无需移动';
+    if (sameSrc) $('#sel-msg').textContent = `与源位置相同，无需${fileSelector.op === 'copy' ? '复制' : '移动'}`;
     else if (conflict) $('#sel-msg').textContent = `目标已存在同名「${name}」，将被拒绝（不覆盖）`;
     else if (!isSystemPath(fileSelector.cwd)) $('#sel-msg').textContent = '';
   }
@@ -1229,36 +1450,81 @@
   }
   function confirmSelectorMove() {
     if (!fileSelector) return;
+    const { srcPath, op } = fileSelector;
     const name = $('#sel-name').value.trim();
-    // 两种分隔符都拒绝（Windows '\' 越目录；与 agent 端 file_rename/file_move 校验同步）
+    // 两种分隔符都拒绝（Windows '\' 越目录；与 agent 端 file_rename/file_move/file_copy 校验同步）
     if (!name || name.includes('/') || name.includes('\\')) return toast('文件名不能为空且不含路径分隔符');
     const dest = fileJoin(fileSelector.cwd, name);
-    if (dest === fileSelector.srcPath) return toast('与源位置相同');
-    fileSess.move(fileSelector.srcPath, dest);
+    if (dest === srcPath) return toast('与源位置相同');
+    // 复制保留原件，移动不保留；两者都由 agent 拒绝覆盖已存在的目标
+    if (op === 'copy') fileSess.copy(srcPath, dest);
+    else fileSess.move(srcPath, dest);
     closeFileSelector();
-    $('#file-msg').textContent = `移动中：${dest}`;
+    $('#file-msg').textContent = `${op === 'copy' ? '复制' : '移动'}中：${dest}`;
   }
 
   // 上传/下载入口：状态机在 FileSession（api.js），这里只负责 UI 接线。
   // 上传前检测当前目录同名文件（服务端首块同样强制校验 overwrite，双保险）——同名需二次确认
+  //
+  // 多文件串行队列：FileSession 的上传状态机是单文件 stop-and-wait（等 write_result 才发下一块），
+  // 多文件在此排队、上一个结束（成功/失败/取消）后自动开下一个——不改动底层状态机，
+  // 也就不会引入并发帧交错的风险（服务端对同一 serverId 的上传本就互斥）。
+  let uploadQueue = [];
+  let uploadStat = { ok: 0, failed: [] };
+
   function uploadFile(file) {
+    uploadFiles([file]);
+  }
+
+  function uploadFiles(files) {
+    const list = Array.from(files || []).filter((f) => f && f.size >= 0);
+    if (!list.length) return;
     if (isSystemPath(fileSess.cwd)) {
       toast('系统目录受保护，禁止上传；如需操作请使用终端 Shell');
       return;
     }
-    const target = fileJoin(fileSess.cwd, file.name);
+    uploadQueue = list;
+    uploadStat = { ok: 0, failed: [] };
+    nextUpload();
+  }
+
+  function nextUpload() {
+    if (!uploadQueue.length) {
+      // 队列收尾：只有多文件（或曾经失败）才汇总提示，单文件成功时保持既有的一次 toast
+      const { ok, failed } = uploadStat;
+      $('#btn-file-cancel').classList.add('hidden');
+      if (failed.length) {
+        toast(`上传结束：成功 ${ok} 个，失败 ${failed.length} 个`, 4000);
+        $('#file-msg').textContent = `失败：${failed.join('；')}`;
+      }
+      return;
+    }
+    const f = uploadQueue[0];
+    const target = fileJoin(fileSess.cwd, f.name);
     const existing = fileEntries.some((e) => e.type !== 'dir' && fileJoin(fileSess.cwd, e.name) === target);
     if (existing) {
-      confirmDialog(`「${file.name}」已存在，是否覆盖？`, () => {
+      confirmDialog(`「${f.name}」已存在，是否覆盖？`, () => {
+        uploadQueue.shift();
         $('#btn-file-cancel').classList.remove('hidden');
-        fileSess.upload(file, { overwrite: true });
+        fileSess.upload(f, { overwrite: true });
+      }, () => {
+        // 取消这一个 → 跳过并继续队列（而不是中断整批）
+        uploadQueue.shift();
+        uploadStat.failed.push(`${f.name}（已跳过）`);
+        nextUpload();
       });
       return;
     }
+    uploadQueue.shift();
     $('#btn-file-cancel').classList.remove('hidden');
-    fileSess.upload(file);
+    fileSess.upload(f);
   }
-  function cancelUpload() { fileSess.cancelUpload(); }
+  // 取消上传 = 取消整批（队列一并清空）：逐个取消在多文件场景下不可点，
+  // 且用户点取消时的意图通常是"别传了"
+  function cancelUpload() {
+    uploadQueue = [];
+    fileSess.cancelUpload();
+  }
   function downloadFile(path, size) {
     $('#btn-dl-cancel').classList.remove('hidden');
     fileSess.download(path, size);
@@ -1657,6 +1923,225 @@
       </div>`).join('');
   }
 
+  // ---------- 批量操作（仅管理员） ----------
+  // 选中集合前端维护；改分组/删除走 POST /api/servers/batch（一次请求、逐项结果），
+  // 更新 Agent 则逐台串行调单机接口——更新是"关会话 + 传二进制 + 远端自替换"的高危操作，
+  // 串行能看清每台进度与失败原因，也天然互斥（后端对同一 serverId 并发更新会 409）。
+  function pruneSelection() {
+    for (const id of [...selectedServers]) {
+      if (!serversCache.some((s) => s.id === id)) selectedServers.delete(id); // 已被删
+    }
+  }
+  function updateBatchBar() {
+    const bar = $('#batch-bar');
+    if (!bar) return;
+    bar.classList.toggle('hidden', !isAdmin || selectedServers.size === 0);
+    $('#batch-count').textContent = `已选 ${selectedServers.size} 台`;
+  }
+  function toggleSelect(id, on) {
+    if (on) selectedServers.add(id); else selectedServers.delete(id);
+    updateBatchBar();
+    // 只切选中样式，不重建 DOM（重建会让打开的卡片菜单消失、hover 抖动）
+    const card = document.querySelector(`#servers .card[data-id="${id}"]`);
+    if (card) card.classList.toggle('selected', on);
+  }
+  function clearSelection() {
+    selectedServers.clear();
+    updateBatchBar();
+    document.querySelectorAll('#servers .card.selected').forEach((c) => c.classList.remove('selected'));
+  }
+
+  // 批量更新 Agent：串行执行，逐台反馈；全部结束后汇总成功/失败
+  async function batchUpdateAgent() {
+    const ids = [...selectedServers];
+    if (!ids.length) return;
+    const target = latestAgent && latestAgent.build_id;
+    confirmDialog(
+      `确认批量更新选中的 ${ids.length} 台 Agent${target ? ` 到 ${target}` : ''}？\n\n将逐台串行执行：每台会关闭现有终端/文件会话并短暂离线；成功后由 supervisor 或 AGENT_SELF_RESTART 拉起。`,
+      async () => {
+        let ok = 0;
+        const failed = [];
+        for (const id of ids) {
+          const s = serversCache.find((x) => x.id === id);
+          updatingAgents.add(id);
+          renderServers(); // 该卡按钮置「更新中...」
+          try {
+            await api(`/api/servers/${id}/agent-update`, { method: 'POST' });
+            ok += 1;
+          } catch (e) {
+            failed.push(`${s ? s.name : `#${id}`}：${e.message}`);
+          } finally {
+            updatingAgents.delete(id);
+          }
+        }
+        renderServers();
+        infoDialog('批量更新完成', `成功 ${ok} 台${failed.length ? `，失败 ${failed.length} 台：\n\n${failed.join('\n')}` : ''}`);
+        loadServers();
+      }
+    );
+  }
+
+  async function batchSetGroup() {
+    const ids = [...selectedServers];
+    if (!ids.length) return;
+    promptDialog(`为选中的 ${ids.length} 台设置分组（留空 = 未分组）`, '', async (group) => {
+      try {
+        const r = await api('/api/servers/batch', {
+          method: 'POST',
+          body: JSON.stringify({ op: 'update-group', ids, group: String(group || '').trim() }),
+        });
+        toast(`已更新 ${r.summary.success} 台`);
+        clearSelection();
+        await loadServers();
+      } catch (e) { toast(e.message); }
+    });
+  }
+
+  function batchDelete() {
+    const ids = [...selectedServers];
+    if (!ids.length) return;
+    const names = ids.map((id) => (serversCache.find((s) => s.id === id) || {}).name || `#${id}`).join('、');
+    confirmDialog(
+      `确认删除选中的 ${ids.length} 台服务器？\n${names}\n\n监控历史（含按天账）与审计记录将一并清除，此操作不可恢复！`,
+      async () => {
+        try {
+          const r = await api('/api/servers/batch', {
+            method: 'POST',
+            body: JSON.stringify({ op: 'delete', ids }),
+          });
+          toast(`已删除 ${r.summary.success} 台${r.summary.failed ? `，失败 ${r.summary.failed} 台` : ''}`);
+          clearSelection();
+          await loadServers();
+        } catch (e) { toast(e.message); }
+      }
+    );
+  }
+
+  // ---------- 轮换 Agent Key（key 泄露/误发后的处置） ----------
+  async function rotateKey(id, name) {
+    confirmDialog(
+      `确认轮换「${name}」的 Agent Key？\n\n旧 key 立即失效并断开现有连接；监控历史与审计记录全部保留。\n需人工到目标机更新 AGENT_KEY 并重启 agent 后才会重新上线。`,
+      async () => {
+        try {
+          const r = await api(`/api/servers/${id}/rotate-key`, { method: 'POST' });
+          infoDialog(
+            'Agent Key 已轮换（仅显示一次）',
+            `WSS 地址: ${r.wss_base}\n\nAGENT_KEY=${r.agent_key}\n\n请到目标机更新 agent 环境变量后重启（如 /etc/cf-panel-agent.env）。`
+          );
+        } catch (e) { toast(e.message); }
+      }
+    );
+  }
+
+  // ---------- 流量 / 可用率（按天账 metrics_day，最长 3 年） ----------
+  // 与「监控」弹窗互补：监控看分钟级瞬时曲线（30 天），这里看按天累计的账
+  // （月度流量、可用率、重启次数），数据源不同、用途不同。
+  let statsState = null; // { serverId, serverName, days }
+  let statsChart = null; // Chart.js 实例（关闭/切换区间时销毁重建）
+
+  const pctText = (v) => (v == null ? '-' : `${Number(v).toFixed(2)}%`);
+  // unix 秒 → datetime-local 输入值（本地时区，与浏览器原生控件口径一致）
+  function toLocalInput(ts) {
+    const d = new Date(Number(ts) * 1000);
+    const p = (n) => String(n).padStart(2, '0');
+    return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`;
+  }
+
+  async function showStats(serverId, serverName, days) {
+    days = Number(days) || 30;
+    statsState = { serverId, serverName, days };
+    document.querySelectorAll('#stats-modal .range-btn').forEach((b) => b.classList.toggle('active', Number(b.dataset.days) === days));
+    let data;
+    try {
+      data = await api(`/api/stats?server_id=${serverId}&days=${days}`);
+    } catch (e) { toast(e.message); return; }
+    $('#stats-title').textContent = `流量 / 可用率 · ${serverName}`;
+    $('#stats-modal').classList.remove('hidden'); // 先显示，保证 canvas 有尺寸
+    lockScroll();
+    renderStatsSummary(data);
+    // Chart.js 与监控弹窗共用本地 vendor（已缓存则零开销）
+    try {
+      await loadScript('/vendor/chart.umd.min.js');
+    } catch (e) {
+      toast(e.message || '图表库加载失败');
+      return;
+    }
+    if (!statsState || statsState.serverId !== serverId || statsState.days !== days) return; // 期间已切换
+    renderStatsChart(data);
+  }
+
+  function renderStatsSummary(data) {
+    const rows = data.rows || [];
+    const sum = data.summary || {};
+    const total = (sum.bytes_in || 0) + (sum.bytes_out || 0);
+    $('#stats-summary').innerHTML = `
+      <div class="stats-item"><span class="stats-num">${fmtBytes(sum.bytes_in || 0)}</span><span class="stats-label">入站合计</span></div>
+      <div class="stats-item"><span class="stats-num">${fmtBytes(sum.bytes_out || 0)}</span><span class="stats-label">出站合计</span></div>
+      <div class="stats-item"><span class="stats-num">${fmtBytes(total)}</span><span class="stats-label">总流量</span></div>
+      <div class="stats-item"><span class="stats-num">${pctText(sum.availability)}</span><span class="stats-label">可用率</span></div>
+      <div class="stats-item"><span class="stats-num">${sum.restarts || 0}</span><span class="stats-label">重启次数</span></div>`;
+    // 明细表：最近日期在前（倒序），便于先看当下
+    const trs = [...rows].reverse().map((r) => {
+      const d = new Date(r.ts * 1000);
+      const p = (n) => String(n).padStart(2, '0');
+      return `<tr>
+        <td>${d.getFullYear()}/${p(d.getMonth() + 1)}/${p(d.getDate())}</td>
+        <td>${fmtBytes(r.bytes_in || 0)}</td>
+        <td>${fmtBytes(r.bytes_out || 0)}</td>
+        <td>${pctText(r.availability)}</td>
+        <td>${r.restarts || 0}</td>
+      </tr>`;
+    }).join('');
+    $('#stats-table').innerHTML = rows.length
+      ? `<table><thead><tr><th>日期</th><th>入站</th><th>出站</th><th>可用率</th><th>重启</th></tr></thead><tbody>${trs}</tbody></table>`
+      : '<p class="muted" style="padding:16px">该区间暂无天账数据。按天账由上报告警链路逐日累积，新接入的节点次日可见。</p>';
+  }
+
+  function renderStatsChart(data) {
+    const rows = data.rows || [];
+    if (statsChart) { try { statsChart.destroy(); } catch { /* ignore */ } statsChart = null; }
+    if (!rows.length || !window.Chart) return;
+    const labels = rows.map((r) => {
+      const d = new Date(r.ts * 1000);
+      return `${d.getMonth() + 1}/${d.getDate()}`;
+    });
+    const grid = cssVar('--chart-grid');
+    const muted = cssVar('--muted');
+    statsChart = new Chart($('#stats-chart'), {
+      data: {
+        labels,
+        datasets: [
+          { type: 'bar', label: '入站', data: rows.map((r) => r.bytes_in || 0), backgroundColor: 'rgba(34,211,238,.45)' },
+          { type: 'bar', label: '出站', data: rows.map((r) => r.bytes_out || 0), backgroundColor: 'rgba(244,114,182,.45)' },
+          // 可用率量纲与字节不同，挂右轴（100% 满量程，直观看出"掉到多少"）
+          { type: 'line', label: '可用率 %', data: rows.map((r) => r.availability), borderColor: '#34d399', backgroundColor: '#34d399', yAxisID: 'y2', tension: 0.3, pointRadius: 0, borderWidth: 1.8, spanGaps: true },
+        ],
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        interaction: { mode: 'index', intersect: false },
+        plugins: {
+          legend: { labels: { color: muted, boxWidth: 12 } },
+          tooltip: {
+            backgroundColor: cssVar('--panel-solid'), borderColor: cssVar('--border'), borderWidth: 1,
+            titleColor: cssVar('--text'), bodyColor: muted,
+            callbacks: {
+              label: (ctx) => (ctx.dataset.label === '可用率 %'
+                ? `可用率：${pctText(ctx.raw)}`
+                : `${ctx.dataset.label}：${fmtBytes(ctx.raw || 0)}`),
+            },
+          },
+        },
+        scales: {
+          x: { ticks: { color: muted, maxTicksLimit: 12, maxRotation: 0 }, grid: { color: grid } },
+          y: { ticks: { color: muted, callback: (v) => fmtBytes(v) }, grid: { color: grid } },
+          y2: { position: 'right', min: 0, max: 100, ticks: { color: muted, callback: (v) => `${v}%` }, grid: { drawOnChartArea: false } },
+        },
+      },
+    });
+  }
+
   // ---------- 下拉菜单各功能入口 ----------
   function openAddModal() {
     editServerId = null;
@@ -1665,6 +2150,7 @@
     $('#inp-name').value = '';
     $('#inp-group').value = '';
     $('#inp-order').value = '';
+    $('#alert-override-box').classList.add('hidden'); // 新增模式无覆盖可言（key 尚未生成）
     $('#add-modal').classList.remove('hidden');
     lockScroll();
     setTimeout(() => $('#inp-name').focus(), 50);
@@ -1699,6 +2185,9 @@
       $('#set-alert-load').value = a.load || '';
       $('#set-alert-cooldown').value = a.cooldown_min || '';
       $('#set-alert-offline').value = a.offline_after_s || '';
+      const mu = Number(a.mute_until) || 0;
+      $('#set-alert-mute').value = mu ? toLocalInput(mu) : '';
+      renderMuteHint(mu);
     }).catch(() => { /* ignore */ });
   }
 
@@ -1732,10 +2221,28 @@
     }
   }
 
+  // 免打扰：datetime-local（浏览器按本地时区解释）→ unix 秒；留空/非法 → null（清除免打扰）。
+  // 与 PAT 有效期不同，这里没有"相对时长"输入——免打扰是一次性的割接窗口，绝对时刻更直观。
+  function parseMuteUntil() {
+    const v = String($('#set-alert-mute').value || '').trim();
+    if (!v) return null;
+    const ts = Math.floor(new Date(v).getTime() / 1000);
+    return Number.isFinite(ts) && ts > 0 ? ts : null;
+  }
+  function renderMuteHint(mu) {
+    const el = $('#mute-hint');
+    if (!el) return;
+    if (!mu) { el.textContent = ''; return; }
+    el.textContent = mu * 1000 > Date.now()
+      ? `免打扰生效中，至 ${new Date(mu * 1000).toLocaleString()}`
+      : '该免打扰时段已过期（未生效）';
+  }
+
   // 组装当前弹窗表单的告警配置（保存/测试共用）
   function collectAlertForm() {
     const num = (v) => (v.trim() ? Number(v) : 0);
     return {
+      mute_until: parseMuteUntil(),
       webhook_url: $('#set-alert-url').value.trim(),
       webhook_token: $('#set-alert-token').value.trim(),
       method: $('#set-alert-method').value,
@@ -1823,7 +2330,7 @@
       const rows = await api('/api/tokens');
       $('#token-list').innerHTML = rows.length
         ? rows.map((r) => `
-            <li>${escapeHtml(r.name)} · ${escapeHtml(r.scopes)}${r.server_ids ? ' · ids=' + escapeHtml(r.server_ids) : ''} · 到期：${escapeHtml(fmtTokenExpiry(r.expires_at))}
+            <li>${escapeHtml(r.name)} · ${escapeHtml(r.scopes)}${r.server_ids ? ' · ids=' + escapeHtml(r.server_ids) : ''} · 到期：${escapeHtml(fmtTokenExpiry(r.expires_at))} · ${r.last_used_at ? `最近使用：${escapeHtml(new Date(r.last_used_at * 1000).toLocaleString())}` : '从未使用'}
               <button data-tok-del="${r.id}" class="danger">删除</button></li>`).join('')
         : '<li class="muted">暂无令牌</li>';
     } catch (e) {
@@ -1885,9 +2392,16 @@
     'terminal.open': '打开终端', 'file.open': '文件管理', 'file.upload': '上传文件',
     'file.write': '写入文件', 'file.zip': '打包目录', 'file.rename': '重命名', 'file.delete': '删除文件',
     'exec.command': '执行命令',
+    'server.rotate_key': '轮换 Agent Key',
+    'server.batch_update_group': '批量修改分组',
     'agent.update.request': '请求更新 Agent',
     'agent.update.installed': 'Agent 更新已安装',
     'agent.update.failed': 'Agent 更新失败',
+    // 登录与鉴权事件（IP 爆破/无效凭据探测此前完全无痕，靠这些识别）
+    'login.success': '登录成功',
+    'login.failed': '登录失败',
+    'login.locked': '登录被锁定',
+    'auth.failed': '无效凭据',
   };
   const auditState = { limit: 100, offset: 0, action: '', user: '', serverId: '' };
   async function openAuditModal() {
@@ -2043,6 +2557,27 @@
     else if (act === 'logout') { token = ''; localStorage.removeItem('cfpanel_token'); showAuth(); }
   });
 
+  // 服务器搜索：debounce 后重渲染（纯前端过滤，零请求；列表已由推送全量送到客户端）
+  $('#server-search').addEventListener('input', () => {
+    clearTimeout(searchTimer);
+    searchTimer = setTimeout(() => {
+      searchQuery = $('#server-search').value || '';
+      renderServers();
+    }, 150);
+  });
+
+  // 批量操作栏（仅管理员；卡片复选框 change 由 #servers 上的委托处理）
+  $('#batch-update-agent').onclick = batchUpdateAgent;
+  $('#batch-group').onclick = batchSetGroup;
+  $('#batch-delete').onclick = batchDelete;
+  $('#batch-clear').onclick = clearSelection;
+  // 卡片复选框：事件委托（卡片会被推送增量/全量重建，逐个绑定会随重建丢失）
+  $('#servers').addEventListener('change', (e) => {
+    const cb = e.target.closest('.card-sel');
+    if (!cb) return;
+    toggleSelect(Number(cb.dataset.sel), cb.checked);
+  });
+
   // 添加服务器弹窗（添加/修改双模式：按钮与 Enter 走同一分发）
   $('#btn-add-server').onclick = submitServerForm;
   $('#btn-add-server-plus').onclick = openAddModal; // toolbar「＋」入口与菜单「添加服务器」同入口
@@ -2057,6 +2592,7 @@
   $('#btn-alerts-close').onclick = () => { $('#alerts-modal').classList.add('hidden'); unlockScroll(); };
   $('#btn-save-alerts').onclick = saveAlerts;
   $('#btn-test-webhook').onclick = testWebhook;
+  $('#btn-mute-clear').onclick = () => { $('#set-alert-mute').value = ''; renderMuteHint(0); };
 
   // 自定义指标设置弹窗
   $('#btn-custom-setup-close').onclick = () => { $('#custom-setup-modal').classList.add('hidden'); unlockScroll(); };
@@ -2150,6 +2686,8 @@
     if (act === 'term') openTerminal(Number(id), name);
     else if (act === 'file') openFileManager(Number(id), name);
     else if (act === 'mon') showMonitor(Number(id), name);
+    else if (act === 'stats') showStats(Number(id), name);
+    else if (act === 'rotate') rotateKey(Number(id), name);
     else if (act === 'agent-update') {
       const target = latestAgent && latestAgent.build_id;
       confirmDialog(
@@ -2204,6 +2742,18 @@
     monitorLive = null;
   };
 
+  // 流量/可用率弹窗：区间切换 + 关闭（同监控弹窗，关闭即销毁图表实例释放内存）
+  $('#stats-modal').addEventListener('click', (e) => {
+    const btn = e.target.closest('.range-btn');
+    if (btn && statsState) showStats(statsState.serverId, statsState.serverName, btn.dataset.days);
+  });
+  $('#btn-stats-close').onclick = () => {
+    $('#stats-modal').classList.add('hidden');
+    unlockScroll();
+    if (statsChart) { try { statsChart.destroy(); } catch { /* ignore */ } statsChart = null; }
+    statsState = null;
+  };
+
   // 告警渠道预设：点击「使用」填入表单模板
   $('#alert-preset-list').addEventListener('click', (e) => {
     const btn = e.target.closest('.ap-use');
@@ -2236,10 +2786,42 @@
   // 主题切换（顶栏 ☀️/🌙）：切换 data-theme + Monaco + 监控图表重建（applyTheme 内处理）
   $('#btn-theme').onclick = () => applyTheme(theme === 'light' ? 'dark' : 'light');
   applyTheme(theme); // 初始化按钮图标（data-theme 已由 theme-init.js 预置，无 FOUC）
-  $('#file-input').addEventListener('change', (e) => { const f = e.target.files[0]; if (f) uploadFile(f); e.target.value = ''; });
-  // 新建目录 / 新建文件 / 在线编辑器 / 移动选择器
+  // 支持一次选多个（multiple）：走串行队列逐个上传
+  $('#file-input').addEventListener('change', (e) => {
+    const files = e.target.files;
+    if (files && files.length) uploadFiles(files);
+    e.target.value = '';
+  });
+  // 拖拽上传：把文件拖到文件管理弹窗即上传（多选同样走串行队列）。
+  // 拖拽区只在文件弹窗上生效——其余界面拖入文件会触发浏览器默认的"打开文件"导航行为
+  const fileDropZone = $('#file-modal');
+  ['dragenter', 'dragover'].forEach((ev) => fileDropZone.addEventListener(ev, (e) => {
+    e.preventDefault(); // 必须阻止默认行为，否则 drop 不会触发
+    if (!isSystemPath(fileSess.cwd)) fileDropZone.classList.add('drag-over');
+  }));
+  fileDropZone.addEventListener('dragleave', (e) => {
+    // 在弹窗内部子元素之间移动也会触发 dragleave，需排除（否则高亮闪烁）
+    if (fileDropZone.contains(e.relatedTarget)) return;
+    fileDropZone.classList.remove('drag-over');
+  });
+  fileDropZone.addEventListener('drop', (e) => {
+    e.preventDefault();
+    fileDropZone.classList.remove('drag-over');
+    const files = e.dataTransfer && e.dataTransfer.files;
+    if (files && files.length) uploadFiles(files);
+  });
+  // 新建目录 / 新建文件 / 在线编辑器 / 移动·复制选择器 / 权限
   $('#btn-file-mkdir').onclick = mkDir;
   $('#btn-file-touch').onclick = touchFile;
+  $('#btn-chmod-close').onclick = closeChmod;
+  $('#btn-chmod-apply').onclick = applyChmod;
+  $('#btn-chmod-ro-apply').onclick = applyChmodReadonly;
+  // 九宫格与八进制双向联动
+  $('#chmod-oct').addEventListener('input', syncChmodBits);
+  for (const [k] of CHMOD_BITS) {
+    const el = $(`#cm-${k}`);
+    if (el) el.addEventListener('change', syncChmodOct);
+  }
   $('#btn-editor-save').onclick = saveFileEditor;
   $('#btn-editor-preview').onclick = toggleEditorPreview;
   $('#btn-editor-close').onclick = () => {
@@ -2272,6 +2854,15 @@
     clearTimeout(fileFilterTimer);
     fileFilterTimer = setTimeout(reloadFileList, 200);
   });
+  // 递归搜索：debounce 更久（400ms）——每键一次全树遍历代价远高于单目录 list
+  $('#file-find').addEventListener('input', () => {
+    clearTimeout(fileFindTimer);
+    fileFindTimer = setTimeout(doFind, 400);
+  });
+  $('#file-find').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') { clearTimeout(fileFindTimer); doFind(); }
+  });
+  $('#btn-find-clear').onclick = clearFind;
   // 行操作下拉菜单：⋯ 切换显隐；点菜单项执行操作；点其他区域关闭
   $('#file-list').addEventListener('click', (e) => {
     const dir = e.target.closest('.f-dir');
@@ -2307,7 +2898,20 @@
     const mv = e.target.closest('.f-act-mv');
     if (mv) {
       closeRowMenus();
-      openFileSelector(mv.dataset.path, CfUtils.fileBase(mv.dataset.path), mv.dataset.type === 'dir');
+      openFileSelector(mv.dataset.path, CfUtils.fileBase(mv.dataset.path), mv.dataset.type === 'dir', 'move');
+      return;
+    }
+    const cp = e.target.closest('.f-act-cp');
+    if (cp) {
+      closeRowMenus();
+      // 复制保留原件：目标不允许与源同名同目录（agent 也会拒），选择器即时提示
+      openFileSelector(cp.dataset.path, CfUtils.fileBase(cp.dataset.path), false, 'copy');
+      return;
+    }
+    const pm = e.target.closest('.f-act-perm');
+    if (pm) {
+      closeRowMenus();
+      openChmod(pm.dataset.path, Number(pm.dataset.mode) || 0);
       return;
     }
     const ed = e.target.closest('.f-act-edit');

@@ -576,6 +576,77 @@ test('按天统计时间工具：天序号与起始时间戳可互相还原', ()
   }
 });
 
+// ---------------- 国际化（i18n） ----------------
+// i18n.js 同为浏览器全局脚本（window.CfI18n，无 ES export），mock 最小环境后 eval 加载。
+// 目前仅内置 zh-CN，但结构与 API 按多语言设计——以下断言锁定"结构可用"，而非"只有中文"。
+function loadCfI18n() {
+  globalThis.window = globalThis;
+  const store = new Map();
+  globalThis.localStorage = {
+    getItem: (k) => (store.has(k) ? store.get(k) : null),
+    setItem: (k, v) => store.set(k, String(v)),
+    removeItem: (k) => store.delete(k),
+  };
+  // 不 mock navigator：Node 21+ 的 globalThis.navigator 是只读 getter，赋值会抛错；
+  // i18n.js 的 detectLocale 用 try/catch 包裹且只登记了 zh-CN，读不到浏览器语言时会
+  // 安全回退默认语言，故此处交给 Node 内置值即可。
+  globalThis.document = { documentElement: {}, querySelectorAll: () => [] };
+  const src = nodeFs.readFileSync(
+    nodePath.join(nodePath.dirname(fileURLToPath(import.meta.url)), '../public/i18n.js'), 'utf8',
+  );
+  (0, eval)(src); // 间接 eval：全局作用域执行，挂载 window.CfI18n
+  return globalThis.CfI18n;
+}
+
+test('i18n：t() 翻译与插值，缺失 key 原样返回', () => {
+  const i18n = loadCfI18n();
+  assert.equal(i18n.t('common.save'), '保存');
+  assert.equal(i18n.t('server.selected', { n: 3 }), '已选 3 台');
+  // 缺失回退：返回 key 本身——开发期一眼看出未翻译项，线上也不会出现"界面空白"这种更糟形态
+  assert.equal(i18n.t('does.not.exist'), 'does.not.exist');
+  assert.equal(i18n.t(''), '');
+  // 占位符无对应变量时保留原样（不静默吞掉，便于发现漏传参数）
+  assert.equal(i18n.t('server.updateFailed', {}), 'Agent 更新失败：{err}');
+});
+
+test('i18n：多语言结构可用——注册语言包即生效', () => {
+  const i18n = loadCfI18n();
+  assert.deepEqual(i18n.supported.map((l) => l.code), ['zh-CN'], '当前仅内置 zh-CN');
+  // 注册一个新语言包并切换 → t() 立即走新包，证明结构支持多语言（现在只差翻译）
+  i18n.register('en-US', { 'common.save': 'Save', 'server.selected': '{n} selected' });
+  assert.equal(i18n.setLocale('en-US'), true);
+  assert.equal(i18n.locale, 'en-US');
+  assert.equal(i18n.t('common.save'), 'Save');
+  assert.equal(i18n.t('server.selected', { n: 2 }), '2 selected');
+  // 未登记（无语言包）的语言不得选中：避免落到"半翻译"状态
+  assert.equal(i18n.setLocale('fr-FR'), false);
+  assert.equal(i18n.locale, 'en-US');
+  i18n.__reset();
+});
+
+test('i18n：index.html 引用的 data-i18n key 必须都在语言包中定义', () => {
+  const i18n = loadCfI18n();
+  const root = nodePath.join(nodePath.dirname(fileURLToPath(import.meta.url)), '..');
+  const html = nodeFs.readFileSync(nodePath.join(root, 'public/index.html'), 'utf8');
+  const keys = [...html.matchAll(/data-i18n(?:-html|-ph|-title|-aria)?="([a-zA-Z0-9_]+(?:\.[a-zA-Z0-9_]+)+)"/g)]
+    .map((m) => m[1]);
+  assert.ok(keys.length > 50, `静态文本应已接入 i18n（当前 ${keys.length} 处）`);
+  // 缺失 key 会被原样显示成 "server.xxx"，是肉眼可见的界面故障——在此提前拦住
+  const broken = keys.filter((k) => i18n.t(k) === k);
+  assert.deepEqual(broken, [], `以下 key 未在语言包定义：${broken.join(', ')}`);
+});
+
+test('i18n：app.js 面向用户的提示不得残留中文字面量', () => {
+  const root = nodePath.join(nodePath.dirname(fileURLToPath(import.meta.url)), '..');
+  const app = nodeFs.readFileSync(nodePath.join(root, 'public/app.js'), 'utf8');
+  // 残留中文 = 新语言加了也不生效。注意只校验"面向用户"的输出，
+  // 代码注释里的中文不在 i18n 范围内（注释是给维护者看的）。
+  assert.doesNotMatch(app, /toast\('[^']*[一-龥]/, '单引号 toast 文案须走 t()');
+  assert.doesNotMatch(app, /toast\(`[^`]*[一-龥]/, '模板 toast 文案须走 t()');
+  assert.match(app, /const \{ t \} = CfI18n/, 'app.js 须解构 t()');
+  assert.match(app, /CfI18n\.applyDom\(\)/, '启动时须填充静态 DOM 文案');
+});
+
 test('终端多标签：会话表取代单例，关闭时三类资源都要释放（静态断言）', () => {
   const root = nodePath.join(nodePath.dirname(fileURLToPath(import.meta.url)), '..');
   const app = nodeFs.readFileSync(nodePath.join(root, 'public/app.js'), 'utf8');

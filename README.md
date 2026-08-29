@@ -26,7 +26,7 @@ cf-panel/
 │   ├── do-panel.js      #   PanelDO：实时推送（Hibernation 休眠态）
 │   ├── report.js        #   agent 监控上报处理
 │   └── utils.js         #   公共工具
-├── public/              # 前端（零构建：index.html / app.js / api.js / utils.js / style.css / vendor/ + icon.svg / manifest.webmanifest）
+├── public/              # 前端（零构建：index.html / app.js / api.js / utils.js / i18n.js / style.css / vendor/ + icon.svg / manifest.webmanifest）
 ├── agent/               # 被控机 agent（README / systemd 模板）
 │   ├── rust/            # ✅ Rust 版 agent（推荐：内存低、单进程、全静态任意发行版直跑）
 │   └── shell/           # ⚠️ Shell 版 agent（已废弃，保留参考/过渡）
@@ -367,6 +367,8 @@ Rust 版 agent 三平台产物从 GitHub Releases 下载（`cf-panel-agent-windo
   > 失败类审计按 IP 做 60 秒节流：爆破与无效 token 扫描会让审计表本身变成写放大源，节流后仍保留"谁在试、试什么"的量级信息。
 - **轮换 Agent Key**：卡片菜单点「轮换 Key」，旧 key 立即失效并断开现有连接，**监控历史（含按天账）与审计记录全部保留**。这是 key 泄露或误发后的正确处置路径——此前只能删服务器重建，会连带清空全部历史。轮换后需人工到目标机更新 `AGENT_KEY` 并重启 agent（key 是 agent 侧配置的静态凭据，服务端无法推送给未连接的 agent）。
 - **界面细节**：顶栏 ☀️/🌙 切换**深浅主题**（持久化，终端配色与监控图表同步热更新）；长时间无操作会提示并**自动暂停推送**（IdleGuard，省配额，任何操作即恢复）；开启 `geo_lookup` 后卡片与审计日志的 IP 会显示**归属地旗帜**（旗帜渲染能力运行时检测，不支持时回退图片）；支持 PWA「添加到主屏幕」（含 manifest 与 SVG 图标）。
+- **国际化**：界面文案全部走 `t(key)`，语言包在 `public/i18n.js`。当前内置 **zh-CN（唯一可用语言）**，但结构与 API 已按多语言设计——新增语言只需 `CfI18n.register('en-US', {...同构 key...})` 登记语言包即可，业务代码零改动；语言选择优先级为「手动选择 > 浏览器语言 > 默认」，只有已登记（有完整语言包）的语言会被选中，避免落到"半翻译"状态。
+  > 缺失的 key 会**原样显示 key 本身**而不是空白——开发期一眼看出未翻译项，线上也不会出现"界面大片空白"这种更糟的失败形态。`index.html` 里保留中文文本作为 zh-CN 兜底（避免语言包加载前闪烁），切到其他语言时由 `applyDom()` 覆盖。
 
 ## 四、API 一览
 

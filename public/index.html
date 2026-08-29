@@ -19,48 +19,48 @@
   <div id="app" class="hidden">
     <header>
       <div class="header-left">
-        <button id="btn-menu" class="menu-btn" aria-label="菜单" title="菜单">☰</button>
-        <button id="btn-theme" class="menu-btn" aria-label="切换主题" title="切换深浅主题">☀️</button>
+        <button id="btn-menu" class="menu-btn" aria-label="菜单" title="菜单" data-i18n-aria="menu.toggleMenu" data-i18n-title="menu.toggleMenu">☰</button>
+        <button id="btn-theme" class="menu-btn" aria-label="切换主题" title="切换深浅主题" data-i18n-aria="menu.toggleTheme" data-i18n-title="menu.toggleTheme">☀️</button>
         <span id="whoami"></span>
       </div>
       <div id="dropdown" class="dropdown hidden">
-        <button class="dd-item" data-menu="add-server">添加服务器</button>
-        <button class="dd-item" data-menu="site">站点信息</button>
-        <button class="dd-item" data-menu="alerts">告警</button>
-        <button class="dd-item" data-menu="custom-setup">自定义指标</button>
-        <button class="dd-item" data-menu="service-setup">服务监控</button>
-        <button class="dd-item" data-menu="tokens">访问令牌</button>
-        <button class="dd-item" data-menu="audit-logs">审计日志</button>
-        <button class="dd-item" data-menu="usage">用量观测</button>
-        <button class="dd-item dd-danger" data-menu="logout">退出</button>
+        <button class="dd-item" data-menu="add-server" data-i18n="menu.addServer">添加服务器</button>
+        <button class="dd-item" data-menu="site" data-i18n="menu.site">站点信息</button>
+        <button class="dd-item" data-menu="alerts" data-i18n="menu.alerts">告警</button>
+        <button class="dd-item" data-menu="custom-setup" data-i18n="menu.customMetrics">自定义指标</button>
+        <button class="dd-item" data-menu="service-setup" data-i18n="menu.serviceMonitor">服务监控</button>
+        <button class="dd-item" data-menu="tokens" data-i18n="menu.tokens">访问令牌</button>
+        <button class="dd-item" data-menu="audit-logs" data-i18n="menu.auditLogs">审计日志</button>
+        <button class="dd-item" data-menu="usage" data-i18n="menu.usage">用量观测</button>
+        <button class="dd-item dd-danger" data-menu="logout" data-i18n="menu.logout">退出</button>
       </div>
     </header>
     <div id="notice-bar" class="notice hidden"></div>
 
     <main>
       <section id="overview" class="overview">
-        <div class="ov-item"><span class="ov-num" id="ov-total">0</span><span class="ov-label">服务器</span></div>
-        <div class="ov-item"><span class="ov-num ov-online" id="ov-online">0</span><span class="ov-label">在线</span></div>
-        <div class="ov-item"><span class="ov-num" id="ov-cpu">-</span><span class="ov-label">平均CPU</span></div>
-        <div class="ov-item"><span class="ov-num" id="ov-load">-</span><span class="ov-label">平均负载</span></div>
-        <div class="ov-item"><span class="ov-num" id="ov-mem">-</span><span class="ov-label">内存占用</span></div>
+        <div class="ov-item"><span class="ov-num" id="ov-total">0</span><span class="ov-label" data-i18n="overview.servers">服务器</span></div>
+        <div class="ov-item"><span class="ov-num ov-online" id="ov-online">0</span><span class="ov-label" data-i18n="overview.online">在线</span></div>
+        <div class="ov-item"><span class="ov-num" id="ov-cpu">-</span><span class="ov-label" data-i18n="overview.avgCpu">平均CPU</span></div>
+        <div class="ov-item"><span class="ov-num" id="ov-load">-</span><span class="ov-label" data-i18n="overview.avgLoad">平均负载</span></div>
+        <div class="ov-item"><span class="ov-num" id="ov-mem">-</span><span class="ov-label" data-i18n="overview.memUsed">内存占用</span></div>
       </section>
       <section class="toolbar">
         <div class="toolbar-title">
-          <h2>服务器</h2>
-          <button id="btn-add-server-plus" class="toolbar-add" title="添加服务器" aria-label="添加服务器">＋</button>
+          <h2 data-i18n="server.title">服务器</h2>
+          <button id="btn-add-server-plus" class="toolbar-add" title="添加服务器" aria-label="添加服务器" data-i18n-aria="server.add" data-i18n-title="server.add">＋</button>
         </div>
         <!-- 搜索：纯前端过滤（列表已全量推送到客户端），无后端请求 -->
         <div class="toolbar-actions">
-          <input id="server-search" class="server-search" type="search" placeholder="搜索名称 / IP / 分组" aria-label="搜索服务器" />
+          <input id="server-search" class="server-search" type="search" placeholder="搜索名称 / IP / 分组" aria-label="搜索服务器" data-i18n-ph="server.search" />
         </div>
       </section>
       <!-- 批量操作栏：选中卡片后出现（仅管理员可见） -->
       <section id="batch-bar" class="batch-bar hidden">
         <span id="batch-count" class="batch-count">已选 0 台</span>
-        <button id="batch-update-agent" class="ghost">更新 Agent</button>
+        <button id="batch-update-agent" class="ghost" data-i18n="server.updateAgent">更新 Agent</button>
         <button id="batch-group" class="ghost">修改分组</button>
-        <button id="batch-delete" class="danger">删除</button>
+        <button id="batch-delete" class="danger" data-i18n="common.delete">删除</button>
         <button id="batch-clear" class="ghost">取消选择</button>
       </section>
       <section id="servers" class="servers-list"></section>
@@ -77,14 +77,14 @@
   <div id="monitor-modal" class="monitor-modal hidden">
     <div class="modal-head">
       <span id="monitor-title"></span>
-      <button id="btn-monitor-close" class="ghost icon" aria-label="关闭" title="关闭">✕</button>
+      <button id="btn-monitor-close" class="ghost icon" aria-label="关闭" title="关闭" data-i18n-aria="common.close" data-i18n-title="common.close">✕</button>
     </div>
     <div class="range-btns">
-      <button class="ghost range-btn" data-range="1h">1小时</button>
-      <button class="ghost range-btn" data-range="12h">12小时</button>
-      <button class="ghost range-btn" data-range="3d">3天</button>
-      <button class="ghost range-btn" data-range="7d">7天</button>
-      <button class="ghost range-btn" data-range="30d">30天</button>
+      <button class="ghost range-btn" data-range="1h" data-i18n="monitor.btn.1h">1小时</button>
+      <button class="ghost range-btn" data-range="12h" data-i18n="monitor.btn.12h">12小时</button>
+      <button class="ghost range-btn" data-range="3d" data-i18n="monitor.btn.3d">3天</button>
+      <button class="ghost range-btn" data-range="7d" data-i18n="monitor.btn.7d">7天</button>
+      <button class="ghost range-btn" data-range="30d" data-i18n="monitor.btn.30d">30天</button>
     </div>
     <div class="chart-wrap"></div>
   </div>
@@ -92,14 +92,14 @@
   <!-- 流量 / 可用率弹窗（按天账 metrics_day，最长 3 年） -->
   <div id="stats-modal" class="monitor-modal hidden">
     <div class="modal-head">
-      <span id="stats-title">流量 / 可用率</span>
-      <button id="btn-stats-close" class="ghost icon" aria-label="关闭" title="关闭">✕</button>
+      <span id="stats-title" data-i18n="stats.title">流量 / 可用率</span>
+      <button id="btn-stats-close" class="ghost icon" aria-label="关闭" title="关闭" data-i18n-aria="common.close" data-i18n-title="common.close">✕</button>
     </div>
     <div class="range-btns">
-      <button class="ghost range-btn" data-days="7">7天</button>
-      <button class="ghost range-btn" data-days="30">30天</button>
-      <button class="ghost range-btn" data-days="90">90天</button>
-      <button class="ghost range-btn" data-days="365">1年</button>
+      <button class="ghost range-btn" data-days="7" data-i18n="stats.range.7d">7天</button>
+      <button class="ghost range-btn" data-days="30" data-i18n="stats.range.30d">30天</button>
+      <button class="ghost range-btn" data-days="90" data-i18n="stats.range.90d">90天</button>
+      <button class="ghost range-btn" data-days="365" data-i18n="stats.range.365d">1年</button>
     </div>
     <div id="stats-summary" class="stats-summary"></div>
     <div class="chart-wrap"><canvas id="stats-chart"></canvas></div>
@@ -110,11 +110,11 @@
   <div id="auth" class="auth-wrap">
     <form id="auth-form" class="auth-card">
       <h1>cf-panel</h1>
-      <p class="sub">在 Cloudflare 上实现带终端与文件管理功能的监控面板</p>
-      <input id="auth-user" type="text" placeholder="用户名（单管理员可留空）" autocomplete="username" />
-      <input id="auth-pass" type="password" placeholder="面板密码" autocomplete="current-password" required />
+      <p class="sub" data-i18n="login.tagline">在 Cloudflare 上实现带终端与文件管理功能的监控面板</p>
+      <input id="auth-user" type="text" placeholder="用户名（单管理员可留空）" autocomplete="username" data-i18n-ph="login.username" />
+      <input id="auth-pass" type="password" placeholder="面板密码" autocomplete="current-password" required data-i18n-ph="login.password" />
       <p id="auth-msg" class="msg"></p>
-      <button type="submit" id="btn-login">登录</button>
+      <button type="submit" id="btn-login" data-i18n="login.submit">登录</button>
     </form>
   </div>
 
@@ -122,11 +122,11 @@
   <div id="term-modal" class="modal hidden">
     <div class="modal-head">
       <div class="term-head-group">
-        <span id="term-title">终端</span>
-        <button id="btn-term-renderer" class="ghost icon" aria-label="切换渲染器" title="切换渲染器">DOM</button>
-        <button id="btn-term-new" class="ghost icon" aria-label="新标签" title="为当前服务器再开一个终端">＋</button>
+        <span id="term-title" data-i18n="term.title">终端</span>
+        <button id="btn-term-renderer" class="ghost icon" aria-label="切换渲染器" title="切换渲染器" data-i18n-aria="term.rendererTip" data-i18n-title="term.rendererTip">DOM</button>
+        <button id="btn-term-new" class="ghost icon" aria-label="新标签" title="为当前服务器再开一个终端" data-i18n-title="term.newTab">＋</button>
       </div>
-      <button id="btn-term-close" class="ghost icon" aria-label="关闭全部终端" title="关闭全部">✕</button>
+      <button id="btn-term-close" class="ghost icon" aria-label="关闭全部终端" title="关闭全部" data-i18n-aria="term.closeAll" data-i18n-title="term.closeAll">✕</button>
     </div>
     <!-- 标签栏：一个标签 = 一个终端会话（✕ 只关该标签）；标签多时横向滚动 -->
     <div id="term-tabs" class="term-tabs"></div>
@@ -137,28 +137,35 @@
   <!-- 文件管理弹窗 -->
   <div id="file-modal" class="modal hidden">
     <div class="modal-head">
-      <span id="file-title">文件管理</span>
-      <button id="btn-file-close" class="ghost icon" aria-label="关闭" title="关闭">✕</button>
+      <span id="file-title" data-i18n="file.title">文件管理</span>
+      <button id="btn-file-close" class="ghost icon" aria-label="关闭" title="关闭" data-i18n-aria="common.close" data-i18n-title="common.close">✕</button>
     </div>
     <div class="file-body">
       <div class="file-toolbar">
-        <button id="file-up" class="ghost" title="上级目录">⬆️</button>
-        <input id="file-path" type="text" placeholder="路径，如 /home/user" />
-        <button id="file-refresh" class="ghost" title="刷新">🔄</button>
-        <label class="file-upload"><input id="file-input" type="file" hidden multiple />上传</label>
-        <button id="btn-file-mkdir" class="ghost">新建目录</button>
-        <button id="btn-file-touch" class="ghost">新建文件</button>
-        <button id="btn-file-cancel" class="ghost hidden">取消上传</button>
-        <button id="btn-dl-cancel" class="ghost hidden">取消下载</button>
+        <button id="file-up" class="ghost" title="上级目录" data-i18n-title="file.up">⬆️</button>
+        <input id="file-path" type="text" placeholder="路径，如 /home/user" data-i18n-ph="file.path" />
+        <button id="file-refresh" class="ghost" title="刷新" data-i18n-title="common.refresh">🔄</button>
+        <!-- 文本包在 span 内：直接给 label 设 data-i18n 会用 textContent 覆盖掉里面的 input -->
+        <label class="file-upload"><input id="file-input" type="file" hidden multiple /><span data-i18n="file.upload">上传</span></label>
+        <button id="btn-file-mkdir" class="ghost" data-i18n="file.mkdir">新建目录</button>
+        <button id="btn-file-touch" class="ghost" data-i18n="file.touch">新建文件</button>
+        <button id="btn-file-cancel" class="ghost hidden" data-i18n="file.cancelUpload">取消上传</button>
+        <button id="btn-dl-cancel" class="ghost hidden" data-i18n="file.cancelDownload">取消下载</button>
       </div>
       <div class="file-filter-row">
-        <input id="file-filter" class="file-filter" type="text" placeholder="过滤当前目录（支持 * 和 ? 通配符）" />
-        <input id="file-find" class="file-find" type="text" placeholder="递归搜索（含子目录，如 *.log）" />
-        <button id="btn-find-clear" class="ghost hidden">清除</button>
+        <input id="file-filter" class="file-filter" type="text" placeholder="过滤当前目录（支持 * 和 ? 通配符）" data-i18n-ph="file.filter" />
+        <input id="file-find" class="file-find" type="text" placeholder="递归搜索（含子目录，如 *.log）" data-i18n-ph="file.find" />
+        <button id="btn-find-clear" class="ghost hidden" data-i18n="file.findClear">清除</button>
       </div>
       <p id="file-msg" class="msg"></p>
       <table class="file-table">
-        <thead><tr><th>名称</th><th>大小</th><th>修改时间</th><th>权限</th><th></th></tr></thead>
+        <thead><tr>
+          <th data-i18n="file.colName">名称</th>
+          <th data-i18n="file.colSize">大小</th>
+          <th data-i18n="file.colMtime">修改时间</th>
+          <th data-i18n="file.colPerm">权限</th>
+          <th></th>
+        </tr></thead>
         <tbody id="file-list"></tbody>
       </table>
     </div>
@@ -167,32 +174,32 @@
   <!-- 权限修改（Unix：POSIX mode 九宫格 + 八进制；Windows：仅只读开关） -->
   <div id="chmod-modal" class="modal hidden">
     <div class="modal-head">
-      <span>权限</span>
-      <button id="btn-chmod-close" class="ghost icon" aria-label="关闭" title="关闭">✕</button>
+      <span data-i18n="chmod.title">权限</span>
+      <button id="btn-chmod-close" class="ghost icon" aria-label="关闭" title="关闭" data-i18n-aria="common.close" data-i18n-title="common.close">✕</button>
     </div>
     <div class="settings-body">
       <p class="muted" id="chmod-path" style="font-size:12px;word-break:break-all"></p>
       <div class="chmod-grid">
-        <span></span><span>读</span><span>写</span><span>执行</span>
-        <span>属主</span>
+        <span></span><span data-i18n="chmod.read">读</span><span data-i18n="chmod.write">写</span><span data-i18n="chmod.exec">执行</span>
+        <span data-i18n="chmod.owner">属主</span>
         <input type="checkbox" id="cm-ur" aria-label="属主读" /><input type="checkbox" id="cm-uw" aria-label="属主写" /><input type="checkbox" id="cm-ux" aria-label="属主执行" />
-        <span>组</span>
+        <span data-i18n="chmod.group">组</span>
         <input type="checkbox" id="cm-gr" aria-label="组读" /><input type="checkbox" id="cm-gw" aria-label="组写" /><input type="checkbox" id="cm-gx" aria-label="组执行" />
-        <span>其他</span>
+        <span data-i18n="chmod.other">其他</span>
         <input type="checkbox" id="cm-or" aria-label="其他读" /><input type="checkbox" id="cm-ow" aria-label="其他写" /><input type="checkbox" id="cm-ox" aria-label="其他执行" />
       </div>
       <div class="settings-row">
-        <input id="chmod-oct" type="text" placeholder="八进制，如 755" maxlength="4" />
-        <button id="btn-chmod-apply">应用</button>
+        <input id="chmod-oct" type="text" placeholder="八进制，如 755" maxlength="4" data-i18n-ph="chmod.octal" />
+        <button id="btn-chmod-apply" data-i18n="common.save">应用</button>
       </div>
-      <p class="muted" style="font-size:12px;margin:4px 0 0">
-        勾选与八进制联动。<b>Windows 无 POSIX 权限</b>，请用下方「只读」开关（填八进制会被拒绝）。
+      <p class="muted" style="font-size:12px;margin:4px 0 0" data-i18n="chmod.hint">
+        勾选与八进制联动。Windows 无 POSIX 权限，请用下方「只读」开关（填八进制会被拒绝）。
       </p>
       <div class="settings-row">
         <label style="display:flex;align-items:center;gap:8px;font-size:13px">
-          <input id="chmod-readonly" type="checkbox" style="width:auto" /> 只读
+          <input id="chmod-readonly" type="checkbox" style="width:auto" /><span data-i18n="chmod.readonly">只读</span>
         </label>
-        <button id="btn-chmod-ro-apply" class="ghost">应用只读设置</button>
+        <button id="btn-chmod-ro-apply" class="ghost" data-i18n="chmod.applyReadonly">应用只读设置</button>
       </div>
       <p class="muted" style="font-size:12px;margin:0" id="chmod-hint"></p>
     </div>
@@ -201,12 +208,12 @@
   <!-- 在线文件编辑器（Monaco 懒加载 + textarea 回退；扩大=全屏） -->
   <div id="file-editor-modal" class="modal hidden">
     <div class="modal-head">
-      <span id="file-editor-title">编辑</span>
+      <span id="file-editor-title" data-i18n="common.edit">编辑</span>
       <div>
-        <button id="btn-editor-save" class="ghost">保存</button>
-        <button id="btn-editor-preview" class="ghost hidden">预览</button>
-        <button id="btn-editor-expand" class="ghost">扩大</button>
-        <button id="btn-editor-close" class="ghost">取消</button>
+        <button id="btn-editor-save" class="ghost" data-i18n="common.save">保存</button>
+        <button id="btn-editor-preview" class="ghost hidden" data-i18n="file.editorPreview">预览</button>
+        <button id="btn-editor-expand" class="ghost" data-i18n="file.editorExpand">扩大</button>
+        <button id="btn-editor-close" class="ghost" data-i18n="common.cancel">取消</button>
       </div>
     </div>
     <div class="file-body">
@@ -219,19 +226,19 @@
   <!-- 移动路径选择器 -->
   <div id="file-selector-modal" class="modal hidden">
     <div class="modal-head">
-      <span id="sel-title">移动</span>
+      <span id="sel-title" data-i18n="file.move">移动</span>
       <div>
-        <button id="btn-sel-ok" class="ghost">移动到此处</button>
-        <button id="btn-sel-close" class="ghost">取消</button>
+        <button id="btn-sel-ok" class="ghost" data-i18n="file.moveTo">移动到此处</button>
+        <button id="btn-sel-close" class="ghost" data-i18n="common.cancel">取消</button>
       </div>
     </div>
     <div class="file-body">
       <div class="file-toolbar">
-        <button id="btn-sel-up" class="ghost">上级</button>
-        <input id="sel-path" type="text" placeholder="路径" />
-        <button id="sel-go" class="ghost">跳转</button>
+        <button id="btn-sel-up" class="ghost" data-i18n="file.selUp">上级</button>
+        <input id="sel-path" type="text" placeholder="路径" data-i18n-ph="file.selPath" />
+        <button id="sel-go" class="ghost" data-i18n="file.selGo">跳转</button>
       </div>
-      <p class="muted" style="margin:4px 0;font-size:12px">当前目录：<span id="sel-cwd"></span></p>
+      <p class="muted" style="margin:4px 0;font-size:12px"><span data-i18n="file.selCwd">当前目录：</span><span id="sel-cwd"></span></p>
       <div class="sel-list-wrap">
         <table class="file-table"><tbody id="sel-list"></tbody></table>
       </div>
@@ -246,26 +253,26 @@
   <!-- 添加/修改服务器弹窗（修改复用同一表单，标题与按钮文案动态切换） -->
   <div id="add-modal" class="modal hidden">
     <div class="modal-head">
-      <span id="add-modal-title">添加服务器</span>
-      <button id="btn-add-close" class="ghost icon" aria-label="关闭" title="关闭">✕</button>
+      <span id="add-modal-title" data-i18n="server.add">添加服务器</span>
+      <button id="btn-add-close" class="ghost icon" aria-label="关闭" title="关闭" data-i18n-aria="common.close" data-i18n-title="common.close">✕</button>
     </div>
     <div class="settings-body">
       <div class="settings-row">
         <div class="field">
-          <input id="inp-name" type="text" placeholder="服务器名称" />
-          <span class="field-tag">名称</span>
+          <input id="inp-name" type="text" placeholder="服务器名称" data-i18n-ph="server.name" />
+          <span class="field-tag" data-i18n="common.name">名称</span>
         </div>
       </div>
       <div class="settings-row">
         <div class="field">
-          <input id="inp-group" type="text" placeholder="分组(可选)" />
-          <span class="field-tag">分组</span>
+          <input id="inp-group" type="text" placeholder="分组(可选)" data-i18n-ph="server.groupOptional" />
+          <span class="field-tag" data-i18n="server.group">分组</span>
         </div>
       </div>
       <div class="settings-row">
         <div class="field">
-          <input id="inp-order" type="number" placeholder="序号(可选)" />
-          <span class="field-tag">序号</span>
+          <input id="inp-order" type="number" placeholder="序号(可选)" data-i18n-ph="server.orderOptional" />
+          <span class="field-tag" data-i18n="server.order">序号</span>
         </div>
       </div>
       <!-- 逐机告警阈值覆盖（仅编辑模式显示；留空 = 继承全局阈值） -->
@@ -306,23 +313,23 @@
   <!-- 站点信息弹窗 -->
   <div id="site-modal" class="modal hidden">
     <div class="modal-head">
-      <span>站点信息（公告对所有访客可见）</span>
-      <button id="btn-site-close" class="ghost icon" aria-label="关闭" title="关闭">✕</button>
+      <span data-i18n="settings.siteTitle">站点信息（公告对所有访客可见）</span>
+      <button id="btn-site-close" class="ghost icon" aria-label="关闭" title="关闭" data-i18n-aria="common.close" data-i18n-title="common.close">✕</button>
     </div>
     <div class="settings-body">
       <div class="settings-row">
-        <input id="set-site-name" type="text" placeholder="站点名称（留空用默认）" />
+        <input id="set-site-name" type="text" placeholder="站点名称（留空用默认）" data-i18n-ph="settings.siteName" />
       </div>
       <div class="settings-row">
-        <input id="set-notice" type="text" placeholder="公告（留空隐藏）" />
+        <input id="set-notice" type="text" placeholder="公告（留空隐藏）" data-i18n-ph="settings.notice" />
       </div>
       <div class="settings-row" style="display:flex;align-items:center;gap:8px">
         <!-- IP 归属地第三方查询开关（默认关，防服务器公网 IP 泄露给 ipapi.co/ipwho.is） -->
         <input id="set-geo" type="checkbox" style="width:auto" />
-        <label for="set-geo" style="font-size:13px;color:var(--muted)">IP 归属地查询（将公网 IP 发送到第三方地理服务）</label>
+        <label for="set-geo" style="font-size:13px;color:var(--muted)" data-i18n="settings.geoLookup">IP 归属地查询（将公网 IP 发送到第三方地理服务）</label>
       </div>
       <div class="settings-row">
-        <button id="btn-save-site">保存站点信息</button>
+        <button id="btn-save-site" data-i18n="settings.saveSite">保存站点信息</button>
       </div>
     </div>
   </div>
@@ -330,8 +337,8 @@
   <!-- 告警弹窗 -->
   <div id="alerts-modal" class="modal hidden">
     <div class="modal-head">
-      <span>告警（Webhook，模板化）</span>
-      <button id="btn-alerts-close" class="ghost icon" aria-label="关闭" title="关闭">✕</button>
+      <span data-i18n="settings.alertsTitle">告警（Webhook，模板化）</span>
+      <button id="btn-alerts-close" class="ghost icon" aria-label="关闭" title="关闭" data-i18n-aria="common.close" data-i18n-title="common.close">✕</button>
     </div>
     <div class="settings-body">
       <div class="settings-row">
@@ -339,44 +346,44 @@
           <option value="POST">POST</option>
           <option value="GET">GET</option>
         </select>
-        <input id="set-alert-url" type="text" placeholder="Webhook 地址（留空禁用；支持占位符）" />
+        <input id="set-alert-url" type="text" placeholder="Webhook 地址（留空禁用；支持占位符）" data-i18n-ph="settings.alertUrl" />
       </div>
       <div class="settings-row">
-        <input id="set-alert-token" type="text" placeholder="Token（作为 {token} 占位符使用）" />
-        <input id="set-alert-content-type" type="text" placeholder="Content-Type（默认 application/json）" />
+        <input id="set-alert-token" type="text" placeholder="Token（作为 {token} 占位符使用）" data-i18n-ph="settings.alertToken" />
+        <input id="set-alert-content-type" type="text" placeholder="Content-Type（默认 application/json）" data-i18n-ph="settings.alertContentType" />
       </div>
       <div class="settings-row">
-        <input id="set-alert-body" type="text" placeholder="Body 模板（POST；留空发结构化 JSON）" />
+        <input id="set-alert-body" type="text" placeholder="Body 模板（POST；留空发结构化 JSON）" data-i18n-ph="settings.alertBody" />
       </div>
       <div class="settings-row">
-        <input id="set-alert-headers" type="text" placeholder='Headers JSON（如 {"Authorization":"Bearer {token}"}）' />
+        <input id="set-alert-headers" type="text" placeholder='Headers JSON（如 {"Authorization":"Bearer {token}"}）' data-i18n-ph="settings.alertHeaders" />
       </div>
       <div class="settings-row">
-        <input id="set-alert-cpu" type="number" placeholder="CPU阈值%" />
-        <input id="set-alert-mem" type="number" placeholder="内存阈值%" />
-        <input id="set-alert-disk" type="number" placeholder="磁盘阈值%" />
-        <input id="set-alert-load" type="number" placeholder="负载阈值(可选)" />
+        <input id="set-alert-cpu" type="number" placeholder="CPU阈值%" data-i18n-ph="settings.alertCpu" />
+        <input id="set-alert-mem" type="number" placeholder="内存阈值%" data-i18n-ph="settings.alertMem" />
+        <input id="set-alert-disk" type="number" placeholder="磁盘阈值%" data-i18n-ph="settings.alertDisk" />
+        <input id="set-alert-load" type="number" placeholder="负载阈值(可选)" data-i18n-ph="settings.alertLoad" />
       </div>
       <div class="settings-row">
-        <input id="set-alert-cooldown" type="number" placeholder="冷却(分钟)" />
-        <input id="set-alert-offline" type="number" placeholder="离线(秒)" />
+        <input id="set-alert-cooldown" type="number" placeholder="冷却(分钟)" data-i18n-ph="settings.alertCooldown" />
+        <input id="set-alert-offline" type="number" placeholder="离线(秒)" data-i18n-ph="settings.alertOffline" />
       </div>
       <!-- 免打扰：计划内重启/割接前设置，暂停全部告警（阈值/探活/离线），到期自动恢复 -->
-      <div class="ao-title">免打扰（计划内重启 / 割接）</div>
+      <div class="ao-title" data-i18n="settings.muteTitle">免打扰（计划内重启 / 割接）</div>
       <div class="settings-row">
         <input id="set-alert-mute" type="datetime-local" aria-label="免打扰截止时间" />
-        <button id="btn-mute-clear" class="ghost">清除</button>
+        <button id="btn-mute-clear" class="ghost" data-i18n="settings.muteClear">清除</button>
         <span id="mute-hint" class="muted" style="font-size:12px"></span>
       </div>
-      <p class="muted" style="font-size:12px">到期前暂停全部告警，到期自动恢复；留空并保存即不启用</p>
-      <p class="muted" style="font-size:12px">占位符：{event} {title} {message} {server_name} {server_id} {details_json} {time} {token}</p>
+      <p class="muted" style="font-size:12px" data-i18n="settings.muteHintEmpty">到期前暂停全部告警，到期自动恢复；留空并保存即不启用</p>
+      <p class="muted" style="font-size:12px" data-i18n="settings.placeholders">占位符：{event} {title} {message} {server_name} {server_id} {details_json} {time} {token}</p>
       <details class="alert-presets">
-        <summary>常见渠道示例（点击「使用」自动填入，再填 Token 即可）</summary>
+        <summary data-i18n="settings.presetSummary">常见渠道示例（点击「使用」自动填入，再填 Token 即可）</summary>
         <div id="alert-preset-list"></div>
       </details>
       <div class="settings-row">
-        <button id="btn-save-alerts">保存告警配置</button>
-        <button id="btn-test-webhook" class="ghost">测试 Webhook</button>
+        <button id="btn-save-alerts" data-i18n="settings.saveAlerts">保存告警配置</button>
+        <button id="btn-test-webhook" class="ghost" data-i18n="settings.testWebhook">测试 Webhook</button>
         <span id="webhook-test-result" class="muted" style="font-size:12px"></span>
       </div>
     </div>
@@ -385,24 +392,24 @@
   <!-- 访问令牌弹窗 -->
   <div id="tokens-modal" class="modal hidden">
     <div class="modal-head">
-      <span>访问令牌（PAT）</span>
-      <button id="btn-tokens-close" class="ghost icon" aria-label="关闭" title="关闭">✕</button>
+      <span data-i18n="token.title">访问令牌（PAT）</span>
+      <button id="btn-tokens-close" class="ghost icon" aria-label="关闭" title="关闭" data-i18n-aria="common.close" data-i18n-title="common.close">✕</button>
     </div>
     <div class="settings-body">
       <div class="settings-row">
-        <input id="tok-name" type="text" placeholder="令牌名称" />
+        <input id="tok-name" type="text" placeholder="令牌名称" data-i18n-ph="token.name" />
         <label class="chk"><input type="checkbox" id="tok-read" checked /> server:read</label>
         <label class="chk"><input type="checkbox" id="tok-exec" /> server:exec</label>
       </div>
       <div class="settings-row">
-        <input id="tok-servers" type="text" placeholder="server_ids（逗号分隔，空=全部服务器）" />
+        <input id="tok-servers" type="text" placeholder="server_ids（逗号分隔，空=全部服务器）" data-i18n-ph="token.serverIds" />
         <div class="field" style="flex:0 0 230px">
-          <input id="tok-expires" type="text" placeholder="天数或截止日期" title="数字=有效天数（支持小数，0.5=12 小时）；日期=精确截止（如 2026/9/5 14:00）；留空=永久。也可点 📅 选择" />
+          <input id="tok-expires" type="text" placeholder="天数或截止日期" title="数字=有效天数（支持小数，0.5=12 小时）；日期=精确截止（如 2026/9/5 14:00）；留空=永久。也可点 📅 选择" data-i18n-ph="token.expiryShort" data-i18n-title="token.expiryTip" />
           <input id="tok-expires-picker" class="tok-picker-input" type="datetime-local" step="60" tabindex="-1" aria-hidden="true" />
-          <button id="tok-exp-btn" type="button" class="tok-cal-btn" title="选择截止时间">📅</button>
-          <span class="field-tag" id="tok-exp-tag">天数</span>
+          <button id="tok-exp-btn" type="button" class="tok-cal-btn" title="选择截止时间" data-i18n-title="token.pickDateTitle">📅</button>
+          <span class="field-tag" id="tok-exp-tag" data-i18n="token.daysTag">天数</span>
         </div>
-        <button id="btn-create-token">创建令牌</button>
+        <button id="btn-create-token" data-i18n="token.create">创建令牌</button>
       </div>
       <p id="tok-hint" class="muted" style="font-size:12px"></p>
       <p id="tok-new" class="msg"></p>
@@ -413,17 +420,17 @@
   <!-- 自定义指标设置弹窗 -->
   <div id="custom-setup-modal" class="modal hidden">
     <div class="modal-head">
-      <span>自定义指标设置</span>
-      <button id="btn-custom-setup-close" class="ghost icon" aria-label="关闭" title="关闭">✕</button>
+      <span data-i18n="setup.customTitle">自定义指标设置</span>
+      <button id="btn-custom-setup-close" class="ghost icon" aria-label="关闭" title="关闭" data-i18n-aria="common.close" data-i18n-title="common.close">✕</button>
     </div>
     <div class="settings-body">
-      <p class="muted" style="font-size:13px">在目标机器的 <code>/etc/cf-panel-agent.env</code> 中配置 <code>CUSTOM_METRICS</code>（JSON 数组：<code>name</code> 指标名、<code>cmd</code> 采集命令），agent 会按上报周期执行命令采集数值指标；配置完成后可在该服务器卡片的「⋯ → 监控」中查看曲线。<br><strong>容量提示</strong>：每机每 1 个自定义指标约新增 1,440 行/天（30 天保留约 43,200 行）；建议每机 ≤20 个，避免 D1 免费 5GB 触顶（总占用 ≈ 43,200 × 服务器数 × 指标数 行）。</p>
+      <p class="muted" style="font-size:13px" data-i18n-html="setup.customHint">在目标机器的 <code>/etc/cf-panel-agent.env</code> 中配置 <code>CUSTOM_METRICS</code>（JSON 数组：<code>name</code> 指标名、<code>cmd</code> 采集命令），agent 会按上报周期执行命令采集数值指标；配置完成后可在该服务器卡片的「⋯ → 监控」中查看曲线。<br><strong>容量提示</strong>：每机每 1 个自定义指标约新增 1,440 行/天（30 天保留约 43,200 行）；建议每机 ≤20 个，避免 D1 免费 5GB 触顶（总占用 ≈ 43,200 × 服务器数 × 指标数 行）。</p>
       <div class="settings-row">
         <textarea id="custom-setup-editor" rows="5" class="custom-editor" spellcheck="false">[{"name":"cpu_temp","cmd":"cat /sys/class/thermal/thermal_zone0/temp"},{"name":"estab_conns","cmd":"ss -t state established | wc -l"}]</textarea>
       </div>
       <div class="settings-row">
-        <button id="btn-custom-gen">生成配置</button>
-        <button id="btn-custom-copy" class="ghost">复制</button>
+        <button id="btn-custom-gen" data-i18n="setup.customGen">生成配置</button>
+        <button id="btn-custom-copy" class="ghost" data-i18n="common.copy">复制</button>
       </div>
       <pre id="custom-setup-out" class="dialog-text mono"></pre>
     </div>
@@ -432,17 +439,17 @@
   <!-- 服务监控设置弹窗 -->
   <div id="service-setup-modal" class="modal hidden">
     <div class="modal-head">
-      <span>服务监控设置</span>
-      <button id="btn-service-setup-close" class="ghost icon" aria-label="关闭" title="关闭">✕</button>
+      <span data-i18n="setup.serviceTitle">服务监控设置</span>
+      <button id="btn-service-setup-close" class="ghost icon" aria-label="关闭" title="关闭" data-i18n-aria="common.close" data-i18n-title="common.close">✕</button>
     </div>
     <div class="settings-body">
-      <p class="muted" style="font-size:13px">配置 agent 的 <code>PROBES</code> 后可探测本机 HTTP/TCP 服务：探测结果会展示在服务器卡片的徽章上（绿=正常 / 红=异常），持续异常会触发 Webhook 告警。格式：<code>名称:类型:目标,...</code>，类型 <code>http</code>（URL，检查 2xx/3xx）或 <code>tcp</code>（host:port 测连通）。</p>
+      <p class="muted" style="font-size:13px" data-i18n-html="setup.serviceHintHtml">配置 agent 的 <code>PROBES</code> 后可探测本机 HTTP/TCP 服务：探测结果会展示在服务器卡片的徽章上（绿=正常 / 红=异常），持续异常会触发 Webhook 告警。格式：<code>名称:类型:目标,...</code>，类型 <code>http</code>（URL，检查 2xx/3xx）或 <code>tcp</code>（host:port 测连通）。</p>
       <div class="settings-row">
         <input id="service-probes-input" type="text" placeholder='如 web:http:http://127.0.0.1/,mysql:tcp:127.0.0.1:3306' />
       </div>
       <div class="settings-row">
-        <button id="btn-service-gen">生成配置</button>
-        <button id="btn-service-copy" class="ghost">复制</button>
+        <button id="btn-service-gen" data-i18n="setup.serviceGen">生成配置</button>
+        <button id="btn-service-copy" class="ghost" data-i18n="common.copy">复制</button>
       </div>
       <pre id="service-setup-out" class="dialog-text mono"></pre>
     </div>
@@ -451,25 +458,25 @@
   <!-- 审计日志弹窗 -->
   <div id="audit-modal" class="modal hidden">
     <div class="modal-head">
-      <span>审计日志（保留 90 天）</span>
-      <button id="btn-audit-close" class="ghost icon" aria-label="关闭" title="关闭">✕</button>
+      <span data-i18n="audit.titleWithDays">审计日志（保留 90 天）</span>
+      <button id="btn-audit-close" class="ghost icon" aria-label="关闭" title="关闭" data-i18n-aria="common.close" data-i18n-title="common.close">✕</button>
     </div>
     <div class="settings-body">
       <div class="settings-row">
         <select id="audit-filter-action" style="padding:8px 12px;border-radius:10px;background:rgba(20,25,40,.6);border:1px solid var(--border);color:var(--text)">
-          <option value="">全部动作</option>
+          <option value="" data-i18n="audit.allActions">全部动作</option>
         </select>
-        <input id="audit-filter-user" type="text" placeholder="用户名筛选" style="width:110px" />
-        <input id="audit-filter-server" type="number" placeholder="服务器 ID" style="width:100px" />
-        <button id="btn-audit-apply">筛选</button>
-        <button id="btn-audit-csv" class="ghost">导出 CSV</button>
+        <input id="audit-filter-user" type="text" placeholder="用户名筛选" style="width:110px" data-i18n-ph="audit.userFilter" />
+        <input id="audit-filter-server" type="number" placeholder="服务器 ID" style="width:100px" data-i18n-ph="audit.server" />
+        <button id="btn-audit-apply" data-i18n="audit.apply">筛选</button>
+        <button id="btn-audit-csv" class="ghost" data-i18n="audit.export">导出 CSV</button>
       </div>
       <ul id="audit-list" class="token-list"></ul>
       <div class="settings-row" style="justify-content:space-between">
         <span id="audit-pager-info" class="muted" style="font-size:12px"></span>
         <span>
-          <button id="btn-audit-prev" class="ghost">上一页</button>
-          <button id="btn-audit-next" class="ghost">下一页</button>
+          <button id="btn-audit-prev" class="ghost" data-i18n="audit.prev">上一页</button>
+          <button id="btn-audit-next" class="ghost" data-i18n="audit.next">下一页</button>
         </span>
       </div>
     </div>
@@ -478,8 +485,8 @@
   <!-- 用量观测弹窗（仅管理员，/api/usage 估算） -->
   <div id="usage-modal" class="modal hidden">
     <div class="modal-head">
-      <span>用量观测（额度估算）</span>
-      <button id="btn-usage-close" class="ghost icon" aria-label="关闭" title="关闭">✕</button>
+      <span data-i18n="usage.titleWithNote">用量观测（额度估算）</span>
+      <button id="btn-usage-close" class="ghost icon" aria-label="关闭" title="关闭" data-i18n-aria="common.close" data-i18n-title="common.close">✕</button>
     </div>
     <div class="settings-body">
       <div id="usage-est" class="usage-grid"></div>
@@ -505,6 +512,8 @@
 
   <div id="toast" class="toast hidden"></div>
 
+  <!-- i18n 须在 app.js 之前加载：app.js 顶部即解构 t()，静态 DOM 文本也由它填充 -->
+  <script src="/i18n.js?v=1"></script>
   <script src="/utils.js?v=9"></script>
   <script src="/api.js?v=5"></script>
   <script src="/app.js?v=56"></script>

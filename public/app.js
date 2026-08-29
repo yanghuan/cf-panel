@@ -6,6 +6,9 @@
           MONITOR_STEP_MAX, MONITOR_RANGE_LABEL, MONITOR_COLORS,
           GEO_PRIVATE, setGeoEnabled, flagHtml, osIconHtml, isSystemPath, isBinaryExt, modeText, loadScript, loadCss, loadMonaco, loadMarkdown, geoLookup, IdleGuard } = CfUtils;
   const { api, setTokenGetter, FileSession, TermSession, PushSession } = CfApi;
+  // i18n：所有面向用户的文案一律走 t(key)，代码里不留中文字面量。
+  // 当前仅内置 zh-CN，但新增语言只需注册语言包（见 i18n.js），无需改本文件。
+  const { t } = CfI18n;
   let token = localStorage.getItem('cfpanel_token') || '';
 
   // ---------- 主题（dark / light） ----------
@@ -97,7 +100,7 @@
   function showApp(user) {
     $('#auth').classList.add('hidden');
     $('#app').classList.remove('hidden');
-    $('#whoami').textContent = user.is_pat ? `令牌（${escapeHtml(user.username)}）` : escapeHtml(user.username || 'admin');
+    $('#whoami').textContent = user.is_pat ? t('user.tokenWith', { name: escapeHtml(user.username) }) : escapeHtml(user.username || 'admin');
     // PAT：exec 权限决定终端/文件菜单显隐（admin 恒有 exec）；修改/删除等管理操作仅 admin（PAT 恒隐藏）
     canExec = user.role === 1 || (user.scopes && user.scopes.includes('server:exec'));
     isAdmin = !user.is_pat;
@@ -123,7 +126,7 @@
     loginBusy = true;
     const btn = $('#btn-login');
     btn.disabled = true;
-    btn.textContent = '登录中...';
+    btn.textContent = t('login.submitting');
     const password = $('#auth-pass').value;
     const msg = $('#auth-msg');
     msg.textContent = '';
@@ -138,7 +141,7 @@
     } finally {
       loginBusy = false;
       btn.disabled = false;
-      btn.textContent = '登录';
+      btn.textContent = t('login.submit');
     }
   }
 
@@ -173,14 +176,14 @@
     if (updatingAgents.has(id) || !latestAgent) return;
     updatingAgents.add(id);
     renderServers();
-    toast(`正在更新「${name}」Agent，请勿关闭页面...`, 180000);
+    toast(t('server.updatingTip', { name }), 180000);
     try {
       const result = await api(`/api/servers/${id}/agent-update`, { method: 'POST' });
       if (result.already_latest) {
-        toast('Agent 已是最新版本');
+        toast(t('server.updateLatest'));
         return;
       }
-      toast(`Agent 已安装 ${result.build_id || latestAgent.build_id}，等待服务重新上线...`, 15000);
+      toast(t('server.installedWaiting', { build: result.build_id || latestAgent.build_id }), 15000);
       // 推送通常会在重连首报时自动刷新；额外短轮询覆盖标签页刚恢复/推送重连窗口。
       const target = result.build_id || latestAgent.build_id;
       const deadline = Date.now() + 90000;
@@ -191,13 +194,13 @@
         const server = serversCache.find((s) => s.id === id);
         updateServerCards();
         if (server && server.online && server.info && server.info.agent_version === target) {
-          toast(`「${name}」Agent 已更新到 ${target}`);
+          toast(t('server.updatedTo', { name, target }));
           return;
         }
       }
-      toast('更新已安装，但 Agent 尚未重新上线；请检查 supervisor/service 日志', 10000);
+      toast(t('server.updateNoComeback'), 10000);
     } catch (e) {
-      toast(`Agent 更新失败：${e.message}`, 10000);
+      toast(t('server.updateFailed', { err: e.message }), 10000);
     } finally {
       updatingAgents.delete(id);
       renderServers();
@@ -241,49 +244,49 @@
     const e = m.extra || {};
     const rows = [];
     rows.push(['CPU', m.cpu != null ? m.cpu.toFixed(1) + '%' : '-']);
-    rows.push(['内存', m.mem_used != null
+    rows.push([t('monitor.mem'), m.mem_used != null
       ? fmtBytes(m.mem_used) + (m.mem_total ? ' / ' + fmtBytes(m.mem_total) + ' (' + (m.mem_used / m.mem_total * 100).toFixed(0) + '%)' : '')
       : '-']);
     rows.push(['Swap', e.swap != null
       ? fmtBytes(e.swap) + (e.swap_total ? ' / ' + fmtBytes(e.swap_total) + ' (' + (e.swap / e.swap_total * 100).toFixed(0) + '%)' : '')
       : '-']);
-    rows.push(['负载 (1/5/15)', [e.load1, e.load5, e.load15].map((v) => (v != null ? Number(v).toFixed(2) : '-')).join(' / ')]);
-    rows.push(['网络', (m.net_in != null ? '↓ ' + fmtBytes(m.net_in) + '/s' : '-') + ' · ' + (m.net_out != null ? '↑ ' + fmtBytes(m.net_out) + '/s' : '-')]);
+    rows.push([t('monitor.load'), [e.load1, e.load5, e.load15].map((v) => (v != null ? Number(v).toFixed(2) : '-')).join(' / ')]);
+    rows.push([t('monitor.network'), (m.net_in != null ? '↓ ' + fmtBytes(m.net_in) + '/s' : '-') + ' · ' + (m.net_out != null ? '↑ ' + fmtBytes(m.net_out) + '/s' : '-')]);
     if (e.disk_io && (e.disk_io.read_kbs != null || e.disk_io.write_kbs != null || e.disk_io.util_pct != null)) {
       const io = e.disk_io;
-      rows.push(['磁盘 IO', [
+      rows.push([t('monitor.diskIo'), [
         io.read_kbs != null ? `↓ ${io.read_kbs}KB/s` : null,
         io.write_kbs != null ? `↑ ${io.write_kbs}KB/s` : null,
         io.r_iops != null && io.w_iops != null ? `IOPS ${io.r_iops}/${io.w_iops}` : null,
         io.util_pct != null ? `util ${io.util_pct}%` : null,
       ].filter(Boolean).join(' · ') || '-']);
     }
-    if (e.procs != null) rows.push(['进程数', escapeHtml(e.procs)]);
+    if (e.procs != null) rows.push([t('monitor.procs'), escapeHtml(e.procs)]);
     if (e.tcp != null) rows.push(['TCP / UDP', escapeHtml(e.tcp) + ' / ' + (e.udp != null ? escapeHtml(e.udp) : '-')]);
-    rows.push(['温度', e.temp != null ? Number(e.temp).toFixed(1) + ' °C' : 'N/A']);
+    rows.push([t('monitor.temp'), e.temp != null ? Number(e.temp).toFixed(1) + ' °C' : 'N/A']);
     const items = rows.map(([k, v]) => `<div class="mt-row"><span>${k}</span><b>${v}</b></div>`).join('');
     // 系统信息：内核 / IP 等（info 仅在 info_json 变更时更新）
     // IP 用 <cf-ip> 组件（自动归属地查询；私网/回环被 GEO_PRIVATE 过滤仅显示 IP）
     let sysHtml = '';
     if (info) {
       const sys = [
-        ['系统', info.os],
-        ['内核', info.kern],
+        [t('monitor.os'), info.os],
+        [t('monitor.kernel'), info.kern],
       ].filter(([, v]) => v);
       let sysRows = sys.map(([k, v]) => `<div class="mt-row"><span>${k}</span><b>${escapeHtml(v)}</b></div>`).join('');
       // Agent 行：当前版本 + 有新版本时的可点击更新入口（点击走与卡片菜单一致的确认流程）
       if (info.agent_version) {
         let cell = escapeHtml(info.agent_version);
         if (s && updatingAgents.has(s.id)) {
-          cell += ' <span class="mt-updating">更新中…</span>';
+          cell += ` <span class="mt-updating">${escapeHtml(t('server.updating'))}</span>`;
         } else if (s && agentUpdateAvailable(s)) {
-          cell += ` <button class="mt-update" data-act="agent-update" data-id="${s.id}" data-name="${escapeHtml(s.name)}" title="当前 ${escapeHtml(info.agent_version)} → ${escapeHtml(latestAgent.build_id)}">↻ 可更新</button>`;
+          cell += ` <button class="mt-update" data-act="agent-update" data-id="${s.id}" data-name="${escapeHtml(s.name)}" title="${escapeHtml(t('server.updateTip', { from: info.agent_version, to: latestAgent.build_id }))}"${escapeHtml(t('server.updatable'))}</button>`;
         }
         sysRows += `<div class="mt-row"><span>Agent</span><b>${cell}</b></div>`;
       }
       if (info.ip4) sysRows += `<div class="mt-row"><span>IPv4</span><b><cf-ip ip="${escapeHtml(info.ip4)}"></cf-ip></b></div>`;
       if (info.ip6) sysRows += `<div class="mt-row"><span>IPv6</span><b><cf-ip ip="${escapeHtml(info.ip6)}"></cf-ip></b></div>`;
-      if (sysRows) sysHtml = `<div class="mt-sub">系统信息</div>` + sysRows;
+      if (sysRows) sysHtml = `<div class="mt-sub">${escapeHtml(t('metric.systemInfo'))}</div>` + sysRows;
     }
     let diskHtml = '';
     if (Array.isArray(e.disk) && e.disk.length) {
@@ -299,9 +302,9 @@
       let sumUsed = 0, sumTotal = 0;
       for (const d of e.disk) if (d.used != null && d.total > 0) { sumUsed += d.used; sumTotal += d.total; }
       const sumHtml = e.disk.length > 1 && sumTotal > 0
-        ? `<b title="累计">${fmtBytes(sumUsed)} / ${fmtBytes(sumTotal)} (${(sumUsed / sumTotal * 100).toFixed(0)}%)</b>`
+        ? `<b title="${escapeHtml(t('metric.total'))}">${fmtBytes(sumUsed)} / ${fmtBytes(sumTotal)} (${(sumUsed / sumTotal * 100).toFixed(0)}%)</b>`
         : '';
-      diskHtml = `<div class="mt-sub mt-disk-head"><span>磁盘（${e.disk.length} 个挂载点）</span>${sumHtml}</div><div class="mt-disk">` +
+      diskHtml = `<div class="mt-sub mt-disk-head">${e.disk ? `<span>${escapeHtml(t('metric.diskMounts', { n: e.disk.length }))}</span>` : ''}${sumHtml}</div><div class="mt-disk">` +
         e.disk.map((d) => `<div><span title="${escapeHtml(d.m)}">${escapeHtml(d.m)}</span><b>${diskRow(d)}</b></div>`).join('') + '</div>';
     }
     return `<div class="mt-title">实时指标</div>${items}${sysHtml}${diskHtml}`;
@@ -330,11 +333,11 @@
     return `
         <div class="metric" data-id="${s.id}">
           <span class="m-cell"${barAttr(m.cpu)}><b>${m.cpu == null ? '-' : m.cpu.toFixed(1) + '%'}</b><i>CPU</i></span>
-          <span class="m-cell"${barAttr(memPct)}><b>${fmtBytes(m.mem_used)}</b><i>内存</i></span>
-          <span class="m-cell" data-nobar><b>${m.extra && m.extra.load1 != null ? Number(m.extra.load1).toFixed(2) : '-'}</b><i>负载</i></span>
-          <span class="m-cell" data-nobar><b>${m.net_in != null ? fmtBytes(m.net_in) + '/s' : '-'}</b><i>网络↓</i></span>
+          <span class="m-cell"${barAttr(memPct)}><b>${fmtBytes(m.mem_used)}</b><i>${escapeHtml(t('metric.mem'))}</i></span>
+          <span class="m-cell" data-nobar><b>${m.extra && m.extra.load1 != null ? Number(m.extra.load1).toFixed(2) : '-'}</b><i>${escapeHtml(t('metric.load'))}</i></span>
+          <span class="m-cell" data-nobar><b>${m.net_in != null ? fmtBytes(m.net_in) + '/s' : '-'}</b><i>${escapeHtml(t('metric.netDown'))}</i></span>
           <span class="m-cell"${barAttr(swapPct)}><b>${swap != null ? fmtBytes(swap) : '-'}</b><i>Swap</i></span>
-          <span class="m-cell"${barAttr(dPct)}><b>${dPct == null ? '-' : dPct.toFixed(1) + '%'}</b><i>磁盘</i></span>
+          <span class="m-cell"${barAttr(dPct)}><b>${dPct == null ? '-' : dPct.toFixed(1) + '%'}</b><i>${escapeHtml(t('metric.disk'))}</i></span>
         </div>`;
   }
   // 探活行 HTML
@@ -346,12 +349,12 @@
   function cardHtml(s) {
     const m = s.metric;
     // 开机时间（秒 → 天）
-    const up = m && m.extra && m.extra.uptime ? `开机 ${(m.extra.uptime / 86400).toFixed(1)}天` : '';
+    const up = m && m.extra && m.extra.uptime ? t('monitor.uptime', { days: (m.extra.uptime / 86400).toFixed(1) }) : '';
     // IP 优先 wan_ip，回退 agent 上报的网卡 IP；私网与否不再这里过滤（<cf-ip> 内部 GEO_PRIVATE 守卫生效，私网仅显示 IP 不查归属地）
     const ip = (s.wan_ip || (s.info && s.info.ip4) || '').trim();
     const info = s.info ? [s.info.os, up].filter(Boolean).join(' · ') : up;
     const updateBtn = agentUpdateAvailable(s)
-      ? `<button data-act="agent-update" data-id="${s.id}" data-name="${escapeHtml(s.name)}" title="目标版本 ${escapeHtml(latestAgent.build_id)}" ${updatingAgents.has(s.id) ? 'disabled' : ''}>${updatingAgents.has(s.id) ? '更新中...' : '更新 Agent'}</button>`
+      ? `<button data-act="agent-update" data-id="${s.id}" data-name="${escapeHtml(s.name)}" title="目标版本 ${escapeHtml(latestAgent.build_id)}" ${updatingAgents.has(s.id) ? 'disabled' : ''}>${updatingAgents.has(s.id) ? escapeHtml(t('server.updating')) : escapeHtml(t('server.updateAgent'))}</button>`
       : '';
     const sel = selectedServers.has(s.id);
     return `
@@ -359,13 +362,13 @@
         <div class="card-head">
           <div class="card-title">
             <span class="name"><span class="flag" data-flag="${escapeHtml(ip)}"></span>${osIconHtml(s.info && s.info.os)}${escapeHtml(s.name)}</span>
-            <button class="more-btn" title="节点操作">⋯</button>
+            <button class="more-btn" title="${escapeHtml(t('server.nodeOps'))}">⋯</button>
             <div class="card-menu hidden">
-              ${canExec ? `<button data-act="term" data-id="${s.id}" data-name="${escapeHtml(s.name)}">终端</button>
-              <button data-act="file" data-id="${s.id}" data-name="${escapeHtml(s.name)}">文件</button>` : ''}
-              <button data-act="mon" data-id="${s.id}" data-name="${escapeHtml(s.name)}">监控</button>
-              <button data-act="stats" data-id="${s.id}" data-name="${escapeHtml(s.name)}">流量/可用率</button>
-              ${isAdmin ? `${updateBtn}<button data-act="rotate" data-id="${s.id}" data-name="${escapeHtml(s.name)}">轮换 Key</button>
+              ${canExec ? `<button data-act="term" data-id="${s.id}" data-name="${escapeHtml(s.name)}">${escapeHtml(t('server.term'))}</button>
+              <button data-act="file" data-id="${s.id}" data-name="${escapeHtml(s.name)}">${escapeHtml(t('server.file'))}</button>` : ''}
+              <button data-act="mon" data-id="${s.id}" data-name="${escapeHtml(s.name)}">${escapeHtml(t('server.monitor'))}</button>
+              <button data-act="stats" data-id="${s.id}" data-name="${escapeHtml(s.name)}">${escapeHtml(t('server.stats'))}</button>
+              ${isAdmin ? `${updateBtn}<button data-act="rotate" data-id="${s.id}" data-name="${escapeHtml(s.name)}">${escapeHtml(t('server.rotate'))}</button>
               <button data-act="edit" data-id="${s.id}" data-name="${escapeHtml(s.name)}" data-group="${escapeHtml(s.group || '')}" data-order="${s.display_index || 0}">修改</button>
               <button data-act="del" data-id="${s.id}" data-name="${escapeHtml(s.name)}" class="dd-danger">删除</button>` : ''}
             </div>
@@ -452,7 +455,8 @@
     updateBatchBar();
     // "没有服务器"与"搜索无结果"要区分：前者引导添加，后者引导换词
     if (!serversCache.length) {
-      box.innerHTML = '<div class="empty"><p>还没有服务器</p><p class="muted">点<a href="#" class="empty-add" id="empty-add">「添加服务器」</a>生成 agent 配置后开始监控</p></div>';
+      // 提示中间嵌了"添加服务器"链接，故文案拆成前/中/后三段拼接
+      box.innerHTML = `<div class="empty"><p>${escapeHtml(t('server.empty'))}</p><p class="muted">${escapeHtml(t('server.emptyHintPre'))}<a href="#" class="empty-add" id="empty-add">「${escapeHtml(t('server.add'))}」</a>${escapeHtml(t('server.emptyHintPost'))}</p></div>`;
       // 事件绑定：内嵌链接点击直接打开添加服务器弹窗（与 toolbar「＋」同入口）
       const emptyAdd = $('#empty-add');
       if (emptyAdd) emptyAdd.onclick = (e) => { e.preventDefault(); openAddModal(); };
@@ -530,7 +534,7 @@
         const on = s.online;
         if ((on && !badge.classList.contains('on')) || (!on && !badge.classList.contains('off'))) {
           badge.className = `badge ${on ? 'on' : 'off'}`;
-          badge.innerHTML = `<i class="dot"></i>${on ? '在线' : '离线'}`;
+          badge.innerHTML = `<i class="dot"></i>${on ? t('common.online') : t('common.offline')}`;
         }
       }
       // 指标行（重建该块；不含菜单/事件绑定，全局 click 委托不受影响）
@@ -568,7 +572,7 @@
       const on = s.online;
       if ((on && badge.classList.contains('on')) || (!on && badge.classList.contains('off'))) return;
       badge.className = `badge ${on ? 'on' : 'off'}`;
-      badge.innerHTML = `<i class="dot"></i>${on ? '在线' : '离线'}`;
+      badge.innerHTML = `<i class="dot"></i>${on ? t('common.online') : t('common.offline')}`;
     });
   }
 
@@ -579,7 +583,7 @@
     const name = $('#inp-name').value.trim();
     const group = $('#inp-group').value.trim();
     const sortOrder = Number($('#inp-order').value) || 0;
-    if (!name) return toast('请输入服务器名称');
+    if (!name) return toast(t('server.nameRequired'));
     try {
       const cfg = await api('/api/servers', { method: 'POST', body: JSON.stringify({ name, group, sort_order: sortOrder }) });
       const text = `服务器已添加，agent 配置（仅显示一次）：\n\nWSS 地址: ${cfg.wss_base}\nKEY: ${cfg.agent_key}`;
@@ -596,8 +600,8 @@
   // 告警覆盖值从 serversCache 取（列表已随推送下发 alert_override），避免为编辑再单开详情接口
   function openEditModal(id, name, group, order) {
     editServerId = id;
-    $('#add-modal-title').textContent = '修改服务器';
-    $('#btn-add-server').textContent = '保存修改';
+    $('#add-modal-title').textContent = t('server.edit');
+    $('#btn-add-server').textContent = t('server.saveEdit');
     $('#inp-name').value = name || '';
     $('#inp-group').value = group || '';
     $('#inp-order').value = order != null ? String(order) : '';
@@ -639,7 +643,7 @@
     const name = $('#inp-name').value.trim();
     const group = $('#inp-group').value.trim();
     const sortOrder = Number($('#inp-order').value) || 0;
-    if (!name) return toast('请输入服务器名称');
+    if (!name) return toast(t('server.nameRequired'));
     try {
       await api(`/api/servers/${editServerId}`, {
         method: 'PATCH',
@@ -648,7 +652,7 @@
       $('#add-modal').classList.add('hidden');
       unlockScroll();
       editServerId = null;
-      toast('服务器信息已更新');
+      toast(t('server.infoUpdated'));
       loadServers();
     } catch (e) {
       toast(e.message);
@@ -682,7 +686,7 @@
     onOpen: () => startPushTimer(), // 连接建立后启动老化计时器
     onData: (list) => { serversCache = list; lastPushAt = Date.now(); updateServerCards(); },
     onAuthFail: () => { token = ''; localStorage.removeItem('cfpanel_token'); showAuth(); },
-    onLongRetry: () => toast('实时刷新连接失败，正在自动重试...'),
+    onLongRetry: () => toast(t('idle.pushRetry')),
   });
   function startPush() {
     if (!token) return;
@@ -712,11 +716,11 @@
     },
     onPause: () => {
       stopPush(); // 断开 /ws/push → 观看者减 1 → agent 恢复慢采
-      toast('已暂停实时刷新（agent 恢复慢采，节省额度）。移动鼠标或按键即可恢复。');
+      toast(t('idle.pausedLong'));
     },
     onResume: () => {
       startPush(); // 重连 /ws/push → 观看者加 1 → agent 恢复快采
-      toast('已恢复实时刷新。');
+      toast(t('idle.resumedLong'));
     },
   });
   idleGuard.bind();
@@ -742,7 +746,7 @@
     $('#dialog-text').textContent = text;
     $('#dialog-text').classList.toggle('mono', !!mono);
     $('#btn-dialog-ok').classList.add('hidden');
-    $('#btn-dialog-cancel').textContent = '知道了';
+    $('#btn-dialog-cancel').textContent = t('common.gotIt');
     $('#btn-dialog-cancel').classList.remove('hidden');
     $('#dialog').classList.remove('hidden');
     lockScroll();
@@ -750,11 +754,11 @@
     $('#btn-dialog-cancel').onclick = closeDialog;
   }
   function confirmDialog(message, onOk, onCancel) {
-    $('#dialog-title').textContent = '确认';
+    $('#dialog-title').textContent = t('common.confirm');
     $('#dialog-text').textContent = message;
     $('#dialog-text').classList.remove('mono');
     $('#btn-dialog-ok').classList.remove('hidden');
-    $('#btn-dialog-cancel').textContent = '取消';
+    $('#btn-dialog-cancel').textContent = t('common.cancel');
     $('#btn-dialog-cancel').classList.remove('hidden');
     $('#dialog').classList.remove('hidden');
     lockScroll();
@@ -782,7 +786,7 @@
     promptInputEl.value = defaultValue || '';
     promptInputEl.style.display = 'block';
     $('#btn-dialog-ok').classList.remove('hidden');
-    $('#btn-dialog-cancel').textContent = '取消';
+    $('#btn-dialog-cancel').textContent = t('common.cancel');
     $('#btn-dialog-cancel').classList.remove('hidden');
     $('#dialog').classList.remove('hidden');
     lockScroll();
@@ -857,7 +861,7 @@
       return;
     }
     if (webglAddonCount() >= TERM_MAX_TABS) {
-      if (!silent) toast(`WebGL 上下文已达上限（${TERM_MAX_TABS} 个），该标签保持 DOM 渲染`);
+      if (!silent) toast(t('term.webglLimit', { n: TERM_MAX_TABS }));
       s.renderer = 'dom';
       syncRendererBtn();
       return;
@@ -885,7 +889,7 @@
     } catch (e) {
       // 无 WebGL2 / 显卡黑名单 / 上下文创建失败 → 保持 DOM
       s.renderer = 'dom';
-      if (!silent) toast('WebGL 渲染不可用，已使用 DOM：' + (e && e.message ? e.message : ''));
+      if (!silent) toast(t('term.webglUnavailable', { err: (e && e.message ? e.message : '') }));
     }
     syncRendererBtn();
     refitTerm();
@@ -902,7 +906,7 @@
 
   async function createTerminal(serverId, serverName) {
     if (termSessions.size >= TERM_MAX_TABS) {
-      toast(`最多同时打开 ${TERM_MAX_TABS} 个终端，请先关闭一个`);
+      toast(t('term.maxTabs', { n: TERM_MAX_TABS }));
       return;
     }
     $('#term-modal').classList.remove('hidden');
@@ -989,7 +993,7 @@
       // 不 fit 的话终端会保持"隐藏时"的错误行列数（表现为内容错位/不换行）
       try { cur.fit.fit(); } catch { /* ignore */ }
       cur.term.focus();
-      $('#term-title').textContent = `终端 · ${cur.serverName}`;
+      $('#term-title').textContent = t('term.titleWith', { name: cur.serverName });
     }
     syncRendererBtn();
   }
@@ -1044,10 +1048,10 @@
       } else {
         renderFileList(entries);
         localStorage.setItem(`cfpanel_file_cwd:${fileServerId}`, path); // 记住最后浏览目录（下次打开恢复）
-        $('#file-msg').textContent = truncated ? '目录条目过多，仅显示前 1000 项' : '';
+        $('#file-msg').textContent = truncated ? t('file.truncated') : '';
       }
     },
-    onUploadProgress: (pct) => { $('#file-msg').textContent = `上传中：${pct}%`; },
+    onUploadProgress: (pct) => { $('#file-msg').textContent = t('file.uploading', { pct }); },
     onUploadDone: (path) => {
       uploadStat.ok += 1;
       reloadFileList();
@@ -1056,7 +1060,7 @@
       if (!batched) {
         $('#btn-file-cancel').classList.add('hidden');
         $('#file-msg').textContent = '';
-        toast(`已上传：${path}`);
+        toast(t('file.uploadDone', { path }));
         return;
       }
       $('#file-msg').textContent = uploadQueue.length
@@ -1064,8 +1068,8 @@
         : `已上传 ${uploadStat.ok} 个（最后：${path}）`;
       nextUpload();
     },
-    onUploadCanceled: () => { $('#btn-file-cancel').classList.add('hidden'); $('#file-msg').textContent = '已取消上传'; },
-    onDownloadProgress: (pct) => { $('#file-msg').textContent = `下载中：${pct}%`; },
+    onUploadCanceled: () => { $('#btn-file-cancel').classList.add('hidden'); $('#file-msg').textContent = t('file.uploadCanceled'); },
+    onDownloadProgress: (pct) => { $('#file-msg').textContent = t('file.downloading', { pct }); },
     onDownloadDone: (path, parts, dlName) => {
       $('#btn-dl-cancel').classList.add('hidden');
       try {
@@ -1077,18 +1081,18 @@
         a.click();
         a.remove();
         URL.revokeObjectURL(a.href);
-        $('#file-msg').textContent = `已下载：${dlName || path}`;
-      } catch { $('#file-msg').textContent = '下载失败'; }
+        $('#file-msg').textContent = t('file.downloadDone', { path: dlName || path });
+      } catch { $('#file-msg').textContent = t('file.downloadFail'); }
     },
-    onDownloadCanceled: () => { $('#btn-dl-cancel').classList.add('hidden'); $('#file-msg').textContent = '已取消下载'; },
+    onDownloadCanceled: () => { $('#btn-dl-cancel').classList.add('hidden'); $('#file-msg').textContent = t('file.downloadCanceled'); },
     // 重命名/删除成功后刷新列表（zip 下载完成的 delete 清理不回执，不会误触 onDeleteDone）
-    onRenameDone: (path) => { reloadFileList(); toast(`已重命名为：${path}`); },
-    onDeleteDone: () => { reloadFileList(); toast('已删除'); },
-    onMkdirDone: () => { reloadFileList(); toast('目录已创建'); },
-    onTouchDone: () => { reloadFileList(); toast('文件已创建'); },
-    onMoveDone: (path) => { reloadFileList(); toast(`已移动到：${path}`); },
-    onCopyDone: (path) => { reloadFileList(); toast(`已复制为：${path}`); },
-    onChmodDone: (mode) => { reloadFileList(); toast(`权限已更新：${modeText(mode) || mode}`); },
+    onRenameDone: (path) => { reloadFileList(); toast(t('file.renamedTo', { path })); },
+    onDeleteDone: () => { reloadFileList(); toast(t('file.deleted')); },
+    onMkdirDone: () => { reloadFileList(); toast(t('file.dirCreated')); },
+    onTouchDone: () => { reloadFileList(); toast(t('file.fileCreated')); },
+    onMoveDone: (path) => { reloadFileList(); toast(t('file.movedTo', { path })); },
+    onCopyDone: (path) => { reloadFileList(); toast(t('file.copiedTo', { path })); },
+    onChmodDone: (mode) => { reloadFileList(); toast(t('file.permUpdated', { mode: modeText(mode) || mode })); },
     onFindDone: (hits, truncated, scanned) => {
       // 迟到的搜索响应（期间已清除搜索或切了目录）：丢弃，不覆盖当前视图
       if (!fileFindState) return;
@@ -1099,15 +1103,15 @@
     onEditLoaded: (path, text) => openFileEditor(path, text),
     // 错误同时 toast：编辑器保存后弹窗已关闭、文件弹窗可能未开——仅写 file-msg 会零提示
     onError: (msg) => {
-      $('#file-msg').textContent = `错误：${msg}`;
-      toast(`文件操作错误：${msg}`);
+      $('#file-msg').textContent = t('file.errPrefix', { msg });
+      toast(t('file.errToast', { msg }));
       // 批量上传中途失败：记录并推进队列，否则剩余文件会一直卡在队列里
       if (uploadQueue.length) {
         uploadStat.failed.push(`（中断：${msg}）`);
         nextUpload();
       }
     },
-    onDisconnected: () => { if (!$('#file-modal').classList.contains('hidden')) $('#file-msg').textContent = '连接断开，点击「刷新」重连'; },
+    onDisconnected: () => { if (!$('#file-modal').classList.contains('hidden')) $('#file-msg').textContent = t('file.disconnected'); },
   });
 
   // 重新拉取列表（带当前过滤规则）。过滤在 agent 端完成（先过滤再截断 1000 条），
@@ -1127,10 +1131,10 @@
   function doFind() {
     const kw = String($('#file-find').value || '').trim();
     if (!kw) { clearFind(); return; }
-    if (isSystemPath(fileSess.cwd)) return toast('系统目录受保护，不支持递归搜索');
+    if (isSystemPath(fileSess.cwd)) return toast(t('file.protectedFind'));
     fileFindState = { pattern: kw, truncated: false, scanned: 0 };
     $('#btn-find-clear').classList.remove('hidden');
-    $('#file-msg').textContent = `搜索中：${kw}`;
+    $('#file-msg').textContent = t('file.searching', { kw });
     fileSess.find(fileSess.cwd, kw);
   }
 
@@ -1156,16 +1160,16 @@
         + `<td>${size}</td><td>—</td><td class="f-perm">${perm}</td>`
         + `<td class="f-ops">${rowOpsMenu(full, e.type, e.size, e.mode, editable)}</td></tr>`;
     });
-    $('#file-list').innerHTML = rows.join('') || '<tr><td colspan="5" class="muted">无匹配结果</td></tr>';
+    $('#file-list').innerHTML = rows.join('') || `<tr><td colspan="5" class="muted">${escapeHtml(t('file.findNoResult'))}</td></tr>`;
     const st = fileFindState || {};
-    $('#file-msg').textContent = `递归搜索「${st.pattern || ''}」：${safe.length} 条`
+    $('#file-msg').textContent = t('file.findResult', { kw: st.pattern || '', n: safe.length })
       + (st.truncated ? `（已达上限，仅显示部分；共扫描 ${st.scanned} 项）` : `（扫描 ${st.scanned} 项）`);
   }
 
   async function openFileManager(serverId, serverName) {
     fileServerId = serverId;
     fileServerName = serverName;
-    $('#file-title').textContent = `文件管理 · ${serverName}`;
+    $('#file-title').textContent = t('file.titleWith', { name: serverName });
     // 恢复该服务器上次浏览目录（列表成功时持久化；格式异常则回退根目录）。
     // 绝对路径判定兼容 Windows 盘符（C:\Users\me）——仅认 / 会把 Windows 上次目录
     // 回退成 "/"，在 Windows agent 上被 fail closed 判为系统路径导致列表为空
@@ -1178,7 +1182,7 @@
     $('#file-find').value = '';
     $('#btn-find-clear').classList.add('hidden');
     $('#file-msg').textContent = '';
-    $('#file-list').innerHTML = '<tr><td colspan="5" class="muted">连接中...</td></tr>';
+    $('#file-list').innerHTML = `<tr><td colspan="5" class="muted">${escapeHtml(t('file.connecting'))}</td></tr>`;
     $('#file-modal').classList.remove('hidden');
     lockScroll();
     fileSess.open(serverId, cwd); // 建会话 + WS + auth + 初始列表
@@ -1229,7 +1233,7 @@
       const perm = e.mode ? escapeHtml(modeText(e.mode)) : '—';
       return `<tr><td>${nameCell}</td><td>${size}</td><td>${escapeHtml(time)}</td><td class="f-perm">${perm}</td><td class="f-ops">${menu}</td></tr>`;
     });
-    $('#file-list').innerHTML = rows.join('') || '<tr><td colspan="5" class="muted">空目录</td></tr>';
+    $('#file-list').innerHTML = rows.join('') || `<tr><td colspan="5" class="muted">${escapeHtml(t('file.emptyDir'))}</td></tr>`;
     // cwd 为受保护系统目录时禁用上传与新建（写操作会被 agent 拒；特殊需求走终端 Shell）
     const cwdProt = isSystemPath(fileSess.cwd);
     const upBtn = document.querySelector('label.file-upload');
@@ -1245,13 +1249,13 @@
   // 新建目录 / 新建文件（当前 cwd 下；名字不带 /，agent mkdir -p 语义 + touch create_new）
   function mkDir() {
     promptDialog(`新建目录（路径：${escapeHtml(fileSess.cwd)}）`, 'new-dir', (name) => {
-      if (!name || name.includes('/')) return toast('目录名不能包含 /');
+      if (!name || name.includes('/')) return toast(t('file.dirNameNoSlash'));
       fileSess.mkdir(fileJoin(fileSess.cwd, name));
     });
   }
   function touchFile() {
     promptDialog(`新建文件（路径：${escapeHtml(fileSess.cwd)}）`, 'new-file.txt', (name) => {
-      if (!name || name.includes('/')) return toast('文件名不能包含 /');
+      if (!name || name.includes('/')) return toast(t('file.nameNoSlash'));
       fileSess.touch(fileJoin(fileSess.cwd, name));
     });
   }
@@ -1274,7 +1278,7 @@
     $('#chmod-oct').value = (n & 0o777).toString(8).padStart(3, '0');
     // 只读 = 所有写位都被清掉（Unix 口径）；Windows 上报的 0444/0666 折算值同样适用
     $('#chmod-readonly').checked = n !== 0 && (n & 0o222) === 0;
-    $('#chmod-hint').textContent = modeText(n) ? `当前：${modeText(n)}` : '';
+    $('#chmod-hint').textContent = modeText(n) ? t('chmod.current', { mode: modeText(n) }) : '';
   }
   // 九宫格 ⇄ 八进制双向联动（改任一侧即同步另一侧，避免两处输入不一致）
   function syncChmodOct() {
@@ -1307,17 +1311,17 @@
   }
   function applyChmod() {
     const raw = String($('#chmod-oct').value || '').trim();
-    if (!/^[0-7]{1,4}$/.test(raw)) return toast('请输入合法的八进制权限（如 755）');
+    if (!/^[0-7]{1,4}$/.test(raw)) return toast(t('chmod.invalid'));
     const n = Number.parseInt(raw, 8);
     fileSess.chmod(chmodPath, n); // 不传 readonly：Unix 路径
     closeChmod();
-    $('#file-msg').textContent = `修改权限中：${chmodPath}`;
+    $('#file-msg').textContent = t('file.permChanging', { path: chmodPath });
   }
   function applyChmodReadonly() {
     const ro = $('#chmod-readonly').checked;
     fileSess.chmod(chmodPath, undefined, ro); // 不传 mode：跨平台只读路径（Windows 唯一可用维度）
     closeChmod();
-    $('#file-msg').textContent = `${ro ? '设为只读' : '取消只读'}：${chmodPath}`;
+    $('#file-msg').textContent = t(ro ? 'file.readonlyOn' : 'file.readonlyOff', { path: chmodPath });
   }
 
   // ---------- 在线编辑器：Monaco（CDN 懒加载，失败回退 textarea）----------
@@ -1370,9 +1374,9 @@
     const btn = $('#btn-editor-save');
     btn.disabled = !dirty; // 无改动置灰：内容与打开时一致，保存是无效动作
     btn.classList.toggle('dirty', dirty);
-    btn.textContent = dirty ? '保存 ●' : '保存';
+    btn.textContent = dirty ? t('file.editorSaveDirty') : t('file.editorSave');
     // 有未保存改动时标题加标记
-    $('#file-editor-title').textContent = `编辑：${editorPath}${dirty ? ' *' : ''}`;
+    $('#file-editor-title').textContent = t('file.editorTitle', { path: editorPath }) + (dirty ? ' *' : '');
   }
 
   async function openFileEditor(path, text) {
@@ -1383,13 +1387,13 @@
     // Markdown 文件显示「预览」按钮；打开新文件时预览态复位
     editorPreviewing = false;
     $('#btn-editor-preview').classList.toggle('hidden', editorLang(path) !== 'markdown');
-    $('#btn-editor-preview').textContent = '预览';
+    $('#btn-editor-preview').textContent = t('file.editorPreview');
     $('#editor-md-preview').classList.add('hidden');
-    $('#file-editor-title').textContent = `编辑：${path}`;
+    $('#file-editor-title').textContent = t('file.editorTitle', { path });
     $('#file-editor-text').value = text; // textarea 始终持有内容（回退与保存兜底）
     $('#file-editor-modal').classList.remove('hidden');
     $('#file-editor-modal').classList.remove('expanded');
-    $('#btn-editor-expand').textContent = '扩大';
+    $('#btn-editor-expand').textContent = t('file.editorExpand');
     lockScroll();
     if (!monacoReady) {
       try {
@@ -1438,7 +1442,7 @@
     // 连接断开（文件弹窗被关/WS 掉线）时 upload 会静默丢弃发送帧——编辑内容丢失且零提示。
     // 先校验连接，断开则阻止保存（编辑器保持打开，重连后可重试）
     if (!fileSess.connected) {
-      toast('文件连接已断开，无法保存。请打开文件管理器并点击「刷新」重连后重试');
+      toast(t('file.disconnectedSave'));
       return;
     }
     const text = editorGetValue();
@@ -1446,13 +1450,13 @@
     // File 构造（Blob + name）：复用上传状态机分块写回；显式 path（编辑期间 cwd 可能已变化）
     fileSess.upload(new File([text], name, { type: 'text/plain' }), { overwrite: true, path: editorPath });
     closeFileEditor();
-    $('#file-msg').textContent = '保存中...';
+    $('#file-msg').textContent = t('file.saving');
   }
 
   function toggleEditorExpand() {
     const modal = $('#file-editor-modal');
     const expanded = modal.classList.toggle('expanded');
-    $('#btn-editor-expand').textContent = expanded ? '还原' : '扩大';
+    $('#btn-editor-expand').textContent = expanded ? t('file.editorRestore') : t('file.editorExpand');
     // Monaco automaticLayout 异步自适应；textarea 用 CSS flex 自动撑满
     if (monacoEditor) setTimeout(() => monacoEditor && monacoEditor.layout(), 60);
   }
@@ -1465,25 +1469,25 @@
       if (monacoEditor) $('#editor-monaco-host').classList.remove('hidden');
       else $('#file-editor-text').classList.remove('hidden');
       editorPreviewing = false;
-      btn.textContent = '预览';
+      btn.textContent = t('file.editorPreview');
       return;
     }
     let md;
     try { md = await loadMarkdown(); }
-    catch { toast('预览组件加载失败，请稍后重试'); return; }
+    catch { toast(t('file.previewFail')); return; }
     $('#editor-md-preview').innerHTML = md.purify.sanitize(md.marked.parse(editorGetValue()));
     $('#editor-md-preview').classList.remove('hidden');
     $('#file-editor-text').classList.add('hidden');
     $('#editor-monaco-host').classList.add('hidden');
     editorPreviewing = true;
-    btn.textContent = '编辑';
+    btn.textContent = t('file.editorEdit');
   }
 
   function closeFileEditor() {
     fileSess.cancelEditText();
     editorPreviewing = false;
     $('#btn-editor-preview').classList.add('hidden');
-    $('#btn-editor-preview').textContent = '预览';
+    $('#btn-editor-preview').textContent = t('file.editorPreview');
     $('#editor-md-preview').classList.add('hidden');
     $('#editor-md-preview').innerHTML = ''; // 清空引用，释放大文档 DOM
     if (monacoEditor) {
@@ -1503,8 +1507,8 @@
   // op: 'move' | 'copy' —— 两者共用目录选择器（选目标目录 + 目标名），仅最终指令不同
   function openFileSelector(srcPath, srcName, srcIsDir, op = 'move') {
     fileSelector = { cwd: fileParent(srcPath), srcPath, srcName, srcIsDir, entries: [], op };
-    $('#sel-title').textContent = `${op === 'copy' ? '复制到' : '移动'}：${srcPath}`;
-    $('#btn-sel-ok').textContent = op === 'copy' ? '复制到此处' : '移动到此处';
+    $('#sel-title').textContent = t(op === 'copy' ? 'file.copyTitle' : 'file.moveTitle', { path: srcPath });
+    $('#btn-sel-ok').textContent = t(op === 'copy' ? 'file.copyTo' : 'file.moveTo');
     $('#sel-name').value = srcName;
     $('#file-selector-modal').classList.remove('hidden');
     lockScroll();
@@ -1524,7 +1528,7 @@
       const prot = isSystemPath(p);
       return `<tr><td><a class="f-dir${prot ? ' f-prot' : ''}" data-path="${escapeHtml(p)}">📁 ${escapeHtml(e.name)}${prot ? ' 🔒' : ''}</a></td></tr>`;
     });
-    $('#sel-list').innerHTML = rows.join('') || '<tr><td class="muted">（无子目录）</td></tr>';
+    $('#sel-list').innerHTML = rows.join('') || `<tr><td class="muted">${escapeHtml(t('file.noSubDir'))}</td></tr>`;
     $('#sel-cwd').textContent = fileSelector.cwd;
     // 目标目录为系统目录 → 禁止确认（agent 也会拦，此处提前提示）
     const protCwd = isSystemPath(fileSelector.cwd);
@@ -1558,9 +1562,9 @@
     const { srcPath, op } = fileSelector;
     const name = $('#sel-name').value.trim();
     // 两种分隔符都拒绝（Windows '\' 越目录；与 agent 端 file_rename/file_move/file_copy 校验同步）
-    if (!name || name.includes('/') || name.includes('\\')) return toast('文件名不能为空且不含路径分隔符');
+    if (!name || name.includes('/') || name.includes('\\')) return toast(t('file.nameNoSep'));
     const dest = fileJoin(fileSelector.cwd, name);
-    if (dest === srcPath) return toast('与源位置相同');
+    if (dest === srcPath) return toast(t('file.samePlace'));
     // 复制保留原件，移动不保留；两者都由 agent 拒绝覆盖已存在的目标
     if (op === 'copy') fileSess.copy(srcPath, dest);
     else fileSess.move(srcPath, dest);
@@ -1585,7 +1589,7 @@
     const list = Array.from(files || []).filter((f) => f && f.size >= 0);
     if (!list.length) return;
     if (isSystemPath(fileSess.cwd)) {
-      toast('系统目录受保护，禁止上传；如需操作请使用终端 Shell');
+      toast(t('file.protected'));
       return;
     }
     uploadQueue = list;
@@ -1599,7 +1603,7 @@
       const { ok, failed } = uploadStat;
       $('#btn-file-cancel').classList.add('hidden');
       if (failed.length) {
-        toast(`上传结束：成功 ${ok} 个，失败 ${failed.length} 个`, 4000);
+        toast(t('file.uploadBatchSummaryFail', { ok, n: failed.length }), 4000);
         $('#file-msg').textContent = `失败：${failed.join('；')}`;
       }
       return;
@@ -1974,13 +1978,13 @@
       }
       $('#custom-setup-out').textContent = `# 追加到 /etc/cf-panel-agent.env\nCUSTOM_METRICS='${JSON.stringify(arr)}'`;
     } catch (e) {
-      toast('JSON 格式错误：' + e.message);
+      toast(t('setup.jsonError', { msg: e.message }));
     }
   }
   function copyCustomCfg() {
     const txt = $('#custom-setup-out').textContent;
-    if (!txt) return toast('请先生成配置');
-    navigator.clipboard.writeText(txt).then(() => toast('已复制')).catch(() => toast('复制失败，请手动复制'));
+    if (!txt) return toast(t('setup.needGen'));
+    navigator.clipboard.writeText(txt).then(() => toast(t('setup.copied'))).catch(() => toast(t('setup.copyFail')));
   }
 
   // ---------- 服务监控（服务探活 PROBES）设置 ----------
@@ -1991,20 +1995,20 @@
   }
   function genServiceCfg() {
     const raw = $('#service-probes-input').value.trim();
-    if (!raw) return toast('请输入探测配置');
+    if (!raw) return toast(t('setup.needProbe'));
     const items = raw.split(',');
     for (const it of items) {
       const parts = it.split(':');
       if (parts.length < 3 || !['http', 'tcp'].includes(parts[1])) {
-        return toast(`格式错误：「${it}」应为 名称:类型(http|tcp):目标`);
+        return toast(t('setup.formatError', { item: it }));
       }
     }
     $('#service-setup-out').textContent = `# 追加到 /etc/cf-panel-agent.env\nPROBES="${raw}"`;
   }
   function copyServiceCfg() {
     const txt = $('#service-setup-out').textContent;
-    if (!txt) return toast('请先生成配置');
-    navigator.clipboard.writeText(txt).then(() => toast('已复制')).catch(() => toast('复制失败，请手动复制'));
+    if (!txt) return toast(t('setup.needGen'));
+    navigator.clipboard.writeText(txt).then(() => toast(t('setup.copied'))).catch(() => toast(t('setup.copyFail')));
   }
 
   // ---------- 设置 / PAT ----------
@@ -2041,7 +2045,7 @@
     const bar = $('#batch-bar');
     if (!bar) return;
     bar.classList.toggle('hidden', !isAdmin || selectedServers.size === 0);
-    $('#batch-count').textContent = `已选 ${selectedServers.size} 台`;
+    $('#batch-count').textContent = t('server.selected', { n: selectedServers.size });
   }
   function toggleSelect(id, on) {
     if (on) selectedServers.add(id); else selectedServers.delete(id);
@@ -2095,7 +2099,7 @@
           method: 'POST',
           body: JSON.stringify({ op: 'update-group', ids, group: String(group || '').trim() }),
         });
-        toast(`已更新 ${r.summary.success} 台`);
+        toast(t('server.batchGroupDone', { n: r.summary.success }));
         clearSelection();
         await loadServers();
       } catch (e) { toast(e.message); }
@@ -2114,7 +2118,7 @@
             method: 'POST',
             body: JSON.stringify({ op: 'delete', ids }),
           });
-          toast(`已删除 ${r.summary.success} 台${r.summary.failed ? `，失败 ${r.summary.failed} 台` : ''}`);
+          toast(t('server.batchDeleted', { ok: r.summary.success, failed: r.summary.failed ? t('server.batchDeletedFailed', { n: r.summary.failed }) : '' }));
           clearSelection();
           await loadServers();
         } catch (e) { toast(e.message); }
@@ -2319,7 +2323,7 @@
         method: 'PUT',
         body: JSON.stringify({ site_name: $('#set-site-name').value, notice: $('#set-notice').value, geo_lookup: $('#set-geo').checked }),
       });
-      toast('站点信息已保存');
+      toast(t('settings.saved'));
       loadPublic();
     } catch (e) {
       toast(e.message);
@@ -2369,7 +2373,7 @@
         method: 'PUT',
         body: JSON.stringify({ alerts: collectAlertForm() }),
       });
-      toast('告警配置已保存');
+      toast(t('settings.alertsSaved'));
     } catch (e) {
       toast(e.message);
     }
@@ -2449,7 +2453,7 @@
     const scopes = [];
     if ($('#tok-read').checked) scopes.push('server:read');
     if ($('#tok-exec').checked) scopes.push('server:exec');
-    if (!scopes.length) return toast('至少勾选一个权限');
+    if (!scopes.length) return toast(t('token.needScope'));
     const serverIDs = $('#tok-servers').value.split(',').map((s) => Number(s.trim())).filter((n) => n > 0);
     const expDays = Number($('#tok-expires').value);
     tokenCreateBusy = true;
@@ -2721,7 +2725,7 @@
       picker.showPicker();
     } catch {
       // 旧浏览器无 showPicker：输入框仍可直接敲日期字符串，功能不缺失
-      toast('当前浏览器不支持弹出日历，请直接输入截止日期（如 2026/9/5 14:00）');
+      toast(t('token.pickDate'));
     }
   };
   // 选中 → 把截止时间写回输入框（人读格式），预览与提交统一走字符串解析
@@ -2871,7 +2875,7 @@
     $('#set-alert-content-type').value = p.ct;
     $('#set-alert-headers').value = p.headers;
     $('#set-alert-token').value = '';
-    toast(`已填入「${p.name}」模板，请填写 Token`);
+    toast(t('settings.presetFilled', { name: p.name }));
   });
 
   // 终端：渲染器切换作用于「当前活动标签」；＋ 为当前服务器再开一个；✕ 关闭全部
@@ -3006,7 +3010,7 @@
       const old = CfUtils.fileBase(ren.dataset.path);
       // 原生 prompt() → promptDialog（对话框体系一致，回车确认/Esc 取消）
       promptDialog(`重命名：${ren.dataset.path}（仅改名，不支持跨目录）`, old, (name) => {
-        if (name.includes('/') || name.includes('\\')) return toast('名称不能包含路径分隔符');
+        if (name.includes('/') || name.includes('\\')) return toast(t('file.nameNoSep2'));
         fileSess.rename(ren.dataset.path, name);
       });
       return;
@@ -3108,6 +3112,8 @@
 
   // ---------- 启动 ----------
   (async function boot() {
+    // 先填充 index.html 上带 data-i18n* 的静态文本/属性，再走业务初始化
+    CfI18n.applyDom();
     loadPublic();
     if (!token) return showAuth();
     try {

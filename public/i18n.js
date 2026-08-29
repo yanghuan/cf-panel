@@ -1,0 +1,613 @@
+// cf-panel 国际化（i18n）：轻量 t() + 语言包注册表
+// 零构建、零依赖——语言包就是普通 JS 对象，新增语言 = 注册一个包。
+//
+// 当前仅内置 zh-CN（唯一可用语言），但结构已按多语言设计：
+//   1) 注册新语言：CfI18n.register('en-US', { ...同构 key... })
+//   2) 加入 SUPPORTED 即可被自动检测/切换
+// 代码里不出现任何面向用户的中文字面量，全部走 t(key)。
+//
+// key 命名：<模块>.<语义>，模块取 app/login/server/term/file/monitor/stats/
+//           alert/token/audit/usage/settings/common。
+(() => {
+  'use strict';
+
+  // ---------------- 通用按钮与状态（跨模块复用） ----------------
+  const common = {
+    'common.ok': '确定',
+    'common.cancel': '取消',
+    'common.close': '关闭',
+    'common.save': '保存',
+    'common.delete': '删除',
+    'common.edit': '编辑',
+    'common.refresh': '刷新',
+    'common.copy': '复制',
+    'common.confirm': '确认',
+    'common.online': '在线',
+    'common.offline': '离线',
+    'common.loading': '加载中...',
+    'common.none': '暂无',
+    'common.empty': '空',
+    'common.optional': '可选',
+    'common.yes': '是',
+    'common.no': '否',
+    'common.all': '全部',
+    'common.name': '名称',
+    'common.unit.day': '天',
+    'common.dash': '—',
+    'common.gotIt': '知道了',
+  };
+
+  // ---------------- 登录 ----------------
+  const login = {
+    'login.submit': '登录',
+    'login.submitting': '登录中...',
+    'login.password': '面板密码',
+    'login.username': '用户名（单管理员可留空）',
+    'login.failed': '登录失败：{msg}',
+    'login.tagline': '在 Cloudflare 上实现带终端与文件管理功能的监控面板',
+    'user.tokenWith': '令牌（{name}）',
+  };
+
+  // ---------------- 顶部与菜单 ----------------
+  const menu = {
+    'menu.addServer': '添加服务器',
+    'menu.site': '站点信息',
+    'menu.alerts': '告警',
+    'menu.customMetrics': '自定义指标',
+    'menu.serviceMonitor': '服务监控',
+    'menu.tokens': '访问令牌',
+    'menu.auditLogs': '审计日志',
+    'menu.usage': '用量观测',
+    'menu.logout': '退出',
+    'menu.toggleTheme': '切换深浅主题',
+    'menu.toggleMenu': '菜单',
+  };
+
+  // ---------------- 概览 ----------------
+  const overview = {
+    'overview.servers': '服务器',
+    'overview.online': '在线',
+    'overview.avgCpu': '平均CPU',
+    'overview.avgLoad': '平均负载',
+    'overview.memUsed': '内存占用',
+  };
+
+  // ---------------- 服务器列表 ----------------
+  const server = {
+    'server.title': '服务器',
+    'server.add': '添加服务器',
+    'server.name': '服务器名称',
+    'server.group': '分组',
+    'server.groupOptional': '分组(可选)',
+    'server.order': '序号',
+    'server.orderOptional': '序号(可选)',
+    'server.batchGroup': '修改分组',
+    'server.batchClear': '取消选择',
+    'server.selected': '已选 {n} 台',
+    'server.edit': '修改服务器',
+    'server.saveEdit': '保存修改',
+    'server.search': '搜索名称 / IP / 分组',
+    'server.bootDays': '开机 {days}天',
+    'server.empty': '还没有服务器',
+    'server.emptyHint': '点「添加服务器」生成 agent 配置后开始监控',
+    'server.noMatch': '没有匹配的服务器',
+    'server.noMatchHint': '没有名称/分组/IP 包含「{kw}」的节点',
+    // 空状态提示中间嵌了"添加服务器"链接，故拆成前/后两段由 app.js 拼接
+    'server.emptyHintPre': '点',
+    'server.emptyHintPost': '生成 agent 配置后开始监控',
+    'server.group.ungrouped': '未分组',
+    'server.moveUp': '上移',
+    'server.moveDown': '下移',
+    'server.selectTip': '选择（批量操作）',
+    'server.selectAria': '选择 {name}',
+    'server.addedTitle': '服务器已添加 · agent 配置（仅显示一次）',
+    'server.addedBody': 'WSS 地址: {wss}\nKEY: {key}',
+    'server.confirmDelete': '确认删除服务器「{name}」？',
+    'server.deleted': '已删除',
+    'server.saved': '已保存',
+    'server.infoUpdated': '服务器信息已更新',
+    'server.nameRequired': '请输入服务器名称',
+    'server.deleteBatchTitle': '确认删除选中的 {n} 台服务器？',
+    'server.deleteBatchBody': '{names}\n\n监控历史（含按天账）与审计记录将一并清除，此操作不可恢复！',
+    'server.batchGroupTitle': '为选中的 {n} 台设置分组（留空 = 未分组）',
+    'server.batchUpdateTitle': '确认批量更新选中的 {n} 台 Agent{target}？',
+    'server.batchUpdateBody': '将逐台串行执行：每台会关闭现有终端/文件会话并短暂离线；成功后由 supervisor 或 AGENT_SELF_RESTART 拉起。',
+    'server.batchUpdateDone': '批量更新完成',
+    'server.batchUpdateSummary': '成功 {ok} 台{rest}',
+    'server.batchUpdateFailed': '，失败 {n} 台：\n\n{list}',
+    'server.batchDeleted': '已删除 {ok} 台{failed}',
+    'server.batchDeletedFailed': '，失败 {n} 台',
+    'server.batchGroupDone': '已更新 {n} 台',
+    'server.rotateTitle': '确认轮换「{name}」的 Agent Key？',
+    'server.rotateBody': '旧 key 立即失效并断开现有连接；监控历史与审计记录全部保留。\n需人工到目标机更新 AGENT_KEY 并重启 agent 后才会重新上线。',
+    'server.rotateDone': 'Agent Key 已轮换（仅显示一次）',
+    'server.rotateResult': 'WSS 地址: {wss}\n\nAGENT_KEY={key}\n\n请到目标机更新 agent 环境变量后重启（如 /etc/cf-panel-agent.env）。',
+    'server.term': '终端',
+    'server.file': '文件',
+    'server.monitor': '监控',
+    'server.stats': '流量/可用率',
+    'server.rotate': '轮换 Key',
+    'server.nodeOps': '节点操作',
+    'server.updatingTip': '正在更新「{name}」Agent，请勿关闭页面...',
+    'server.installedWaiting': 'Agent 已安装 {build}，等待服务重新上线...',
+    'server.updatedTo': '「{name}」Agent 已更新到 {target}',
+    'server.updateFailed': 'Agent 更新失败：{err}',
+    'server.updateAgent': '更新 Agent',
+    'server.updating': '更新中...',
+    'server.updatable': '↻ 可更新',
+    'server.updateTip': '当前 {from} → {to}',
+    'server.updateLatest': 'Agent 已是最新版本',
+    'server.updateNoComeback': '更新已安装，但 Agent 尚未重新上线；请检查 supervisor/service 日志',
+  };
+
+  // ---------------- 站点信息与告警 ----------------
+  const settings = {
+    'settings.siteTitle': '站点信息（公告对所有访客可见）',
+    'settings.siteName': '站点名称（留空用默认）',
+    'settings.notice': '公告（留空隐藏）',
+    'settings.geoLookup': 'IP 归属地查询（将公网 IP 发送到第三方地理服务）',
+    'settings.saveSite': '保存站点信息',
+    'settings.saved': '站点信息已保存',
+    'settings.alertsTitle': '告警（Webhook，模板化）',
+    'settings.alertUrl': 'Webhook 地址（留空禁用；支持占位符）',
+    'settings.alertToken': 'Token（作为 {token} 占位符使用）',
+    'settings.alertContentType': 'Content-Type（默认 application/json）',
+    'settings.alertBody': 'Body 模板（POST；留空发结构化 JSON）',
+    'settings.alertHeaders': 'Headers JSON（如 {"Authorization":"Bearer {token}"}）',
+    'settings.alertCpu': 'CPU阈值%',
+    'settings.alertMem': '内存阈值%',
+    'settings.alertDisk': '磁盘阈值%',
+    'settings.alertLoad': '负载阈值(可选)',
+    'settings.alertCooldown': '冷却(分钟)',
+    'settings.alertOffline': '离线(秒)',
+    'settings.alertsSaved': '告警配置已保存',
+    'settings.testWebhook': '测试 Webhook',
+    'settings.testing': '发送中…',
+    'settings.testOk': '✓ 发送成功（HTTP {status}）',
+    'settings.testFail': '✗ 发送失败：{err}',
+    'settings.presetSummary': '常见渠道示例（点击「使用」自动填入，再填 Token 即可）',
+    'settings.presetUse': '使用',
+    'settings.presetFilled': '已填入「{name}」模板，请填写 Token',
+    'settings.muteTitle': '免打扰（计划内重启 / 割接）',
+    'settings.muteClear': '清除',
+    'settings.muteHintOn': '免打扰生效中，至 {time}',
+    'settings.muteHintExpired': '该免打扰时段已过期（未生效）',
+    'settings.muteHintEmpty': '到期前暂停全部告警，到期自动恢复；留空并保存即不启用',
+    'settings.saveAlerts': '保存告警配置',
+    // 占位符说明是技术文本：t() 不传 vars 时不做插值替换，故 {event} 等原样输出
+    'settings.placeholders': '占位符：{event} {title} {message} {server_name} {server_id} {details_json} {time} {token}',
+    'settings.overrideTitle': '告警阈值覆盖（留空继承全局）',
+    'settings.overrideCpu': 'CPU %',
+    'settings.overrideMem': '内存 %',
+    'settings.overrideDisk': '磁盘 %',
+    'settings.overrideLoad': '负载',
+    'settings.overrideOffline': '离线(秒)',
+    'settings.overrideInherit': '继承',
+  };
+
+  // ---------------- 访问令牌 ----------------
+  const token = {
+    'token.title': '访问令牌（PAT）',
+    'token.name': '令牌名称',
+    'token.expiryShort': '天数或截止日期',
+    'token.expiryTip': '数字=有效天数（支持小数，0.5=12 小时）；日期=精确截止（如 2026/9/5 14:00）；留空=永久。也可点 📅 选择',
+    'token.pickDateTitle': '选择截止时间',
+    'token.daysTag': '天数',
+    'token.scopes': '权限',
+    'token.serverIds': '服务器 ID 白名单（逗号分隔，留空=全部）',
+    'token.expiry': '有效期（天数如 30，或截止日期如 2026/9/5 14:00；留空=永久）',
+    'token.create': '创建令牌',
+    'token.creating': '创建中...',
+    'token.empty': '暂无令牌',
+    'token.forever': '永久有效',
+    'token.expired': '（已过期）',
+    'token.neverUsed': '从未使用',
+    'token.lastUsed': '最近使用：{time}',
+    'token.expiresAt': '到期：{time}',
+    'token.createdTitle': '令牌已创建（仅显示一次）',
+    'token.createdBody': '令牌：\n{token}\n\n用法：Authorization: Bearer {token}\n\n有效期：{expiry}',
+    'token.confirmDelete': '确认删除该令牌？',
+    'token.needScope': '至少勾选一个权限',
+    'token.hint': 'server_id 参考：{list}',
+    'token.hintEmpty': '暂无服务器',
+    'token.pickDate': '当前浏览器不支持弹出日历，请直接输入截止日期（如 2026/9/5 14:00）',
+  };
+
+  // ---------------- 审计日志 ----------------
+  const audit = {
+    'audit.title': '审计日志',
+    'audit.titleWithDays': '审计日志（保留 90 天）',
+    'audit.allActions': '全部动作',
+    'audit.userFilter': '用户名筛选',
+    'audit.export': '导出 CSV',
+    'audit.empty': '暂无审计记录',
+    'audit.pager': '第 {from}-{to} 条 / 共 {total} 条',
+    'audit.action': '动作',
+    'audit.user': '用户',
+    'audit.server': '服务器 ID',
+    'audit.apply': '筛选',
+    'audit.prev': '上一页',
+    'audit.next': '下一页',
+    'audit.loginSuccess': '登录成功',
+    'audit.loginFailed': '登录失败',
+    'audit.loginLocked': '登录被锁定',
+    'audit.authFailed': '无效凭据',
+    'audit.serverCreate': '添加服务器',
+    'audit.serverUpdate': '修改服务器',
+    'audit.serverDelete': '删除服务器',
+    'audit.serverRotateKey': '轮换 Agent Key',
+    'audit.serverBatchGroup': '批量修改分组',
+    'audit.terminalOpen': '打开终端',
+    'audit.fileOpen': '文件管理',
+    'audit.fileUpload': '上传文件',
+    'audit.fileWrite': '写入文件',
+    'audit.fileZip': '打包目录',
+    'audit.fileRename': '重命名',
+    'audit.fileDelete': '删除文件',
+    'audit.execCommand': '执行命令',
+    'audit.agentUpdateRequest': '请求更新 Agent',
+    'audit.agentUpdateInstalled': 'Agent 更新已安装',
+    'audit.agentUpdateFailed': 'Agent 更新失败',
+  };
+
+  // ---------------- 用量观测 ----------------
+  const usage = {
+    'usage.title': '用量观测',
+    'usage.titleWithNote': '用量观测（额度估算）',
+    'usage.reportFrames': '上报帧/天',
+    'usage.doEvents': 'DO 事件/天',
+    'usage.d1Writes': 'D1 写行/天',
+    'usage.empty': '暂无请求计数（Worker 实例级）',
+  };
+
+  // ---------------- 终端 ----------------
+  const term = {
+    'term.title': '终端',
+    'term.titleWith': '终端 · {name}',
+    'term.newTab': '为当前服务器再开一个终端',
+    'term.closeAll': '关闭全部',
+    'term.rendererTip': '切换渲染器',
+    'term.maxTabs': '最多同时打开 {n} 个终端，请先关闭一个',
+    'term.webglLimit': 'WebGL 上下文已达上限（{n} 个），该标签保持 DOM 渲染',
+    'term.webglUnavailable': 'WebGL 渲染不可用，已使用 DOM：{err}',
+    'term.authExpired': '[权限已失效，连接已关闭]',
+    'term.connecting': '连接断开，{n}s 后自动重连...',
+    'term.closed': '连接已关闭',
+    'term.createFailedRetry': '创建会话失败：{err}，{n}s 后重试',
+    'term.createFailed': '创建会话失败：{err}',
+    'term.rebuilding': '[会话无响应，正在重建...]',
+    'term.componentLoading': '终端组件加载中...',
+  };
+
+  // ---------------- 文件管理 ----------------
+  const file = {
+    'file.title': '文件管理',
+    'file.titleWith': '文件管理 · {name}',
+    'file.path': '路径，如 /home/user',
+    'file.up': '上级目录',
+    'file.refresh': '刷新',
+    'file.upload': '上传',
+    'file.mkdir': '新建目录',
+    'file.touch': '新建文件',
+    'file.cancelUpload': '取消上传',
+    'file.cancelDownload': '取消下载',
+    'file.filter': '过滤当前目录（支持 * 和 ? 通配符）',
+    'file.find': '递归搜索（含子目录，如 *.log）',
+    'file.findClear': '清除',
+    'file.colName': '名称',
+    'file.colSize': '大小',
+    'file.colMtime': '修改时间',
+    'file.colPerm': '权限',
+    'file.emptyDir': '空目录',
+    'file.connecting': '连接中...',
+    'file.disconnected': '连接断开，点击「刷新」重连',
+    'file.protected': '系统目录受保护，禁止上传；如需操作请使用终端 Shell',
+    'file.protectedFind': '系统目录受保护，不支持递归搜索',
+    'file.protectedTarget': '系统目录受保护，不可作为目标；如需操作请使用终端 Shell',
+    'file.truncated': '目录条目过多，仅显示前 1000 项',
+    'file.dl': '下载',
+    'file.rename': '重命名',
+    'file.move': '移动',
+    'file.copy': '复制',
+    'file.perm': '权限',
+    'file.delete': '删除',
+    'file.zipping': '正在打包目录，请稍候...',
+    'file.uploading': '上传中：{pct}%',
+    'file.uploadDone': '已上传：{path}',
+    'file.uploadBatchProgress': '已上传 {ok} 个，还剩 {left} 个（当前：{path}）',
+    'file.uploadBatchDone': '已上传 {ok} 个（最后：{path}）',
+    'file.uploadBatchSummaryFail': '上传结束：成功 {ok} 个，失败 {n} 个',
+    'file.uploadCanceled': '已取消上传',
+    'file.downloading': '下载中：{pct}%',
+    'file.downloadDone': '已下载：{path}',
+    'file.downloadCanceled': '已取消下载',
+    'file.downloadFail': '下载失败',
+    'file.errPrefix': '错误：{msg}',
+    'file.errToast': '文件操作错误：{msg}',
+    'file.renamedTo': '已重命名为：{path}',
+    'file.deleted': '已删除',
+    'file.dirCreated': '目录已创建',
+    'file.fileCreated': '文件已创建',
+    'file.movedTo': '已移动到：{path}',
+    'file.copiedTo': '已复制为：{path}',
+    'file.permUpdated': '权限已更新：{mode}',
+    'file.moving': '移动中：{dest}',
+    'file.copying': '复制中：{dest}',
+    'file.permChanging': '修改权限中：{path}',
+    'file.readonlyOn': '设为只读：{path}',
+    'file.readonlyOff': '取消只读：{path}',
+    'file.moveTo': '移动到此处',
+    'file.copyTo': '复制到此处',
+    'file.moveTitle': '移动：{path}',
+    'file.copyTitle': '复制到：{path}',
+    'file.samePlace': '与源位置相同',
+    'file.samePlaceHint': '与源位置相同，无需{mode}',
+    'file.conflict': '目标已存在同名「{name}」，将被拒绝（不覆盖）',
+    'file.nameNoSep': '文件名不能为空且不含路径分隔符',
+    'file.nameNoSlash': '文件名不能包含 /',
+    'file.dirNameNoSlash': '目录名不能包含 /',
+    'file.renameTitle': '重命名：{path}（仅改名，不支持跨目录）',
+    'file.mkdirTitle': '新建目录（路径：{path}）',
+    'file.touchTitle': '新建文件（路径：{path}）',
+    'file.confirmDelete': '确认删除「{path}」{dirHint}？\n此操作不可恢复！',
+    'file.confirmDeleteDir': '（目录将递归删除）',
+    'file.overwriteConfirm': '「{name}」已存在，是否覆盖？',
+    'file.noSubDir': '（无子目录）',
+    'file.editorSave': '保存',
+    'file.editorEdit': '编辑',
+    'file.editorSaveDirty': '保存 ●',
+    'file.saving': '保存中...',
+    'file.editorTitle': '编辑：{path}',
+    'file.editorRestore': '还原',
+    'file.editorPreview': '预览',
+    'file.editorExpand': '扩大',
+    'file.editorCancel': '取消',
+    'file.editorDirtyConfirm': '有未保存的修改，确认放弃？',
+    'file.findResult': '递归搜索「{kw}」：{n} 条{extra}',
+    'file.findTruncated': '（已达上限，仅显示部分；共扫描 {n} 项）',
+    'file.findScanned': '（扫描 {n} 项）',
+    'file.findNoResult': '无匹配结果',
+    'file.searching': '搜索中：{kw}',
+    'file.dropHint': '松开即可上传（可多选，逐个串行上传）',
+    'file.disconnectedSave': '文件连接已断开，无法保存。请打开文件管理器并点击「刷新」重连后重试',
+    'file.previewFail': '预览组件加载失败，请稍后重试',
+    'file.nameNoSep2': '名称不能包含路径分隔符',
+    'file.selUp': '上级',
+    'file.selGo': '跳转',
+    'file.selPath': '路径',
+    'file.selCwd': '当前目录：',
+  };
+
+  // ---------------- 权限弹窗 ----------------
+  const chmod = {
+    'chmod.title': '权限',
+    'chmod.owner': '属主',
+    'chmod.group': '组',
+    'chmod.other': '其他',
+    'chmod.read': '读',
+    'chmod.write': '写',
+    'chmod.exec': '执行',
+    'chmod.octal': '八进制，如 755',
+    'chmod.apply': '应用',
+    'chmod.readonly': '只读',
+    'chmod.applyReadonly': '应用只读设置',
+    'chmod.current': '当前：{mode}',
+    'chmod.hint': '勾选与八进制联动。<b>Windows 无 POSIX 权限</b>，请用下方「只读」开关（填八进制会被拒绝）。',
+    'chmod.invalid': '请输入合法的八进制权限（如 755）',
+  };
+
+  // ---------------- 监控 ----------------
+  const monitor = {
+    'monitor.title': '监控 · {name}（{label}，{n} 点{ds}{custom}）',
+    'monitor.downsampled': '，降采样',
+    'monitor.customSuffix': ' +{n} 自定义',
+    'monitor.cpu': 'CPU（%）',
+    'monitor.memSwap': '内存 / Swap（%）',
+    'monitor.mem': '内存',
+    'monitor.swap': 'Swap',
+    'monitor.load': '负载 (1/5/15)',
+    'monitor.disk': '磁盘（%）',
+    'monitor.diskIo': '磁盘 IO（KB/s · %）',
+    'monitor.iops': '磁盘 IOPS',
+    'monitor.network': '网络（KB/s）',
+    'monitor.conns': '连接数（TCP/UDP）',
+    'monitor.procs': '进程数',
+    'monitor.custom': '自定义指标',
+    'metric.realtime': '实时指标',
+    'metric.systemInfo': '系统信息',
+    'metric.diskMounts': '磁盘（{n} 个挂载点）',
+    'metric.cpu': 'CPU',
+    'metric.mem': '内存',
+    'metric.load': '负载',
+    'metric.netDown': '网络↓',
+    'metric.disk': '磁盘',
+    'metric.total': '累计',
+    'monitor.temp': '温度',
+    'monitor.os': '系统',
+    'monitor.kernel': '内核',
+    'monitor.read': '读',
+    'monitor.write': '写',
+    'monitor.down': '下行',
+    'monitor.up': '上行',
+    'monitor.noData': '该时间范围暂无数据。',
+    'monitor.chartLibFail': '图表库（Chart.js）加载失败，请检查网络。',
+    'monitor.uptime': '开机 {days}天',
+    'monitor.range.1h': '近1小时',
+    'monitor.range.12h': '近12小时',
+    'monitor.range.3d': '近3天',
+    'monitor.range.7d': '近7天',
+    'monitor.range.30d': '近30天',
+    // 范围切换按钮（比标题里的"近N天"更短，按钮空间有限）
+    'monitor.btn.1h': '1小时',
+    'monitor.btn.12h': '12小时',
+    'monitor.btn.3d': '3天',
+    'monitor.btn.7d': '7天',
+    'monitor.btn.30d': '30天',
+  };
+
+  // ---------------- 流量 / 可用率 ----------------
+  const stats = {
+    'stats.title': '流量 / 可用率',
+    'stats.titleWith': '流量 / 可用率 · {name}',
+    'stats.inTotal': '入站合计',
+    'stats.outTotal': '出站合计',
+    'stats.total': '总流量',
+    'stats.availability': '可用率',
+    'stats.restarts': '重启次数',
+    'stats.colDate': '日期',
+    'stats.colIn': '入站',
+    'stats.colOut': '出站',
+    'stats.colAvail': '可用率',
+    'stats.colRestart': '重启',
+    'stats.empty': '该区间暂无天账数据。按天账由上报告警链路逐日累积，新接入的节点次日可见。',
+    'stats.range.7d': '7天',
+    'stats.range.30d': '30天',
+    'stats.range.90d': '90天',
+    'stats.range.365d': '1年',
+  };
+
+  // ---------------- 自定义指标 / 服务监控设置 ----------------
+  const setup = {
+    'setup.customTitle': '自定义监控项',
+    'setup.customName': '指标名（如 cpu_temp）',
+    'setup.customCmd': '采集命令（输出第一行为数值）',
+    'setup.customAdd': '添加一项',
+    'setup.customGen': '生成配置',
+    'setup.customCopy': '复制',
+    'setup.customCopied': '已复制到剪贴板',
+    'setup.customHint': '把生成的 CUSTOM_METRICS 追加到 agent 的环境变量文件（如 /etc/cf-panel-agent.env）后重启 agent。',
+    'setup.serviceTitle': '服务探活',
+    'setup.serviceName': '名称',
+    'setup.serviceType': '类型',
+    'setup.serviceTarget': '目标（http 填 URL，tcp 填 host:port）',
+    'setup.serviceAdd': '添加一项',
+    'setup.serviceGen': '生成配置',
+    'setup.serviceCopy': '复制',
+    'setup.serviceHint': '把生成的 PROBES 追加到 agent 的环境变量文件后重启 agent。',
+    'setup.jsonError': 'JSON 格式错误：{msg}',
+    'setup.needGen': '请先生成配置',
+    'setup.copied': '已复制',
+    'setup.copyFail': '复制失败，请手动复制',
+    'setup.needProbe': '请输入探测配置',
+    'setup.formatError': '格式错误：「{item}」应为 名称:类型(http|tcp):目标',
+    // 说明段落含 <code>/<strong>/<br> 标记，走 data-i18n-html（文案来自语言包本身，非用户输入）
+    'setup.customHint': '在目标机器的 <code>/etc/cf-panel-agent.env</code> 中配置 <code>CUSTOM_METRICS</code>（JSON 数组：<code>name</code> 指标名、<code>cmd</code> 采集命令），agent 会按上报周期执行命令采集数值指标；配置完成后可在该服务器卡片的「⋯ → 监控」中查看曲线。<br><strong>容量提示</strong>：每机每 1 个自定义指标约新增 1,440 行/天（30 天保留约 43,200 行）；建议每机 ≤20 个，避免 D1 免费 5GB 触顶（总占用 ≈ 43,200 × 服务器数 × 指标数 行）。',
+    'setup.serviceHintHtml': '配置 agent 的 <code>PROBES</code> 后可探测本机 HTTP/TCP 服务：探测结果会展示在服务器卡片的徽章上（绿=正常 / 红=异常），持续异常会触发 Webhook 告警。格式：<code>名称:类型:目标,...</code>，类型 <code>http</code>（URL，检查 2xx/3xx）或 <code>tcp</code>（host:port 测连通）。',
+  };
+
+  // ---------------- 空闲保护 ----------------
+  const idle = {
+    'idle.pushRetry': '实时刷新连接失败，正在自动重试...',
+    'idle.pausedLong': '已暂停实时刷新（agent 恢复慢采，节省额度）。移动鼠标或按键即可恢复。',
+    'idle.resumedLong': '已恢复实时刷新。',
+    'idle.title': '还在看吗？',
+    'idle.body': '长时间没有操作，是否继续保持实时刷新？',
+    'idle.continue': '继续观看',
+    'idle.pause': '暂停刷新',
+    'idle.paused': '已暂停实时刷新（任意操作可恢复）',
+    'idle.resumed': '已恢复实时刷新',
+  };
+
+  // ---------------- 语言包注册 ----------------
+  // 新增语言：在此注册并在 SUPPORTED 中加入一项（key 必须与 zhCN 完全同构，
+  // 缺失的 key 会回退显示 key 本身，便于发现未翻译项）。
+  const locales = {
+    'zh-CN': Object.assign({}, common, login, menu, overview, server, settings,
+      token, audit, usage, term, file, chmod, monitor, stats, setup, idle),
+  };
+
+  const DEFAULT_LOCALE = 'zh-CN';
+  const STORAGE_KEY = 'cfpanel_locale';
+  // 目前仅 zh-CN 可用；新增语言在此登记（顺序即选择器展示顺序）
+  const SUPPORTED = [
+    { code: 'zh-CN', label: '简体中文' },
+  ];
+
+  let current = DEFAULT_LOCALE;
+
+  // 语言选择优先级：用户手动选择 > 浏览器语言 > 默认。
+  // 只有已登记（有完整语言包）的语言会被选中，避免落到"半翻译"状态。
+  function detectLocale() {
+    try {
+      const saved = localStorage.getItem(STORAGE_KEY);
+      if (saved && locales[saved]) return saved;
+      const nav = [].concat(navigator.languages || [], navigator.language || []).filter(Boolean);
+      for (const n of nav) {
+        const s = String(n);
+        if (locales[s]) return s;
+        const base = s.split('-')[0].toLowerCase();
+        const hit = SUPPORTED.find((l) => l.code.split('-')[0].toLowerCase() === base);
+        if (hit && locales[hit.code]) return hit.code;
+      }
+    } catch { /* localStorage/navigator 不可用时按默认处理 */ }
+    return DEFAULT_LOCALE;
+  }
+
+  function setLocale(code) {
+    if (!code || !locales[code]) return false;
+    current = code;
+    try { localStorage.setItem(STORAGE_KEY, code); } catch { /* 忽略写入失败 */ }
+    document.documentElement.lang = code;
+    return true;
+  }
+
+  // 翻译：缺失 key 原样返回（而不是空串）——开发期一眼看出未翻译项，
+  // 线上也不会出现"界面大片空白"这种更糟的失败形态。
+  function t(key, vars) {
+    if (key == null || key === '') return '';
+    const pack = locales[current] || {};
+    let s = pack[key];
+    if (s == null) return String(key);
+    if (vars) {
+      s = String(s).replace(/\{(\w+)\}/g, (m, k) => (vars[k] != null ? String(vars[k]) : m));
+    }
+    return s;
+  }
+
+  // 批量填充带 data-i18n 的静态 DOM（index.html 的文本/属性）：
+  //   data-i18n="key"                        → textContent
+  //   data-i18n-html="key"                   → innerHTML（说明段落里带 <code>/<strong> 等标记时用；
+  //                                            文案来自语言包本身，不是用户输入，无注入面）
+  //   data-i18n-ph="key"                     → placeholder
+  //   data-i18n-title="key"                  → title
+  //   data-i18n-aria="key"                   → aria-label
+  function applyDom(root) {
+    const scope = root || document;
+    scope.querySelectorAll('[data-i18n]').forEach((el) => {
+      el.textContent = t(el.getAttribute('data-i18n'));
+    });
+    scope.querySelectorAll('[data-i18n-html]').forEach((el) => {
+      el.innerHTML = t(el.getAttribute('data-i18n-html'));
+    });
+    scope.querySelectorAll('[data-i18n-ph]').forEach((el) => {
+      el.placeholder = t(el.getAttribute('data-i18n-ph'));
+    });
+    scope.querySelectorAll('[data-i18n-title]').forEach((el) => {
+      el.title = t(el.getAttribute('data-i18n-title'));
+    });
+    scope.querySelectorAll('[data-i18n-aria]').forEach((el) => {
+      el.setAttribute('aria-label', t(el.getAttribute('data-i18n-aria')));
+    });
+  }
+
+  current = detectLocale();
+  if (document.documentElement) document.documentElement.lang = current;
+
+  window.CfI18n = {
+    t,
+    setLocale,
+    applyDom,
+    get locale() { return current; },
+    get supported() { return SUPPORTED.slice(); },
+    // 供测试/后续扩展：注册新语言包（key 结构须与内置包同构）
+    register(code, pack) {
+      if (!code || !pack) return;
+      locales[code] = pack;
+      if (!SUPPORTED.some((l) => l.code === code)) SUPPORTED.push({ code, label: code });
+    },
+    // 测试用：还原到默认语言
+    __reset() {
+      current = DEFAULT_LOCALE;
+    },
+  };
+})();

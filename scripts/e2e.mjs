@@ -3,7 +3,7 @@
 // cf-panel E2E 测试（Node >= 22，零外部依赖：fetch + WebSocket 内置）
 // 验证链路：wrangler dev → D1 建表 → 登录 → 注册服务器 →
 //           agent 控制通道上线 → 监控上报落库 → 终端双向透传 →
-//           文件上传/下载 → MCP 全量工具（14 个）
+//           文件上传/下载 → MCP 全量工具（15 个）
 // 用法：node scripts/e2e.mjs
 // 环境变量：E2E_PORT（默认 8787）、E2E_PASSWORD（默认读 .dev.vars）
 //           AGENT_CMD（默认 agent/rust/target/release/cf-panel-agent）
@@ -389,10 +389,10 @@ async function step7_file() {
 }
 
 // ============================================================
-// 第 8 步：MCP 接口测试（14 个工具全覆盖）
+// 第 8 步：MCP 接口测试（15 个工具全覆盖）
 // ============================================================
 async function step8_mcp() {
-  section('MCP 接口测试（14 个工具）');
+  section('MCP 接口测试（15 个工具）');
 
   // ---- MCP 辅助函数 ----
   async function mcpCall(id, method, params) {
@@ -426,8 +426,8 @@ async function step8_mcp() {
   // ---- 8.1) tools/list ----
   const list = await mcpCall(2, 'tools/list');
   const toolCount = list?.result?.tools?.length;
-  if (toolCount === 14) ok(`MCP tools/list：14 个工具全部注册`);
-  else bad(`MCP tools/list：期望 14 个工具，实际 ${toolCount}`);
+  if (toolCount === 15) ok(`MCP tools/list：15 个工具全部注册`);
+  else bad(`MCP tools/list：期望 15 个工具，实际 ${toolCount}`);
 
   // ---- 8.2) list_servers ----
   const ls = await mcpTool(3, 'list_servers');
@@ -491,6 +491,16 @@ async function step8_mcp() {
     if (upData?.name === 'e2e-mcp-renamed') ok('MCP update_server：重命名成功');
     else bad(`MCP update_server 失败：${JSON.stringify(upData)}`);
   } else bad('MCP update_server：跳过（add_server 未返回有效 ID）');
+
+  // ---- 8.7.1) rotate_agent_key（对未连 agent 的服务器：验证签发/旧 key 失效/历史保留路径） ----
+  if (asId > 0) {
+    const rot = await mcpTool(115, 'rotate_agent_key', { server_id: asId });
+    const rotData = mcpContent(rot);
+    const rotKey = rotData?.agent_key || '';
+    if (rotKey.length === 64 && rotKey !== asKey && rotData?.wss_base)
+      ok('MCP rotate_agent_key：新 key 签发（≠旧 key），监控历史保留');
+    else bad(`MCP rotate_agent_key 失败：${JSON.stringify(rotData)}`);
+  } else bad('MCP rotate_agent_key：跳过（add_server 未返回有效 ID）');
 
   // ---- 8.8) delete_server ----
   if (asId > 0) {

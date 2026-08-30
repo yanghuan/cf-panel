@@ -799,7 +799,7 @@ button.danger:hover { background: rgba(248, 113, 113, .12); }
 /* 过滤/递归搜索二合一：输入框 + 右侧 switch 开关。
    布局用 flex（align-items:center）保证开关与输入框**始终垂直居中**——
    不用 absolute+top:50%，那会被容器高度变化（行内其他元素拉伸）带偏 */
-.file-filter-row { display: flex; gap: 8px; align-items: center; }
+.file-filter-row { display: flex; gap: 8px; align-items: center; margin-bottom: 12px; }
 .file-filter-wrap {
   display: flex;
   align-items: center;

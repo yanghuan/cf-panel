@@ -1165,7 +1165,6 @@
   // 过滤再截断 1000 条）；「递归」下钻子目录（find）——大目录树里定位文件靠它。
   let findMode = false;     // false = 过滤当前目录；true = 递归搜索
   let fileFindState = null; // { pattern, truncated, scanned }；非 null = 当前显示的是搜索结果
-  let fileFindTimer = null;
 
   // 同步切换按钮/输入框占位/清除按钮的显隐（模式与状态变化的唯一出口）
   function syncFindUI() {
@@ -2526,7 +2525,7 @@
       $('#token-list').innerHTML = rows.length
         ? rows.map((r) => `
             <li>${escapeHtml(r.name)} · ${escapeHtml(r.scopes)}${r.server_ids ? ' · ids=' + escapeHtml(r.server_ids) : ''} · 到期：${escapeHtml(fmtTokenExpiry(r.expires_at))} · ${r.last_used_at ? `最近使用：${escapeHtml(new Date(r.last_used_at * 1000).toLocaleString())}` : t('token.neverUsed')}
-              <button data-tok-del="${r.id}" class="danger">${e(t('common.delete'))}</button></li>`).join('')
+              <button data-tok-del="${r.id}" class="danger">${escapeHtml(t('common.delete'))}</button></li>`).join('')
         : `<li class="muted">${t('token.empty')}</li>`;
     } catch (e) {
       $('#token-list').innerHTML = `<li class="muted">${escapeHtml(e.message)}</li>`;
@@ -2582,35 +2581,45 @@
   }
 
   // ---------- 审计日志（仅管理员，保留 90 天；筛选/分页/CSV 导出） ----------
+  // 审计动作 → i18n key（值为语言包 audit.* 的 key，渲染时经 t() 翻译——
+  // 自动接线曾把值误替换成语义巧合的其他段 key（menu.addServer）且为加载时求值，
+  // 切语言后标签不跟随；此处统一为 audit.* key 字面量，展示时动态翻译）
   const AUDIT_ACTION_LABEL = {
-    'server.create': t('menu.addServer'), 'server.update': t('server.edit'), 'server.delete': t('audit.serverDelete'),
-    'terminal.open': t('audit.terminalOpen'), 'file.open': t('audit.fileOpen'), 'file.upload': t('audit.fileUpload'),
-    'file.write': t('audit.fileWrite'), 'file.zip': t('audit.fileZip'), 'file.rename': t('audit.fileRename'), 'file.delete': t('audit.fileDelete'),
-    'exec.command': t('audit.execCommand'),
-    'server.rotate_key': t('audit.serverRotateKey'),
-    'server.batch_update_group': t('audit.serverBatchGroup'),
-    'agent.update.request': t('audit.agentUpdateRequest'),
-    'agent.update.installed': t('audit.agentUpdateInstalled'),
-    'agent.update.failed': t('audit.agentUpdateFailed'),
+    'server.create': 'audit.serverCreate', 'server.update': 'audit.serverUpdate', 'server.delete': 'audit.serverDelete',
+    'terminal.open': 'audit.terminalOpen', 'file.open': 'audit.fileOpen', 'file.upload': 'audit.fileUpload',
+    'file.write': 'audit.fileWrite', 'file.zip': 'audit.fileZip', 'file.rename': 'audit.fileRename', 'file.delete': 'audit.fileDelete',
+    'exec.command': 'audit.execCommand',
+    'server.rotate_key': 'audit.serverRotateKey',
+    'server.batch_update_group': 'audit.serverBatchGroup',
+    'agent.update.request': 'audit.agentUpdateRequest',
+    'agent.update.installed': 'audit.agentUpdateInstalled',
+    'agent.update.failed': 'audit.agentUpdateFailed',
     // 登录与鉴权事件（IP 爆破/无效凭据探测此前完全无痕，靠这些识别）
-    'login.success': t('audit.loginSuccess'),
-    'login.failed': t('audit.loginFailed'),
-    'login.locked': t('audit.loginLocked'),
-    'auth.failed': t('audit.authFailed'),
+    'login.success': 'audit.loginSuccess',
+    'login.failed': 'audit.loginFailed',
+    'login.locked': 'audit.loginLocked',
+    'auth.failed': 'audit.authFailed',
   };
+  // 未知 action 原样显示（新版本前端看到旧后端的新动作时不至于空白）
+  const auditLabel = (action) => (AUDIT_ACTION_LABEL[action] ? t(AUDIT_ACTION_LABEL[action]) : action);
   const auditState = { limit: 100, offset: 0, action: '', user: '', serverId: '' };
   async function openAuditModal() {
     $('#audit-modal').classList.remove('hidden');
     lockScroll();
     // 动作筛选下拉（后端按 action 精确匹配）
     const sel = $('#audit-filter-action');
-    if (sel.options.length <= 1) {
-      for (const [k, v] of Object.entries(AUDIT_ACTION_LABEL)) {
-        const opt = document.createElement('option');
-        opt.value = k; opt.textContent = v;
-        sel.appendChild(opt);
-      }
+    // 每次打开都重建：选项文案随语言变化；保留当前选中值
+    const prev = sel.value;
+    sel.innerHTML = '';
+    const allOpt = document.createElement('option');
+    allOpt.value = ''; allOpt.textContent = t('audit.allActions');
+    sel.appendChild(allOpt);
+    for (const [k, v] of Object.entries(AUDIT_ACTION_LABEL)) {
+      const opt = document.createElement('option');
+      opt.value = k; opt.textContent = t(v);
+      sel.appendChild(opt);
     }
+    sel.value = prev;
     await loadAuditLogs();
   }
   async function loadAuditLogs() {
@@ -2624,7 +2633,7 @@
       $('#audit-list').innerHTML = rows.length
         ? rows.map((r) => `
             <li><div class="audit-row">
-              <span class="audit-action">${escapeHtml(AUDIT_ACTION_LABEL[r.action] || r.action)}</span>
+              <span class="audit-action">${escapeHtml((AUDIT_ACTION_LABEL[r.action] ? t(AUDIT_ACTION_LABEL[r.action]) : r.action))}</span>
               <span class="audit-info">${escapeHtml(r.username || `uid=${r.user_id}`)}${r.client_ip ? ` · <cf-ip ip="${escapeHtml(r.client_ip)}"></cf-ip>` : ''}${r.target_server_id ? ` · server#${escapeHtml(r.target_server_id)}` : ''}${r.detail ? ` · ${escapeHtml(r.detail)}` : ''}</span>
               <span class="audit-time">${escapeHtml(r.created_at || '')}</span>
             </div></li>`).join('')
@@ -2752,6 +2761,7 @@
     CfI18n.applyDom();
     renderServers();
     renderLangMenu();
+    syncFindUI(); // 文件管理占位符/开关 title 随语言刷新
     if (activeTermSession()) syncRendererBtn();
   }
 
@@ -3231,6 +3241,7 @@
     // 语言菜单按已注册的语言包生成，并订阅切换事件刷新动态内容
     CfI18n.applyDom();
     renderLangMenu();
+    syncFindUI(); // 文件管理占位符/开关 title 随语言刷新
     CfI18n.onChange(onLangChange);
     loadPublic();
     if (!token) return showAuth();

@@ -2163,21 +2163,37 @@
       async () => {
         let ok = 0;
         const failed = [];
-        for (const id of ids) {
+        // 与单台更新一致的逐台过程提示：开始（长驻，被下一条覆盖）→ 已安装（等待上线）→ 失败。
+        // 不做单台那样 90s 等待上线的轮询——批量串行等待会让总时长线性膨胀，
+        // 上线确认交给推送刷新与收尾汇总
+        for (let i = 0; i < ids.length; i++) {
+          const id = ids[i];
           const s = serversCache.find((x) => x.id === id);
+          const name = s ? s.name : `#${id}`;
           updatingAgents.add(id);
           renderServers(); // 该卡按钮置「更新中...」
+          toast(t('server.batchUpdatingOne', { i: i + 1, n: ids.length, name }), 30000);
           try {
-            await api(`/api/servers/${id}/agent-update`, { method: 'POST' });
+            const result = await api(`/api/servers/${id}/agent-update`, { method: 'POST' });
             ok += 1;
+            if (result.already_latest) {
+              toast(t('server.updateLatest'), 6000);
+            } else {
+              toast(t('server.installedWaiting', { build: result.build_id || target || '' }), 8000);
+            }
           } catch (e) {
-            failed.push(`${s ? s.name : `#${id}`}：${e.message}`);
+            failed.push(`${name}：${e.message}`);
+            toast(t('server.updateFailed', { err: e.message }), 6000);
           } finally {
             updatingAgents.delete(id);
           }
+          renderServers();
         }
         renderServers();
-        infoDialog(t('server.batchUpdateDone'), `成功 ${ok} 台${failed.length ? `，失败 ${failed.length} 台：\n\n${failed.join('\n')}` : ''}`);
+        infoDialog(t('server.batchUpdateDone'), t('server.batchUpdateSummary', {
+          ok,
+          rest: failed.length ? t('server.batchUpdateFailed', { n: failed.length, list: failed.join('\n') }) : '',
+        }));
         loadServers();
       }
     );

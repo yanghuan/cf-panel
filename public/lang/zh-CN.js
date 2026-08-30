@@ -104,6 +104,7 @@
     'server.batchGroupTitle': '为选中的 {n} 台设置分组（留空 = 未分组）',
     'server.batchUpdateTitle': '确认批量更新选中的 {n} 台 Agent{target}？',
     'server.batchUpdateBody': '将逐台串行执行：每台会关闭现有终端/文件会话并短暂离线；成功后由 supervisor 或 AGENT_SELF_RESTART 拉起。',
+    'server.batchUpdatingOne': '批量更新中（{i}/{n}）：{name}，请勿关闭页面...',
     'server.batchUpdateDone': '批量更新完成',
     'server.batchUpdateSummary': '成功 {ok} 台{rest}',
     'server.batchUpdateFailed': '，失败 {n} 台：\n\n{list}',

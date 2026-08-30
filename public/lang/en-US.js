@@ -105,6 +105,7 @@
     'server.batchGroupTitle': 'Set group for {n} selected servers (empty = Ungrouped)',
     'server.batchUpdateTitle': 'Update Agent on {n} selected servers{target}?',
     'server.batchUpdateBody': 'Runs one by one: each server closes its terminal/file sessions and goes offline briefly; the new binary is started by supervisor or AGENT_SELF_RESTART.',
+    'server.batchUpdatingOne': 'Batch update ({i}/{n}): {name} — do not close this page...',
     'server.batchUpdateDone': 'Batch update finished',
     'server.batchUpdateSummary': '{ok} succeeded{rest}',
     'server.batchUpdateFailed': ', {n} failed:\n\n{list}',

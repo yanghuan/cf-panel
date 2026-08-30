@@ -1045,13 +1045,24 @@ a.f-dir.f-prot { opacity: .55; }
 .batch-count { font-size: 13px; font-weight: 600; margin-right: 4px; }
 /* 选中态：描边高亮，与批量栏呼应（.card 已 position:relative，复选框可绝对定位） */
 .card.selected { border-color: var(--accent); box-shadow: 0 0 0 1px rgba(99, 102, 241, .25); }
-/* 复选框随 card-head 的 flex 排在徽章之后（不用绝对定位：右上角已被在线徽章占用） */
+/* 复选框随 card-head 的 flex 排在徽章之后（不用绝对定位：右上角已被在线徽章占用）。
+   默认隐藏、悬停/选中/键盘聚焦时出现——常驻显示会与在线徽章、节点名争抢视觉焦点，
+   且几十台机器时一排复选框很吵 */
 .card-sel {
   width: 15px;
   height: 15px;
   flex-shrink: 0;
   accent-color: var(--accent);
   cursor: pointer;
+  opacity: 0;
+  transition: opacity .15s ease;
+}
+.card:hover .card-sel,
+.card.selected .card-sel,
+.card-sel:focus-visible { opacity: 1; }
+/* 触屏没有 hover：常显，否则永远看不到多选入口 */
+@media (hover: none) {
+  .card-sel { opacity: 1; }
 }
 
 /* ---------- 告警阈值覆盖 / 免打扰 ---------- */

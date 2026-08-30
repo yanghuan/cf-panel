@@ -368,13 +368,13 @@
               <button data-act="file" data-id="${s.id}" data-name="${escapeHtml(s.name)}">${escapeHtml(t('server.file'))}</button>` : ''}
               <button data-act="mon" data-id="${s.id}" data-name="${escapeHtml(s.name)}">${escapeHtml(t('server.monitor'))}</button>
               <button data-act="stats" data-id="${s.id}" data-name="${escapeHtml(s.name)}">${escapeHtml(t('server.stats'))}</button>
-              ${isAdmin ? `${updateBtn}<button data-act="rotate" data-id="${s.id}" data-name="${escapeHtml(s.name)}">${escapeHtml(t('server.rotate'))}</button>
-              <button data-act="edit" data-id="${s.id}" data-name="${escapeHtml(s.name)}" data-group="${escapeHtml(s.group || '')}" data-order="${s.display_index || 0}">修改</button>
-              <button data-act="del" data-id="${s.id}" data-name="${escapeHtml(s.name)}" class="dd-danger">删除</button>` : ''}
+              ${isAdmin ? `${updateBtn}
+              <button data-act="edit" data-id="${s.id}" data-name="${escapeHtml(s.name)}" data-group="${escapeHtml(s.group || '')}" data-order="${s.display_index || 0}">${escapeHtml(t('server.edit'))}</button>
+              <button data-act="del" data-id="${s.id}" data-name="${escapeHtml(s.name)}" class="dd-danger">${escapeHtml(t('common.delete'))}</button>` : ''}
             </div>
           </div>
-          <span class="badge ${s.online ? 'on' : 'off'}"><i class="dot"></i>${s.online ? '在线' : '离线'}</span>
-          ${isAdmin ? `<input type="checkbox" class="card-sel" data-sel="${s.id}" ${sel ? 'checked' : ''} aria-label="选择 ${escapeHtml(s.name)}" title="选择（批量操作）">` : ''}
+          <span class="badge ${s.online ? 'on' : 'off'}"><i class="dot"></i>${s.online ? t('common.online') : t('common.offline')}</span>
+          ${isAdmin ? `<input type="checkbox" class="card-sel" data-sel="${s.id}" ${sel ? 'checked' : ''} aria-label="${escapeHtml(t('server.selectAria', { name: s.name }))}" title="${escapeHtml(t('server.selectTip'))}">` : ''}
         </div>
         ${metricBlockHtml(s)}
         ${probesBlockHtml(s)}
@@ -612,6 +612,25 @@
 
   // 修改服务器（菜单「修改」）：预填当前值，提交 PATCH；不动 agent key，在线状态不受影响
   // 告警覆盖值从 serversCache 取（列表已随推送下发 alert_override），避免为编辑再单开详情接口
+  // 覆盖输入框的动态 placeholder：拉全局阈值，把"继承全局"细化为"全局 90"——
+  // 用户不用去翻告警设置就知道继承的是多少。拉取失败静默保留通用文案。
+  async function fillOverridePlaceholders() {
+    let a;
+    try { a = (await api('/api/settings')).alerts || {}; } catch { return; }
+    const set = (sel, v, unit) => {
+      const el = $(sel);
+      if (el && Number.isFinite(Number(v)) && Number(v) > 0) el.placeholder = t('settings.overridePlaceholder', { v: Number(v) + unit });
+    };
+    set('#ao-cpu', a.cpu_pct, '%');
+    set('#ao-mem', a.mem_pct, '%');
+    set('#ao-disk', a.disk_pct, '%');
+    // load=0 表示全局未启用该维度（0 不是有效阈值），单独文案
+    const lo = $('#ao-load');
+    if (lo && Number(a.load) > 0) lo.placeholder = t('settings.overridePlaceholder', { v: a.load });
+    else if (lo) lo.placeholder = t('settings.overrideGlobalOff');
+    set('#ao-offline', a.offline_after_s, 's');
+  }
+
   function openEditModal(id, name, group, order) {
     editServerId = id;
     $('#add-modal-title').textContent = t('server.edit');
@@ -620,15 +639,18 @@
     $('#inp-group').value = group || '';
     $('#inp-order').value = order != null ? String(order) : '';
     const ov = (serversCache.find((x) => x.id === id) || {}).alert_override || {};
-    // 未设置/继承全局的输入框留空（placeholder "继承"）；load=0 是"关闭该维度"的显式值，要显示 0
+    // 未设置/继承全局的输入框留空（placeholder 随后细化为"全局 N"）；load=0 是"关闭该维度"的显式值，要显示 0
     $('#ao-cpu').value = ov.cpu_pct != null ? ov.cpu_pct : '';
     $('#ao-mem').value = ov.mem_pct != null ? ov.mem_pct : '';
     $('#ao-disk').value = ov.disk_pct != null ? ov.disk_pct : '';
     $('#ao-load').value = ov.load != null ? ov.load : '';
     $('#ao-offline').value = ov.offline_after_s != null ? ov.offline_after_s : '';
     $('#alert-override-box').classList.remove('hidden'); // 仅修改模式显示（新增时无覆盖可言）
+    // 轮换 Key 入口（从卡片菜单移入）：编辑模式才显示，携带当前服务器上下文
+    $('#rotate-row').classList.remove('hidden');
     $('#add-modal').classList.remove('hidden');
     lockScroll();
+    fillOverridePlaceholders(); // 异步回填全局值 placeholder，不阻塞弹窗打开
     setTimeout(() => $('#inp-name').focus(), 50);
   }
 
@@ -2274,6 +2296,7 @@
     $('#inp-group').value = '';
     $('#inp-order').value = '';
     $('#alert-override-box').classList.add('hidden'); // 新增模式无覆盖可言（key 尚未生成）
+    $('#rotate-row').classList.add('hidden'); // 轮换仅对已存在的服务器有意义
     $('#add-modal').classList.remove('hidden');
     lockScroll();
     setTimeout(() => $('#inp-name').focus(), 50);
@@ -2730,6 +2753,12 @@
 
   // 添加服务器弹窗（添加/修改双模式：按钮与 Enter 走同一分发）
   $('#btn-add-server').onclick = submitServerForm;
+  // 轮换 Key（编辑弹窗内的危险操作入口）：携带当前编辑的服务器上下文
+  $('#btn-rotate-key').onclick = () => {
+    if (!editServerId) return;
+    const s = serversCache.find((x) => x.id === editServerId);
+    rotateKey(editServerId, s ? s.name : `#${editServerId}`);
+  };
   $('#btn-add-server-plus').onclick = openAddModal; // toolbar「＋」入口与菜单「添加服务器」同入口
   $('#btn-add-close').onclick = () => { $('#add-modal').classList.add('hidden'); unlockScroll(); };
   $('#inp-name').addEventListener('keydown', (e) => { if (e.key === 'Enter') submitServerForm(); });
@@ -2837,7 +2866,6 @@
     else if (act === 'file') openFileManager(Number(id), name);
     else if (act === 'mon') showMonitor(Number(id), name);
     else if (act === 'stats') showStats(Number(id), name);
-    else if (act === 'rotate') rotateKey(Number(id), name);
     else if (act === 'agent-update') {
       const target = latestAgent && latestAgent.build_id;
       confirmDialog(

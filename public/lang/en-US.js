@@ -175,7 +175,11 @@
     'settings.overrideDisk': 'Disk %',
     'settings.overrideLoad': 'Load',
     'settings.overrideOffline': 'Offline after (s)',
-    'settings.overrideInherit': 'Inherit',
+    'settings.overrideInherit': 'Inherit global',
+    // Dynamic placeholder for override inputs: shows the current global value
+    'settings.overridePlaceholder': 'Global {v}',
+    'settings.overrideGlobalOff': 'Global: off',
+    'server.rotateRowHint': 'Old key is revoked and connections dropped; history is kept — restart the agent with the new key',
   };
 
   // ---------------- Access tokens ----------------

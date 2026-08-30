@@ -174,7 +174,11 @@
     'settings.overrideDisk': '磁盘 %',
     'settings.overrideLoad': '负载',
     'settings.overrideOffline': '离线(秒)',
-    'settings.overrideInherit': '继承',
+    'settings.overrideInherit': '继承全局',
+    // 覆盖输入框的动态 placeholder：显示全局当前值，用户据此决定要不要覆盖
+    'settings.overridePlaceholder': '全局 {v}',
+    'settings.overrideGlobalOff': '全局未启用',
+    'server.rotateRowHint': '旧 key 立即失效并断开连接，监控历史保留；需用新 key 重启 agent',
   };
 
   // ---------------- 访问令牌 ----------------

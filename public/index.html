@@ -279,34 +279,41 @@
           <span class="field-tag" data-i18n="server.order">序号</span>
         </div>
       </div>
-      <!-- 逐机告警阈值覆盖（仅编辑模式显示；留空 = 继承全局阈值） -->
+      <!-- 逐机告警阈值覆盖（仅编辑模式显示；留空 = 继承全局阈值）。
+           placeholder 会被 JS 动态改写为"全局 N"（openEditModal 拉全局配置回填） -->
       <div id="alert-override-box" class="ao-box hidden">
         <div class="ao-title">告警阈值覆盖（留空继承全局）</div>
         <div class="ao-grid">
           <div class="field">
-            <input id="ao-cpu" type="number" placeholder="继承" />
+            <input id="ao-cpu" type="number" placeholder="继承全局" data-i18n-ph="settings.overrideInherit" />
             <span class="field-tag">CPU %</span>
           </div>
           <div class="field">
-            <input id="ao-mem" type="number" placeholder="继承" />
+            <input id="ao-mem" type="number" placeholder="继承全局" data-i18n-ph="settings.overrideInherit" />
             <span class="field-tag">内存 %</span>
           </div>
           <div class="field">
-            <input id="ao-disk" type="number" placeholder="继承" />
+            <input id="ao-disk" type="number" placeholder="继承全局" data-i18n-ph="settings.overrideInherit" />
             <span class="field-tag">磁盘 %</span>
           </div>
           <div class="field">
-            <input id="ao-load" type="number" placeholder="继承" />
+            <input id="ao-load" type="number" placeholder="继承全局" data-i18n-ph="settings.overrideInherit" />
             <span class="field-tag">负载</span>
           </div>
           <div class="field">
-            <input id="ao-offline" type="number" placeholder="继承" />
+            <input id="ao-offline" type="number" placeholder="继承全局" data-i18n-ph="settings.overrideInherit" />
             <span class="field-tag">离线(秒)</span>
           </div>
         </div>
         <p class="muted" style="font-size:12px;margin:6px 0 0">
           负载填 0 = 关闭该维度告警；全部留空 = 清除覆盖，回退全局阈值
         </p>
+      </div>
+      <!-- 危险操作：轮换 Agent Key（仅编辑模式显示；从卡片菜单移入此处，
+           与"修改"同屏——轮换属于节点配置变更，且确认弹窗需要上下文） -->
+      <div class="settings-row hidden" id="rotate-row">
+        <button id="btn-rotate-key" class="danger" data-i18n="server.rotate">轮换 Key</button>
+        <span class="muted" style="font-size:12px" data-i18n="server.rotateRowHint">旧 key 立即失效并断开连接，监控历史保留；需用新 key 重启 agent</span>
       </div>
       <div class="settings-row">
         <button id="btn-add-server">添加服务器</button>

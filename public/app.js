@@ -307,7 +307,7 @@
       diskHtml = `<div class="mt-sub mt-disk-head">${e.disk ? `<span>${escapeHtml(t('metric.diskMounts', { n: e.disk.length }))}</span>` : ''}${sumHtml}</div><div class="mt-disk">` +
         e.disk.map((d) => `<div><span title="${escapeHtml(d.m)}">${escapeHtml(d.m)}</span><b>${diskRow(d)}</b></div>`).join('') + '</div>';
     }
-    return `<div class="mt-title">实时指标</div>${items}${sysHtml}${diskHtml}`;
+    return `<div class="mt-title">${escapeHtml(t('metric.realtime'))}</div>${items}${sysHtml}${diskHtml}`;
   }
 
   // 指标行 HTML（数值随推送变化；tooltip 数据内嵌 data-metric，事件委托绑定不受重建影响）
@@ -354,7 +354,7 @@
     const ip = (s.wan_ip || (s.info && s.info.ip4) || '').trim();
     const info = s.info ? [s.info.os, up].filter(Boolean).join(' · ') : up;
     const updateBtn = agentUpdateAvailable(s)
-      ? `<button data-act="agent-update" data-id="${s.id}" data-name="${escapeHtml(s.name)}" title="目标版本 ${escapeHtml(latestAgent.build_id)}" ${updatingAgents.has(s.id) ? 'disabled' : ''}>${updatingAgents.has(s.id) ? escapeHtml(t('server.updating')) : escapeHtml(t('server.updateAgent'))}</button>`
+      ? `<button data-act="agent-update" data-id="${s.id}" data-name="${escapeHtml(s.name)}" title="${escapeHtml(t('server.updateTip', { from: info.agent_version, to: latestAgent.build_id }))}" ${updatingAgents.has(s.id) ? 'disabled' : ''}>${updatingAgents.has(s.id) ? escapeHtml(t('server.updating')) : escapeHtml(t('server.updateAgent'))}</button>`
       : '';
     const sel = selectedServers.has(s.id);
     return `
@@ -600,10 +600,10 @@
     if (!name) return toast(t('server.nameRequired'));
     try {
       const cfg = await api('/api/servers', { method: 'POST', body: JSON.stringify({ name, group, sort_order: sortOrder }) });
-      const text = `服务器已添加，agent 配置（仅显示一次）：\n\nWSS 地址: ${cfg.wss_base}\nKEY: ${cfg.agent_key}`;
+      const text = `${t('server.addedBody', { wss: cfg.wss_base, key: cfg.agent_key })}`;
       $('#add-modal').classList.add('hidden');
       unlockScroll();
-      infoDialog('服务器已添加 · agent 配置（仅显示一次）', text); // 内部会重新 lockScroll，弹窗期间保持锁定
+      infoDialog(t('server.addedTitle'), text); // 内部会重新 lockScroll，弹窗期间保持锁定
       loadServers();
     } catch (e) {
       toast(e.message);
@@ -742,7 +742,7 @@
     isActive: () => !!token,
     onPrompt: (onContinue, onPause) => {
       // 确认=继续观看（重置计时）；取消=立即暂停；关闭弹窗=忽略提示（60s 倒计时自动暂停兜底）
-      confirmDialog('长时间未操作。为节省 Cloudflare 额度，将暂停实时刷新（agent 将恢复慢采）。\n\n点击「确认」继续观看，或「取消」暂停；60 秒无响应将自动暂停。', onContinue, onPause);
+      confirmDialog(t('idle.confirmBody'), onContinue, onPause);
     },
     onPromptDismiss: () => {
       // 暂停时提示弹窗可能仍显示（60s 无响应自动暂停路径）——关闭残留的过期弹窗；
@@ -856,8 +856,8 @@
     const mode = cur ? cur.renderer : 'dom';
     btn.textContent = mode === 'webgl' ? 'WebGL' : 'DOM';
     btn.title = mode === 'webgl'
-      ? '当前标签渲染器：WebGL（GPU 加速，刷日志更流畅）——点击切换为 DOM'
-      : '当前标签渲染器：DOM（兼容兜底）——点击切换为 WebGL';
+      ? t('term.rendererTipWebgl')
+      : t('term.rendererTipDom');
     btn.disabled = !cur;
   }
 
@@ -908,7 +908,7 @@
       if (!termSessions.has(s.id)) return; // 加载期间该标签已关闭
       const W = window.WebglAddon;
       const Ctor = W && (W.WebglAddon || W); // UMD 导出对象上挂类，兼容直接挂类的形态
-      if (!Ctor) throw new Error('WebGL 渲染器插件加载异常');
+      if (!Ctor) throw new Error(t('term.webglLoadError'));
       detachWebglAddonOf(s);
       const addon = new Ctor();
       // GPU 上下文丢失（驱动重置/切虚拟桌面/省电策略/远程桌面禁加速）→ 自动回退 DOM
@@ -955,7 +955,7 @@
         loadScript('/vendor/addon-fit.min.js'),
       ]);
     } catch (e) {
-      toast(e.message || '终端组件加载失败');
+      toast(e.message || t('term.componentLoadFail'));
       // 已有标签时不收起弹窗（只是新标签失败）；首个标签失败才收起
       if (!termSessions.size) { $('#term-modal').classList.add('hidden'); unlockScroll(); }
       return;
@@ -1006,7 +1006,7 @@
     tab.className = 'term-tab';
     tab.dataset.id = String(s.id);
     tab.innerHTML = `<span class="tab-name">${escapeHtml(s.serverName)}</span>`
-      + '<button class="tab-close" type="button" aria-label="关闭该终端" title="关闭">✕</button>';
+    + '<button class="tab-close" type="button" aria-label="' + t('term.closeTab') + '" title="' + t('term.closeTab') + '">✕</button>';
     tab.addEventListener('click', (e) => {
       // ✕ 只关这一个标签；点标签其余区域 = 切过去
       if (e.target.closest('.tab-close')) { closeTerm(s.id); return; }
@@ -1100,8 +1100,8 @@
         return;
       }
       $('#file-msg').textContent = uploadQueue.length
-        ? `已上传 ${uploadStat.ok} 个，还剩 ${uploadQueue.length} 个（当前：${path}）`
-        : `已上传 ${uploadStat.ok} 个（最后：${path}）`;
+        ? `${t('file.uploadBatchProgress', { ok: uploadStat.ok, left: uploadQueue.length, path })}`
+        : `${t('file.uploadBatchDone', { ok: uploadStat.ok, path })}`;
       nextUpload();
     },
     onUploadCanceled: () => { $('#btn-file-cancel').classList.add('hidden'); $('#file-msg').textContent = t('file.uploadCanceled'); },
@@ -1143,7 +1143,7 @@
       toast(t('file.errToast', { msg }));
       // 批量上传中途失败：记录并推进队列，否则剩余文件会一直卡在队列里
       if (uploadQueue.length) {
-        uploadStat.failed.push(`（中断：${msg}）`);
+        uploadStat.failed.push(t('file.interrupted', { msg }));
         nextUpload();
       }
     },
@@ -1199,7 +1199,7 @@
     $('#file-list').innerHTML = rows.join('') || `<tr><td colspan="5" class="muted">${escapeHtml(t('file.findNoResult'))}</td></tr>`;
     const st = fileFindState || {};
     $('#file-msg').textContent = t('file.findResult', { kw: st.pattern || '', n: safe.length })
-      + (st.truncated ? `（已达上限，仅显示部分；共扫描 ${st.scanned} 项）` : `（扫描 ${st.scanned} 项）`);
+      + (st.truncated ? `${t('file.findTruncated', { n: st.scanned })}` : `${t('file.findScanned', { n: st.scanned })}`);
   }
 
   async function openFileManager(serverId, serverName) {
@@ -1236,15 +1236,15 @@
     const prot = isSystemPath(full);
     const e = escapeHtml;
     return `<div class="row-menu-wrap">
-      <button class="row-menu" type="button" title="操作" aria-label="操作">⋯</button>
+      <button class="row-menu" type="button" title="${e(t('server.nodeOps'))}" aria-label="${e(t('server.nodeOps'))}">⋯</button>
       <div class="row-menu-pop hidden">
-        <button class="f-act-dl" type="button" data-path="${e(full)}" data-type="${e(type)}" data-size="${e(size)}">下载</button>
-        ${editable ? `<button class="f-act-edit" type="button" data-path="${e(full)}" data-size="${e(size)}">编辑</button>` : ''}
-        ${prot ? '' : `<button class="f-act-mv" type="button" data-path="${e(full)}">移动</button>
-        <button class="f-act-cp" type="button" data-path="${e(full)}">复制</button>
-        <button class="f-act-perm" type="button" data-path="${e(full)}" data-mode="${e(mode)}">权限</button>
-        <button class="f-act-ren" type="button" data-path="${e(full)}">重命名</button>
-        <button class="f-act-del danger" type="button" data-path="${e(full)}" data-type="${e(type)}">删除</button>`}
+        <button class="f-act-dl" type="button" data-path="${e(full)}" data-type="${e(type)}" data-size="${e(size)}">${e(t('file.dl'))}</button>
+        ${editable ? `<button class="f-act-edit" type="button" data-path="${e(full)}" data-size="${e(size)}">${e(t('common.edit'))}</button>` : ''}
+        ${prot ? '' : `<button class="f-act-mv" type="button" data-path="${e(full)}">${e(t('file.move'))}</button>
+        <button class="f-act-cp" type="button" data-path="${e(full)}">${e(t('file.copy'))}</button>
+        <button class="f-act-perm" type="button" data-path="${e(full)}" data-mode="${e(mode)}">${e(t('file.perm'))}</button>
+        <button class="f-act-ren" type="button" data-path="${e(full)}">${e(t('file.rename'))}</button>
+        <button class="f-act-del danger" type="button" data-path="${e(full)}" data-type="${e(type)}">${e(t('common.delete'))}</button>`}
       </div>
     </div>`;
   }
@@ -1275,7 +1275,7 @@
     const upBtn = document.querySelector('label.file-upload');
     if (upBtn) {
       upBtn.classList.toggle('hidden', cwdProt);
-      upBtn.title = cwdProt ? '系统目录受保护，禁止上传；如需操作请使用终端 Shell' : '';
+      upBtn.title = cwdProt ? t('file.protected') : '';
     }
     $('#file-input').disabled = cwdProt;
     $('#btn-file-mkdir').classList.toggle('hidden', cwdProt);
@@ -1284,13 +1284,13 @@
 
   // 新建目录 / 新建文件（当前 cwd 下；名字不带 /，agent mkdir -p 语义 + touch create_new）
   function mkDir() {
-    promptDialog(`新建目录（路径：${escapeHtml(fileSess.cwd)}）`, 'new-dir', (name) => {
+    promptDialog(`${t('file.mkdirTitle', { path: fileSess.cwd })}`, 'new-dir', (name) => {
       if (!name || name.includes('/')) return toast(t('file.dirNameNoSlash'));
       fileSess.mkdir(fileJoin(fileSess.cwd, name));
     });
   }
   function touchFile() {
-    promptDialog(`新建文件（路径：${escapeHtml(fileSess.cwd)}）`, 'new-file.txt', (name) => {
+    promptDialog(`${t('file.touchTitle', { path: fileSess.cwd })}`, 'new-file.txt', (name) => {
       if (!name || name.includes('/')) return toast(t('file.nameNoSlash'));
       fileSess.touch(fileJoin(fileSess.cwd, name));
     });
@@ -1569,7 +1569,7 @@
     // 目标目录为系统目录 → 禁止确认（agent 也会拦，此处提前提示）
     const protCwd = isSystemPath(fileSelector.cwd);
     $('#btn-sel-ok').disabled = protCwd;
-    $('#sel-msg').textContent = protCwd ? '系统目录受保护，不可作为目标；如需操作请使用终端 Shell' : '';
+    $('#sel-msg').textContent = protCwd ? t('file.protectedTarget') : '';
     checkSelectorConflict();
   }
   // 即时同名冲突提示（最终以 agent 拒绝为准——列表可能过期）
@@ -1579,8 +1579,8 @@
     const conflict = name && fileSelector.entries.some((e) => e.name === name);
     const sameSrc = name === fileSelector.srcName && fileSelector.cwd === fileParent(fileSelector.srcPath);
     $('#btn-sel-ok').disabled = isSystemPath(fileSelector.cwd) || !name || sameSrc;
-    if (sameSrc) $('#sel-msg').textContent = `与源位置相同，无需${fileSelector.op === 'copy' ? '复制' : '移动'}`;
-    else if (conflict) $('#sel-msg').textContent = `目标已存在同名「${name}」，将被拒绝（不覆盖）`;
+    if (sameSrc) $('#sel-msg').textContent = `${t('file.samePlaceHint', { mode: fileSelector.op === 'copy' ? t('common.copy') : t('file.move') })}`;
+    else if (conflict) $('#sel-msg').textContent = `${t('file.conflict', { name })}`;
     else if (!isSystemPath(fileSelector.cwd)) $('#sel-msg').textContent = '';
   }
   function selEnter(path) {
@@ -1605,7 +1605,7 @@
     if (op === 'copy') fileSess.copy(srcPath, dest);
     else fileSess.move(srcPath, dest);
     closeFileSelector();
-    $('#file-msg').textContent = `${op === 'copy' ? '复制' : '移动'}中：${dest}`;
+    $('#file-msg').textContent = `${op === 'copy' ? t('common.copy') : t('file.move')}中：${dest}`;
   }
 
   // 上传/下载入口：状态机在 FileSession（api.js），这里只负责 UI 接线。
@@ -1640,7 +1640,7 @@
       $('#btn-file-cancel').classList.add('hidden');
       if (failed.length) {
         toast(t('file.uploadBatchSummaryFail', { ok, n: failed.length }), 4000);
-        $('#file-msg').textContent = `失败：${failed.join('；')}`;
+        $('#file-msg').textContent = `${t('file.uploadBatchFailList', { list: failed.join('；') })}`;
       }
       return;
     }
@@ -1648,14 +1648,14 @@
     const target = fileJoin(fileSess.cwd, f.name);
     const existing = fileEntries.some((e) => e.type !== 'dir' && fileJoin(fileSess.cwd, e.name) === target);
     if (existing) {
-      confirmDialog(`「${f.name}」已存在，是否覆盖？`, () => {
+      confirmDialog(`${t('file.overwriteConfirm', { name: f.name })}`, () => {
         uploadQueue.shift();
         $('#btn-file-cancel').classList.remove('hidden');
         fileSess.upload(f, { overwrite: true });
       }, () => {
         // 取消这一个 → 跳过并继续队列（而不是中断整批）
         uploadQueue.shift();
-        uploadStat.failed.push(`${f.name}（已跳过）`);
+        uploadStat.failed.push(`${f.name}${t('file.skipped')}`);
         nextUpload();
       });
       return;
@@ -1688,7 +1688,7 @@
     // Chart.js 首次使用才加载（200KB，缓存后零开销）；与数据请求并行
     const chartReady = loadScript('/vendor/chart.umd.min.js').catch((e) => {
       if (seq !== monitorReqSeq) return; // 已切换其他 range，无需提示
-      toast(e.message || '图表库加载失败');
+      toast(e.message || t('common.chartLibFail'));
       return null;
     });
     document.querySelectorAll('.range-btn').forEach((b) => b.classList.toggle('active', b.dataset.range === range));
@@ -1700,7 +1700,7 @@
       const label = MONITOR_RANGE_LABEL[range] || range;
       const cCount = Object.keys(custom).length;
       const downsampled = rows.length > MONITOR_STEP_MAX;
-      $('#monitor-title').textContent = `监控 · ${serverName}（${label}，${rows.length} 点${downsampled ? '，降采样' : ''}${cCount ? ` +${cCount} 自定义` : ''}）`;
+      $('#monitor-title').textContent = `监控 · ${serverName}（${label}，${rows.length} 点${downsampled ? t('monitor.downsampled') : ''}${cCount ? ` +${cCount} 自定义` : ''}）`;
       $('#monitor-modal').classList.remove('hidden'); // 先显示，保证 canvas 有尺寸
       lockScroll();
       if (null === await chartReady) return; // 图表库加载失败（toast 已提示），数据请求不再渲染
@@ -1721,11 +1721,11 @@
     monitorLive = null;
     wrap.innerHTML = '';
     if (!window.Chart) {
-      wrap.innerHTML = '<p class="muted" style="padding:24px">图表库（Chart.js）加载失败，请检查网络。</p>';
+    wrap.innerHTML = `<p class="muted" style="padding:24px">${t('monitor.chartLibFail')}</p>`;
       return;
     }
     if (!rows.length) {
-      wrap.innerHTML = '<p class="muted" style="padding:24px">该时间范围暂无数据。</p>';
+    wrap.innerHTML = `<p class="muted" style="padding:24px">${t('monitor.noData')}</p>`;
       return;
     }
     const tsArr = rows.map((r) => r.ts);
@@ -1808,8 +1808,8 @@
     // 内存 + Swap：同为 % 量纲合并一张图；tooltip 显示各自 当前值/总量/百分比
     const memPctData = rows.map(memPctOf);
     const swapPctData = rows.map(swapPctOf);
-    mkChart('内存 / Swap（%）', [
-      { label: '内存', data: memPctData, ...lineCfg('#f59e0b', 'rgba(245,158,11,.08)'), fill: true },
+    mkChart(t('monitor.memSwap'), [
+      { label: t('monitor.mem'), data: memPctData, ...lineCfg('#f59e0b', 'rgba(245,158,11,.08)'), fill: true },
       { label: 'Swap', data: swapPctData, ...lineCfg('#22d3ee', 'transparent') },
     ],
       (ctx) => {
@@ -1825,19 +1825,19 @@
         }
         if (r.mem_used == null) return '';
         const mmb = +(r.mem_used / 1048576).toFixed(1);
-        if (r.mem_total > 0) return `内存：${mmb} MB / ${+(r.mem_total / 1048576).toFixed(1)} MB（${memPctOf(r)}%）`;
-        return `内存：${mmb} MB`;
+        if (r.mem_total > 0) return t('monitor.tipMemFull', { v: mmb, t: +(r.mem_total / 1048576).toFixed(1), p: memPctOf(r) });
+        return t('monitor.tipMemShort', { v: mmb });
       },
-      [['内存', lastVal(memPctData)], ['Swap', lastVal(swapPctData)]].filter(([, v]) => v != null).map(([d, v]) => `${d}：${v}%`).join(' · '),
+      [[t('monitor.mem'), lastVal(memPctData)], ['Swap', lastVal(swapPctData)]].filter(([, v]) => v != null).map(([d, v]) => `${d}：${v}%`).join(' · '),
       (m) => [memPctOf(m), swapPctOf(m)].map((v) => (v == null ? null : v + '%')),
       '%',
-      ([mem, swap]) => [['内存', mem], ['Swap', swap]].filter(([, v]) => v != null).map(([d, v]) => `${d}：${v}`).join(' · '),
+      ([mem, swap]) => [[t('monitor.mem'), mem], ['Swap', swap]].filter(([, v]) => v != null).map(([d, v]) => `${d}：${v}`).join(' · '),
       undefined, 2);
     // 负载：1/5/15 分钟三条线（无单位），独立图
     const load1Data = rows.map((r) => (r && r.extra && r.extra.load1 != null ? Number(r.extra.load1) : null));
     const load5Data = rows.map((r) => (r && r.extra && r.extra.load5 != null ? Number(r.extra.load5) : null));
     const load15Data = rows.map((r) => (r && r.extra && r.extra.load15 != null ? Number(r.extra.load15) : null));
-    mkChart('负载 (1/5/15)', [
+    mkChart(t('monitor.load'), [
       { label: '1m', data: load1Data, ...lineCfg('#3b82f6', 'transparent') },
       { label: '5m', data: load5Data, ...lineCfg('#f59e0b', 'transparent') },
       { label: '15m', data: load15Data, ...lineCfg('#34d399', 'transparent') },
@@ -1853,13 +1853,13 @@
     // 磁盘：整体使用率（累计，与卡片/tooltip 标题栏一致），% 量纲独立图；tooltip 显示累计当前值/最大值
     const diskSumData = rows.map(diskSumOf);
     const diskPctData = diskSumData.map((d) => (d ? d.pct : null));
-    mkChart('磁盘（%）', [
-      { label: '磁盘', data: diskPctData, ...lineCfg('#34d399', 'rgba(52,211,153,.08)'), fill: true },
+    mkChart(t('monitor.disk'), [
+      { label: t('metric.disk'), data: diskPctData, ...lineCfg('#34d399', 'rgba(52,211,153,.08)'), fill: true },
     ],
       (ctx) => {
         const d = diskSumData[ctx.dataIndex];
         if (!d) return '';
-        return d.used != null ? `磁盘：${fmtBytes(d.used)} / ${fmtBytes(d.total)}（${d.pct}%）` : `磁盘：${d.pct}%`;
+        return d.used != null ? t('monitor.tipDiskFull', { u: fmtBytes(d.used), t: fmtBytes(d.total), p: d.pct }) : t('monitor.tipDiskPct', { p: d.pct });
       },
       lastVal(diskPctData) != null ? `${lastVal(diskPctData)}%` : '',
       (m) => { const d = diskSumOf(m); return d ? d.pct + '%' : null; },
@@ -1873,11 +1873,11 @@
     const ioLast = (io) => (io && io.read_kbs != null ? `↓ ${io.read_kbs} KB/s` : '') +
       (io && io.write_kbs != null ? ` · ↑ ${io.write_kbs} KB/s` : '') +
       (io && io.util_pct != null ? ` · util ${io.util_pct}%` : '');
-    mkChart('磁盘 IO（KB/s · %）', [
-      { label: '读', data: ioReadData, ...lineCfg('#22d3ee', 'transparent') },
-      { label: '写', data: ioWriteData, ...lineCfg('#f472b6', 'transparent') },
+    mkChart(t('monitor.diskIo'), [
+      { label: t('chmod.read'), data: ioReadData, ...lineCfg('#22d3ee', 'transparent') },
+      { label: t('chmod.write'), data: ioWriteData, ...lineCfg('#f472b6', 'transparent') },
       { label: 'util', data: ioUtilData, ...lineCfg('#34d399', 'transparent'), yAxisID: 'y2' },
-    ], tipWith({ 读: ' KB/s', 写: ' KB/s', util: '%' }),
+    ], tipWith({ [t('monitor.read')]: ' KB/s', [t('monitor.write')]: ' KB/s', util: '%' }),
       ioLast({ read_kbs: lastVal(ioReadData), write_kbs: lastVal(ioWriteData), util_pct: lastVal(ioUtilData) }),
       (m) => {
         const io = ioOf(m);
@@ -1888,25 +1888,25 @@
       '%', 2);
     const ioRData = rows.map((r) => { const io = ioOf(r); return io && io.r_iops != null ? io.r_iops : null; });
     const ioWData = rows.map((r) => { const io = ioOf(r); return io && io.w_iops != null ? io.w_iops : null; });
-    mkChart('磁盘 IOPS', [
-      { label: '读', data: ioRData, ...lineCfg('#22d3ee', 'transparent') },
-      { label: '写', data: ioWData, ...lineCfg('#f472b6', 'transparent') },
-    ], tipWith({ 读: ' 次/秒', 写: ' 次/秒' }),
-      [['读', lastVal(ioRData)], ['写', lastVal(ioWData)]].filter(([, v]) => v != null).map(([d, v]) => `${d} ${v}`).join(' · '),
+    mkChart(t('monitor.iops'), [
+      { label: t('chmod.read'), data: ioRData, ...lineCfg('#22d3ee', 'transparent') },
+      { label: t('chmod.write'), data: ioWData, ...lineCfg('#f472b6', 'transparent') },
+    ], tipWith({ [t('monitor.read')]: ' ' + t('monitor.unit.iops'), [t('monitor.write')]: ' ' + t('monitor.unit.iops') }),
+      [[t('chmod.read'), lastVal(ioRData)], [t('chmod.write'), lastVal(ioWData)]].filter(([, v]) => v != null).map(([d, v]) => `${d} ${v}`).join(' · '),
       (m) => {
         const io = ioOf(m);
         return [io && io.r_iops, io && io.w_iops].map((v) => (v == null ? null : v));
       },
-      '次/秒',
-      ([r, w]) => [['读', r], ['写', w]].filter(([, v]) => v != null).map(([d, v]) => `${d} ${v}`).join(' · '),
+      t('monitor.unit.iops'),
+      ([r, w]) => [[t('chmod.read'), r], [t('chmod.write'), w]].filter(([, v]) => v != null).map(([d, v]) => `${d} ${v}`).join(' · '),
       undefined, 3);
     // 网络：上下行同量纲（KB/s）放一张，便于对比
     const netInData = rows.map((r) => (r.net_in == null ? null : +(r.net_in / 1024).toFixed(1)));
     const netOutData = rows.map((r) => (r.net_out == null ? null : +(r.net_out / 1024).toFixed(1)));
-    mkChart('网络（KB/s）', [
-      { label: '下行', data: netInData, ...lineCfg('#22d3ee', 'transparent') },
-      { label: '上行', data: netOutData, ...lineCfg('#f472b6', 'transparent') },
-    ], tipWith({ 下行: ' KB/s', 上行: ' KB/s' }),
+    mkChart(t('monitor.network'), [
+      { label: t('monitor.down'), data: netInData, ...lineCfg('#22d3ee', 'transparent') },
+      { label: t('monitor.up'), data: netOutData, ...lineCfg('#f472b6', 'transparent') },
+    ], tipWith({ [t('monitor.down')]: ' KB/s', [t('monitor.up')]: ' KB/s' }),
       [['↓', lastVal(netInData)], ['↑', lastVal(netOutData)]].filter(([, v]) => v != null).map(([d, v]) => `${d} ${v} KB/s`).join(' · '),
       (m) => {
         const vals = [m.net_in, m.net_out].map((v) => (v == null ? null : +(v / 1024).toFixed(1)));
@@ -1916,7 +1916,7 @@
     // 连接数：TCP + UDP（与网络图风格一致，双线便于对比）
     const tcpData = rows.map((r) => (r && r.extra && r.extra.tcp != null ? r.extra.tcp : null));
     const udpData = rows.map((r) => (r && r.extra && r.extra.udp != null ? r.extra.udp : null));
-    mkChart('连接数（TCP/UDP）', [
+    mkChart(t('monitor.conns'), [
       { label: 'TCP', data: tcpData, ...lineCfg('#22d3ee', 'transparent') },
       { label: 'UDP', data: udpData, ...lineCfg('#f472b6', 'transparent') },
     ], null,
@@ -1930,8 +1930,8 @@
       undefined, 2);
     // 进程数：extra.procs（整数），独立图
     const procsData = rows.map((r) => (r && r.extra && r.extra.procs != null ? r.extra.procs : null));
-    mkChart('进程数', [
-      { label: '进程', data: procsData, ...lineCfg('#a78bfa', 'rgba(167,139,250,.08)'), fill: true },
+    mkChart(t('monitor.procs'), [
+      { label: t('monitor.procs'), data: procsData, ...lineCfg('#a78bfa', 'rgba(167,139,250,.08)'), fill: true },
     ], null,
       lastVal(procsData) != null ? String(lastVal(procsData)) : '',
       (m) => (m && m.extra && m.extra.procs != null ? m.extra.procs : null),
@@ -1939,7 +1939,7 @@
     // 自定义指标：按 ts 对齐系统时间轴，独立一张（量纲差异仅看趋势）
     const cNames = Object.keys(custom || {}).filter((n) => Array.isArray(custom[n]) && custom[n].length);
     if (cNames.length) {
-      mkChart('自定义指标', cNames.map((n, i) => {
+      mkChart(t('menu.customMetrics'), cNames.map((n, i) => {
         const cMap = new Map(custom[n].map((p) => [p.ts, p.value]));
         return { label: n, data: rows.map((r) => (cMap.has(r.ts) ? cMap.get(r.ts) : null)), ...lineCfg(MONITOR_COLORS[i % MONITOR_COLORS.length], 'transparent') };
       }), null,
@@ -2008,9 +2008,9 @@
     const raw = $('#custom-setup-editor').value.trim();
     try {
       const arr = JSON.parse(raw);
-      if (!Array.isArray(arr)) throw new Error('必须是数组');
+      if (!Array.isArray(arr)) throw new Error(t('setup.errArray'));
       for (const it of arr) {
-        if (!it || typeof it !== 'object' || !it.name || !it.cmd) throw new Error('每项需包含 name 与 cmd');
+        if (!it || typeof it !== 'object' || !it.name || !it.cmd) throw new Error(t('setup.errItem'));
       }
       $('#custom-setup-out').textContent = `# 追加到 /etc/cf-panel-agent.env\nCUSTOM_METRICS='${JSON.stringify(arr)}'`;
     } catch (e) {
@@ -2049,12 +2049,12 @@
 
   // ---------- 设置 / PAT ----------
   const ALERT_PRESETS = [
-    { name: 'Server酱', desc: 'GET，token 在 URL', method: 'GET', url: 'https://sctapi.ftqq.com/{token}.send?title={title}&desp={message}', body: '', ct: '', headers: '' },
-    { name: '钉钉机器人', desc: 'POST JSON，token 在 URL', method: 'POST', url: 'https://oapi.dingtalk.com/robot/send?access_token={token}', body: '{"msgtype":"text","text":{"content":"{message}"}}', ct: '', headers: '' },
-    { name: '企业微信机器人', desc: 'POST JSON，token 在 URL', method: 'POST', url: 'https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key={token}', body: '{"msgtype":"text","text":{"content":"{message}"}}', ct: '', headers: '' },
-    { name: 'Telegram Bot', desc: 'POST JSON，token 在 URL', method: 'POST', url: 'https://api.telegram.org/bot{token}/sendMessage', body: '{"chat_id":"你的chat_id","text":"{message}"}', ct: '', headers: '' },
-    { name: 'Bark', desc: 'GET，token 在 URL', method: 'GET', url: 'https://api.day.app/{token}/{title}/{message}', body: '', ct: '', headers: '' },
-    { name: 'Slack', desc: 'POST 结构化 JSON，token 走 Header', method: 'POST', url: 'https://hooks.slack.com/services/T/B/{token}', body: '', ct: '', headers: '{"Authorization":"Bearer {token}"}' },
+    { name: 'Server酱', desc: t('setup.presetDescGet'), method: 'GET', url: 'https://sctapi.ftqq.com/{token}.send?title={title}&desp={message}', body: '', ct: '', headers: '' },
+    { name: '钉钉机器人', desc: t('setup.presetDescPost'), method: 'POST', url: 'https://oapi.dingtalk.com/robot/send?access_token={token}', body: '{"msgtype":"text","text":{"content":"{message}"}}', ct: '', headers: '' },
+    { name: '企业微信机器人', desc: t('setup.presetDescPost'), method: 'POST', url: 'https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key={token}', body: '{"msgtype":"text","text":{"content":"{message}"}}', ct: '', headers: '' },
+    { name: 'Telegram Bot', desc: t('setup.presetDescPost'), method: 'POST', url: 'https://api.telegram.org/bot{token}/sendMessage', body: '{"chat_id":"你的chat_id","text":"{message}"}', ct: '', headers: '' },
+    { name: 'Bark', desc: t('setup.presetDescGet'), method: 'GET', url: 'https://api.day.app/{token}/{title}/{message}', body: '', ct: '', headers: '' },
+    { name: 'Slack', desc: t('setup.presetDescSlack'), method: 'POST', url: 'https://hooks.slack.com/services/T/B/{token}', body: '', ct: '', headers: '{"Authorization":"Bearer {token}"}' },
   ];
 
   function renderAlertPresets() {
@@ -2064,7 +2064,7 @@
       <div class="alert-preset">
         <span class="ap-name">${escapeHtml(p.name)}</span>
         <span class="muted">${escapeHtml(p.desc)}</span>
-        <button class="ghost ap-use" data-i="${i}">使用</button>
+        <button class="ghost ap-use" data-i="${i}">${t('settings.presetUse')}</button>
       </div>`).join('');
   }
 
@@ -2102,7 +2102,7 @@
     if (!ids.length) return;
     const target = latestAgent && latestAgent.build_id;
     confirmDialog(
-      `确认批量更新选中的 ${ids.length} 台 Agent${target ? ` 到 ${target}` : ''}？\n\n将逐台串行执行：每台会关闭现有终端/文件会话并短暂离线；成功后由 supervisor 或 AGENT_SELF_RESTART 拉起。`,
+      `${t('server.batchUpdateTitle', { n: ids.length, target: target ? ` → ${target}` : '' })}\n\n${t('server.batchUpdateBody')}`,
       async () => {
         let ok = 0;
         const failed = [];
@@ -2120,7 +2120,7 @@
           }
         }
         renderServers();
-        infoDialog('批量更新完成', `成功 ${ok} 台${failed.length ? `，失败 ${failed.length} 台：\n\n${failed.join('\n')}` : ''}`);
+        infoDialog(t('server.batchUpdateDone'), `成功 ${ok} 台${failed.length ? `，失败 ${failed.length} 台：\n\n${failed.join('\n')}` : ''}`);
         loadServers();
       }
     );
@@ -2147,7 +2147,7 @@
     if (!ids.length) return;
     const names = ids.map((id) => (serversCache.find((s) => s.id === id) || {}).name || `#${id}`).join('、');
     confirmDialog(
-      `确认删除选中的 ${ids.length} 台服务器？\n${names}\n\n监控历史（含按天账）与审计记录将一并清除，此操作不可恢复！`,
+      `${t('server.deleteBatchTitle', { n: ids.length })}\n${t('server.deleteBatchBody', { names })}`,
       async () => {
         try {
           const r = await api('/api/servers/batch', {
@@ -2165,13 +2165,13 @@
   // ---------- 轮换 Agent Key（key 泄露/误发后的处置） ----------
   async function rotateKey(id, name) {
     confirmDialog(
-      `确认轮换「${name}」的 Agent Key？\n\n旧 key 立即失效并断开现有连接；监控历史与审计记录全部保留。\n需人工到目标机更新 AGENT_KEY 并重启 agent 后才会重新上线。`,
+      `${t('server.rotateTitle', { name })}\n\n${t('server.rotateBody')}`,
       async () => {
         try {
           const r = await api(`/api/servers/${id}/rotate-key`, { method: 'POST' });
           infoDialog(
-            'Agent Key 已轮换（仅显示一次）',
-            `WSS 地址: ${r.wss_base}\n\nAGENT_KEY=${r.agent_key}\n\n请到目标机更新 agent 环境变量后重启（如 /etc/cf-panel-agent.env）。`
+            t('server.rotateDone'),
+            `${t('server.rotateResult', { wss: r.wss_base, key: r.agent_key })}`
           );
         } catch (e) { toast(e.message); }
       }
@@ -2200,7 +2200,7 @@
     try {
       data = await api(`/api/stats?server_id=${serverId}&days=${days}`);
     } catch (e) { toast(e.message); return; }
-    $('#stats-title').textContent = `流量 / 可用率 · ${serverName}`;
+    $('#stats-title').textContent = t('stats.titleWith', { name: serverName });
     $('#stats-modal').classList.remove('hidden'); // 先显示，保证 canvas 有尺寸
     lockScroll();
     renderStatsSummary(data);
@@ -2208,7 +2208,7 @@
     try {
       await loadScript('/vendor/chart.umd.min.js');
     } catch (e) {
-      toast(e.message || '图表库加载失败');
+      toast(e.message || t('common.chartLibFail'));
       return;
     }
     if (!statsState || statsState.serverId !== serverId || statsState.days !== days) return; // 期间已切换
@@ -2220,11 +2220,11 @@
     const sum = data.summary || {};
     const total = (sum.bytes_in || 0) + (sum.bytes_out || 0);
     $('#stats-summary').innerHTML = `
-      <div class="stats-item"><span class="stats-num">${fmtBytes(sum.bytes_in || 0)}</span><span class="stats-label">入站合计</span></div>
-      <div class="stats-item"><span class="stats-num">${fmtBytes(sum.bytes_out || 0)}</span><span class="stats-label">出站合计</span></div>
-      <div class="stats-item"><span class="stats-num">${fmtBytes(total)}</span><span class="stats-label">总流量</span></div>
-      <div class="stats-item"><span class="stats-num">${pctText(sum.availability)}</span><span class="stats-label">可用率</span></div>
-      <div class="stats-item"><span class="stats-num">${sum.restarts || 0}</span><span class="stats-label">重启次数</span></div>`;
+      <div class="stats-item"><span class="stats-num">${fmtBytes(sum.bytes_in || 0)}</span><span class="stats-label">${t('stats.inTotal')}</span></div>
+      <div class="stats-item"><span class="stats-num">${fmtBytes(sum.bytes_out || 0)}</span><span class="stats-label">${t('stats.outTotal')}</span></div>
+      <div class="stats-item"><span class="stats-num">${fmtBytes(total)}</span><span class="stats-label">${t('stats.total')}</span></div>
+      <div class="stats-item"><span class="stats-num">${pctText(sum.availability)}</span><span class="stats-label">${t('stats.availability')}</span></div>
+      <div class="stats-item"><span class="stats-num">${sum.restarts || 0}</span><span class="stats-label">${t('stats.restarts')}</span></div>`;
     // 明细表：最近日期在前（倒序），便于先看当下
     const trs = [...rows].reverse().map((r) => {
       const d = new Date(r.ts * 1000);
@@ -2238,8 +2238,8 @@
       </tr>`;
     }).join('');
     $('#stats-table').innerHTML = rows.length
-      ? `<table><thead><tr><th>日期</th><th>入站</th><th>出站</th><th>可用率</th><th>重启</th></tr></thead><tbody>${trs}</tbody></table>`
-      : '<p class="muted" style="padding:16px">该区间暂无天账数据。按天账由上报告警链路逐日累积，新接入的节点次日可见。</p>';
+      ? `<table><thead><tr><th>${escapeHtml(t('stats.colDate'))}</th><th>${escapeHtml(t('stats.colIn'))}</th><th>${escapeHtml(t('stats.colOut'))}</th><th>${escapeHtml(t('stats.colAvail'))}</th><th>${escapeHtml(t('stats.colRestart'))}</th></tr></thead><tbody>${trs}</tbody></table>`
+      : `<p class="muted" style="padding:16px">${t('stats.empty')}</p>`;
   }
 
   function renderStatsChart(data) {
@@ -2256,10 +2256,10 @@
       data: {
         labels,
         datasets: [
-          { type: 'bar', label: '入站', data: rows.map((r) => r.bytes_in || 0), backgroundColor: 'rgba(34,211,238,.45)' },
-          { type: 'bar', label: '出站', data: rows.map((r) => r.bytes_out || 0), backgroundColor: 'rgba(244,114,182,.45)' },
+          { type: 'bar', label: t('stats.colIn'), data: rows.map((r) => r.bytes_in || 0), backgroundColor: 'rgba(34,211,238,.45)' },
+          { type: 'bar', label: t('stats.colOut'), data: rows.map((r) => r.bytes_out || 0), backgroundColor: 'rgba(244,114,182,.45)' },
           // 可用率量纲与字节不同，挂右轴（100% 满量程，直观看出"掉到多少"）
-          { type: 'line', label: '可用率 %', data: rows.map((r) => r.availability), borderColor: '#34d399', backgroundColor: '#34d399', yAxisID: 'y2', tension: 0.3, pointRadius: 0, borderWidth: 1.8, spanGaps: true },
+          { type: 'line', label: t('stats.datasetAvail'), data: rows.map((r) => r.availability), borderColor: '#34d399', backgroundColor: '#34d399', yAxisID: 'y2', tension: 0.3, pointRadius: 0, borderWidth: 1.8, spanGaps: true },
         ],
       },
       options: {
@@ -2272,8 +2272,8 @@
             backgroundColor: cssVar('--panel-solid'), borderColor: cssVar('--border'), borderWidth: 1,
             titleColor: cssVar('--text'), bodyColor: muted,
             callbacks: {
-              label: (ctx) => (ctx.dataset.label === '可用率 %'
-                ? `可用率：${pctText(ctx.raw)}`
+              label: (ctx) => (ctx.dataset.label === t('stats.datasetAvail')
+                ? t('stats.tipAvail', { v: pctText(ctx.raw) })
                 : `${ctx.dataset.label}：${fmtBytes(ctx.raw || 0)}`),
             },
           },
@@ -2290,8 +2290,8 @@
   // ---------- 下拉菜单各功能入口 ----------
   function openAddModal() {
     editServerId = null;
-    $('#add-modal-title').textContent = '添加服务器';
-    $('#btn-add-server').textContent = '添加服务器';
+    $('#add-modal-title').textContent = t('menu.addServer');
+    $('#btn-add-server').textContent = t('menu.addServer');
     $('#inp-name').value = '';
     $('#inp-group').value = '';
     $('#inp-order').value = '';
@@ -2349,8 +2349,8 @@
     try {
       const list = await api('/api/servers');
       $('#tok-hint').textContent = list.length
-        ? 'server_id 参考：' + list.map((s) => `${s.id}=${s.name}`).join('，')
-        : '暂无服务器';
+        ? t('token.hint', { list: list.map((s) => `${s.id}=${s.name}`).join('，') })
+        : t('token.hintEmpty');
     } catch { /* 加载失败则不提示 */ }
   }
 
@@ -2380,8 +2380,8 @@
     if (!el) return;
     if (!mu) { el.textContent = ''; return; }
     el.textContent = mu * 1000 > Date.now()
-      ? `免打扰生效中，至 ${new Date(mu * 1000).toLocaleString()}`
-      : '该免打扰时段已过期（未生效）';
+      ? `${t('settings.muteHintOn', { time: new Date(mu * 1000).toLocaleString() })}`
+      : t('settings.muteHintExpired');
   }
 
   // 组装当前弹窗表单的告警配置（保存/测试共用）
@@ -2419,24 +2419,24 @@
   // 测试 Webhook：用当前表单配置（未保存）发一条测试通知并回显 HTTP 状态
   async function testWebhook() {
     const el = $('#webhook-test-result');
-    el.textContent = '发送中…';
+    el.textContent = t('settings.testing');
     try {
       const res = await api('/api/settings/test_webhook', {
         method: 'POST',
         body: JSON.stringify({ alerts: collectAlertForm() }),
       });
       el.textContent = res.ok
-        ? `✓ 发送成功（HTTP ${res.status}）`
-        : `✗ 发送失败：${res.error || `HTTP ${res.status}`}`;
+        ? `${t('settings.testOk', { status: res.status })}`
+        : `${t('settings.testFail', { err: res.error || `HTTP ${res.status}` })}`;
     } catch (e) {
       el.textContent = `✗ ${e.message}`;
     }
   }
 
   function fmtTokenExpiry(exp) {
-    if (!exp) return '永久有效';
+    if (!exp) return t('token.forever');
     const expired = exp * 1000 < Date.now();
-    return `${new Date(exp * 1000).toLocaleString()}${expired ? '（已过期）' : ''}`;
+    return `${new Date(exp * 1000).toLocaleString()}${expired ? t('token.expired') : ''}`;
   }
   // 有效期右端标签：仅数字（天数）模式显示——天数本身不是时间，需要换算提示
   //（含年份/时区）；日期字符串模式下输入框自身即截止时间，标签隐藏（再显示一遍
@@ -2466,9 +2466,9 @@
     const asNum = Number(v);
     if (Number.isFinite(asNum) && asNum > 0) return { expires_in_days: asNum };
     const ts = Date.parse(v);
-    if (!Number.isFinite(ts)) throw new Error('无法识别的有效期：请输入天数（如 30）或截止日期（如 2026/9/5 14:00）');
+    if (!Number.isFinite(ts)) throw new Error(t('token.errExpiry'));
     const at = Math.floor(ts / 1000);
-    if (at <= Math.floor(Date.now() / 1000)) throw new Error('截止时间已过去，请重新选择');
+    if (at <= Math.floor(Date.now() / 1000)) throw new Error(t('token.errPast'));
     return { expires_at: at };
   }
   async function loadTokens() {
@@ -2476,9 +2476,9 @@
       const rows = await api('/api/tokens');
       $('#token-list').innerHTML = rows.length
         ? rows.map((r) => `
-            <li>${escapeHtml(r.name)} · ${escapeHtml(r.scopes)}${r.server_ids ? ' · ids=' + escapeHtml(r.server_ids) : ''} · 到期：${escapeHtml(fmtTokenExpiry(r.expires_at))} · ${r.last_used_at ? `最近使用：${escapeHtml(new Date(r.last_used_at * 1000).toLocaleString())}` : '从未使用'}
-              <button data-tok-del="${r.id}" class="danger">删除</button></li>`).join('')
-        : '<li class="muted">暂无令牌</li>';
+            <li>${escapeHtml(r.name)} · ${escapeHtml(r.scopes)}${r.server_ids ? ' · ids=' + escapeHtml(r.server_ids) : ''} · 到期：${escapeHtml(fmtTokenExpiry(r.expires_at))} · ${r.last_used_at ? `最近使用：${escapeHtml(new Date(r.last_used_at * 1000).toLocaleString())}` : t('token.neverUsed')}
+              <button data-tok-del="${r.id}" class="danger">${e(t('common.delete'))}</button></li>`).join('')
+        : `<li class="muted">${t('token.empty')}</li>`;
     } catch (e) {
       $('#token-list').innerHTML = `<li class="muted">${escapeHtml(e.message)}</li>`;
     }
@@ -2506,7 +2506,7 @@
           ...parseTokenExpiry(),
         }),
       });
-      infoDialog('令牌已创建（仅显示一次）', `令牌：\n${res.token}\n\n用法：Authorization: Bearer ${res.token}\n\n有效期：${res.expires_at ? new Date(res.expires_at * 1000).toLocaleString() : '永久有效'}`);
+      infoDialog(t('token.createdTitle'), `令牌：\n${res.token}\n\n用法：Authorization: Bearer ${res.token}\n\n有效期：${res.expires_at ? new Date(res.expires_at * 1000).toLocaleString() : t('token.forever')}`);
       $('#tok-name').value = '';
       $('#tok-servers').value = '';
       $('#tok-expires').value = '';
@@ -2522,7 +2522,7 @@
   }
 
   function deleteToken(id) {
-    confirmDialog('确认删除该令牌？', async () => {
+    confirmDialog(t('token.confirmDelete'), async () => {
       try {
         await api(`/api/tokens/${id}`, { method: 'DELETE' });
         loadTokens();
@@ -2534,20 +2534,20 @@
 
   // ---------- 审计日志（仅管理员，保留 90 天；筛选/分页/CSV 导出） ----------
   const AUDIT_ACTION_LABEL = {
-    'server.create': '添加服务器', 'server.update': '修改服务器', 'server.delete': '删除服务器',
-    'terminal.open': '打开终端', 'file.open': '文件管理', 'file.upload': '上传文件',
-    'file.write': '写入文件', 'file.zip': '打包目录', 'file.rename': '重命名', 'file.delete': '删除文件',
-    'exec.command': '执行命令',
-    'server.rotate_key': '轮换 Agent Key',
-    'server.batch_update_group': '批量修改分组',
-    'agent.update.request': '请求更新 Agent',
-    'agent.update.installed': 'Agent 更新已安装',
-    'agent.update.failed': 'Agent 更新失败',
+    'server.create': t('menu.addServer'), 'server.update': t('server.edit'), 'server.delete': t('audit.serverDelete'),
+    'terminal.open': t('audit.terminalOpen'), 'file.open': t('audit.fileOpen'), 'file.upload': t('audit.fileUpload'),
+    'file.write': t('audit.fileWrite'), 'file.zip': t('audit.fileZip'), 'file.rename': t('audit.fileRename'), 'file.delete': t('audit.fileDelete'),
+    'exec.command': t('audit.execCommand'),
+    'server.rotate_key': t('audit.serverRotateKey'),
+    'server.batch_update_group': t('audit.serverBatchGroup'),
+    'agent.update.request': t('audit.agentUpdateRequest'),
+    'agent.update.installed': t('audit.agentUpdateInstalled'),
+    'agent.update.failed': t('audit.agentUpdateFailed'),
     // 登录与鉴权事件（IP 爆破/无效凭据探测此前完全无痕，靠这些识别）
-    'login.success': '登录成功',
-    'login.failed': '登录失败',
-    'login.locked': '登录被锁定',
-    'auth.failed': '无效凭据',
+    'login.success': t('audit.loginSuccess'),
+    'login.failed': t('audit.loginFailed'),
+    'login.locked': t('audit.loginLocked'),
+    'auth.failed': t('audit.authFailed'),
   };
   const auditState = { limit: 100, offset: 0, action: '', user: '', serverId: '' };
   async function openAuditModal() {
@@ -2579,11 +2579,11 @@
               <span class="audit-info">${escapeHtml(r.username || `uid=${r.user_id}`)}${r.client_ip ? ` · <cf-ip ip="${escapeHtml(r.client_ip)}"></cf-ip>` : ''}${r.target_server_id ? ` · server#${escapeHtml(r.target_server_id)}` : ''}${r.detail ? ` · ${escapeHtml(r.detail)}` : ''}</span>
               <span class="audit-time">${escapeHtml(r.created_at || '')}</span>
             </div></li>`).join('')
-        : '<li class="muted">暂无审计记录</li>';
+        : `<li class="muted">${t('audit.empty')}</li>`;
       const total = Number(body.total || rows.length);
       const from = total ? auditState.offset + 1 : 0;
       const to = Math.min(auditState.offset + rows.length, total);
-      $('#audit-pager-info').textContent = total ? `第 ${from}-${to} 条 / 共 ${total} 条` : '';
+      $('#audit-pager-info').textContent = total ? `${t('audit.pager', { from, to, total })}` : '';
       $('#btn-audit-prev').disabled = auditState.offset <= 0;
       $('#btn-audit-next').disabled = auditState.offset + rows.length >= total;
     } catch (e) {
@@ -2603,18 +2603,18 @@
       $('#usage-note').textContent = u.note || '';
       const est = u.estimates_per_day || {};
       $('#usage-est').innerHTML = `
-        <div class="usage-item"><span class="usage-num">${est.report_frames ?? '-'}</span><span class="usage-label">上报帧/天</span></div>
-        <div class="usage-item"><span class="usage-num">${est.do_events ?? '-'}</span><span class="usage-label">DO 事件/天</span></div>
-        <div class="usage-item"><span class="usage-num">${est.d1_writes ?? '-'}</span><span class="usage-label">D1 写行/天</span></div>`;
+        <div class="usage-item"><span class="usage-num">${est.report_frames ?? '-'}</span><span class="usage-label">${t('usage.reportFrames')}</span></div>
+        <div class="usage-item"><span class="usage-num">${est.do_events ?? '-'}</span><span class="usage-label">${t('usage.doEvents')}</span></div>
+        <div class="usage-item"><span class="usage-num">${est.d1_writes ?? '-'}</span><span class="usage-label">${t('usage.d1Writes')}</span></div>`;
       // Worker 请求计数（实例级，evict/重启清零，仅趋势参考）
       const apiRows = Object.entries(u.api || {}).sort((a, b) => b[1] - a[1]).slice(0, 10);
       $('#usage-list').innerHTML = apiRows.length
         ? apiRows.map(([k, v]) => `
             <li><div class="audit-row">
               <span class="audit-action">${escapeHtml(k)}</span>
-              <span class="audit-info">${v} 次</span>
+              <span class="audit-info">${v} ${t('usage.times')}</span>
             </div></li>`).join('')
-        : '<li class="muted">暂无请求计数（Worker 实例级）</li>';
+        : `<li class="muted">${t('usage.empty')}</li>`;
     } catch (e) {
       $('#usage-est').innerHTML = `<p class="muted">${escapeHtml(e.message)}</p>`;
       $('#usage-list').innerHTML = '';
@@ -2669,7 +2669,7 @@
       const { id, name } = updBtn.dataset;
       const target = latestAgent && latestAgent.build_id;
       confirmDialog(
-        `确认将「${name}」Agent 更新到 ${target}？\n\n更新会关闭该节点现有终端/文件会话，并短暂离线；成功后由 supervisor 自动重启。`,
+        `${t('server.updateConfirmTitle', { name, target })}\n\n${t('server.updateConfirmBody')}`,
         () => updateAgent(Number(id), name)
       );
       return;
@@ -2829,7 +2829,7 @@
     if (auditState.serverId) q.set('server_id', auditState.serverId);
     try {
       const res = await fetch(`/api/audit-logs?${q}`, { headers: { authorization: `Bearer ${token}` } });
-      if (!res.ok) throw new Error(`导出失败：HTTP ${res.status}`);
+      if (!res.ok) throw new Error(`${t('audit.exportFail', { status: res.status })}`);
       const blob = await res.blob();
       const a = document.createElement('a');
       a.href = URL.createObjectURL(blob);
@@ -2869,13 +2869,13 @@
     else if (act === 'agent-update') {
       const target = latestAgent && latestAgent.build_id;
       confirmDialog(
-        `确认将「${name}」Agent 更新到 ${target}？\n\n更新会关闭该节点现有终端/文件会话，并短暂离线；成功后由 supervisor 自动重启。`,
+        `${t('server.updateConfirmTitle', { name, target })}\n\n${t('server.updateConfirmBody')}`,
         () => updateAgent(Number(id), name)
       );
     }
     else if (act === 'edit') openEditModal(Number(id), name, btn.dataset.group, btn.dataset.order);
     else if (act === 'del') {
-      confirmDialog(`确认删除服务器「${name}」？`, () => {
+      confirmDialog(`${t('server.confirmDelete', { name })}`, () => {
         api(`/api/servers/${id}`, { method: 'DELETE' }).then(loadServers).catch((e2) => toast(e2.message));
       });
     }
@@ -3015,7 +3015,7 @@
   $('#btn-editor-preview').onclick = toggleEditorPreview;
   $('#btn-editor-close').onclick = () => {
     // 有未保存改动时二次确认（Monaco 与 textarea 共用 editorDirty）
-    if (editorDirty) confirmDialog('有未保存的修改，确认放弃？', closeFileEditor);
+    if (editorDirty) confirmDialog(t('file.editorDirtyConfirm'), closeFileEditor);
     else closeFileEditor();
   };
   $('#btn-editor-expand').onclick = toggleEditorExpand;
@@ -3069,7 +3069,7 @@
     if (dl) {
       closeRowMenus();
       const path = dl.dataset.path;
-      if (dl.dataset.type === 'dir') { $('#file-msg').textContent = '正在打包目录，请稍候...'; fileSess.zipDownload(path); }
+      if (dl.dataset.type === 'dir') { $('#file-msg').textContent = t('file.zipping'); fileSess.zipDownload(path); }
       else downloadFile(path, Number(dl.dataset.size) || 0);
       return;
     }
@@ -3078,7 +3078,7 @@
       closeRowMenus();
       const old = CfUtils.fileBase(ren.dataset.path);
       // 原生 prompt() → promptDialog（对话框体系一致，回车确认/Esc 取消）
-      promptDialog(`重命名：${ren.dataset.path}（仅改名，不支持跨目录）`, old, (name) => {
+      promptDialog(`${t('file.renameTitle', { path: ren.dataset.path })}`, old, (name) => {
         if (name.includes('/') || name.includes('\\')) return toast(t('file.nameNoSep2'));
         fileSess.rename(ren.dataset.path, name);
       });
@@ -3113,7 +3113,7 @@
     if (del) {
       closeRowMenus();
       const isDir = del.dataset.type === 'dir';
-      confirmDialog(`确认删除「${del.dataset.path}」${isDir ? '（目录将递归删除）' : ''}？\n此操作不可恢复！`, () => fileSess.delete(del.dataset.path));
+      confirmDialog(`确认删除「${del.dataset.path}」${isDir ? t('file.confirmDeleteDir') : ''}？\n此操作不可恢复！`, () => fileSess.delete(del.dataset.path));
     }
   });
   // 双击可编辑文件直接进入编辑器（下划线即视觉提示；触摸设备走 ⋯ 菜单的「编辑」）
@@ -3169,7 +3169,7 @@
       // 终端 head 里渲染器切换与「＋」也是 button.icon 且排在 ✕ 之前——取第一个会把
       // Esc 变成"切换渲染器"，弹窗关不掉（多标签后这几个按钮都在，误匹配更容易发生）。
       const closeBtn = [...open.querySelectorAll('.modal-head button.icon')]
-        .find((b) => /关闭/.test(b.title || '') || /关闭/.test(b.getAttribute('aria-label') || ''));
+        .find((b) => b.hasAttribute('data-close'));
       if (closeBtn) { closeBtn.click(); return; }
       // 无 ✕ 按钮的弹窗分派到各自的关闭入口（保持 dirty 确认/状态清理等既有逻辑）
       if (open.id === 'file-editor-modal') { $('#btn-editor-close').click(); return; }

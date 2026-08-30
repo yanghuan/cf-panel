@@ -4,6 +4,8 @@
 (() => {
   'use strict';
 
+  const t = (k, v) => (window.CfI18n ? window.CfI18n.t(k, v) : k); // i18n 缺席时回退显示 key（顺序由 index.html 保证，此处兜底） // i18n：协议层用户可见文案
+
   // ---------- 通用工具 ----------
   const $ = (sel) => document.querySelector(sel);
 
@@ -98,7 +100,7 @@
 
   // 监控常量与降采样
   const MONITOR_STEP_MAX = 240; // 长区间降采样目标点数
-  const MONITOR_RANGE_LABEL = { '1h': '近1小时', '12h': '近12小时', '3d': '近3天', '7d': '近7天', '30d': '近30天' };
+  const MONITOR_RANGE_LABEL = { '1h': t('monitor.range.1h'), '12h': t('monitor.range.12h'), '3d': t('monitor.range.3d'), '7d': t('monitor.range.7d'), '30d': t('monitor.range.30d') };
   const MONITOR_COLORS = ['#8b5cf6', '#22d3ee', '#f472b6', '#34d399', '#fbbf24', '#a78bfa'];
 
   // 长区间数据太多时按区间平均降采样，保证可读性
@@ -344,7 +346,7 @@
         s.onerror = () => {
           s.remove();
           loadedAssets.delete(src); // 失败清缓存：下次调用重试，不永久卡死
-          reject(new Error('加载失败：' + src));
+          reject(new Error(t('common.loadFail') + src));
         };
         document.head.appendChild(s);
       }));
@@ -361,7 +363,7 @@
         l.onerror = () => {
           l.remove();
           loadedAssets.delete(href);
-          reject(new Error('加载失败：' + href));
+          reject(new Error(t('common.loadFail') + href));
         };
         document.head.appendChild(l);
       }));
@@ -379,12 +381,12 @@
     if (!monacoPromise) {
       monacoPromise = (async () => {
         await loadScript(`${MONACO_BASE}/vs/loader.min.js`);
-        if (!window.require) throw new Error('Monaco loader 未初始化');
+        if (!window.require) throw new Error(t('utils.monacoLoader'));
         window.require.config({ paths: { vs: `${MONACO_BASE}/vs` } });
         await new Promise((resolve, reject) => {
           window.require(['vs/editor/editor.main'], resolve, reject);
         });
-        if (!window.monaco) throw new Error('Monaco 加载异常');
+        if (!window.monaco) throw new Error(t('utils.monacoError'));
         // blob proxy worker：跨域 CDN 无法直接 new Worker(cdn url)，经 blob importScripts 中转
         const src = `self.MonacoEnvironment={baseUrl:'${MONACO_BASE}/'};importScripts('${MONACO_BASE}/vs/base/worker/workerMain.js');`;
         window.MonacoEnvironment = {
@@ -414,7 +416,7 @@
         const m = markedMod.marked || markedMod.default;
         const p = purifyMod.default || purifyMod;
         if (!m || typeof m.parse !== 'function' || !p || typeof p.sanitize !== 'function') {
-          throw new Error('Markdown 组件加载异常');
+          throw new Error(t('utils.mdError'));
         }
         return { marked: m, purify: p };
       })().catch((e) => {

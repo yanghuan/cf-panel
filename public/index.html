@@ -81,7 +81,7 @@
   <div id="monitor-modal" class="monitor-modal hidden">
     <div class="modal-head">
       <span id="monitor-title"></span>
-      <button id="btn-monitor-close" class="ghost icon" aria-label="关闭" title="关闭" data-i18n-aria="common.close" data-i18n-title="common.close">✕</button>
+      <button id="btn-monitor-close" class="ghost icon" data-close aria-label="关闭" title="关闭" data-i18n-aria="common.close" data-i18n-title="common.close">✕</button>
     </div>
     <div class="range-btns">
       <button class="ghost range-btn" data-range="1h" data-i18n="monitor.btn.1h">1小时</button>
@@ -97,7 +97,7 @@
   <div id="stats-modal" class="monitor-modal hidden">
     <div class="modal-head">
       <span id="stats-title" data-i18n="stats.title">流量 / 可用率</span>
-      <button id="btn-stats-close" class="ghost icon" aria-label="关闭" title="关闭" data-i18n-aria="common.close" data-i18n-title="common.close">✕</button>
+      <button id="btn-stats-close" class="ghost icon" data-close aria-label="关闭" title="关闭" data-i18n-aria="common.close" data-i18n-title="common.close">✕</button>
     </div>
     <div class="range-btns">
       <button class="ghost range-btn" data-days="7" data-i18n="stats.range.7d">7天</button>
@@ -130,7 +130,7 @@
         <button id="btn-term-renderer" class="ghost icon" aria-label="切换渲染器" title="切换渲染器" data-i18n-aria="term.rendererTip" data-i18n-title="term.rendererTip">DOM</button>
         <button id="btn-term-new" class="ghost icon" aria-label="新标签" title="为当前服务器再开一个终端" data-i18n-title="term.newTab">＋</button>
       </div>
-      <button id="btn-term-close" class="ghost icon" aria-label="关闭全部终端" title="关闭全部" data-i18n-aria="term.closeAll" data-i18n-title="term.closeAll">✕</button>
+      <button id="btn-term-close" class="ghost icon" data-close aria-label="关闭全部终端" title="关闭全部" data-i18n-aria="term.closeAll" data-i18n-title="term.closeAll">✕</button>
     </div>
     <!-- 标签栏：一个标签 = 一个终端会话（✕ 只关该标签）；标签多时横向滚动 -->
     <div id="term-tabs" class="term-tabs"></div>
@@ -142,7 +142,7 @@
   <div id="file-modal" class="modal hidden">
     <div class="modal-head">
       <span id="file-title" data-i18n="file.title">文件管理</span>
-      <button id="btn-file-close" class="ghost icon" aria-label="关闭" title="关闭" data-i18n-aria="common.close" data-i18n-title="common.close">✕</button>
+      <button id="btn-file-close" class="ghost icon" data-close aria-label="关闭" title="关闭" data-i18n-aria="common.close" data-i18n-title="common.close">✕</button>
     </div>
     <div class="file-body">
       <div class="file-toolbar">
@@ -179,7 +179,7 @@
   <div id="chmod-modal" class="modal hidden">
     <div class="modal-head">
       <span data-i18n="chmod.title">权限</span>
-      <button id="btn-chmod-close" class="ghost icon" aria-label="关闭" title="关闭" data-i18n-aria="common.close" data-i18n-title="common.close">✕</button>
+      <button id="btn-chmod-close" class="ghost icon" data-close aria-label="关闭" title="关闭" data-i18n-aria="common.close" data-i18n-title="common.close">✕</button>
     </div>
     <div class="settings-body">
       <p class="muted" id="chmod-path" style="font-size:12px;word-break:break-all"></p>
@@ -258,7 +258,7 @@
   <div id="add-modal" class="modal hidden">
     <div class="modal-head">
       <span id="add-modal-title" data-i18n="server.add">添加服务器</span>
-      <button id="btn-add-close" class="ghost icon" aria-label="关闭" title="关闭" data-i18n-aria="common.close" data-i18n-title="common.close">✕</button>
+      <button id="btn-add-close" class="ghost icon" data-close aria-label="关闭" title="关闭" data-i18n-aria="common.close" data-i18n-title="common.close">✕</button>
     </div>
     <div class="settings-body">
       <div class="settings-row">
@@ -327,7 +327,7 @@
   <div id="site-modal" class="modal hidden">
     <div class="modal-head">
       <span data-i18n="settings.siteTitle">站点信息（公告对所有访客可见）</span>
-      <button id="btn-site-close" class="ghost icon" aria-label="关闭" title="关闭" data-i18n-aria="common.close" data-i18n-title="common.close">✕</button>
+      <button id="btn-site-close" class="ghost icon" data-close aria-label="关闭" title="关闭" data-i18n-aria="common.close" data-i18n-title="common.close">✕</button>
     </div>
     <div class="settings-body">
       <div class="settings-row">
@@ -351,7 +351,7 @@
   <div id="alerts-modal" class="modal hidden">
     <div class="modal-head">
       <span data-i18n="settings.alertsTitle">告警（Webhook，模板化）</span>
-      <button id="btn-alerts-close" class="ghost icon" aria-label="关闭" title="关闭" data-i18n-aria="common.close" data-i18n-title="common.close">✕</button>
+      <button id="btn-alerts-close" class="ghost icon" data-close aria-label="关闭" title="关闭" data-i18n-aria="common.close" data-i18n-title="common.close">✕</button>
     </div>
     <div class="settings-body">
       <div class="settings-row">
@@ -406,7 +406,7 @@
   <div id="tokens-modal" class="modal hidden">
     <div class="modal-head">
       <span data-i18n="token.title">访问令牌（PAT）</span>
-      <button id="btn-tokens-close" class="ghost icon" aria-label="关闭" title="关闭" data-i18n-aria="common.close" data-i18n-title="common.close">✕</button>
+      <button id="btn-tokens-close" class="ghost icon" data-close aria-label="关闭" title="关闭" data-i18n-aria="common.close" data-i18n-title="common.close">✕</button>
     </div>
     <div class="settings-body">
       <div class="settings-row">
@@ -434,7 +434,7 @@
   <div id="custom-setup-modal" class="modal hidden">
     <div class="modal-head">
       <span data-i18n="setup.customTitle">自定义指标设置</span>
-      <button id="btn-custom-setup-close" class="ghost icon" aria-label="关闭" title="关闭" data-i18n-aria="common.close" data-i18n-title="common.close">✕</button>
+      <button id="btn-custom-setup-close" class="ghost icon" data-close aria-label="关闭" title="关闭" data-i18n-aria="common.close" data-i18n-title="common.close">✕</button>
     </div>
     <div class="settings-body">
       <p class="muted" style="font-size:13px" data-i18n-html="setup.customHint">在目标机器的 <code>/etc/cf-panel-agent.env</code> 中配置 <code>CUSTOM_METRICS</code>（JSON 数组：<code>name</code> 指标名、<code>cmd</code> 采集命令），agent 会按上报周期执行命令采集数值指标；配置完成后可在该服务器卡片的「⋯ → 监控」中查看曲线。<br><strong>容量提示</strong>：每机每 1 个自定义指标约新增 1,440 行/天（30 天保留约 43,200 行）；建议每机 ≤20 个，避免 D1 免费 5GB 触顶（总占用 ≈ 43,200 × 服务器数 × 指标数 行）。</p>
@@ -453,7 +453,7 @@
   <div id="service-setup-modal" class="modal hidden">
     <div class="modal-head">
       <span data-i18n="setup.serviceTitle">服务监控设置</span>
-      <button id="btn-service-setup-close" class="ghost icon" aria-label="关闭" title="关闭" data-i18n-aria="common.close" data-i18n-title="common.close">✕</button>
+      <button id="btn-service-setup-close" class="ghost icon" data-close aria-label="关闭" title="关闭" data-i18n-aria="common.close" data-i18n-title="common.close">✕</button>
     </div>
     <div class="settings-body">
       <p class="muted" style="font-size:13px" data-i18n-html="setup.serviceHintHtml">配置 agent 的 <code>PROBES</code> 后可探测本机 HTTP/TCP 服务：探测结果会展示在服务器卡片的徽章上（绿=正常 / 红=异常），持续异常会触发 Webhook 告警。格式：<code>名称:类型:目标,...</code>，类型 <code>http</code>（URL，检查 2xx/3xx）或 <code>tcp</code>（host:port 测连通）。</p>
@@ -472,7 +472,7 @@
   <div id="audit-modal" class="modal hidden">
     <div class="modal-head">
       <span data-i18n="audit.titleWithDays">审计日志（保留 90 天）</span>
-      <button id="btn-audit-close" class="ghost icon" aria-label="关闭" title="关闭" data-i18n-aria="common.close" data-i18n-title="common.close">✕</button>
+      <button id="btn-audit-close" class="ghost icon" data-close aria-label="关闭" title="关闭" data-i18n-aria="common.close" data-i18n-title="common.close">✕</button>
     </div>
     <div class="settings-body">
       <div class="settings-row">
@@ -499,7 +499,7 @@
   <div id="usage-modal" class="modal hidden">
     <div class="modal-head">
       <span data-i18n="usage.titleWithNote">用量观测（额度估算）</span>
-      <button id="btn-usage-close" class="ghost icon" aria-label="关闭" title="关闭" data-i18n-aria="common.close" data-i18n-title="common.close">✕</button>
+      <button id="btn-usage-close" class="ghost icon" data-close aria-label="关闭" title="关闭" data-i18n-aria="common.close" data-i18n-title="common.close">✕</button>
     </div>
     <div class="settings-body">
       <div id="usage-est" class="usage-grid"></div>
@@ -512,7 +512,7 @@
   <div id="dialog" class="modal hidden">
     <div class="modal-head">
       <span id="dialog-title"></span>
-      <button id="btn-dialog-close" class="ghost icon" aria-label="关闭" title="关闭">✕</button>
+      <button id="btn-dialog-close" class="ghost icon" data-close aria-label="关闭" title="关闭">✕</button>
     </div>
     <div class="settings-body dialog-body">
       <pre id="dialog-text" class="dialog-text"></pre>

@@ -246,12 +246,18 @@ test('sanitizeReportPayload 磁盘 IO 嵌套对象白名单归一化', () => {
 
 // ---------------- 前端工具：系统路径 / 二进制扩展名 ----------------
 // utils.js 是浏览器全局脚本（window.CfUtils，无 ES export），mock 最小 DOM 环境后 eval 加载
+function loadI18nFirst() {
+  for (const f of ['public/i18n.js', 'public/lang/zh-CN.js']) {
+    (0, eval)(nodeFs.readFileSync(nodePath.join(nodePath.dirname(fileURLToPath(import.meta.url)), '..', f), 'utf8'));
+  }
+}
 function loadCfUtils() {
   globalThis.window = globalThis;
   // navigator 用 Node 内置只读全局即可（detectFlagEmoji 不依赖 UA，canvas ctx 为 null 走 catch）
   globalThis.document = { createElement: () => ({ getContext: () => null, width: 0, height: 0 }) };
   globalThis.HTMLElement = class HTMLElement { }; // utils.js IdleGuard 的 instanceof 引用
   globalThis.customElements = { define() { } }; // utils.js 顶部 customElements.define 调用
+  loadI18nFirst();
   const src = nodeFs.readFileSync(nodePath.join(nodePath.dirname(fileURLToPath(import.meta.url)), '../public/utils.js'), 'utf8');
   (0, eval)(src); // 间接 eval：全局作用域执行，挂载 window.CfUtils
   return globalThis.CfUtils;
@@ -259,6 +265,8 @@ function loadCfUtils() {
 const CfUtils = loadCfUtils();
 
 function loadCfApi() {
+  loadI18nFirst();
+
   const src = nodeFs.readFileSync(nodePath.join(nodePath.dirname(fileURLToPath(import.meta.url)), '../public/api.js'), 'utf8');
   (0, eval)(src);
   return globalThis.CfApi;
@@ -694,13 +702,19 @@ test('终端多标签：会话表取代单例，关闭时三类资源都要释�
   assert.match(app, /for \(const s of termSessions\.values\(\)\) s\.term\.options\.theme/);
 });
 
-test('Esc 关闭弹窗：按「关闭」语义筛选按钮，不得直接取第一个 button.icon', () => {
+test('Esc 关闭弹窗：按 data-close 属性识别关闭按钮，不取第一个 button.icon', () => {
   const root = nodePath.join(nodePath.dirname(fileURLToPath(import.meta.url)), '..');
   const app = nodeFs.readFileSync(nodePath.join(root, 'public/app.js'), 'utf8');
-  // 终端 head 的渲染器切换与「＋」都是 button.icon 且排在 ✕ 之前——
-  // 取第一个会把 Esc 变成"切换渲染器"，弹窗关不掉（多标签后按钮更多，更易误匹配）
+  // 终端 head 的渲染器切换与「＋」都是 button.icon 且排在 ✕ 之前——取第一个会把
+  // Esc 变成"切换渲染器"，弹窗关不掉；按 title/文案匹配又会随语言切换失效。
+  // data-close 属性与语言无关，是唯一可靠标识。
   assert.doesNotMatch(app, /open\.querySelector\('\.modal-head button\.icon'\)/);
-  assert.match(app, /关闭\/\.test\(b\.title/, '按 title/aria-label 含「关闭」筛选');
+  assert.doesNotMatch(app, /\/关闭\/\.test\(b\.title/, '不得按「关闭」文案匹配（切语言后失效）');
+  assert.match(app, /hasAttribute\('data-close'\)/, '按 data-close 属性筛选');
+  // index.html 的弹窗 ✕ 按钮必须都带 data-close（缺了该弹窗 Esc 关不掉）
+  const html = nodeFs.readFileSync(nodePath.join(root, 'public/index.html'), 'utf8');
+  const withClose = (html.match(/data-close aria-label="关闭/g) || []).length;
+  assert.ok(withClose >= 10, `弹窗关闭按钮应都带 data-close（当前 ${withClose} 个）`);
 });
 
 test('PWA：manifest 声明与图标文件齐备（支持"添加到主屏幕"）', () => {

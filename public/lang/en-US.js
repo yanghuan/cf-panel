@@ -255,6 +255,7 @@
     'usage.doEvents': 'DO events/day',
     'usage.d1Writes': 'D1 row writes/day',
     'usage.empty': 'No request counters yet (per Worker instance)',
+    'usage.times': 'times',
   };
 
   // ---------------- Terminal ----------------
@@ -505,10 +506,53 @@
     'idle.resumed': 'Live refresh resumed',
   };
 
+  // ---------------- Batch 2: chart tooltips / presets / validation / loader errors ----------------
+  const extra = {
+    'monitor.tipMemFull': 'Memory: {v} MB / {t} MB ({p}%)',
+    'monitor.tipMemShort': 'Memory: {v} MB',
+    'monitor.tipDiskFull': 'Disk: {u} / {t} ({p}%)',
+    'monitor.tipDiskPct': 'Disk: {p}%',
+    'monitor.unit.iops': 'ops/s',
+    'setup.presetDescGet': 'GET, token in URL',
+    'setup.presetDescPost': 'POST JSON, token in URL',
+    'setup.presetDescSlack': 'POST structured JSON, token via Header',
+    'setup.errArray': 'Must be an array',
+    'setup.errItem': 'Each item needs name and cmd',
+    'token.errExpiry': 'Unrecognized expiry: enter days (e.g. 30) or a date (e.g. 2026/9/5 14:00)',
+    'token.errPast': 'The expiry time is in the past — pick again',
+    'server.updateConfirmTitle': 'Update Agent on "{name}" to {target}?',
+    'server.updateConfirmBody': 'This closes the node\'s terminal/file sessions and goes offline briefly; the new binary is started by supervisor.',
+    'idle.confirmBody': 'Idle for a while. To save Cloudflare quota, live refresh will pause (agent back to slow sampling).\n\nClick "OK" to keep watching, or "Cancel" to pause; auto-pauses after 60s.',
+    'term.rendererTipWebgl': 'Current tab renderer: WebGL (GPU-accelerated, smoother for heavy output) — click to switch to DOM',
+    'term.rendererTipDom': 'Current tab renderer: DOM (compatible fallback) — click to switch to WebGL',
+    'term.webglLoadError': 'WebGL renderer addon failed to load',
+    'term.componentLoadFail': 'Failed to load terminal component',
+    'term.closeTab': 'Close this terminal',
+    'file.interrupted': '(interrupted: {msg})',
+    'file.skipped': '(skipped)',
+    'file.uploadBatchFailList': 'Failed: {list}',
+    'stats.datasetAvail': 'Uptime %',
+    'stats.tipAvail': 'Uptime: {v}',
+    'audit.exportFail': 'Export failed: HTTP {status}',
+    'common.chartLibFail': 'Failed to load chart library',
+    'common.loadFail': 'Failed to load: ',
+    'utils.monacoLoader': 'Monaco loader not initialized',
+    'utils.monacoError': 'Monaco load error',
+    'utils.mdError': 'Markdown components load error',
+    'file.errUpBusy': 'An upload is already in progress, please wait',
+    'file.errFileMax': 'File exceeds the 500MB limit',
+    'file.errDlBusy': 'A download is already in progress, please wait',
+    'file.errEmpty': 'Empty file, nothing to download',
+    'file.errZipEmpty': 'Directory is empty, nothing to zip',
+    'file.errReadFail': 'Failed to read file (empty or changed)',
+    'file.errBinary': 'Binary file detected — inline editing disabled (saving would corrupt it)',
+    'file.errShrunk': 'File changed or shrank — download aborted ({done}/{size} bytes done)',
+  };
+
   window.CfI18n.register(
     'en-US',
     Object.assign({}, common, login, menu, overview, server, settings,
-      token, audit, usage, term, file, chmod, monitor, stats, setup, idle),
+      token, audit, usage, term, file, chmod, monitor, stats, setup, idle, extra),
     { label: 'English' }
   );
 })();

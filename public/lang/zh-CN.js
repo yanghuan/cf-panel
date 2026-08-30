@@ -254,6 +254,7 @@
     'usage.doEvents': 'DO 事件/天',
     'usage.d1Writes': 'D1 写行/天',
     'usage.empty': '暂无请求计数（Worker 实例级）',
+    'usage.times': '次',
   };
 
   // ---------------- 终端 ----------------
@@ -503,10 +504,53 @@
     'idle.resumed': '已恢复实时刷新',
   };
 
+  // ---------------- 第二批提取（图表 tooltip/预设/校验/加载错误等） ----------------
+  const extra = {
+    'monitor.tipMemFull': '内存：{v} MB / {t} MB（{p}%）',
+    'monitor.tipMemShort': '内存：{v} MB',
+    'monitor.tipDiskFull': '磁盘：{u} / {t}（{p}%）',
+    'monitor.tipDiskPct': '磁盘：{p}%',
+    'monitor.unit.iops': '次/秒',
+    'setup.presetDescGet': 'GET，token 在 URL',
+    'setup.presetDescPost': 'POST JSON，token 在 URL',
+    'setup.presetDescSlack': 'POST 结构化 JSON，token 走 Header',
+    'setup.errArray': '必须是数组',
+    'setup.errItem': '每项需包含 name 与 cmd',
+    'token.errExpiry': '无法识别的有效期：请输入天数（如 30）或截止日期（如 2026/9/5 14:00）',
+    'token.errPast': '截止时间已过去，请重新选择',
+    'server.updateConfirmTitle': '确认将「{name}」Agent 更新到 {target}？',
+    'server.updateConfirmBody': '更新会关闭该节点现有终端/文件会话，并短暂离线；成功后由 supervisor 自动重启。',
+    'idle.confirmBody': '长时间未操作。为节省 Cloudflare 额度，将暂停实时刷新（agent 将恢复慢采）。\n\n点击「确认」继续观看，或「取消」暂停；60 秒无响应将自动暂停。',
+    'term.rendererTipWebgl': '当前标签渲染器：WebGL（GPU 加速，刷日志更流畅）——点击切换为 DOM',
+    'term.rendererTipDom': '当前标签渲染器：DOM（兼容兜底）——点击切换为 WebGL',
+    'term.webglLoadError': 'WebGL 渲染器插件加载异常',
+    'term.componentLoadFail': '终端组件加载失败',
+    'term.closeTab': '关闭该终端',
+    'file.interrupted': '（中断：{msg}）',
+    'file.skipped': '（已跳过）',
+    'file.uploadBatchFailList': '失败：{list}',
+    'stats.datasetAvail': '可用率 %',
+    'stats.tipAvail': '可用率：{v}',
+    'audit.exportFail': '导出失败：HTTP {status}',
+    'common.chartLibFail': '图表库加载失败',
+    'common.loadFail': '加载失败：',
+    'utils.monacoLoader': 'Monaco loader 未初始化',
+    'utils.monacoError': 'Monaco 加载异常',
+    'utils.mdError': 'Markdown 组件加载异常',
+    'file.errUpBusy': '已有上传进行中，请等待完成',
+    'file.errFileMax': '文件超过 500MB 限制',
+    'file.errDlBusy': '已有下载进行中，请等待完成',
+    'file.errEmpty': '空文件，无需下载',
+    'file.errZipEmpty': '目录为空，无内容可打包',
+    'file.errReadFail': '读取文件失败（为空或已变化）',
+    'file.errBinary': '检测到二进制文件，不支持在线编辑（保存会损坏内容）',
+    'file.errShrunk': '文件已变化或缩短，中止下载（已完成 {done}/{size} 字节）',
+  };
+
   window.CfI18n.register(
     'zh-CN',
     Object.assign({}, common, login, menu, overview, server, settings,
-      token, audit, usage, term, file, chmod, monitor, stats, setup, idle),
+      token, audit, usage, term, file, chmod, monitor, stats, setup, idle, extra),
     { label: '简体中文' }
   );
 })();

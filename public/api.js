@@ -4,6 +4,8 @@
 (() => {
   'use strict';
 
+  const t = (k, v) => (window.CfI18n ? window.CfI18n.t(k, v) : k); // i18n 缺席时回退显示 key（顺序由 index.html 保证，此处兜底） // i18n：协议层用户可见文案
+
   // 文件协议常量（文件会话专用）
   const FILE_CHUNK = 512 * 1024;       // 分段传输块大小 512KB（Binary 混合帧直传无 base64；
   // 512KB 远小于 workerd WS 1MB 消息限制与 agent 侧 READ_BLOCK/WS_MSG_LIMIT）
@@ -158,8 +160,8 @@
     // ---------- 上传状态机（stop-and-wait：等 write_result 确认才发下一块） ----------
     // opts.path：显式目标绝对路径（在线编辑器保存用，避免编辑期间 cwd 变化写错位置）
     upload(file, opts) {
-      if (this.uploadState) { if (this.h.onError) this.h.onError('已有上传进行中，请等待完成'); return; }
-      if (file.size > FILE_MAX) { if (this.h.onError) this.h.onError('文件超过 500MB 限制'); return; }
+      if (this.uploadState) { if (this.h.onError) this.h.onError(t('file.errUpBusy')); return; }
+      if (file.size > FILE_MAX) { if (this.h.onError) this.h.onError(t('file.errFileMax')); return; }
       const uploadId = (window.crypto && crypto.randomUUID) ? crypto.randomUUID() : String(Date.now()) + '-' + Math.random().toString(36).slice(2);
       // overwrite：目标已存在时是否覆盖（默认 false，服务端首块强制校验，与签名上传路径语义一致）
       const path = (opts && opts.path) || CfUtils.fileJoin(this.cwd, file.name);
@@ -206,9 +208,9 @@
 
     // ---------- 下载状态机（分段拉取，Blob 直引 parts） ----------
     download(path, size) {
-      if (this.downloadState) { if (this.h.onError) this.h.onError('已有下载进行中，请等待完成'); return; } // 并发防护
-      if (size > FILE_MAX) { if (this.h.onError) this.h.onError('文件超过 500MB 限制'); return; }
-      if (size <= 0) { if (this.h.onError) this.h.onError('空文件，无需下载'); return; }
+      if (this.downloadState) { if (this.h.onError) this.h.onError(t('file.errDlBusy')); return; } // 并发防护
+      if (size > FILE_MAX) { if (this.h.onError) this.h.onError(t('file.errFileMax')); return; }
+      if (size <= 0) { if (this.h.onError) this.h.onError(t('file.errEmpty')); return; }
       this.downloadState = { path, size, parts: [], received: 0 };
       if (this.h.onDownloadProgress) this.h.onDownloadProgress(0);
       this.send({ type: 'read', path, offset: 0, limit: FILE_CHUNK });
@@ -221,12 +223,12 @@
     // 目录打包 zip 下载：agent 端生成临时 dl-{sid}.zip（zip_result 带 path/size），
     // 分段 read 拉取完成后发 delete 清理临时文件（文件名用目录名.zip）
     zipDownload(path) {
-      if (this.downloadState) { if (this.h.onError) this.h.onError('已有下载进行中，请等待完成'); return; }
+      if (this.downloadState) { if (this.h.onError) this.h.onError(t('file.errDlBusy')); return; }
       this._zipBaseName = (CfUtils.fileBase(path) || 'download') + '.zip';
       this.send({ type: 'zip', path });
     }
     _startZipDownload(zipPath, size) {
-      if (size <= 0) { if (this.h.onError) this.h.onError('目录为空，无内容可打包'); return; }
+      if (size <= 0) { if (this.h.onError) this.h.onError(t('file.errZipEmpty')); return; }
       this.downloadState = { path: zipPath, size, parts: [], received: 0, isZip: true, dlName: this._zipBaseName };
       if (this.h.onDownloadProgress) this.h.onDownloadProgress(0);
       this.send({ type: 'read', path: zipPath, offset: 0, limit: FILE_CHUNK });
@@ -271,7 +273,7 @@
         }
         if (j.got === 0 || !data) {
           this.editState = null;
-          if (this.h.onError) this.h.onError('读取文件失败（为空或已变化）');
+          if (this.h.onError) this.h.onError(t('file.errReadFail'));
           return;
         }
         ed.parts.push(data);
@@ -286,7 +288,7 @@
           const fffd = (text.match(/\uFFFD/g) || []).length;
           if (fffd > 0 && fffd / Math.max(all.length, 1) > 0.01) {
             this.editState = null;
-            if (this.h.onError) this.h.onError('检测到二进制文件，不支持在线编辑（保存会损坏内容）');
+            if (this.h.onError) this.h.onError(t('file.errBinary'));
             return;
           }
           this.editState = null;
@@ -301,7 +303,7 @@
       if (j.got === 0) {
         // EOF 未达预期 size → 文件已缩短/被替换，中止（zip 临时文件同步清理）
         if (d.isZip) { this._zipCleanup = true; this.send({ type: 'delete', path: d.path }); }
-        const msg = `文件已变化或缩短，中止下载（已完成 ${d.received}/${d.size} 字节）`;
+        const msg = t('file.errShrunk', { done: d.received, size: d.size });
         this.downloadState = null;
         if (this.h.onDownloadCanceled) this.h.onDownloadCanceled();
         if (this.h.onError) this.h.onError(msg);
@@ -360,10 +362,10 @@
           if (this.closed) return;
           if (this.retries < TERM_RETRY_MAX) {
             this.retries += 1;
-            this.term.write(`\r\n[创建会话失败：${e.message}，${this.retries}s 后重试]\r\n`);
+            this.term.write(`\r\n${t('term.createFailedRetry', { err: e.message, n: this.retries })}\r\n`);
             setTimeout(() => this.open(this.serverId), this.retries * 1000);
           } else {
-            this.term.write(`\r\n[创建会话失败：${e.message}]\r\n`);
+            this.term.write(`\r\n${t('term.createFailed', { err: e.message })}\r\n`);
           }
         });
     }
@@ -381,7 +383,7 @@
       this.noDataTimer = setTimeout(() => {
         this.noDataTimer = null;
         if (this.closed || this.rebuilding) return;
-        this.term.write('\r\n\x1b[90m[会话无响应，正在重建...]\x1b[0m\r\n');
+        this.term.write(`\r\n${t('term.rebuilding')}\x1b[0m\r\n`);
         this.rebuilding = true;
         try { w.close(); } catch { /* ignore */ }
         this.open(this.serverId);
@@ -399,16 +401,16 @@
       if (ev && ev.code === 1008) {
         // 鉴权已失效（PAT 撤销/服务端拒绝）：关闭会话并回登录页，不再重连
         this.closed = true;
-        this.term.write('\r\n\x1b[90m[权限已失效，连接已关闭]\x1b[0m\r\n');
+        this.term.write(`\r\n${t('term.authExpired')}\x1b[0m\r\n`);
         if (this.h.onAuthFail) this.h.onAuthFail();
         return;
       }
       if (this.retries < TERM_RETRY_MAX) {
         this.retries += 1;
-        this.term.write(`\r\n\x1b[90m[连接断开，${this.retries}s 后自动重连...]\x1b[0m\r\n`);
+        this.term.write(`\r\n\x1b[90m${t('term.connecting', { n: this.retries })}\x1b[0m\r\n`);
         setTimeout(() => this.open(this.serverId), this.retries * 1000);
       } else {
-        this.term.write('\r\n\x1b[90m[连接已关闭]\x1b[0m\r\n');
+        this.term.write(`\r\n${t('term.closed')}\x1b[0m\r\n`);
       }
     }
     send(data) { if (this.connected) this.ws.send(data); }

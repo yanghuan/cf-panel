@@ -1197,6 +1197,12 @@
 
   // 输入词驱动：递归模式走 find，过滤模式走 list
   function runSearchOrFilter() {
+    if (!fileSess.connected) {
+      // WS 断开时 list/find 都会静默丢弃（send 判 connected）——显式提示并自动重连
+      toast(t('file.disconnected'));
+      fileSess.reconnect();
+      return;
+    }
     if (findMode) doFind();
     else reloadFileList();
   }

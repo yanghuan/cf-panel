@@ -784,8 +784,6 @@ button.danger:hover { background: rgba(248, 113, 113, .12); }
   box-shadow: 0 2px 12px rgba(99, 102, 241, .28);
 }
 .file-upload:hover { filter: brightness(1.12); }
-/* 文件名通配符过滤输入框（type=text 基础外观继承全局样式） */
-.file-filter { width: 100%; margin-bottom: 12px; }
 .file-table { width: 100%; border-collapse: collapse; font-size: 13px; }
 .file-table th, .file-table td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); }
 .file-table th { color: var(--muted); font-weight: 600; font-size: 12px; }
@@ -798,18 +796,35 @@ button.danger:hover { background: rgba(248, 113, 113, .12); }
   white-space: nowrap;
 }
 
-/* 过滤/递归搜索二合一：输入框 + 框内右侧模式切换按钮（复用 tok-cal-btn 的内嵌定位思路） */
+/* 过滤/递归搜索二合一：输入框 + 右侧 switch 开关。
+   布局用 flex（align-items:center）保证开关与输入框**始终垂直居中**——
+   不用 absolute+top:50%，那会被容器高度变化（行内其他元素拉伸）带偏 */
 .file-filter-row { display: flex; gap: 8px; align-items: center; }
-.file-filter-wrap { flex: 1 1 240px; min-width: 0; }
-.file-filter { width: 100%; padding-right: 64px; } /* 右侧留出「递归」按钮宽度 */
-/* switch 开关样式：滑轨 + 滑块（::after），激活态滑向右侧并变主题色。
-   无文字——语义由 role="switch" + aria-pressed + aria-label 承担，
-   模式含义由输入框 placeholder 与按钮 title 随语言/状态说明 */
+.file-filter-wrap {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex: 1 1 240px;
+  min-width: 0;
+  padding: 0 8px 0 0;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: rgba(20, 25, 40, .6);
+}
+.file-filter-wrap:focus-within { border-color: var(--accent); }
+.file-filter {
+  flex: 1;
+  min-width: 0;
+  border: none;
+  background: transparent;
+}
+.file-filter:focus { outline: none; box-shadow: none; }
+/* switch 开关：滑轨 + 滑块（::after），激活态滑向右侧并变主题色。
+   语义由 role="switch" + aria-pressed + aria-label 承担；
+   ::before 把命中区向四周扩 8px——34×18 的滑轨太小，是此前"经常点不到"的原因之一 */
 .find-toggle {
-  position: absolute;
-  right: 8px;
-  top: 50%;
-  transform: translateY(-50%);
+  position: relative;
+  flex-shrink: 0;
   width: 34px;
   height: 18px;
   border-radius: 9px;
@@ -818,6 +833,11 @@ button.danger:hover { background: rgba(248, 113, 113, .12); }
   background: var(--border);
   cursor: pointer;
   transition: background .18s ease;
+}
+.find-toggle::before {
+  content: '';
+  position: absolute;
+  inset: -8px; /* 扩大点击热区 */
 }
 .find-toggle::after {
   content: '';

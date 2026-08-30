@@ -280,7 +280,7 @@
         if (s && updatingAgents.has(s.id)) {
           cell += ` <span class="mt-updating">${escapeHtml(t('server.updating'))}</span>`;
         } else if (s && agentUpdateAvailable(s)) {
-          cell += ` <button class="mt-update" data-act="agent-update" data-id="${s.id}" data-name="${escapeHtml(s.name)}" title="${escapeHtml(t('server.updateTip', { from: info.agent_version, to: latestAgent.build_id }))}"${escapeHtml(t('server.updatable'))}</button>`;
+          cell += ` <button class="mt-update" data-act="agent-update" data-id="${s.id}" data-name="${escapeHtml(s.name)}" title="${escapeHtml(t('server.updateTip', { from: info.agent_version, to: latestAgent.build_id }))}">${escapeHtml(t('server.updatable'))}</button>`;
         }
         sysRows += `<div class="mt-row"><span>Agent</span><b>${cell}</b></div>`;
       }

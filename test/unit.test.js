@@ -717,6 +717,14 @@ test('Esc 关闭弹窗：按 data-close 属性识别关闭按钮，不取第一�
   assert.ok(withClose >= 10, `弹窗关闭按钮应都带 data-close（当前 ${withClose} 个）`);
 });
 
+test('metricTipHtml 更新按钮：属性闭合后才能跟文本（批量替换曾吞 > 导致按钮空文本）', () => {
+  const root = nodePath.join(nodePath.dirname(fileURLToPath(import.meta.url)), '..');
+  const app = nodeFs.readFileSync(nodePath.join(root, 'public/app.js'), 'utf8');
+  // 短语替换把「>↻ 可更新」的 > 一起吞掉后，按钮文本被浏览器解析成无引号属性——
+  // 按钮只剩纯色没有文字。锁定正确的属性闭合形态，防同类回归。
+  assert.match(app, /\}">\$\{escapeHtml\(t\('server\.updatable'\)\)\}<\/button>/);
+});
+
 test('PWA：manifest 声明与图标文件齐备（支持"添加到主屏幕"）', () => {
   const root = nodePath.join(nodePath.dirname(fileURLToPath(import.meta.url)), '..');
   const html = nodeFs.readFileSync(nodePath.join(root, 'public/index.html'), 'utf8');

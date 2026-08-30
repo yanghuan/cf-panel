@@ -1074,11 +1074,11 @@ a.f-dir.f-prot { opacity: .55; }
 }
 .ao-title { font-size: 13px; font-weight: 600; color: var(--text); margin-bottom: 8px; }
 .ao-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 10px 8px; }
-/* 指标名常驻在输入框上方（label 上置）：field-tag 的"placeholder 显示时隐藏"
-   规则与这里的常驻 placeholder（动态显示全局值）互斥，标签必须独立于输入框 */
-.ao-item { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
-.ao-item label { font-size: 11px; color: var(--muted); }
-.ao-item input { width: 100%; }
+/* 告警覆盖的 tag 需与 placeholder 共存：左侧 placeholder 动态显示全局值
+   （"全局 90"/"继承全局"），右侧 field-tag 常驻显示指标名——覆盖全局的
+   "placeholder 显示时隐藏 tag"规则。不重叠的依据：.field input 已预留
+   48px 右侧 padding，placeholder 最长"全局 180s"（约 56px）不会越界 */
+.ao-field input:placeholder-shown ~ .field-tag { display: block; }
 
 /* ---------- 流量 / 可用率（按天账） ---------- */
 .stats-summary {

@@ -1158,15 +1158,52 @@
     fileSess.list(fileSess.cwd, $('#file-filter').value);
   }
 
-  // ---------- 递归搜索（find）：从当前目录下钻子目录匹配文件名 ----------
-  // 与「过滤」的分工：过滤只看当前目录（agent 端先过滤再截断 1000 条），
-  // 搜索递归下钻——大目录树里定位文件只能靠它。有搜索词时忽略过滤词（两者互斥）。
-  let fileFindState = null; // { pattern, truncated, scanned }；null = 正常目录浏览
+  // ---------- 过滤 / 递归搜索（二合一：一个输入框 + 框内右侧模式切换） ----------
+  // 两种模式共用同一个输入框：「过滤」只看当前目录（list pattern，agent 端先
+  // 过滤再截断 1000 条）；「递归」下钻子目录（find）——大目录树里定位文件靠它。
+  let findMode = false;     // false = 过滤当前目录；true = 递归搜索
+  let fileFindState = null; // { pattern, truncated, scanned }；非 null = 当前显示的是搜索结果
   let fileFindTimer = null;
 
+  // 同步切换按钮/输入框占位/清除按钮的显隐（模式与状态变化的唯一出口）
+  function syncFindUI() {
+    const btn = $('#btn-find-toggle');
+    if (btn) {
+      btn.classList.toggle('active', findMode);
+      btn.setAttribute('aria-pressed', findMode ? 'true' : 'false');
+      btn.title = t(findMode ? 'file.findToggleTitleOn' : 'file.findToggleTitleOff');
+    }
+    const inp = $('#file-filter');
+    if (inp) inp.placeholder = t(findMode ? 'file.find' : 'file.filter');
+    const clr = $('#btn-find-clear');
+    if (clr) clr.classList.toggle('hidden', !findMode && !String(inp ? inp.value : '').trim());
+  }
+
+  function setFindMode(on) {
+    findMode = !!on;
+    syncFindUI();
+  }
+
+  function toggleFindMode() {
+    setFindMode(!findMode);
+    runSearchOrFilter(); // 按当前词立即执行新模式（无词时清空列表区并复位清除按钮）
+  }
+
+  // 输入词驱动：递归模式走 find，过滤模式走 list
+  function runSearchOrFilter() {
+    if (findMode) doFind();
+    else reloadFileList();
+  }
+
   function doFind() {
-    const kw = String($('#file-find').value || '').trim();
-    if (!kw) { clearFind(); return; }
+    const kw = String($('#file-filter').value || '').trim();
+    if (!kw) {
+      fileFindState = null;
+      $('#file-list').innerHTML = `<tr><td colspan="5" class="muted">${escapeHtml(t('file.emptyDir'))}</td></tr>`;
+      $('#file-msg').textContent = '';
+      syncFindUI();
+      return;
+    }
     if (isSystemPath(fileSess.cwd)) return toast(t('file.protectedFind'));
     fileFindState = { pattern: kw, truncated: false, scanned: 0 };
     $('#btn-find-clear').classList.remove('hidden');
@@ -1176,8 +1213,8 @@
 
   function clearFind() {
     fileFindState = null;
-    $('#file-find').value = '';
-    $('#btn-find-clear').classList.add('hidden');
+    $('#file-filter').value = '';
+    setFindMode(false);
     reloadFileList(); // 回到正常目录浏览
   }
 
@@ -1215,7 +1252,7 @@
     $('#file-filter').value = '';
     // 新会话不保留上次的搜索态（直接重置，不调 clearFind——它会触发尚未建立连接的 reload）
     fileFindState = null;
-    $('#file-find').value = '';
+    setFindMode(false);
     $('#btn-find-clear').classList.add('hidden');
     $('#file-msg').textContent = '';
     $('#file-list').innerHTML = `<tr><td colspan="5" class="muted">${escapeHtml(t('file.connecting'))}</td></tr>`;
@@ -3038,19 +3075,16 @@
     const a = e.target.closest('a.f-dir');
     if (a) selEnter(a.dataset.path);
   });
-  // 文件名通配符过滤：debounce 后发 list（pattern 由 agent 端匹配，先过滤再截断）
+  // 过滤/递归共用一个输入框：debounce 后按模式分发（递归 400ms——全树遍历代价更高）
   $('#file-filter').addEventListener('input', () => {
     clearTimeout(fileFilterTimer);
-    fileFilterTimer = setTimeout(reloadFileList, 200);
+    fileFilterTimer = setTimeout(runSearchOrFilter, findMode ? 400 : 200);
   });
-  // 递归搜索：debounce 更久（400ms）——每键一次全树遍历代价远高于单目录 list
-  $('#file-find').addEventListener('input', () => {
-    clearTimeout(fileFindTimer);
-    fileFindTimer = setTimeout(doFind, 400);
+  $('#file-filter').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') { clearTimeout(fileFilterTimer); runSearchOrFilter(); }
   });
-  $('#file-find').addEventListener('keydown', (e) => {
-    if (e.key === 'Enter') { clearTimeout(fileFindTimer); doFind(); }
-  });
+  // 模式切换：递归开 = 输入即下钻子目录；关 = 只过滤当前目录
+  $('#btn-find-toggle').onclick = toggleFindMode;
   $('#btn-find-clear').onclick = clearFind;
   // 行操作下拉菜单：⋯ 切换显隐；点菜单项执行操作；点其他区域关闭
   $('#file-list').addEventListener('click', (e) => {

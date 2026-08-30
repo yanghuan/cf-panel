@@ -798,9 +798,26 @@ button.danger:hover { background: rgba(248, 113, 113, .12); }
   white-space: nowrap;
 }
 
-/* 过滤与递归搜索并排：前者只看当前目录，后者下钻子目录（窄屏自动换行） */
-.file-filter-row { display: flex; gap: 8px; flex-wrap: wrap; }
-.file-filter, .file-find { flex: 1 1 200px; min-width: 0; }
+/* 过滤/递归搜索二合一：输入框 + 框内右侧模式切换按钮（复用 tok-cal-btn 的内嵌定位思路） */
+.file-filter-row { display: flex; gap: 8px; align-items: center; }
+.file-filter-wrap { flex: 1 1 240px; min-width: 0; }
+.file-filter { width: 100%; padding-right: 64px; } /* 右侧留出「递归」按钮宽度 */
+.find-toggle {
+  position: absolute;
+  right: 8px;
+  top: 50%;
+  transform: translateY(-50%);
+  font-size: 11px;
+  padding: 3px 9px;
+  line-height: 1;
+  pointer-events: auto;
+}
+.find-toggle.active {
+  color: var(--accent-2);
+  border-color: var(--accent);
+  background: rgba(99, 102, 241, .12);
+  font-weight: 600;
+}
 
 /* ---------- 语言菜单（☰ 下拉底部） ---------- */
 .dd-sep { height: 1px; background: var(--border); margin: 6px 0; }

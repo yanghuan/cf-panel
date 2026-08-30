@@ -156,9 +156,13 @@
         <button id="btn-file-cancel" class="ghost hidden" data-i18n="file.cancelUpload">取消上传</button>
         <button id="btn-dl-cancel" class="ghost hidden" data-i18n="file.cancelDownload">取消下载</button>
       </div>
+      <!-- 过滤/递归搜索二合一：一个输入框 + 框内右侧模式切换按钮。
+           递归关 = 只过滤当前目录（list pattern）；递归开 = 下钻子目录（find） -->
       <div class="file-filter-row">
-        <input id="file-filter" class="file-filter" type="text" placeholder="过滤当前目录（支持 * 和 ? 通配符）" data-i18n-ph="file.filter" />
-        <input id="file-find" class="file-find" type="text" placeholder="递归搜索（含子目录，如 *.log）" data-i18n-ph="file.find" />
+        <div class="field file-filter-wrap">
+          <input id="file-filter" class="file-filter" type="text" placeholder="过滤当前目录（支持 * 和 ? 通配符）" data-i18n-ph="file.filter" />
+          <button id="btn-find-toggle" class="ghost find-toggle" aria-pressed="false" data-i18n="file.findToggle">递归</button>
+        </div>
         <button id="btn-find-clear" class="ghost hidden" data-i18n="file.findClear">清除</button>
       </div>
       <p id="file-msg" class="msg"></p>

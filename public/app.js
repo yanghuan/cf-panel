@@ -1153,8 +1153,10 @@
   // 重新拉取列表（带当前过滤规则）。过滤在 agent 端完成（先过滤再截断 1000 条），
   // 避免大目录下前端只拿到截断区间子集而遗漏匹配文件
   function reloadFileList() {
-    // 搜索模式下"刷新"要重跑搜索——否则 list 结果会把搜索结果覆盖掉
-    if (fileFindState) { doFind(); return; }
+    // 分发按 findMode（模式开关）而非 fileFindState（结果态）：
+    // 后者只在结果返回后置位，作为分发依据会让"退出递归"的首次刷新仍走 doFind
+    if (findMode) { doFind(); return; }
+    fileFindState = null;
     fileSess.list(fileSess.cwd, $('#file-filter').value);
   }
 
@@ -1186,6 +1188,10 @@
 
   function toggleFindMode() {
     setFindMode(!findMode);
+    // 退出递归时必须清搜索结果态：reloadFileList 按 findMode 分发（见下），
+    // 但残留的 fileFindState 会让 onFindDone 迟到响应继续覆盖列表——
+    // 表现即"点了开关没反应"，界面停在搜索结果回不到过滤模式
+    if (!findMode) fileFindState = null;
     runSearchOrFilter(); // 按当前词立即执行新模式（无词时清空列表区并复位清除按钮）
   }
 

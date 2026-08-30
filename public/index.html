@@ -161,7 +161,7 @@
       <div class="file-filter-row">
         <div class="field file-filter-wrap">
           <input id="file-filter" class="file-filter" type="text" placeholder="过滤当前目录（支持 * 和 ? 通配符）" data-i18n-ph="file.filter" />
-          <button id="btn-find-toggle" class="ghost find-toggle" aria-pressed="false" data-i18n="file.findToggle">递归</button>
+          <button id="btn-find-toggle" type="button" class="find-toggle" role="switch" aria-pressed="false" aria-label="递归搜索" data-i18n-aria="file.findToggle" title="切换为递归搜索（含子目录）" data-i18n-title="file.findToggleTitleOff"></button>
         </div>
         <button id="btn-find-clear" class="ghost hidden" data-i18n="file.findClear">清除</button>
       </div>

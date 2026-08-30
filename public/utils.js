@@ -100,7 +100,6 @@
 
   // 监控常量与降采样
   const MONITOR_STEP_MAX = 240; // 长区间降采样目标点数
-  const MONITOR_RANGE_LABEL = { '1h': t('monitor.range.1h'), '12h': t('monitor.range.12h'), '3d': t('monitor.range.3d'), '7d': t('monitor.range.7d'), '30d': t('monitor.range.30d') };
   const MONITOR_COLORS = ['#8b5cf6', '#22d3ee', '#f472b6', '#34d399', '#fbbf24', '#a78bfa'];
 
   // 长区间数据太多时按区间平均降采样，保证可读性
@@ -525,7 +524,7 @@
   window.CfUtils = {
     $, escapeHtml, fmtBytes, normalizeFileEntry, fileJoin, fileParent, fileBase, downsample, modeText,
     lockScroll, unlockScroll,
-    MONITOR_STEP_MAX, MONITOR_RANGE_LABEL, MONITOR_COLORS,
+    MONITOR_STEP_MAX, MONITOR_COLORS,
     GEO_PRIVATE, geoLookup, flagHtml, osIconHtml, isSystemPath, isBinaryExt, loadScript, loadCss, loadMonaco, loadMarkdown, setGeoEnabled, IdleGuard,
   };
 })();

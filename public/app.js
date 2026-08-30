@@ -3,7 +3,7 @@
   'use strict';
   // 工具函数与 <cf-ip> 组件从 utils.js 解构；api 层从 api.js 解构（index.html 中均须先加载）
   const { $, escapeHtml, fmtBytes, normalizeFileEntry, fileJoin, fileParent, fileBase, downsample, lockScroll, unlockScroll,
-          MONITOR_STEP_MAX, MONITOR_RANGE_LABEL, MONITOR_COLORS,
+          MONITOR_STEP_MAX, MONITOR_COLORS,
           GEO_PRIVATE, setGeoEnabled, flagHtml, osIconHtml, isSystemPath, isBinaryExt, modeText, loadScript, loadCss, loadMonaco, loadMarkdown, geoLookup, IdleGuard } = CfUtils;
   const { api, setTokenGetter, FileSession, TermSession, PushSession } = CfApi;
   // i18n：所有面向用户的文案一律走 t(key)，代码里不留中文字面量。
@@ -1186,6 +1186,7 @@
   }
 
   function toggleFindMode() {
+    clearTimeout(fileFilterTimer); // 丢弃挂起的 debounce：避免切换后同词再跑一次重复请求
     setFindMode(!findMode);
     // 退出递归时必须清搜索结果态：reloadFileList 按 findMode 分发（见下），
     // 但残留的 fileFindState 会让 onFindDone 迟到响应继续覆盖列表——
@@ -1732,6 +1733,17 @@
   async function showMonitor(serverId, serverName, range) {
     range = range || '12h';
     monitorState = { serverId, serverName, range };
+    document.querySelectorAll('.range-btn').forEach((b) => b.classList.toggle('active', b.dataset.range === range));
+    const alreadyOpen = !$('#monitor-modal').classList.contains('hidden');
+    $('#monitor-modal').classList.remove('hidden'); // 先显示，保证 canvas 有尺寸
+    if (!alreadyOpen) lockScroll(); // 语言切换重渲染等场景弹窗已打开，不重复锁（计数栈会失衡）
+    await refreshMonitorView();
+  }
+
+  // 拉取并渲染监控视图（不含弹窗打开/滚动锁）——首次打开与语言切换重渲染共用：
+  // 标题/range 标签在渲染那一刻求值，切语言后须整体重取才能跟随
+  async function refreshMonitorView() {
+    const { serverId, serverName, range } = monitorState;
     const seq = ++monitorReqSeq;
     // Chart.js 首次使用才加载（200KB，缓存后零开销）；与数据请求并行
     const chartReady = loadScript('/vendor/chart.umd.min.js').catch((e) => {
@@ -1739,18 +1751,15 @@
       toast(e.message || t('common.chartLibFail'));
       return null;
     });
-    document.querySelectorAll('.range-btn').forEach((b) => b.classList.toggle('active', b.dataset.range === range));
     try {
       const data = await api(`/api/monitor?server_id=${serverId}&range=${range}`);
       if (seq !== monitorReqSeq) return; // 过期响应（慢的旧 range 先返回）丢弃，防覆盖新 range 图表
       const rows = data.system || data; // 兼容：新结构 {system, custom}
       const custom = data.custom || {};
-      const label = MONITOR_RANGE_LABEL[range] || range;
+      const label = t('monitor.range.' + range);
       const cCount = Object.keys(custom).length;
       const downsampled = rows.length > MONITOR_STEP_MAX;
-      $('#monitor-title').textContent = `监控 · ${serverName}（${label}，${rows.length} 点${downsampled ? t('monitor.downsampled') : ''}${cCount ? ` +${cCount} 自定义` : ''}）`;
-      $('#monitor-modal').classList.remove('hidden'); // 先显示，保证 canvas 有尺寸
-      lockScroll();
+      $('#monitor-title').textContent = t('monitor.title', { name: serverName, label, n: rows.length, ds: downsampled ? t('monitor.downsampled') : '', custom: cCount ? t('monitor.customSuffix', { n: cCount }) : '' });
       if (null === await chartReady) return; // 图表库加载失败（toast 已提示），数据请求不再渲染
       if (seq !== monitorReqSeq) return; // 等待期间已切换 range
       renderMonitorChart(downsample(rows), custom, downsampled);
@@ -2097,12 +2106,12 @@
 
   // ---------- 设置 / PAT ----------
   const ALERT_PRESETS = [
-    { name: 'Server酱', desc: t('setup.presetDescGet'), method: 'GET', url: 'https://sctapi.ftqq.com/{token}.send?title={title}&desp={message}', body: '', ct: '', headers: '' },
-    { name: '钉钉机器人', desc: t('setup.presetDescPost'), method: 'POST', url: 'https://oapi.dingtalk.com/robot/send?access_token={token}', body: '{"msgtype":"text","text":{"content":"{message}"}}', ct: '', headers: '' },
-    { name: '企业微信机器人', desc: t('setup.presetDescPost'), method: 'POST', url: 'https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key={token}', body: '{"msgtype":"text","text":{"content":"{message}"}}', ct: '', headers: '' },
-    { name: 'Telegram Bot', desc: t('setup.presetDescPost'), method: 'POST', url: 'https://api.telegram.org/bot{token}/sendMessage', body: '{"chat_id":"你的chat_id","text":"{message}"}', ct: '', headers: '' },
-    { name: 'Bark', desc: t('setup.presetDescGet'), method: 'GET', url: 'https://api.day.app/{token}/{title}/{message}', body: '', ct: '', headers: '' },
-    { name: 'Slack', desc: t('setup.presetDescSlack'), method: 'POST', url: 'https://hooks.slack.com/services/T/B/{token}', body: '', ct: '', headers: '{"Authorization":"Bearer {token}"}' },
+    { name: 'Server酱', desc: 'setup.presetDescGet', method: 'GET', url: 'https://sctapi.ftqq.com/{token}.send?title={title}&desp={message}', body: '', ct: '', headers: '' },
+    { name: '钉钉机器人', desc: 'setup.presetDescPost', method: 'POST', url: 'https://oapi.dingtalk.com/robot/send?access_token={token}', body: '{"msgtype":"text","text":{"content":"{message}"}}', ct: '', headers: '' },
+    { name: '企业微信机器人', desc: 'setup.presetDescPost', method: 'POST', url: 'https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key={token}', body: '{"msgtype":"text","text":{"content":"{message}"}}', ct: '', headers: '' },
+    { name: 'Telegram Bot', desc: 'setup.presetDescPost', method: 'POST', url: 'https://api.telegram.org/bot{token}/sendMessage', body: '{"chat_id":"你的chat_id","text":"{message}"}', ct: '', headers: '' },
+    { name: 'Bark', desc: 'setup.presetDescGet', method: 'GET', url: 'https://api.day.app/{token}/{title}/{message}', body: '', ct: '', headers: '' },
+    { name: 'Slack', desc: 'setup.presetDescSlack', method: 'POST', url: 'https://hooks.slack.com/services/T/B/{token}', body: '', ct: '', headers: '{"Authorization":"Bearer {token}"}' },
   ];
 
   function renderAlertPresets() {
@@ -2111,7 +2120,7 @@
     box.innerHTML = ALERT_PRESETS.map((p, i) => `
       <div class="alert-preset">
         <span class="ap-name">${escapeHtml(p.name)}</span>
-        <span class="muted">${escapeHtml(p.desc)}</span>
+        <span class="muted">${escapeHtml(t(p.desc))}</span>
         <button class="ghost ap-use" data-i="${i}">${t('settings.presetUse')}</button>
       </div>`).join('');
   }
@@ -2244,13 +2253,20 @@
     days = Number(days) || 30;
     statsState = { serverId, serverName, days };
     document.querySelectorAll('#stats-modal .range-btn').forEach((b) => b.classList.toggle('active', Number(b.dataset.days) === days));
+    const alreadyOpen = !$('#stats-modal').classList.contains('hidden');
+    $('#stats-modal').classList.remove('hidden'); // 先显示，保证 canvas 有尺寸
+    if (!alreadyOpen) lockScroll(); // 语言切换重渲染等场景弹窗已打开，不重复锁（计数栈会失衡）
+    await refreshStatsView();
+  }
+
+  // 拉取并渲染统计视图（不含弹窗打开/滚动锁）——首次打开与语言切换重渲染共用
+  async function refreshStatsView() {
+    const { serverId, serverName, days } = statsState;
     let data;
     try {
       data = await api(`/api/stats?server_id=${serverId}&days=${days}`);
     } catch (e) { toast(e.message); return; }
     $('#stats-title').textContent = t('stats.titleWith', { name: serverName });
-    $('#stats-modal').classList.remove('hidden'); // 先显示，保证 canvas 有尺寸
-    lockScroll();
     renderStatsSummary(data);
     // Chart.js 与监控弹窗共用本地 vendor（已缓存则零开销）
     try {
@@ -2757,12 +2773,15 @@
 
   // 语言切换后的界面刷新。动态渲染的内容（卡片/概览/批量栏）是常显的，必须立即重渲染；
   // 静态文本由 applyDom 覆盖；弹窗内文本在打开那一刻求值，重开即新语言，不强行重填。
-  function onLangChange() {
+  async function onLangChange() {
     CfI18n.applyDom();
     renderServers();
     renderLangMenu();
     syncFindUI(); // 文件管理占位符/开关 title 随语言刷新
     if (activeTermSession()) syncRendererBtn();
+    // 已打开的监控/统计弹窗：标题与图例在渲染那一刻求值，整体重取才能跟随语言
+    if (monitorState && !$('#monitor-modal').classList.contains('hidden')) await refreshMonitorView();
+    if (statsState && !$('#stats-modal').classList.contains('hidden')) await refreshStatsView();
   }
 
   $('#dropdown').addEventListener('click', (e) => {

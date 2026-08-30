@@ -480,7 +480,7 @@ export async function handleApi(request, env) {
     // 顶层 error boundary：任何未捕获异常（D1 类型错误/约束失败等）返回 JSON 500，
     // 前端可读，不再暴露 CF 裸 500 白屏
     console.error('handleApi unhandled error:', e);
-    return err('internal error', 500);
+    return err('internal error', 500, 'INTERNAL_ERROR');
   }
 }
 
@@ -511,7 +511,7 @@ async function handleApiInner(request, env) {
       await auditLogThrottled(env, `login.locked:${ip}`, {
         ip, action: 'login.locked', detail: `retry in ${lockRemain}s`,
       });
-      return json({ error: `too many failed logins, retry in ${lockRemain}s` }, 429, { 'retry-after': String(lockRemain) });
+      return json({ error: `too many failed logins, retry in ${lockRemain}s`, code: 'AUTH_LOCKED' }, 429, { 'retry-after': String(lockRemain) });
     }
     const body = await request.json().catch(() => ({}));
     const inputUsername = String(body.username || '').trim();
@@ -528,7 +528,7 @@ async function handleApiInner(request, env) {
       await auditLogThrottled(env, `login.failed:${ip}`, {
         username: inputUsername || '(空)', ip, action: 'login.failed',
       });
-      return err('bad password', 401);
+      return err('bad password', 401, 'AUTH_BAD_PASSWORD');
     }
     loginFails.delete(ip); // 登录成功：清零该 IP 失败计数
     const uid = userIdx + 1;
@@ -557,7 +557,7 @@ async function handleApiInner(request, env) {
     await auditLogThrottled(env, `auth.failed:${ip}`, {
       ip, action: 'auth.failed', detail: `${method} ${normalizeApiPath(path)}`,
     });
-    return err('unauthorized', 401);
+    return err('unauthorized', 401, 'AUTH_REQUIRED');
   }
 
   // GET /api/me —— 当前用户
@@ -572,7 +572,7 @@ async function handleApiInner(request, env) {
 
   // GET /api/agent/latest —— 最新 Agent 更新清单（仅管理员；5min 模块缓存，避免每卡查 GitHub）
   if (method === 'GET' && path === '/api/agent/latest') {
-    if (!isAdmin(user)) return err('forbidden', 403);
+    if (!isAdmin(user)) return err('forbidden', 403, 'FORBIDDEN');
     try {
       const manifest = await getAgentManifest(env, url.searchParams.get('refresh') === '1');
       return json({
@@ -591,10 +591,10 @@ async function handleApiInner(request, env) {
   // Worker 流式中转 Release 资产，不物化整个二进制；Agent 做大小/SHA/版本复核后 self-replace。
   const updateMatch = path.match(/^\/api\/servers\/(\d+)\/agent-update$/);
   if (method === 'POST' && updateMatch) {
-    if (!isAdmin(user)) return err('forbidden', 403); // PAT（即使 server:exec）也不得升级 Agent
+    if (!isAdmin(user)) return err('forbidden', 403, 'FORBIDDEN'); // PAT（即使 server:exec）也不得升级 Agent
     const id = Number(updateMatch[1]) || 0;
     const server = await env.DB.prepare('SELECT * FROM servers WHERE id = ?').bind(id).first();
-    if (!server) return err('server not found', 404);
+    if (!server) return err('server not found', 404, 'NOT_FOUND');
     const info = safeJson(server.info_json) || {};
     if (Number(info.update_protocol) < 1 || !info.self_update_enabled) {
       return err('agent does not support self update or ALLOW_SELF_UPDATE is disabled', 409);
@@ -687,10 +687,10 @@ async function handleApiInner(request, env) {
 
   // POST /api/servers —— 注册一台服务器（name + 可选 group + 可选序号；仅管理员）
   if (method === 'POST' && path === '/api/servers') {
-    if (!isAdmin(user)) return err('forbidden', 403);
+    if (!isAdmin(user)) return err('forbidden', 403, 'FORBIDDEN');
     const body = await request.json().catch(() => ({}));
     const name = String(body.name || '').trim();
-    if (!name) return err('name required');
+    if (!name) return err('name required', 400, 'NAME_REQUIRED');
     const group = String(body.group || '').trim();
     const displayIndex = Number(body.sort_order) || 0;
     const key = randomHex(32); // key 即唯一身份 + 凭证，agent 侧只保留这一个
@@ -718,20 +718,20 @@ async function handleApiInner(request, env) {
   // 返回逐项结果而非整体成败：批量天然允许部分失败（某台已被删/不存在），
   // 前端需要知道"哪几台成了"，而不是一个笼统的 500。
   if (method === 'POST' && path === '/api/servers/batch') {
-    if (!isAdmin(user)) return err('forbidden', 403);
+    if (!isAdmin(user)) return err('forbidden', 403, 'FORBIDDEN');
     const body = await request.json().catch(() => ({}));
     const op = String(body.op || '');
     const ids = Array.isArray(body.ids)
       ? [...new Set(body.ids.map(Number).filter((n) => Number.isInteger(n) && n > 0))]
       : [];
-    if (!['update-group', 'delete'].includes(op)) return err('invalid op (update-group | delete)', 400);
-    if (!ids.length) return err('ids required', 400);
-    if (ids.length > 100) return err('too many ids (max 100)', 400);
+    if (!['update-group', 'delete'].includes(op)) return err('invalid op (update-group | delete)', 400, 'BATCH_BAD_OP');
+    if (!ids.length) return err('ids required', 400, 'BATCH_IDS_REQUIRED');
+    if (ids.length > 100) return err('too many ids (max 100)', 400, 'BATCH_TOO_MANY');
 
     const results = [];
     if (op === 'update-group') {
       const group = String(body.group || '').trim();
-      if (group.length > 100) return err('group too long', 400);
+      if (group.length > 100) return err('group too long', 400, 'GROUP_TOO_LONG');
       // 单事务：全成功或全回滚。分组是列表的展示维度，部分生效会让列表呈现撕裂态
       const stmts = ids.map((id) => env.DB.prepare('UPDATE servers SET "group" = ? WHERE id = ?').bind(group, id));
       stmts.push(
@@ -772,10 +772,10 @@ async function handleApiInner(request, env) {
   // 服务端无法推送新 key 给未连接的 agent。
   const rotateMatch = path.match(/^\/api\/servers\/(\d+)\/rotate-key$/);
   if (method === 'POST' && rotateMatch) {
-    if (!isAdmin(user)) return err('forbidden', 403);
+    if (!isAdmin(user)) return err('forbidden', 403, 'FORBIDDEN');
     const id = Number(rotateMatch[1]) || 0;
     const server = await env.DB.prepare('SELECT id, name FROM servers WHERE id = ?').bind(id).first();
-    if (!server) return err('not found', 404);
+    if (!server) return err('not found', 404, 'NOT_FOUND');
     const key = randomHex(32);
     const keyId = await sha256Hex(key);
     const hash = await hashSecret(key, env);
@@ -803,13 +803,13 @@ async function handleApiInner(request, env) {
 
   // PATCH /api/servers/:id —— 仅管理员；修改名称/分组/序号/告警覆盖（不动 agent key，在线状态不受影响）
   if (method === 'PATCH' && path.startsWith('/api/servers/')) {
-    if (!isAdmin(user)) return err('forbidden', 403);
+    if (!isAdmin(user)) return err('forbidden', 403, 'FORBIDDEN');
     const id = Number(path.split('/')[3]) || 0;
     const server = await env.DB.prepare('SELECT name, "group", display_index, alert_override FROM servers WHERE id = ?').bind(id).first();
-    if (!server) return err('not found', 404);
+    if (!server) return err('not found', 404, 'NOT_FOUND');
     const body = await request.json().catch(() => ({}));
     const name = body.name !== undefined ? String(body.name).trim() : server.name;
-    if (!name) return err('name required');
+    if (!name) return err('name required', 400, 'NAME_REQUIRED');
     const group = body.group !== undefined ? String(body.group).trim() : server.group;
     const displayIndex = body.sort_order !== undefined ? Number(body.sort_order) || 0 : server.display_index;
     // alert_override：传 null/空对象 = 清除覆盖回退全局；不传该字段 = 保持原值不变。
@@ -836,16 +836,16 @@ async function handleApiInner(request, env) {
 
   // DELETE /api/servers/:id —— 仅管理员；级联清理（D1 历史数据 + 各 DO 残留 + 审计）
   if (method === 'DELETE' && path.startsWith('/api/servers/')) {
-    if (!isAdmin(user)) return err('forbidden', 403);
+    if (!isAdmin(user)) return err('forbidden', 403, 'FORBIDDEN');
     const id = Number(path.split('/')[3]) || 0;
     const name = await deleteServerCascade(env, user, ip, id);
-    if (name === null) return err('not found', 404);
+    if (name === null) return err('not found', 404, 'NOT_FOUND');
     return json({ ok: true });
   }
 
   // GET /api/usage —— 用量观测（仅管理员）：Worker 请求计数 + MetricsDO 上报/查询计数（近 24h 估算参考）
   if (method === 'GET' && path === '/api/usage') {
-    if (!isAdmin(user)) return err('forbidden', 403);
+    if (!isAdmin(user)) return err('forbidden', 403, 'FORBIDDEN');
     return json(await collectUsageView(env));
   }
 
@@ -853,8 +853,8 @@ async function handleApiInner(request, env) {
   if (method === 'POST' && path === '/api/terminal') {
     const body = await request.json().catch(() => ({}));
     const server = await env.DB.prepare('SELECT * FROM servers WHERE id = ?').bind(Number(body.server_id) || 0).first();
-    if (!server) return err('server not found', 404);
-    if (!canExec(user, server)) return err('forbidden', 403);
+    if (!server) return err('server not found', 404, 'NOT_FOUND');
+    if (!canExec(user, server)) return err('forbidden', 403, 'FORBIDDEN');
     const streamId = makeStreamId(server.id);
     const stub = doForShard(env, shardForServerId(server.id));
     const resp = await stub.fetch('https://do.internal/rpc', {
@@ -871,8 +871,8 @@ async function handleApiInner(request, env) {
   if (method === 'POST' && path === '/api/file/open') {
     const body = await request.json().catch(() => ({}));
     const server = await env.DB.prepare('SELECT * FROM servers WHERE id = ?').bind(Number(body.server_id) || 0).first();
-    if (!server) return err('server not found', 404);
-    if (!canExec(user, server)) return err('forbidden', 403);
+    if (!server) return err('server not found', 404, 'NOT_FOUND');
+    if (!canExec(user, server)) return err('forbidden', 403, 'FORBIDDEN');
     const streamId = makeStreamId(server.id);
     const stub = doForShard(env, shardForServerId(server.id));
     const resp = await stub.fetch('https://do.internal/rpc', {
@@ -891,8 +891,8 @@ async function handleApiInner(request, env) {
     const serverId = Number(url.searchParams.get('server_id')) || 0;
     const range = String(url.searchParams.get('range') || '12h');
     const s = await env.DB.prepare('SELECT * FROM servers WHERE id = ?').bind(serverId).first();
-    if (!s) return err('not found', 404);
-    if (!canAccessServer(user, s)) return err('forbidden', 403);
+    if (!s) return err('not found', 404, 'NOT_FOUND');
+    if (!canAccessServer(user, s)) return err('forbidden', 403, 'FORBIDDEN');
     const hours = parseRangeHours(range);
     const [system, custom] = await Promise.all([
       queryMonitorRows(env, serverId, hours),
@@ -909,8 +909,8 @@ async function handleApiInner(request, env) {
     const serverId = Number(url.searchParams.get('server_id')) || 0;
     const days = Math.min(Math.max(Math.floor(Number(url.searchParams.get('days'))) || 30, 1), 1095);
     const s = await env.DB.prepare('SELECT * FROM servers WHERE id = ?').bind(serverId).first();
-    if (!s) return err('not found', 404);
-    if (!canAccessServer(user, s)) return err('forbidden', 403);
+    if (!s) return err('not found', 404, 'NOT_FOUND');
+    if (!canAccessServer(user, s)) return err('forbidden', 403, 'FORBIDDEN');
     const offset = statsTzOffsetSec(env);
     const rows = await queryDayStats(env, serverId, days, offset);
     const total = rows.reduce((acc, r) => {
@@ -935,7 +935,7 @@ async function handleApiInner(request, env) {
 
   // ---- PAT 管理（仅管理员）----
   if (path === '/api/tokens') {
-    if (!isAdmin(user)) return err('forbidden', 403);
+    if (!isAdmin(user)) return err('forbidden', 403, 'FORBIDDEN');
     if (method === 'GET') {
       const rows = await env.DB.prepare('SELECT id, name, scopes, server_ids, expires_at, last_used_at, created_at FROM api_tokens ORDER BY id').all();
       return json(rows.results);
@@ -943,10 +943,10 @@ async function handleApiInner(request, env) {
     if (method === 'POST') {
       const body = await request.json().catch(() => ({}));
       const name = String(body.name || '').trim();
-      if (!name) return err('name required');
+      if (!name) return err('name required', 400, 'NAME_REQUIRED');
       // 同名令牌拒绝：前置查询快速失败 + 唯一索引（迁移 0010）兜底并发竞态；与 MCP create_token 一致
       const dup = await env.DB.prepare('SELECT id FROM api_tokens WHERE name = ?').bind(name).first();
-      if (dup) return err('token name already exists', 409);
+      if (dup) return err('token name already exists', 409, 'TOKEN_NAME_EXISTS');
       // scopes 白名单校验：只允许 server:read / server:exec，非法值直接拒绝
       let scopes;
       if (Array.isArray(body.scopes) && body.scopes.length) {
@@ -974,7 +974,7 @@ async function handleApiInner(request, env) {
           .run();
       } catch (e) {
         // 并发竞态兜底：前置查重通过后被并发请求抢先插入（唯一索引迁移 0010 拒绝）
-        if (TOKEN_NAME_UNIQUE_RE.test(String(e && e.message))) return err('token name already exists', 409);
+        if (TOKEN_NAME_UNIQUE_RE.test(String(e && e.message))) return err('token name already exists', 409, 'TOKEN_NAME_EXISTS');
         throw e;
       }
       return json({ token, expires_at: expiresAt }); // 明文只返回一次
@@ -982,7 +982,7 @@ async function handleApiInner(request, env) {
     return err('method not allowed', 405);
   }
   if (method === 'DELETE' && path.startsWith('/api/tokens/')) {
-    if (!isAdmin(user)) return err('forbidden', 403);
+    if (!isAdmin(user)) return err('forbidden', 403, 'FORBIDDEN');
     const id = Number(path.split('/')[3]) || 0;
     const res = await env.DB.prepare('DELETE FROM api_tokens WHERE id = ?').bind(id).run();
     if (!res.meta.changes) return err(`token not found (id=${id})`, 404);
@@ -997,7 +997,7 @@ async function handleApiInner(request, env) {
   // 参数：limit（默认 100 最大 500）、offset（分页偏移）、action（精确匹配）、user（用户名模糊）、
   //       server_id（数字）、format=csv（导出，text/csv 附件）
   if (method === 'GET' && path === '/api/audit-logs') {
-    if (!isAdmin(user)) return err('forbidden', 403);
+    if (!isAdmin(user)) return err('forbidden', 403, 'FORBIDDEN');
     const limit = Math.min(Math.max(Number(url.searchParams.get('limit')) || 100, 1), 500);
     const offset = Math.max(Number(url.searchParams.get('offset')) || 0, 0);
     const action = String(url.searchParams.get('action') || '').trim();
@@ -1041,7 +1041,7 @@ async function handleApiInner(request, env) {
   // POST /api/settings/test_webhook —— 测试 Webhook（仅管理员；传当前弹窗表单值，不保存配置）
   // 回显 HTTP 状态码，供用户验证模板化配置（占位符/Headers/Body）是否正确
   if (method === 'POST' && path === '/api/settings/test_webhook') {
-    if (!isAdmin(user)) return err('forbidden', 403);
+    if (!isAdmin(user)) return err('forbidden', 403, 'FORBIDDEN');
     const body = await request.json().catch(() => ({}));
     const cfg = sanitizeAlerts(body.alerts || {});
     if (!cfg.webhook_url) return err('webhook_url required（请先填写 Webhook 地址）', 400);
@@ -1063,7 +1063,7 @@ async function handleApiInner(request, env) {
     return json({ order: Array.isArray(order) ? order : [] });
   }
   if (method === 'PUT' && path === '/api/group-order') {
-    if (!isAdmin(user)) return err('forbidden', 403);
+    if (!isAdmin(user)) return err('forbidden', 403, 'FORBIDDEN');
     const body = await request.json().catch(() => ({}));
     if (!Array.isArray(body.order)) return err('order array required');
     const seen = new Set();
@@ -1085,11 +1085,11 @@ async function handleApiInner(request, env) {
 
   // ---- 面板设置（D1 kv_json，仅管理员） ----
   if (method === 'GET' && path === '/api/settings') {
-    if (!isAdmin(user)) return err('forbidden', 403);
+    if (!isAdmin(user)) return err('forbidden', 403, 'FORBIDDEN');
     return json((await kvGet(env, 'settings', {})) || {});
   }
   if (method === 'PUT' && path === '/api/settings') {
-    if (!isAdmin(user)) return err('forbidden', 403);
+    if (!isAdmin(user)) return err('forbidden', 403, 'FORBIDDEN');
     const body = await request.json().catch(() => ({}));
     const current = (await kvGet(env, 'settings', {})) || {};
     const next = {
@@ -1108,7 +1108,7 @@ async function handleApiInner(request, env) {
     return json(next);
   }
 
-  return err('not found', 404);
+  return err('not found', 404, 'NOT_FOUND');
 }
 
 // 上传公共转发：流式转发到 TerminalDO（body 保持原始流，DO 内切分片）；query 参数原样传递。

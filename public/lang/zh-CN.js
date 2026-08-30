@@ -547,9 +547,27 @@
     'file.errShrunk': '文件已变化或缩短，中止下载（已完成 {done}/{size} 字节）',
   };
 
+  // ---------------- 后端错误码（data.code → 前端按语言翻译） ----------------
+  const errors = {
+    'error.INTERNAL_ERROR': '服务器内部错误',
+    'error.AUTH_BAD_PASSWORD': '密码错误',
+    'error.AUTH_LOCKED': '尝试过于频繁，请稍后再试',
+    'error.AUTH_REQUIRED': '请先登录',
+    'error.FORBIDDEN': '没有权限执行此操作',
+    'error.NOT_FOUND': '目标不存在',
+    'error.NAME_REQUIRED': '名称不能为空',
+    'error.TOKEN_NAME_EXISTS': '令牌名称已存在',
+    'error.AGENT_OFFLINE': '服务器不在线（agent 未连接）',
+    'error.BATCH_BAD_OP': '不支持的批量操作',
+    'error.BATCH_IDS_REQUIRED': '请选择要操作的服务器',
+    'error.BATCH_TOO_MANY': '一次最多操作 100 台',
+    'error.GROUP_TOO_LONG': '分组名过长',
+    'error.UPLOAD_TOO_LARGE': '文件超过大小上限',
+  };
+
   window.CfI18n.register(
     'zh-CN',
-    Object.assign({}, common, login, menu, overview, server, settings,
+    Object.assign({}, common, errors, login, menu, overview, server, settings,
       token, audit, usage, term, file, chmod, monitor, stats, setup, idle, extra),
     { label: '简体中文' }
   );

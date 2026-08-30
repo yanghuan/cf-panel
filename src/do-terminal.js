@@ -91,7 +91,7 @@ export class TerminalDO {
         if (this.updating.has(body.serverId)) return json({ error: 'agent update in progress' }, 409);
         // 先确认 agent 在线，离线时不创建/不落盘（避免失败会话残留）
         const agentWs = this.agents.get(body.serverId);
-        if (!agentWs) return json({ error: 'agent offline' }, 502);
+        if (!agentWs) return json({ error: 'agent offline', code: 'AGENT_OFFLINE' }, 502);
         // 每服务器并发会话上限（防批量创建耗尽 PTY/bash/FD/WebSocket）
         let active = 0;
         for (const s of this.sessions.values()) {
@@ -153,7 +153,7 @@ export class TerminalDO {
       if (this.updating.has(serverId)) return json({ error: 'agent update in progress' }, 409);
       const timeoutMs = Math.min(Math.max(Number(body.timeoutMs) || EXEC_DEFAULT_TIMEOUT_MS, 1000), EXEC_MAX_TIMEOUT_MS);
       const agentWs = this.agents.get(serverId);
-      if (!agentWs) return json({ error: 'agent offline' }, 502);
+      if (!agentWs) return json({ error: 'agent offline', code: 'AGENT_OFFLINE' }, 502);
       const execId = `e-${crypto.randomUUID()}`;
       const result = await new Promise((resolve) => {
         // 兜底定时器晚于 agent 实际超时（EXEC_TIMEOUT_GRACE_MS）：正常路径 agent 先回执
@@ -189,7 +189,7 @@ export class TerminalDO {
         return err('invalid agent update metadata');
       }
       const agentWs = this.agents.get(serverId);
-      if (!agentWs) return json({ error: 'agent offline' }, 502);
+      if (!agentWs) return json({ error: 'agent offline', code: 'AGENT_OFFLINE' }, 502);
       if (this.updating.has(serverId) || this.uploading.has(serverId)) {
         return json({ error: 'agent update/upload already in progress' }, 409);
       }
@@ -219,7 +219,7 @@ export class TerminalDO {
       if (!serverId) return err('server_id is required');
       if (!targetPath || !targetPath.startsWith('/')) return err('path is required (absolute)');
       const agentWs = this.agents.get(serverId);
-      if (!agentWs) return json({ error: 'agent offline' }, 502);
+      if (!agentWs) return json({ error: 'agent offline', code: 'AGENT_OFFLINE' }, 502);
       if (this.uploading.has(serverId) || this.updating.has(serverId)) {
         return json({ error: 'upload/update already in progress for this server' }, 409);
       }

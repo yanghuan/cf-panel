@@ -549,9 +549,27 @@
     'file.errShrunk': 'File changed or shrank — download aborted ({done}/{size} bytes done)',
   };
 
+  // ---------------- Backend error codes (data.code → translated per locale) ----------------
+  const errors = {
+    'error.INTERNAL_ERROR': 'Internal server error',
+    'error.AUTH_BAD_PASSWORD': 'Incorrect password',
+    'error.AUTH_LOCKED': 'Too many attempts — try again later',
+    'error.AUTH_REQUIRED': 'Please sign in first',
+    'error.FORBIDDEN': 'Permission denied',
+    'error.NOT_FOUND': 'Not found',
+    'error.NAME_REQUIRED': 'Name is required',
+    'error.TOKEN_NAME_EXISTS': 'Token name already exists',
+    'error.AGENT_OFFLINE': 'Server is offline (agent not connected)',
+    'error.BATCH_BAD_OP': 'Unsupported batch operation',
+    'error.BATCH_IDS_REQUIRED': 'Select servers first',
+    'error.BATCH_TOO_MANY': 'At most 100 servers per batch',
+    'error.GROUP_TOO_LONG': 'Group name too long',
+    'error.UPLOAD_TOO_LARGE': 'File exceeds the size limit',
+  };
+
   window.CfI18n.register(
     'en-US',
-    Object.assign({}, common, login, menu, overview, server, settings,
+    Object.assign({}, common, errors, login, menu, overview, server, settings,
       token, audit, usage, term, file, chmod, monitor, stats, setup, idle, extra),
     { label: 'English' }
   );

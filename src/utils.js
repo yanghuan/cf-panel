@@ -14,8 +14,9 @@ export function json(data, status = 200, headers = {}) {
     headers: { 'content-type': 'application/json; charset=utf-8', ...SECURITY_HEADERS, ...headers },
   });
 }
-export function err(message, status = 400) {
-  return json({ error: message }, status);
+export function err(message, status = 400, code = null) {
+  // code：机器可读错误码（前端按当前语言翻译；无 code 时结构不变，向后兼容）
+  return json(code ? { error: message, code } : { error: message }, status);
 }
 const JWT_SECRET_CONFIG_ERROR = 'server misconfigured: JWT_SECRET not set';
 export function secret(env) {

@@ -22,7 +22,15 @@
     if (tk) headers.authorization = `Bearer ${tk}`;
     const resp = await fetch(path, { ...opts, headers });
     const data = await resp.json().catch(() => ({}));
-    if (!resp.ok) throw new Error(data.error || `HTTP ${resp.status}`);
+    if (!resp.ok) {
+      let msg = data.error || `HTTP ${resp.status}`;
+      // 后端错误码 → 当前语言文案（error.<CODE>；无翻译时回退原始消息，新错误不至于空白）
+      if (data.code && window.CfI18n) {
+        const tr = window.CfI18n.t('error.' + data.code);
+        if (tr && tr !== 'error.' + data.code) msg = tr;
+      }
+      throw new Error(msg);
+    }
     return data;
   }
 

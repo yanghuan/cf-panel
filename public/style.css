@@ -809,7 +809,7 @@ button.danger:hover { background: rgba(248, 113, 113, .12); }
   padding: 0 8px 0 0;
   border: 1px solid var(--border);
   border-radius: 10px;
-  background: rgba(20, 25, 40, .6);
+  background: var(--input-bg);
 }
 .file-filter-wrap:focus-within { border-color: var(--accent); }
 .file-filter {
@@ -1075,7 +1075,7 @@ a.f-dir.f-prot { opacity: .55; }
   min-width: 220px;
   padding: 7px 12px;
   border-radius: 10px;
-  background: rgba(20, 25, 40, .6);
+  background: var(--input-bg);
   border: 1px solid var(--border);
   color: var(--text);
   font-size: 13px;

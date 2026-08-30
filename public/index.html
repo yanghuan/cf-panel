@@ -280,29 +280,31 @@
         </div>
       </div>
       <!-- 逐机告警阈值覆盖（仅编辑模式显示；留空 = 继承全局阈值）。
-           placeholder 会被 JS 动态改写为"全局 N"（openEditModal 拉全局配置回填） -->
+           指标名用输入框上方的常驻 label（不用 field-tag：它的规则是
+           "placeholder 显示时隐藏"，而这里的输入框永远有 placeholder——
+           placeholder 本身要拿去动态显示全局值"全局 90"） -->
       <div id="alert-override-box" class="ao-box hidden">
         <div class="ao-title">告警阈值覆盖（留空继承全局）</div>
         <div class="ao-grid">
-          <div class="field">
+          <div class="ao-item">
+            <label for="ao-cpu" data-i18n="settings.overrideCpu">CPU %</label>
             <input id="ao-cpu" type="number" placeholder="继承全局" data-i18n-ph="settings.overrideInherit" />
-            <span class="field-tag">CPU %</span>
           </div>
-          <div class="field">
+          <div class="ao-item">
+            <label for="ao-mem" data-i18n="settings.overrideMem">内存 %</label>
             <input id="ao-mem" type="number" placeholder="继承全局" data-i18n-ph="settings.overrideInherit" />
-            <span class="field-tag">内存 %</span>
           </div>
-          <div class="field">
+          <div class="ao-item">
+            <label for="ao-disk" data-i18n="settings.overrideDisk">磁盘 %</label>
             <input id="ao-disk" type="number" placeholder="继承全局" data-i18n-ph="settings.overrideInherit" />
-            <span class="field-tag">磁盘 %</span>
           </div>
-          <div class="field">
+          <div class="ao-item">
+            <label for="ao-load" data-i18n="settings.overrideLoad">负载</label>
             <input id="ao-load" type="number" placeholder="继承全局" data-i18n-ph="settings.overrideInherit" />
-            <span class="field-tag">负载</span>
           </div>
-          <div class="field">
+          <div class="ao-item">
+            <label for="ao-offline" data-i18n="settings.overrideOffline">离线(秒)</label>
             <input id="ao-offline" type="number" placeholder="继承全局" data-i18n-ph="settings.overrideInherit" />
-            <span class="field-tag">离线(秒)</span>
           </div>
         </div>
         <p class="muted" style="font-size:12px;margin:6px 0 0">

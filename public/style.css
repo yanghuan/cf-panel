@@ -1073,7 +1073,12 @@ a.f-dir.f-prot { opacity: .55; }
   border-radius: 12px;
 }
 .ao-title { font-size: 13px; font-weight: 600; color: var(--text); margin-bottom: 8px; }
-.ao-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); gap: 8px; }
+.ao-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 10px 8px; }
+/* 指标名常驻在输入框上方（label 上置）：field-tag 的"placeholder 显示时隐藏"
+   规则与这里的常驻 placeholder（动态显示全局值）互斥，标签必须独立于输入框 */
+.ao-item { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.ao-item label { font-size: 11px; color: var(--muted); }
+.ao-item input { width: 100%; }
 
 /* ---------- 流量 / 可用率（按天账） ---------- */
 .stats-summary {

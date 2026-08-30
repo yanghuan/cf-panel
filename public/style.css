@@ -802,6 +802,12 @@ button.danger:hover { background: rgba(248, 113, 113, .12); }
 .file-filter-row { display: flex; gap: 8px; flex-wrap: wrap; }
 .file-filter, .file-find { flex: 1 1 200px; min-width: 0; }
 
+/* ---------- 语言菜单（☰ 下拉底部） ---------- */
+.dd-sep { height: 1px; background: var(--border); margin: 6px 0; }
+.dd-lang-title { font-size: 11px; color: var(--muted); padding: 4px 12px 2px; }
+.dd-lang-list { display: flex; flex-direction: column; }
+.dd-lang.active { color: var(--accent-2); font-weight: 600; }
+
 /* 拖拽上传：拖文件进入文件管理弹窗时高亮（提示可放置） */
 #file-modal.drag-over { outline: 2px dashed var(--accent); outline-offset: -6px; }
 #file-modal.drag-over::after {

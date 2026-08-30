@@ -588,13 +588,14 @@ function loadCfI18n() {
     removeItem: (k) => store.delete(k),
   };
   // 不 mock navigator：Node 21+ 的 globalThis.navigator 是只读 getter，赋值会抛错；
-  // i18n.js 的 detectLocale 用 try/catch 包裹且只登记了 zh-CN，读不到浏览器语言时会
-  // 安全回退默认语言，故此处交给 Node 内置值即可。
+  // i18n.js 的 detectLocale 用 try/catch 包裹，读不到浏览器语言时安全回退默认语言。
   globalThis.document = { documentElement: {}, querySelectorAll: () => [] };
-  const src = nodeFs.readFileSync(
-    nodePath.join(nodePath.dirname(fileURLToPath(import.meta.url)), '../public/i18n.js'), 'utf8',
-  );
-  (0, eval)(src); // 间接 eval：全局作用域执行，挂载 window.CfI18n
+  // 与 index.html 的脚本顺序一致：先框架后语言包（语言包加载时向框架注册）
+  const root = nodePath.join(nodePath.dirname(fileURLToPath(import.meta.url)), '..');
+  for (const f of ['public/i18n.js', 'public/lang/zh-CN.js']) {
+    const src = nodeFs.readFileSync(nodePath.join(root, f), 'utf8');
+    (0, eval)(src); // 间接 eval：全局作用域执行，挂载 window.CfI18n
+  }
   return globalThis.CfI18n;
 }
 
@@ -609,19 +610,43 @@ test('i18n：t() 翻译与插值，缺失 key 原样返回', () => {
   assert.equal(i18n.t('server.updateFailed', {}), 'Agent 更新失败：{err}');
 });
 
-test('i18n：多语言结构可用——注册语言包即生效', () => {
+test('i18n：多语言结构可用——注册语言包即生效，setLocale 广播订阅者', () => {
   const i18n = loadCfI18n();
-  assert.deepEqual(i18n.supported.map((l) => l.code), ['zh-CN'], '当前仅内置 zh-CN');
-  // 注册一个新语言包并切换 → t() 立即走新包，证明结构支持多语言（现在只差翻译）
+  // 语言包已外置到 public/lang/*.js，加载器只装了 zh-CN
+  assert.deepEqual(i18n.supported().map((l) => l.code), ['zh-CN']);
+  // 注册一个新语言包并切换 → t() 立即走新包
   i18n.register('en-US', { 'common.save': 'Save', 'server.selected': '{n} selected' });
+  // 显式回到中文起点：Node 的 navigator 语言不确定，detectLocale 可能已直接落在
+  // en-US（浏览器语言自动检测是产品预期行为），不回起点的话下面的切换会因幂等不广播
+  assert.equal(i18n.setLocale('zh-CN'), true);
+  let notified = 0;
+  const off = i18n.onChange(() => notified += 1);
   assert.equal(i18n.setLocale('en-US'), true);
   assert.equal(i18n.locale, 'en-US');
   assert.equal(i18n.t('common.save'), 'Save');
   assert.equal(i18n.t('server.selected', { n: 2 }), '2 selected');
+  assert.equal(notified, 1, '切换应广播订阅者（界面刷新依赖它）');
+  // 同语言重复设置幂等：不写存储、不广播（避免无意义的全界面重渲染）
+  assert.equal(i18n.setLocale('en-US'), true);
+  assert.equal(notified, 1, '幂等切换不得重复广播');
+  off();
   // 未登记（无语言包）的语言不得选中：避免落到"半翻译"状态
   assert.equal(i18n.setLocale('fr-FR'), false);
   assert.equal(i18n.locale, 'en-US');
   i18n.__reset();
+});
+
+test('i18n：zh-CN 与 en-US 语言包 key 结构完全同构', () => {
+  const root = nodePath.join(nodePath.dirname(fileURLToPath(import.meta.url)), '..');
+  const keys = (f) => new Set([...nodeFs.readFileSync(nodePath.join(root, f), 'utf8')
+    .matchAll(/'([a-zA-Z0-9_]+(?:\.[a-zA-Z0-9_]+)+)':/g)].map((m) => m[1]));
+  const zh = keys('public/lang/zh-CN.js');
+  const en = keys('public/lang/en-US.js');
+  assert.ok(zh.size > 300, `中文包应覆盖全部 key（当前 ${zh.size}）`);
+  const onlyZh = [...zh].filter((k) => !en.has(k));
+  const onlyEn = [...en].filter((k) => !zh.has(k));
+  assert.deepEqual(onlyZh, [], `以下 key 缺英文翻译：${onlyZh.join(', ')}`);
+  assert.deepEqual(onlyEn, [], `以下 key 中文包没有（疑似拼写不一致）：${onlyEn.join(', ')}`);
 });
 
 test('i18n：index.html 引用的 data-i18n key 必须都在语言包中定义', () => {

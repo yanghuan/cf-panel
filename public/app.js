@@ -433,18 +433,29 @@
     });
   }
 
+  // "未分组"的内部哨兵：分组数据里空字符串即未分组。显示时经 t() 翻译，
+  // 内部比较/排序/过滤/结构比对一律用哨兵——若拿翻译后的文本当标识，
+  // 切语言后同一批数据会匹配不上。取双下划线前缀而非 \u0000 控制字符：
+  // 后者写入 HTML 属性时会被解析器替换成 U+FFFD，导致 DOM 比对永不匹配。
+  // （用户恰好建了同名分组的概率可忽略；即便发生也只是与未分组合并显示。）
+  const UNGROUPED = '__ungrouped__';
+  // 组显示名：哨兵 → 翻译文本；真实分组名原样返回
+  const groupLabel = (g) => (g === UNGROUPED ? t('server.group.ungrouped') : g);
+
   // 分组标题序列（用于判断分组结构是否变化）
   function groupList() {
     const groups = {};
     for (const s of visibleServers()) {
-      const g = s.group || '未分组';
+      const g = s.group || UNGROUPED;
       (groups[g] = groups[g] || []).push(s);
     }
     // 组内按 display_index（序号）排序；分组按 groupOrder 数组下标排序，
     // 未配置的组追加尾部按名称排，「未分组」始终最后
     const idx = (g) => { const i = groupOrder.indexOf(g); return i < 0 ? groupOrder.length : i; };
+    // 排序规则跟随当前界面语言（写死 'zh' 的话，切到英文后仍按中文排序规则）
+    const coll = CfI18n.locale || 'zh';
     return Object.keys(groups).sort(
-      (a, b) => (a === '未分组') - (b === '未分组') || idx(a) - idx(b) || a.localeCompare(b, 'zh')
+      (a, b) => (a === UNGROUPED) - (b === UNGROUPED) || idx(a) - idx(b) || a.localeCompare(b, coll)
     );
   }
   function renderServers() {
@@ -464,23 +475,25 @@
     }
     const visible = visibleServers();
     if (!visible.length) {
-      box.innerHTML = `<div class="empty"><p>没有匹配的服务器</p><p class="muted">没有名称/分组/IP 包含「${escapeHtml(searchQuery.trim())}」的节点</p></div>`;
+      box.innerHTML = `<div class="empty"><p>${escapeHtml(t('server.noMatch'))}</p><p class="muted">${escapeHtml(t('server.noMatchHint', { kw: searchQuery.trim() }))}</p></div>`;
       return;
     }
     const groups = groupList();
     const byGroup = (g) => visible
-      .filter((s) => (s.group || '未分组') === g)
+      .filter((s) => (s.group || UNGROUPED) === g)
       .sort((a, b) => (a.display_index || 0) - (b.display_index || 0));
     // 组标题：名称 + 计数 + 管理员可见的 ↑↓ 排序按钮（未分组固定最后，不给按钮；
     // 边界禁用以「可排序组」序列计算——与 groupSort handler 的交换逻辑一致）
-    const sortable = groups.filter((g) => g !== '未分组');
+    const sortable = groups.filter((g) => g !== UNGROUPED);
     const gTitle = (g, count) => {
       const pos = sortable.indexOf(g);
       // 边界方向不可用时直接隐藏（首组无 ↑、末组无 ↓），比禁用态更干净
       const sortBtns = isAdmin && pos >= 0
-        ? `<span class="g-sort">${pos > 0 ? `<button data-gact="up" data-group="${escapeHtml(g)}" title="上移">↑</button>` : ''}${pos < sortable.length - 1 ? `<button data-gact="down" data-group="${escapeHtml(g)}" title="下移">↓</button>` : ''}</span>`
+        ? `<span class="g-sort">${pos > 0 ? `<button data-gact="up" data-group="${escapeHtml(g)}" title="${escapeHtml(t('server.moveUp'))}">↑</button>` : ''}${pos < sortable.length - 1 ? `<button data-gact="down" data-group="${escapeHtml(g)}" title="${escapeHtml(t('server.moveDown'))}">↓</button>` : ''}</span>`
         : '';
-      return `<h3 class="group-title"><span class="g-name">${escapeHtml(g)}（${count}）</span>${sortBtns}</h3>`;
+      // data-group 存内部标识（哨兵/真实组名）：updateServerCards 用它比对分组结构，
+      // 显示名会随语言与计数变化，不能做结构标识
+      return `<h3 class="group-title" data-group="${escapeHtml(g)}"><span class="g-name">${escapeHtml(groupLabel(g))}（${count}）</span>${sortBtns}</h3>`;
     };
     box.innerHTML = groups.map((g) => `
       ${gTitle(g, byGroup(g).length)}
@@ -517,7 +530,8 @@
       renderServers();
       return;
     }
-    const domGroups = [...box.querySelectorAll('.group-title')].map((h) => (h.querySelector('.g-name') || h).textContent.replace(/[（(]\d+[）)]\s*$/, ''));
+    // 读 data-group（内部标识）而非显示文本：显示名随语言/计数变化，不能做结构比对
+    const domGroups = [...box.querySelectorAll('.group-title')].map((h) => h.dataset.group || '');
     const wantGroups = groupList();
     if (domGroups.join('|') !== wantGroups.join('|')) {
       renderServers();
@@ -2093,7 +2107,7 @@
   async function batchSetGroup() {
     const ids = [...selectedServers];
     if (!ids.length) return;
-    promptDialog(`为选中的 ${ids.length} 台设置分组（留空 = 未分组）`, '', async (group) => {
+    promptDialog(t('server.batchGroupTitle', { n: ids.length }), '', async (group) => {
       try {
         const r = await api('/api/servers/batch', {
           method: 'POST',
@@ -2650,7 +2664,34 @@
       document.querySelectorAll('#servers .card-menu').forEach((m) => m.classList.add('hidden'));
     }
   });
+  // 语言菜单：由已注册的语言包动态生成（i18n 框架不内置语言——支持哪些
+  // 取决于 index.html 加载了哪些 lang/*.js），当前语言前打勾
+  function renderLangMenu() {
+    const box = $('#lang-list');
+    if (!box) return;
+    const cur = CfI18n.locale;
+    box.innerHTML = CfI18n.supported().map((l) => `
+      <button class="dd-item dd-lang${l.code === cur ? ' active' : ''}" data-lang="${escapeHtml(l.code)}">${l.code === cur ? '✓ ' : ''}${escapeHtml(l.label)}</button>`).join('');
+  }
+
+  // 语言切换后的界面刷新。动态渲染的内容（卡片/概览/批量栏）是常显的，必须立即重渲染；
+  // 静态文本由 applyDom 覆盖；弹窗内文本在打开那一刻求值，重开即新语言，不强行重填。
+  function onLangChange() {
+    CfI18n.applyDom();
+    renderServers();
+    renderLangMenu();
+    if (activeTermSession()) syncRendererBtn();
+  }
+
   $('#dropdown').addEventListener('click', (e) => {
+    // 语言切换按钮（data-lang）优先于通用菜单项分发
+    const langBtn = e.target.closest('[data-lang]');
+    if (langBtn) {
+      $('#dropdown').classList.add('hidden');
+      // 成功后由 onChange 订阅刷新界面；失败（未知语言）静默——菜单只列已注册语言
+      CfI18n.setLocale(langBtn.dataset.lang);
+      return;
+    }
     const item = e.target.closest('.dd-item');
     if (!item) return;
     $('#dropdown').classList.add('hidden');
@@ -2818,7 +2859,7 @@
     const btn = e.target.closest('button[data-gact]');
     if (!btn || btn.disabled) return;
     const g = btn.dataset.group;
-    const visual = groupList().filter((x) => x !== '未分组'); // 未分组固定最后，不参与
+    const visual = groupList().filter((x) => x !== UNGROUPED); // 未分组固定最后，不参与
     const i = visual.indexOf(g);
     const j = btn.dataset.gact === 'up' ? i - 1 : i + 1;
     if (i < 0 || j < 0 || j >= visual.length) return;
@@ -3112,8 +3153,11 @@
 
   // ---------- 启动 ----------
   (async function boot() {
-    // 先填充 index.html 上带 data-i18n* 的静态文本/属性，再走业务初始化
+    // 先填充 index.html 上带 data-i18n* 的静态文本/属性，再走业务初始化；
+    // 语言菜单按已注册的语言包生成，并订阅切换事件刷新动态内容
     CfI18n.applyDom();
+    renderLangMenu();
+    CfI18n.onChange(onLangChange);
     loadPublic();
     if (!token) return showAuth();
     try {

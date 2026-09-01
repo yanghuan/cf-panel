@@ -361,6 +361,7 @@ Rust 版 agent 三平台产物从 GitHub Releases 下载（`cf-panel-agent-windo
 - **搜索与批量操作**：工具栏搜索框按名称 / IP / 分组即时过滤（纯前端，列表已全量推送到客户端，零请求）；勾选卡片后出现批量操作栏，支持**批量更新 Agent**（逐台串行，可见每台进度）、**批量修改分组**、**批量删除**（均仅管理员）。批量接口返回逐项结果，部分失败不会让整体变成 500。
 - **登录**：`PANEL_USERS` 多用户（`user:pass,user:pass`）或单管理员（`PANEL_PASSWORD`），登录即管理员。**应用内置失败限流**（同一 IP 在 15 分钟窗口内失败 ≥5 次 → 锁定 15 分钟并返回 `429` + `Retry-After`，登录成功自动清零）；生产部署**必须**再前置 **Cloudflare Access**（登录密码作为第二层），以覆盖跨边缘实例的限流一致性。
   > ⚠️ Access 需为非浏览器会话路径放行（使用 `X-Agent-Key` 头 / Bearer 鉴权，非浏览器 SSO，必须配置 Bypass 或 Service Token 策略）：`/ws/agent/*`（agent 控制/终端/文件流，否则 agent 无法连接）与 `/mcp*`（MCP JSON-RPC + `/mcp/file_upload` 签名 URL 直传，否则 MCP 客户端与 curl 上传被拦）。
+  > 另：面板若配了 Web Analytics（JS 片段方式），使用统计类浏览器扩展（uBlock 等）会拦截 `cloudflareinsights.com` 导致本机浏览不计入（ERR_BLOCKED_BY_CLIENT）——属访客侧拦截，不影响其他访客。PWA 的 `/manifest.webmanifest` 也会被 Access 认证重定向，若在意「添加到主屏幕」可为其配置 Bypass。
 - **公告**：设置里可改站点名/公告（存 D1 `kv_json` 表），公告对所有访客可见。
 - **PAT**：设置里可创建访问令牌（scopes + server_ids 白名单 + 可选有效期，留空=永久有效，到期自动拒绝鉴权），供 API 调用（`Authorization: Bearer cfp_xxx`）。有效期可填天数（如 `30`）或截止日期（如 `2026/9/5 14:00`，可用 📅 按钮选），输入时右侧实时预览换算结果。令牌列表显示每个令牌的**最近使用时间**（60 秒节流回写，不增加请求级写放大），便于识别长期不用的僵尸令牌。
 - **审计日志**：右上角菜单「审计日志」可查看，支持按动作/用户/服务器筛选、分页与 CSV 导出，D1 保留 90 天后自动清理。覆盖：**登录与鉴权**（`login.success` 成功 / `login.failed` 密码错误 / `login.locked` 触发限流锁定 / `auth.failed` 无效或过期凭据探测——记来源 IP 与归一化路径，**不记密码**）、**服务器**（增删改、轮换 key、批量改分组）、**终端/文件会话**、**文件写操作**（上传/写入/打包/重命名/移动/删除）、**执行命令**、**Agent 更新**。

@@ -227,9 +227,24 @@ pub fn log(msg: impl AsRef<str>) {
 const RETRY_INITIAL_SECS: u64 = 3;
 const RETRY_MAX_SECS: u64 = 300;
 const AUTH_FAIL_SECS: u64 = 300;
+const SUPERSEDED_SECS: u64 = 300; // 被新连接替换（close 4001）：长退避，防双开互踢 ping-pong
+const CLOSE_SUPERSEDED: u16 = 4001; // 面板替换语义的 close code（do-terminal.js 同步定义）
+const INSTANCE_LOCK_WAIT_MS: u64 = 20_000; // 单实例锁交接窗口：self-restart 时老进程尚未退出
 const MIN_UPTIME_RESET_SECS: u64 = 10; // 存活 ≥10s 才算"健康连接"，才重置退避（防秒断风暴）
 const CONTROL_READ_TIMEOUT_S: u64 = 180; // 读循环超时：180s 无任何消息判定半开（健康连接有 30s 心跳）
 const CTRL_MSG_LIMIT: usize = 64 * 1024; // 控制通道入站消息上限 64KB（指令/心跳远小于此）
+
+// 面板替换关闭（close 4001）：同 key 的另一实例连上时，DO 主动关闭旧通道。收到后
+// 走长退避而非常规秒级重连——双开场景下立即重连会再次抢回连接、与新实例互踢，
+// 形成 A 踢 B、B 重连踢 A 的 ping-pong 循环
+#[derive(Debug)]
+struct Superseded;
+impl std::fmt::Display for Superseded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "superseded by another agent instance (close 4001)")
+    }
+}
+impl std::error::Error for Superseded {}
 
 async fn run_control(
     cfg: &Config,
@@ -256,6 +271,9 @@ async fn run_control(
                 if is_auth_error(e.as_ref()) {
                     log("auth failed (401): retrying slowly");
                     backoff = AUTH_FAIL_SECS;
+                } else if e.downcast_ref::<Superseded>().is_some() {
+                    log("superseded by another instance: retrying slowly");
+                    backoff = SUPERSEDED_SECS;
                 } else if started.elapsed().as_secs() >= MIN_UPTIME_RESET_SECS {
                     // 健康连接存活 ≥10s 后被重置（代理空闲超时/网络抖动）：连接本身没问题，
                     // 快速重连（不翻倍）；否则退避单调膨胀到 300s，表现为"长时间重连不上"
@@ -362,6 +380,15 @@ async fn control_conn(
                 if let Err(e) = handled {
                     break Err(e);
                 }
+            }
+            Message::Close(frame) => {
+                // 面板替换关闭：同 key 新控制通道到达时 DO 主动踢旧连接（4001 superseded）。
+                // 按专用错误上报走长退避（防互踢 ping-pong）；其余 close 与流结束同语义，
+                // 按正常关闭处理
+                if frame.as_ref().map(|f| u16::from(f.code)).unwrap_or(0) == CLOSE_SUPERSEDED {
+                    break Err(Box::new(Superseded));
+                }
+                break Ok(());
             }
             _ => {}
         }
@@ -1041,6 +1068,32 @@ async fn main() {
         std::process::exit(1);
     }
     let _ = CONFIG.set(cfg.clone());
+    // 单实例锁：同 key 双开（手动重复启动/脚本误执行）会形成两条控制通道交替上报
+    // （面板版本号/信息来回跳变）且更新指令打到不确定的连接。抢锁失败不立即退出：
+    // self-restart 交接时老进程 spawn 新进程后尚未退出，新进程需等它释放锁；窗口耗尽
+    // 仍失败才明确退出（真双开）。
+    let lock_slug: String = cfg.key.chars().take(8).collect();
+    let lock_path = platform::tmp_base().join(format!("cfpanel-{lock_slug}.lock"));
+    let mut waited_ms: u64 = 0;
+    let mut instance_guard: Option<platform::InstanceGuard> = loop {
+        match platform::acquire_instance_lock(&lock_path) {
+            Ok(g) => break Some(g),
+            Err(_e) => {
+                if waited_ms == 0 {
+                    log("another agent instance is holding the lock; waiting for handover");
+                }
+                if waited_ms >= INSTANCE_LOCK_WAIT_MS {
+                    eprintln!(
+                        "another agent instance is running (lock: {}): exiting",
+                        lock_path.display()
+                    );
+                    std::process::exit(1);
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                waited_ms += 500;
+            }
+        }
+    };
     update::cleanup_stale(); // 异常退出留下的同目录 .update-* staging（不删除人工回滚 .bak）
     // 保留 AGENT_TMPDIR 环境变量兼容（Rust 版不依赖临时目录，pty/文件均由进程内管理）
     let _ = std::fs::create_dir_all(&cfg.tmp_dir);
@@ -1092,6 +1145,9 @@ async fn main() {
     }
     drop(guards);
     if RESTART_AFTER_UPDATE.load(Ordering::SeqCst) {
+        // 先释放单实例锁再拉起新进程：新进程启动即抢锁，不必等老进程完全退出
+        // （等待也不致命——新进程有 20s 交接窗口，但显式释放让交接零延迟）
+        drop(instance_guard.take());
         match platform::restart_executable(&cfg.executable) {
             Ok(()) => log("replacement agent started"),
             Err(e) => log(format!(

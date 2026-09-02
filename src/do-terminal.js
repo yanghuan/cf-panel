@@ -274,6 +274,16 @@ export class TerminalDO {
       // 让 agent 侧 websocat 收到 close → 退出 → 触发清理链（kill pty/bash/脚本），防半开残留。
       // 配合服务端心跳后，健康连接不会因 read -t 180 误重连，故此处只会在真正断链时触发。
       this.dropAgentSessions(server.id);
+      // 替换语义：同服务器已登记的控制通道（同 key 双开实例或断链后的半开残留）主动
+      // 关闭，收敛到「一服务器一活连接」。否则两条连接交替 report 造成面板信息来回
+      // 跳变（版本号/更新模式），DO 冻结唤醒后 rebuildIndex 还可能让半开死连接压过
+      // 活连接，更新/exec 指令发往死连接悬挂超时。
+      // close code 4001 = superseded：agent 收到后进入长退避，避免旧实例立即重连与新
+      // 连接互踢形成 ping-pong 循环。
+      const prevAgent = this.agents.get(server.id);
+      if (prevAgent && prevAgent !== pair[1]) {
+        try { prevAgent.close(4001, 'superseded by new connection'); } catch { /* ignore */ }
+      }
       this.agents.set(server.id, pair[1]);
       // 附件随连接持久化：休眠唤醒后靠它重建 agents 索引（role 区分控制通道与会话流）
       pair[1].serializeAttachment({ role: 'control', serverId: server.id });

@@ -119,6 +119,32 @@ pub mod imp {
         cmd.spawn().map(|_| ())
     }
 
+    // ---------------- 单实例锁 ----------------
+    // 同 key 双开（手动重复启动/脚本误执行）会让两条控制通道交替上报（面板信息来回
+    // 跳变）且更新指令打到不确定的连接。用 flock 而非 pidfile：内核原子仲裁无
+    // TOCTOU 竞态，进程退出（含 kill -9）自动释放，无 stale 文件误判问题。
+
+    /// 实例锁守卫：持有底层 File（open file description 打开期间锁有效），drop 关闭
+    /// fd 即释放锁。跨 await 持有（main 全程），File 本身 Send。
+    pub struct InstanceGuard {
+        _file: std::fs::File,
+    }
+
+    /// 抢单实例锁（非阻塞）。成功返回守卫；锁被占（EWOULDBLOCK）或 IO 错误返回 Err。
+    pub fn acquire_instance_lock(path: &std::path::Path) -> std::io::Result<InstanceGuard> {
+        use std::os::unix::io::AsRawFd;
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(path)?;
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(InstanceGuard { _file: file })
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -316,6 +342,49 @@ pub mod imp {
         cmd.spawn().map(|_| ())
     }
 
+    // ---------------- 单实例锁（与 Unix flock 语义对齐）----------------
+
+    /// 实例锁守卫：持有 CreateFileW 独占句柄，drop 关句柄即释放。
+    pub struct InstanceGuard {
+        handle: *mut std::ffi::c_void,
+    }
+    // 内核句柄值本身跨线程可用（本进程内 main 持有），不跨进程
+    unsafe impl Send for InstanceGuard {}
+
+    impl Drop for InstanceGuard {
+        fn drop(&mut self) {
+            unsafe { CloseHandle(self.handle) };
+        }
+    }
+
+    /// 抢单实例锁（非阻塞）：CreateFileW 不设任何共享位 = 独占语义，第二个进程打开
+    /// 同一文件即失败（ERROR_SHARING_VIOLATION），与 flock 的 LOCK_NB|LOCK_EX 等价。
+    pub fn acquire_instance_lock(path: &std::path::Path) -> std::io::Result<InstanceGuard> {
+        use std::os::windows::ffi::OsStrExt;
+        const GENERIC_READ: u32 = 0x8000_0000;
+        const GENERIC_WRITE: u32 = 0x4000_0000;
+        const OPEN_ALWAYS: u32 = 4;
+        const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
+        let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+        wide.push(0);
+        let handle = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                GENERIC_READ | GENERIC_WRITE,
+                0, // dwShareMode = 0：独占，后续打开冲突
+                std::ptr::null_mut(),
+                OPEN_ALWAYS,
+                FILE_ATTRIBUTE_NORMAL,
+                std::ptr::null_mut(),
+            )
+        };
+        if handle as isize == -1 {
+            // INVALID_HANDLE_VALUE
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(InstanceGuard { handle })
+    }
+
     // ---- Win32 FFI（仅本模块使用；避免引 windows-rs 全家桶，六个函数足矣）----
     #[allow(non_snake_case)]
     #[repr(C)]
@@ -372,6 +441,15 @@ pub mod imp {
     const PROCESS_ALL_ACCESS: u32 = 0x1F0FFF;
     #[link(name = "kernel32")]
     unsafe extern "system" {
+        fn CreateFileW(
+            lpFileName: *const u16,
+            dwDesiredAccess: u32,
+            dwShareMode: u32,
+            lpSecurityAttributes: *mut std::ffi::c_void,
+            dwCreationDisposition: u32,
+            dwFlagsAndAttributes: u32,
+            hTemplateFile: *mut std::ffi::c_void,
+        ) -> *mut std::ffi::c_void;
         fn CreateJobObjectW(
             lpJobAttributes: *mut std::ffi::c_void,
             lpName: *const u16,

@@ -1146,6 +1146,32 @@ test('Agent 更新：仅管理员、能力检查、Release 流式中转与审计
     assert.equal((await call(env, {
       method: 'POST', path: '/api/servers/1/agent-update', token: pat,
     })).status, 403);
+
+    // 独立 scope：agent:update 的 PAT 可触发更新（审计记 PAT 身份）
+    const patUpdRes = await call(env, {
+      method: 'POST', path: '/api/tokens', token: admin,
+      body: { name: 'upd', scopes: ['agent:update'] },
+    });
+    const updToken = (await patUpdRes.json()).token;
+    const updByPat = await call(env, {
+      method: 'POST', path: '/api/servers/1/agent-update', token: updToken,
+    });
+    assert.equal(updByPat.status, 200);
+    assert.equal((await updByPat.json()).build_id, manifest.build_id);
+
+    // agent:update PAT 命中 server_ids 白名单限定：限定到其他服务器时对该机拒绝
+    const patScopedRes = await call(env, {
+      method: 'POST', path: '/api/tokens', token: admin,
+      body: { name: 'upd-scoped', scopes: ['agent:update'], server_ids: [2] },
+    });
+    const scopedToken = (await patScopedRes.json()).token;
+    assert.equal((await call(env, {
+      method: 'POST', path: '/api/servers/1/agent-update', token: scopedToken,
+    })).status, 403);
+    const patAudits = await env.DB.prepare(
+      "SELECT username, action FROM audit_logs WHERE action LIKE 'agent.update.%' AND username LIKE 'token:%' ORDER BY id"
+    ).all();
+    assert.ok(patAudits.results.length >= 2, 'PAT 触发的更新写入审计（request + installed）');
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -1263,7 +1289,7 @@ test('MCP：tools/list 与 tools/call', async () => {
 
   const list = await (await mcp(env, { token, body: { jsonrpc: '2.0', id: 1, method: 'tools/list' } })).json();
   assert.deepEqual(list.result.tools.map((t) => t.name), [
-    'list_servers', 'get_monitor', 'exec_command', 'create_upload',
+    'list_servers', 'get_monitor', 'exec_command', 'update_agent', 'create_upload',
     'add_server', 'delete_server', 'update_server', 'rotate_agent_key',
     'list_tokens', 'create_token', 'revoke_token',
     'get_audit_logs', 'get_usage', 'get_settings', 'update_settings',

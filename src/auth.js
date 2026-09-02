@@ -1,5 +1,5 @@
 // cf-panel — 鉴权与权限（JWT/PAT + 服务器列表）
-import { PAT_PREFIX, SCOPE_READ, SCOPE_EXEC, ONLINE_GRACE_FAST_S, ONLINE_GRACE_SLOW_S } from './config.js';
+import { PAT_PREFIX, SCOPE_READ, SCOPE_EXEC, SCOPE_AGENT_UPDATE, ONLINE_GRACE_FAST_S, ONLINE_GRACE_SLOW_S } from './config.js';
 import { hashSecret, verifyJwt, safeJson, doPanel, doMetrics } from './utils.js';
 
 // PAT 最后使用时间回写节流（秒）：鉴权是每请求/每 WS 心跳级热路径，逐次 UPDATE 会把
@@ -107,6 +107,19 @@ export function canExec(user, server) {
     return user.pat.scopes.includes(SCOPE_EXEC);
   }
   return server.user_id === user.id;
+}
+
+// Agent 更新是最高危的供应链操作（远程替换二进制）：独立 scope，不并入 exec——
+// 持有 exec 的 PAT 仍不能更新（REST 与 MCP update_agent 共用此判定）。
+// member 用户不允许（与旧「仅管理员」语义一致）。
+export function canUpdateAgent(user, server) {
+  if (!user) return false;
+  if (isAdmin(user)) return true;
+  if (user.pat) {
+    if (user.pat.serverIDs && !user.pat.serverIDs.includes(server.id)) return false;
+    return user.pat.scopes.includes(SCOPE_AGENT_UPDATE);
+  }
+  return false;
 }
 
 // 按用户权限查询服务器列表（admin 全量；PAT 按白名单+read scope 在 SQL 层过滤，避免查全表再 JS 过滤；member 看自己的）。

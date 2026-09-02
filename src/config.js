@@ -7,6 +7,7 @@ export const SHARDS = 4; // 终端 DO 分片数（utils 分片路由 / routes �
 export const PAT_PREFIX = 'cfp_'; // PAT token 前缀（auth 鉴权 + routes 创建共用）
 export const SCOPE_READ = 'server:read';
 export const SCOPE_EXEC = 'server:exec';
+export const SCOPE_AGENT_UPDATE = 'agent:update';
 
 // 监控时序：超过 1 小时的旧数据才归档/可淘汰（db 监控查询 + do-metrics 归档共用）
 export const ARCHIVE_AFTER_MIN = 60;

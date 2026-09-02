@@ -1,10 +1,10 @@
 // cf-panel — 路由层：REST API（handleApi）+ MCP（handleMcp）+ WebSocket 路由（handleWs）
 import {
-  SCOPE_READ, SCOPE_EXEC, PAT_PREFIX, SHARDS, parsePanelUsers, statsTzOffsetSec,
+  SCOPE_READ, SCOPE_EXEC, SCOPE_AGENT_UPDATE, PAT_PREFIX, SHARDS, parsePanelUsers, statsTzOffsetSec,
 } from './config.js';
 
 // 本模块专用常量（PAT scope 白名单 / MCP 协议与工具，就近定义便于对照使用代码）
-const ALLOWED_SCOPES = [SCOPE_READ, SCOPE_EXEC]; // PAT 合法 scope 白名单
+const ALLOWED_SCOPES = [SCOPE_READ, SCOPE_EXEC, SCOPE_AGENT_UPDATE]; // PAT 合法 scope 白名单
 const TOKEN_NAME_UNIQUE_RE = /UNIQUE constraint failed: api_tokens\.name/; // D1 唯一索引（迁移 0010）约束冲突标识
 const MCP_VERSION = '2025-11-25'; // 服务器声明支持的协议版本（缺失头时客户端按 2025-03-26 兼容）
 const MCP_TOOLS = [
@@ -38,6 +38,18 @@ const MCP_TOOLS = [
         timeout: { type: 'integer', description: '超时秒数，默认 25，最大 25' },
       },
       required: ['command'],
+    },
+  },
+  {
+    name: 'update_agent',
+    description: '触发指定服务器的 Agent 自更新：从官方 Release 下载最新构建（SHA-256 校验）经控制通道流式中转，Agent 原子替换并重启。需要 agent:update 权限（管理员或带 agent:update scope 的 PAT，且命中 server_ids 白名单），且目标 Agent 已配置 ALLOW_SELF_UPDATE=1。单机语义：多台请串行逐台调用（与前端批量更新同策略），每次调用可看到该台的失败原因与审计。已是最新版本时返回 already_latest。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        server_id: { type: 'integer', description: '服务器 ID（见 list_servers 返回值中的 id）' },
+        server_name: { type: 'string', description: '服务器名称（与 server_id 二选一，重名时拒绝）' },
+      },
+      required: [],
     },
   },
   {
@@ -186,7 +198,7 @@ import {
   signUploadToken, verifyUploadToken,
 } from './utils.js';
 import { queryMonitorRows, queryCustomMetrics, queryDayStats, kvClearCache } from './db.js';
-import { authUser, isAdmin, canAccessServer, canExec, listServersWithState, serverListCache } from './auth.js';
+import { authUser, isAdmin, canAccessServer, canExec, canUpdateAgent, listServersWithState, serverListCache } from './auth.js';
 import { serverRowCache, lastSeenWrite, customWritten } from './report.js';
 
 // ---------------- Agent Release / 更新清单 ----------------
@@ -587,102 +599,13 @@ async function handleApiInner(request, env) {
     }
   }
 
-  // POST /api/servers/:id/agent-update —— 管理员触发专用更新协议。
+  // POST /api/servers/:id/agent-update —— 触发专用更新协议（与 MCP update_agent 共用 agentUpdateCore）。
+  // 权限：管理员或带 agent:update scope 的 PAT（canUpdateAgent，含 server_ids 白名单）；
+  // PAT 即使有 server:exec 也不行——更新是独立 scope 的高危供应链操作。
   // Worker 流式中转 Release 资产，不物化整个二进制；Agent 做大小/SHA/版本复核后 self-replace。
   const updateMatch = path.match(/^\/api\/servers\/(\d+)\/agent-update$/);
   if (method === 'POST' && updateMatch) {
-    if (!isAdmin(user)) return err('forbidden', 403, 'FORBIDDEN'); // PAT（即使 server:exec）也不得升级 Agent
-    const id = Number(updateMatch[1]) || 0;
-    const server = await env.DB.prepare('SELECT * FROM servers WHERE id = ?').bind(id).first();
-    if (!server) return err('server not found', 404, 'NOT_FOUND');
-    const info = safeJson(server.info_json) || {};
-    if (Number(info.update_protocol) < 1 || !info.self_update_enabled) {
-      return err('agent does not support self update or ALLOW_SELF_UPDATE is disabled', 409);
-    }
-    const platform = String(info.agent_platform || '');
-    let manifest;
-    try {
-      manifest = await getAgentManifest(env);
-    } catch (e) {
-      return err(`agent release unavailable: ${e.message}`, 502);
-    }
-    const asset = manifest.assets[platform];
-    if (!asset) return err(`no release asset for platform ${platform || 'unknown'}`, 409);
-    if (String(info.agent_version || '') === manifest.build_id) {
-      return json({ ok: true, already_latest: true, build_id: manifest.build_id });
-    }
-    if (!isNewerAgentBuild(info.agent_version, manifest.build_id)) {
-      return err(`current agent ${info.agent_version} is newer than latest release ${manifest.build_id}`, 409);
-    }
-
-    // 更新是高权限供应链操作：审计写失败则 fail closed，不执行远端替换。
-    await env.DB.prepare(
-      'INSERT INTO audit_logs (user_id, username, client_ip, action, target_server_id, detail) VALUES (?,?,?,?,?,?)'
-    ).bind(user.id, user.username, clientIp(request), 'agent.update.request', id,
-      `${info.agent_version || 'unknown'} → ${manifest.build_id} (${platform})`).run();
-    const auditUpdateResult = async (action, detail) => {
-      try {
-        await env.DB.prepare(
-          'INSERT INTO audit_logs (user_id, username, client_ip, action, target_server_id, detail) VALUES (?,?,?,?,?,?)'
-        ).bind(user.id, user.username, clientIp(request), action, id, String(detail).slice(0, 300)).run();
-      } catch { /* request 审计已存在，结果审计 best effort */ }
-    };
-
-    let assetResp;
-    try {
-      assetResp = await fetch(asset.url, {
-        headers: { accept: 'application/octet-stream', 'user-agent': 'cf-panel-agent-updater' },
-        redirect: 'follow',
-        cf: { cacheTtl: 86400, cacheEverything: true }, // 同版本多机更新复用边缘缓存
-      });
-    } catch (e) {
-      await auditUpdateResult('agent.update.failed', `asset download: ${e.message}`);
-      return err(`agent asset download failed: ${e.message}`, 502);
-    }
-    if (!assetResp.ok || !assetResp.body) {
-      await auditUpdateResult('agent.update.failed', `asset download HTTP ${assetResp.status}`);
-      return err(`agent asset download failed (${assetResp.status})`, 502);
-    }
-    const contentLength = Number(assetResp.headers.get('content-length'));
-    if (Number.isFinite(contentLength) && contentLength > 0 && contentLength !== asset.size) {
-      try { await assetResp.body.cancel(); } catch { /* ignore */ }
-      await auditUpdateResult('agent.update.failed', 'asset size differs from manifest');
-      return err('agent asset size differs from manifest', 502);
-    }
-
-    const stub = doForShard(env, shardForServerId(id));
-    let result;
-    try {
-      const resp = await stub.fetch(
-        `https://do.internal/rpc/agent_update?server_id=${id}`,
-        {
-          method: 'POST',
-          headers: {
-            'content-type': 'application/octet-stream',
-            'x-agent-build-id': manifest.build_id,
-            'x-agent-platform': platform,
-            'x-agent-size': String(asset.size),
-            'x-agent-sha256': asset.sha256,
-          },
-          body: assetResp.body,
-          duplex: 'half', // ReadableStream request body（Node 测试/标准 Fetch 要求；Workers 忽略或支持）
-        }
-      );
-      result = await resp.json().catch(() => ({ error: `update failed (${resp.status})` }));
-      if (!resp.ok) {
-        await auditUpdateResult('agent.update.failed', result.error || `HTTP ${resp.status}`);
-        return json({ error: result.error || 'agent update failed' }, resp.status);
-      }
-    } catch (e) {
-      await auditUpdateResult('agent.update.failed', `relay: ${e.message}`);
-      return err(`agent update relay failed: ${e.message}`, 502);
-    }
-    await auditUpdateResult(
-      'agent.update.installed',
-      `${info.agent_version || 'unknown'} → ${manifest.build_id}`
-    );
-    serverListCacheClear();
-    return json({ ...result, build_id: manifest.build_id });
+    return agentUpdateCore(env, user, Number(updateMatch[1]) || 0, clientIp(request));
   }
 
   // POST /api/servers —— 注册一台服务器（name + 可选 group + 可选序号；仅管理员）
@@ -1237,6 +1160,129 @@ async function mcpListServers(user, env) {
   }));
 }
 
+// Agent 更新核心：REST POST /api/servers/:id/agent-update 与 MCP update_agent 共用。
+// 权限：canUpdateAgent（管理员，或带 agent:update scope 且命中 server_ids 白名单的 PAT）。
+// 单机语义：批量由调用方串行逐台（前端批量更新同策略），每台的失败原因与审计独立可见。
+// 审计写失败 fail closed，不执行远端替换。返回 REST 语义 Response（MCP 侧转工具结果/错误）。
+async function agentUpdateCore(env, user, id, ip) {
+  const server = await env.DB.prepare('SELECT * FROM servers WHERE id = ?').bind(id).first();
+  if (!server) return err('server not found', 404, 'NOT_FOUND');
+  if (!canUpdateAgent(user, server)) return err('forbidden', 403, 'FORBIDDEN');
+  const info = safeJson(server.info_json) || {};
+  if (Number(info.update_protocol) < 1 || !info.self_update_enabled) {
+    return err('agent does not support self update or ALLOW_SELF_UPDATE is disabled', 409);
+  }
+  const platform = String(info.agent_platform || '');
+  let manifest;
+  try {
+    manifest = await getAgentManifest(env);
+  } catch (e) {
+    return err(`agent release unavailable: ${e.message}`, 502);
+  }
+  const asset = manifest.assets[platform];
+  if (!asset) return err(`no release asset for platform ${platform || 'unknown'}`, 409);
+  if (String(info.agent_version || '') === manifest.build_id) {
+    return json({ ok: true, already_latest: true, build_id: manifest.build_id });
+  }
+  if (!isNewerAgentBuild(info.agent_version, manifest.build_id)) {
+    return err(`current agent ${info.agent_version} is newer than latest release ${manifest.build_id}`, 409);
+  }
+
+  // 更新是高权限供应链操作：审计写失败则 fail closed，不执行远端替换。
+  await env.DB.prepare(
+    'INSERT INTO audit_logs (user_id, username, client_ip, action, target_server_id, detail) VALUES (?,?,?,?,?,?)'
+  ).bind(user.id, user.username, ip, 'agent.update.request', id,
+    `${info.agent_version || 'unknown'} → ${manifest.build_id} (${platform})`).run();
+  const auditUpdateResult = async (action, detail) => {
+    try {
+      await env.DB.prepare(
+        'INSERT INTO audit_logs (user_id, username, client_ip, action, target_server_id, detail) VALUES (?,?,?,?,?,?)'
+      ).bind(user.id, user.username, ip, action, id, String(detail).slice(0, 300)).run();
+    } catch { /* request 审计已存在，结果审计 best effort */ }
+  };
+
+  let assetResp;
+  try {
+    assetResp = await fetch(asset.url, {
+      headers: { accept: 'application/octet-stream', 'user-agent': 'cf-panel-agent-updater' },
+      redirect: 'follow',
+      cf: { cacheTtl: 86400, cacheEverything: true }, // 同版本多机更新复用边缘缓存
+    });
+  } catch (e) {
+    await auditUpdateResult('agent.update.failed', `asset download: ${e.message}`);
+    return err(`agent asset download failed: ${e.message}`, 502);
+  }
+  if (!assetResp.ok || !assetResp.body) {
+    await auditUpdateResult('agent.update.failed', `asset download HTTP ${assetResp.status}`);
+    return err(`agent asset download failed (${assetResp.status})`, 502);
+  }
+  const contentLength = Number(assetResp.headers.get('content-length'));
+  if (Number.isFinite(contentLength) && contentLength > 0 && contentLength !== asset.size) {
+    try { await assetResp.body.cancel(); } catch { /* ignore */ }
+    await auditUpdateResult('agent.update.failed', 'asset size differs from manifest');
+    return err('agent asset size differs from manifest', 502);
+  }
+
+  const stub = doForShard(env, shardForServerId(id));
+  let result;
+  try {
+    const resp = await stub.fetch(
+      `https://do.internal/rpc/agent_update?server_id=${id}`,
+      {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/octet-stream',
+          'x-agent-build-id': manifest.build_id,
+          'x-agent-platform': platform,
+          'x-agent-size': String(asset.size),
+          'x-agent-sha256': asset.sha256,
+        },
+        body: assetResp.body,
+        duplex: 'half', // ReadableStream request body（Node 测试/标准 Fetch 要求；Workers 忽略或支持）
+      }
+    );
+    result = await resp.json().catch(() => ({ error: `update failed (${resp.status})` }));
+    if (!resp.ok) {
+      await auditUpdateResult('agent.update.failed', result.error || `HTTP ${resp.status}`);
+      return json({ error: result.error || 'agent update failed' }, resp.status);
+    }
+  } catch (e) {
+    await auditUpdateResult('agent.update.failed', `relay: ${e.message}`);
+    return err(`agent update relay failed: ${e.message}`, 502);
+  }
+  await auditUpdateResult(
+    'agent.update.installed',
+    `${info.agent_version || 'unknown'} → ${manifest.build_id}`
+  );
+  serverListCacheClear();
+  return json({ ...result, build_id: manifest.build_id });
+}
+
+// 工具：触发指定服务器的 Agent 自更新（复用 REST 更新核心：manifest 校验/SHA/审计全链路一致）。
+// 鉴权：canUpdateAgent（管理员或 agent:update scope PAT）；server_name 重名拒绝，防更新到错误机器。
+async function mcpUpdateAgent(user, env, args, ip) {
+  const serverId = Number(args.server_id) || 0;
+  let server = null;
+  if (serverId) {
+    server = await env.DB.prepare('SELECT * FROM servers WHERE id = ?').bind(serverId).first();
+  } else if (args.server_name) {
+    // 更新是写操作：重名时拒绝静默取第一条（与 exec_command 同策略）
+    const rows = await env.DB.prepare('SELECT * FROM servers WHERE name = ?').bind(String(args.server_name)).all();
+    if (rows.results.length > 1) {
+      throw new Error(
+        `ambiguous server_name "${args.server_name}": matches ${rows.results.length} servers (ids: ${rows.results.map((r) => r.id).join(', ')}); use server_id to disambiguate`
+      );
+    }
+    server = rows.results[0] || null;
+  }
+  if (!server) throw new Error('server not found: provide server_id or server_name');
+  const resp = await agentUpdateCore(env, user, server.id, ip);
+  const body = await resp.json().catch(() => ({ error: `update failed (${resp.status})` }));
+  if (!resp.ok) throw new Error(body.error || `agent update failed (${resp.status})`);
+  if (body.already_latest) return `服务器「${server.name}」Agent 已是最新版本（${body.build_id}），无需更新。`;
+  return `服务器「${server.name}」Agent 更新指令已送达（→ ${body.build_id}）。新二进制已替换并由 supervisor 或 AGENT_SELF_RESTART 拉起；稍后可用 list_servers 确认上报的新版本号。`;
+}
+
 // 工具：在 agent 上执行一次性命令（经 TerminalDO 控制通道，等待 exec_result）
 // 鉴权：管理员或 PAT 带 server:exec scope 且命中 server_ids 白名单（canExec）
 async function mcpExecCommand(user, env, args, ip) {
@@ -1668,7 +1714,7 @@ async function handleMcpInner(request, env) {
         protocolVersion: MCP_VERSION,
         capabilities: { tools: {} },
         serverInfo: { name: 'cf-panel', version: '0.1.0' },
-        instructions: 'cf-panel 面板。工具：list_servers（服务器状态）、get_monitor（监控历史）、exec_command（执行命令，需 exec 权限）、create_upload（签发上传签名 URL）、管理类（仅管理员）：add_server/delete_server/update_server/list_tokens/create_token/revoke_token/get_audit_logs/get_usage/get_settings/update_settings。认证：Authorization: Bearer <JWT 或 PAT>',
+        instructions: 'cf-panel 面板。工具：list_servers（服务器状态）、get_monitor（监控历史）、exec_command（执行命令，需 exec 权限）、update_agent（触发 Agent 自更新，需 agent:update 权限，单机语义、多台请串行）、create_upload（签发上传签名 URL）、管理类（仅管理员）：add_server/delete_server/update_server/list_tokens/create_token/revoke_token/get_audit_logs/get_usage/get_settings/update_settings。认证：Authorization: Bearer <JWT 或 PAT>',
       });
     case 'notifications/initialized':
     case 'notifications/cancelled':
@@ -1686,6 +1732,7 @@ async function handleMcpInner(request, env) {
         if (params.name === 'list_servers') content = await mcpListServers(user, env);
         else if (params.name === 'get_monitor') content = await mcpGetMonitor(user, env, params.arguments || {});
         else if (params.name === 'exec_command') content = await mcpExecCommand(user, env, params.arguments || {}, clientIp(request));
+        else if (params.name === 'update_agent') content = await mcpUpdateAgent(user, env, params.arguments || {}, clientIp(request));
         else if (params.name === 'create_upload') content = await mcpCreateUpload(user, env, params.arguments || {}, url, clientIp(request));
         else if (params.name === 'add_server') content = await mcpAddServer(user, env, params.arguments || {}, clientIp(request), url);
         else if (params.name === 'delete_server') content = await mcpDeleteServer(user, env, params.arguments || {}, clientIp(request));

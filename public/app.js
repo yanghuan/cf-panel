@@ -2617,6 +2617,7 @@
     const scopes = [];
     if ($('#tok-read').checked) scopes.push('server:read');
     if ($('#tok-exec').checked) scopes.push('server:exec');
+    if ($('#tok-agent-update').checked) scopes.push('agent:update');
     if (!scopes.length) return toast(t('token.needScope'));
     const serverIDs = $('#tok-servers').value.split(',').map((s) => Number(s.trim())).filter((n) => n > 0);
     const expDays = Number($('#tok-expires').value);

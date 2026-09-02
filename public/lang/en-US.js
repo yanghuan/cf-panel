@@ -203,7 +203,7 @@
     'token.lastUsed': 'Last used: {time}',
     'token.expiresAt': 'Expires: {time}',
     'token.createdTitle': 'Token created (shown only once)',
-    'token.createdBody': 'Token:\n{token}\n\nUsage: Authorization: Bearer {token}\n\nValid until: {expiry}',
+    'token.createdBody': 'Token:\n{token}\n\nUsage: Authorization: Bearer {token}\n\nMCP config (mcp.json, paste into your client\'s mcpServers):\n{mcp}\n\nValid until: {expiry}',
     'token.confirmDelete': 'Delete this token?',
     'token.needScope': 'Pick at least one scope',
     'token.hint': 'server_id reference: {list}',

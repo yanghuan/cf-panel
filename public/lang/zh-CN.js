@@ -202,7 +202,7 @@
     'token.lastUsed': '最近使用：{time}',
     'token.expiresAt': '到期：{time}',
     'token.createdTitle': '令牌已创建（仅显示一次）',
-    'token.createdBody': '令牌：\n{token}\n\n用法：Authorization: Bearer {token}\n\n有效期：{expiry}',
+    'token.createdBody': '令牌：\n{token}\n\n用法：Authorization: Bearer {token}\n\nMCP 配置（mcp.json，粘进客户端的 mcpServers）：\n{mcp}\n\n有效期：{expiry}',
     'token.confirmDelete': '确认删除该令牌？',
     'token.needScope': '至少勾选一个权限',
     'token.hint': 'server_id 参考：{list}',

@@ -2634,7 +2634,21 @@
           ...parseTokenExpiry(),
         }),
       });
-      infoDialog(t('token.createdTitle'), `令牌：\n${res.token}\n\n用法：Authorization: Bearer ${res.token}\n\n有效期：${res.expires_at ? new Date(res.expires_at * 1000).toLocaleString() : t('token.forever')}`);
+      // 弹出一次性明文令牌时附上 MCP 客户端配置：url 用当前站点 origin（Fork 部署域名不同也正确）
+      const mcpCfg = JSON.stringify({
+        mcpServers: {
+          'cf-panel': {
+            type: 'http',
+            url: `${location.origin}/mcp`,
+            headers: { Authorization: `Bearer ${res.token}` },
+          },
+        },
+      }, null, 2);
+      infoDialog(t('token.createdTitle'), t('token.createdBody', {
+        token: res.token,
+        mcp: mcpCfg,
+        expiry: res.expires_at ? new Date(res.expires_at * 1000).toLocaleString() : t('token.forever'),
+      }));
       $('#tok-name').value = '';
       $('#tok-servers').value = '';
       $('#tok-expires').value = '';

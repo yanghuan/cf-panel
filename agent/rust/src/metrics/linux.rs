@@ -510,8 +510,9 @@ pub async fn collect_info() -> serde_json::Value {
             .and_then(|r| r.ok())
             .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
             .unwrap_or_default();
-    // hostname -I 在 busybox/精简镜像不支持 → 依次回退 `ip -4 -o addr show scope global`
-    // （busybox ip 可用）与裸 `hostname`（单值）；ip 输出解析为 IP 列表（去掉 /prefix）
+    // hostname -I 在 busybox/精简镜像不支持 → 依次回退 `ip -o addr show scope global`
+    // （busybox ip 可用，不限 -4：v4/v6 一次取齐，精简镜像上否则永远无 IPv6）与裸
+    // `hostname`（单值）；ip 输出解析为 IP 列表（去掉 /prefix）
     let host = crate::blocking::run_blocking(5, || {
         if let Ok(o) = std::process::Command::new("hostname").arg("-I").output()
             && o.status.success()
@@ -519,7 +520,7 @@ pub async fn collect_info() -> serde_json::Value {
             return String::from_utf8_lossy(&o.stdout).trim().to_string();
         }
         if let Ok(o) = std::process::Command::new("ip")
-            .args(["-4", "-o", "addr", "show", "scope", "global"])
+            .args(["-o", "addr", "show", "scope", "global"])
             .output()
             && o.status.success()
         {

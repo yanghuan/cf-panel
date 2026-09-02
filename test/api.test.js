@@ -1685,6 +1685,44 @@ test('免打扰：未来时间落库，非法/0 不落库', async () => {
   assert.equal(bogus.alerts.mute_until, undefined);
 });
 
+// ---------------- 拖拽排序持久化 ----------------
+test('PUT /api/servers/order：组内重排 + 跨组移动（组内编号 0..n，审计留痕）', async () => {
+  const env = makeEnv();
+  const token = await login(env);
+  await addServer(env, token, { name: 'r-1', group: 'A' });
+  await addServer(env, token, { name: 'r-2', group: 'A' });
+  await addServer(env, token, { name: 'r-3' });
+  const list = await (await call(env, { path: '/api/servers', token })).json();
+  const idOf = (name) => list.find((s) => s.name === name).id;
+
+  // 拖拽语义：r-3 移入 A 组排 r-1 之前（跨组移动）
+  const items = [
+    { id: idOf('r-3'), group: 'A' },
+    { id: idOf('r-1'), group: 'A' },
+    { id: idOf('r-2'), group: 'A' },
+  ];
+  const res = await (await call(env, { method: 'PUT', path: '/api/servers/order', token, body: { items } })).json();
+  assert.equal(res.ok, true);
+
+  const after = await (await call(env, { path: '/api/servers', token })).json();
+  const inA = after.filter((s) => s.group === 'A');
+  assert.deepEqual(inA.map((s) => s.name), ['r-3', 'r-1', 'r-2'], 'A 组按拖放目标顺序');
+  assert.deepEqual(inA.map((s) => s.display_index), [0, 1, 2], '组内按出现顺序 0..n 编号');
+  assert.equal(after.find((s) => s.name === 'r-3').group, 'A', '跨组移动生效');
+
+  const logs = await env.DB.prepare('SELECT * FROM audit_logs WHERE action = ?').bind('server.reorder').all();
+  assert.equal(logs.results.length, 1, '排序是变更操作，须留痕');
+});
+
+test('PUT /api/servers/order：空 items / 重复 id 拒绝（400）', async () => {
+  const env = makeEnv();
+  const token = await login(env);
+  assert.equal((await call(env, { method: 'PUT', path: '/api/servers/order', token, body: { items: [] } })).status, 400);
+  assert.equal((await call(env, { method: 'PUT', path: '/api/servers/order', token, body: {} })).status, 400);
+  const dup = (await call(env, { method: 'PUT', path: '/api/servers/order', token, body: { items: [{ id: 1 }, { id: 1 }] } })).status;
+  assert.equal(dup, 400, '重复 id 拒绝（前端发全量列表，重复即异常）');
+});
+
 test('MCP：坏 JSON → Parse error；协议版本不一致 → HeaderMismatch', async () => {
   const env = makeEnv();
   const token = await login(env);

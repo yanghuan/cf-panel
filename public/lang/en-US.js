@@ -234,6 +234,7 @@
     'audit.serverUpdate': 'Server updated',
     'audit.serverDelete': 'Server deleted',
     'audit.serverRotateKey': 'Agent key rotated',
+    'audit.serverReorder': 'Drag reorder',
     'audit.serverBatchGroup': 'Batch group change',
     'audit.terminalOpen': 'Terminal opened',
     'audit.fileOpen': 'File manager opened',
@@ -257,6 +258,7 @@
     'usage.d1Writes': 'D1 row writes/day',
     'usage.empty': 'No request counters yet (per Worker instance)',
     'usage.times': 'times',
+    'server.dragDisabledFiltered': 'Drag reorder is disabled while filtering — clear the search first',
   };
 
   // ---------------- Terminal ----------------

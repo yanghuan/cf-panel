@@ -313,6 +313,12 @@ button.danger:hover { background: rgba(248, 113, 113, .12); }
   transform: translateY(-2px);
   z-index: 1; /* hover 的 transform 会创建层叠上下文，提升避免被其他卡片覆盖 */
 }
+/* 拖拽排序（仅管理员）：整卡可拖（cursor 提示），拖动中半透明，插入位置在目标卡
+   上/下缘显示主题色指示线 */
+.card[draggable="true"] { cursor: grab; }
+.card[draggable="true"]:active { cursor: grabbing; }
+.card.dragging { opacity: .45; transform: none; }
+.card.drop-before { box-shadow: 0 -3px 0 0 var(--accent), 0 -1px 0 0 var(--accent); }
 /* 菜单打开的卡片整体置顶，防止下拉菜单被下方卡片遮挡 */
 .card:has(.card-menu:not(.hidden)) { z-index: 2; }
 .card-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 10px; }

@@ -358,7 +358,7 @@
       : '';
     const sel = selectedServers.has(s.id);
     return `
-      <div class="card${sel ? ' selected' : ''}" data-id="${s.id}">
+      <div class="card${sel ? ' selected' : ''}" data-id="${s.id}"${isAdmin ? ' draggable="true"' : ''}>
         <div class="card-head">
           <div class="card-title">
             <span class="name"><span class="flag" data-flag="${escapeHtml(ip)}"></span>${osIconHtml(s.info && s.info.os)}${escapeHtml(s.name)}</span>
@@ -2213,6 +2213,39 @@
     );
   }
 
+  // ---------- 卡片拖拽排序（仅管理员；HTML5 DnD，桌面端） ----------
+  // 移动端/触屏不支持 HTML5 DnD——移动端继续用「修改」弹窗与批量改分组。
+  // DOM 顺序即真源：drop 时先移动节点，再从 DOM 视觉顺序反推 (id, group)
+  // 全量列表持久化——避免手写数组插拔逻辑（组间顺序由 groupOrder 重排，数组
+  // 顺序本身不是视觉顺序，手工插拔极易出错）。
+  let dragId = 0;
+
+  // 从 DOM 视觉顺序反推 (id, group) 列表并持久化；本地乐观同步，失败回滚
+  async function persistOrderFromDom() {
+    const items = [];
+    const counter = new Map(); // group -> 组内计数器（按视觉顺序 0..n 编号）
+    for (const grid of document.querySelectorAll('#servers .grid')) {
+      const title = grid.previousElementSibling;
+      const group = title && title.dataset.group != null ? title.dataset.group : '';
+      for (const card of grid.querySelectorAll('.card')) {
+        const idx = counter.get(group) || 0;
+        counter.set(group, idx + 1);
+        items.push({ id: Number(card.dataset.id), group, index: idx });
+      }
+    }
+    // 本地乐观同步 group/index（渲染与下拉/弹窗回填读缓存）
+    for (const it of items) {
+      const s = serversCache.find((x) => x.id === it.id);
+      if (s) { s.group = it.group; s.display_index = it.index; }
+    }
+    try {
+      await api('/api/servers/order', { method: 'PUT', body: JSON.stringify({ items }) });
+    } catch (e) {
+      toast(e.message);
+      await loadServers(); // 回滚到服务端真实顺序
+    }
+  }
+
   async function batchSetGroup() {
     const ids = [...selectedServers];
     if (!ids.length) return;
@@ -2636,6 +2669,7 @@
     'file.write': 'audit.fileWrite', 'file.zip': 'audit.fileZip', 'file.rename': 'audit.fileRename', 'file.delete': 'audit.fileDelete',
     'exec.command': 'audit.execCommand',
     'server.rotate_key': 'audit.serverRotateKey',
+    'server.reorder': 'audit.serverReorder',
     'server.batch_update_group': 'audit.serverBatchGroup',
     'agent.update.request': 'audit.agentUpdateRequest',
     'agent.update.installed': 'audit.agentUpdateInstalled',
@@ -2987,6 +3021,50 @@
         api(`/api/servers/${id}`, { method: 'DELETE' }).then(loadServers).catch((e2) => toast(e2.message));
       });
     }
+  });
+
+  // ---------- 卡片拖拽排序（仅管理员；HTML5 DnD，桌面端） ----------
+  // DOM 顺序即真源：drop 时先移动节点，再从 DOM 视觉顺序反推全量 (id, group)
+  // 列表持久化——组间顺序由 groupOrder 重排，数组顺序本身不是视觉顺序，
+  // 手写数组插拔极易出错（且过滤/搜索视图的顺序不等于全量顺序，该状态下禁拖）。
+  $('#servers').addEventListener('dragstart', (e) => {
+    const card = e.target.closest('.card');
+    if (!isAdmin || !card) { e.preventDefault(); return; }
+    // 过滤/搜索视图下顺序不等于全量顺序——拖拽语义不成立，禁拖并提示
+    if ($('#server-search').value.trim()) {
+      e.preventDefault();
+      toast(t('server.dragDisabledFiltered'));
+      return;
+    }
+    dragId = Number(card.dataset.id);
+    e.dataTransfer.effectAllowed = 'move';
+    e.dataTransfer.setData('text/plain', String(dragId));
+    requestAnimationFrame(() => card.classList.add('dragging'));
+  });
+  $('#servers').addEventListener('dragover', (e) => {
+    if (!dragId) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'move';
+    const card = e.target.closest('.card');
+    document.querySelectorAll('#servers .card.drop-before').forEach((c) => { if (c !== card) c.classList.remove('drop-before'); });
+    if (card && Number(card.dataset.id) !== dragId) card.classList.add('drop-before'); // 插入指示：将插到该卡之前
+  });
+  $('#servers').addEventListener('drop', (e) => {
+    e.preventDefault();
+    const id = Number(e.dataTransfer.getData('text/plain')) || dragId;
+    const moving = $('#servers').querySelector(`.card[data-id="${id}"]`);
+    const card = e.target.closest('.card');
+    const grid = e.target.closest('.grid');
+    if (!moving) return;
+    // DOM 移动（跨组自动迁移节点）：目标卡前插入；落到组空白处则追加组尾
+    if (card && Number(card.dataset.id) !== id) card.parentNode.insertBefore(moving, card);
+    else if (grid && !grid.contains(moving)) grid.appendChild(moving);
+    if (id) persistOrderFromDom();
+  });
+  $('#servers').addEventListener('dragend', () => {
+    dragId = 0;
+    document.querySelectorAll('#servers .card.dragging, #servers .card.drop-before')
+      .forEach((c) => c.classList.remove('dragging', 'drop-before'));
   });
 
   // 分组排序：↑↓ 与相邻组交换位置（以当前视觉顺序为准重建全量数组，

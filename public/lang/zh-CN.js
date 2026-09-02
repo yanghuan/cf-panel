@@ -233,6 +233,7 @@
     'audit.serverUpdate': '修改服务器',
     'audit.serverDelete': '删除服务器',
     'audit.serverRotateKey': '轮换 Agent Key',
+    'audit.serverReorder': '拖拽排序',
     'audit.serverBatchGroup': '批量修改分组',
     'audit.terminalOpen': '打开终端',
     'audit.fileOpen': '文件管理',
@@ -256,6 +257,7 @@
     'usage.d1Writes': 'D1 写行/天',
     'usage.empty': '暂无请求计数（Worker 实例级）',
     'usage.times': '次',
+    'server.dragDisabledFiltered': '筛选/搜索状态下不支持拖拽排序，请清除搜索词后再试',
   };
 
   // ---------------- 终端 ----------------

@@ -1062,6 +1062,35 @@ async function handleApiInner(request, env) {
     const order = await kvGet(env, 'group_order', []);
     return json({ order: Array.isArray(order) ? order : [] });
   }
+  // PUT /api/servers/order —— 卡片拖拽排序持久化（仅管理员）
+  // items：全量 (id, group) 有序列表（前端按拖放后的视觉顺序生成）；后端按数组
+  // 顺序为每组成员分配组内 display_index（0..n），组间顺序仍由 /api/group-order 管。
+  // 整体一个 batch：原子生效，不会出现「拖了 A 组成功、B 组失败」的中间态。
+  if (method === 'PUT' && path === '/api/servers/order') {
+    if (!isAdmin(user)) return err('forbidden', 403, 'FORBIDDEN');
+    const body = await request.json().catch(() => ({}));
+    const items = Array.isArray(body.items) ? body.items : null;
+    if (!items || !items.length) return err('items required', 400, 'ORDER_ITEMS_REQUIRED');
+    if (items.length > 500) return err('too many items (max 500)', 400, 'ORDER_TOO_MANY');
+    const stmts = [];
+    const seen = new Set();
+    const counter = new Map(); // group -> 组内计数器（按出现顺序 0..n 编号）
+    for (const it of items) {
+      const id = Number(it && it.id) || 0;
+      const group = String((it && it.group) || '').trim().slice(0, 100);
+      if (!id || seen.has(id)) return err('invalid items', 400, 'ORDER_BAD_ITEM');
+      seen.add(id);
+      const idx = counter.get(group) || 0;
+      counter.set(group, idx + 1);
+      stmts.push(env.DB.prepare('UPDATE servers SET "group" = ?, display_index = ? WHERE id = ?').bind(group, idx, id));
+    }
+    stmts.push(env.DB.prepare('INSERT INTO audit_logs (user_id, username, client_ip, action, target_server_id, detail) VALUES (?,?,?,?,?,?)')
+      .bind(user.id, user.username, clientIp(request), 'server.reorder', null, `拖拽排序 ${seen.size} 台服务器`));
+    await env.DB.batch(stmts); // 原子：任一失败整体回滚，不存在部分排序生效
+    serverListCacheClear();
+    return json({ ok: true });
+  }
+
   if (method === 'PUT' && path === '/api/group-order') {
     if (!isAdmin(user)) return err('forbidden', 403, 'FORBIDDEN');
     const body = await request.json().catch(() => ({}));

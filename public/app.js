@@ -720,7 +720,21 @@
   // PushSession：连接生命周期 + 指数重连 + 30s 兜底 + 1008 权限失效，数据经回调交给 UI
   const pushSess = new PushSession({
     onOpen: () => startPushTimer(), // 连接建立后启动老化计时器
-    onData: (list) => { serversCache = list; lastPushAt = Date.now(); updateServerCards(); },
+    onData: (list) => {
+      // 空窗合并：agent 重连后控制通道立即标记在线，但首帧要经 reportBatch 节流
+      // 才落 MetricsDO——空窗期推送的 metric 为 null，指标块会闪没。
+      // 沿用上一次的指标（语义即「最近一次上报」），首帧到达后自然被覆盖
+      const prev = new Map((Array.isArray(serversCache) ? serversCache : []).map((x) => [x.id, x]));
+      serversCache = (Array.isArray(list) ? list : []).map((s) => {
+        if (!s.metric && s.online) {
+          const old = prev.get(s.id);
+          if (old && old.metric) s.metric = old.metric;
+        }
+        return s;
+      });
+      lastPushAt = Date.now();
+      updateServerCards();
+    },
     onAuthFail: () => { token = ''; localStorage.removeItem('cfpanel_token'); showAuth(); },
     onLongRetry: () => toast(t('idle.pushRetry')),
   });

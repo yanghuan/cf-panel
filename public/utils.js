@@ -257,7 +257,7 @@
     ['ubuntu', ['ubuntu']],
     ['debian', ['debian']],
     ['centos', ['centos']],
-    ['alpine', ['alpine']],
+    ['alpinelinux', ['alpine']], // 系统名匹配 'alpine'，CDN slug 是 alpinelinux（'alpine' 在 simple-icons 404）
     ['fedora', ['fedora']],
     ['archlinux', ['arch']],
     ['rockylinux', ['rocky']],

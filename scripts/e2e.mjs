@@ -3,7 +3,7 @@
 // cf-panel E2E 测试（Node >= 22，零外部依赖：fetch + WebSocket 内置）
 // 验证链路：wrangler dev → D1 建表 → 登录 → 注册服务器 →
 //           agent 控制通道上线 → 监控上报落库 → 终端双向透传 →
-//           文件上传/下载 → MCP 全量工具（15 个）
+//           文件上传/下载 → MCP 全量工具（16 个）
 // 用法：node scripts/e2e.mjs
 // 环境变量：E2E_PORT（默认 8787）、E2E_PASSWORD（默认读 .dev.vars）
 //           AGENT_CMD（默认 agent/rust/target/release/cf-panel-agent）
@@ -389,10 +389,10 @@ async function step7_file() {
 }
 
 // ============================================================
-// 第 8 步：MCP 接口测试（15 个工具全覆盖）
+// 第 8 步：MCP 接口测试（16 个工具全覆盖）
 // ============================================================
 async function step8_mcp() {
-  section('MCP 接口测试（15 个工具）');
+  section('MCP 接口测试（16 个工具）');
 
   // ---- MCP 辅助函数 ----
   async function mcpCall(id, method, params) {
@@ -426,8 +426,8 @@ async function step8_mcp() {
   // ---- 8.1) tools/list ----
   const list = await mcpCall(2, 'tools/list');
   const toolCount = list?.result?.tools?.length;
-  if (toolCount === 15) ok(`MCP tools/list：15 个工具全部注册`);
-  else bad(`MCP tools/list：期望 15 个工具，实际 ${toolCount}`);
+  if (toolCount === 16) ok(`MCP tools/list：16 个工具全部注册`);
+  else bad(`MCP tools/list：期望 16 个工具，实际 ${toolCount}`);
 
   // ---- 8.2) list_servers ----
   const ls = await mcpTool(3, 'list_servers');
@@ -528,6 +528,17 @@ async function step8_mcp() {
     const patText = patBody?.result?.content?.[0]?.text || '';
     if (patText.includes('admin only')) ok('MCP 权限：PAT 被拒管理工具（admin only）');
     else bad(`MCP 权限：PAT 未正确拒绝：${JSON.stringify(patBody)}`);
+
+    // update_agent 需要独立 agent:update scope：仅 server:read 的 PAT 应被拒（403 forbidden）
+    const updPat = await fetch(`${BASE}/mcp`, {
+      method: 'POST',
+      headers: { 'authorization': `Bearer ${patToken}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 31, method: 'tools/call', params: { name: 'update_agent', arguments: { server_id: serverId } } }),
+    });
+    const updBody = await updPat.json();
+    const updText = updBody?.result?.content?.[0]?.text || '';
+    if (updText.includes('forbidden')) ok('MCP 权限：无 agent:update scope 的 PAT 被拒更新 Agent');
+    else bad(`MCP 权限：update_agent 未正确拒绝无 scope PAT：${JSON.stringify(updBody)}`);
   } else bad('MCP 权限测试跳过（无有效 PAT）');
 
   // list_tokens

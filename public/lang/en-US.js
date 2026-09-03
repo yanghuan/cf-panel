@@ -8,6 +8,7 @@
     'common.ok': 'OK',
     'common.cancel': 'Cancel',
     'common.close': 'Close',
+    'common.switchServer': 'Switch server',
     'common.save': 'Save',
     'common.delete': 'Delete',
     'common.edit': 'Edit',
@@ -264,7 +265,6 @@
   // ---------------- Terminal ----------------
   const term = {
     'term.title': 'Terminal',
-    'term.switchServer': 'Switch server',
     'term.newTab': 'Open another terminal for this server',
     'term.closeAll': 'Close all',
     'term.rendererTip': 'Switch renderer',

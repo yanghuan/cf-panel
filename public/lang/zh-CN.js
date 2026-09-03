@@ -7,6 +7,7 @@
     'common.ok': '确定',
     'common.cancel': '取消',
     'common.close': '关闭',
+    'common.switchServer': '切换服务器',
     'common.save': '保存',
     'common.delete': '删除',
     'common.edit': '编辑',
@@ -263,7 +264,6 @@
   // ---------------- 终端 ----------------
   const term = {
     'term.title': '终端',
-    'term.switchServer': '切换服务器',
     'term.newTab': '为当前服务器再开一个终端',
     'term.closeAll': '关闭全部',
     'term.rendererTip': '切换渲染器',

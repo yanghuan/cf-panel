@@ -570,7 +570,8 @@ button.danger:hover { background: rgba(248, 113, 113, .12); }
 /* ---------------- 终端标题：服务器切换（下划线按钮 + 两级下拉） ---------------- */
 .term-server-btn:hover { color: var(--text); }
 .term-server-btn .caret { font-size: 10px; color: var(--muted); margin-left: 4px; }
-#term-server-menu {
+/* 服务器切换下拉（终端/监控/流量弹窗共用）：一级分组 + 二级服务器 */
+.srv-switch-menu {
   position: absolute;
   top: calc(100% + 6px);
   left: 0;

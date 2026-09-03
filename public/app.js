@@ -1083,11 +1083,11 @@
     syncRendererBtn();
   }
 
-  // ---------- 终端标题：服务器切换（两级下拉：一级分组 / 二级服务器） ----------
+  // ---------- 弹窗内服务器切换（终端/监控/流量共用：两级下拉，一级分组/二级服务器） ----------
   // 数据源 serversCache 与列表页同源（推送驱动，在线状态实时）；组序沿用 groupOrder
-  // 规则（未分组恒最后）。点击服务器项复用 openTerminal：已开则切既有标签，否则新建。
-  function buildTermServerMenu() {
-    const menu = $('#term-server-menu');
+  // 规则（未分组恒最后）。onPick(id, name) 由各弹窗提供：终端复用 openTerminal
+  // （已开则切既有标签），监控/流量带各自当前 range/days 重新拉取。
+  function buildServerSwitchMenu(menu, activeId, onPick) {
     const buckets = new Map();
     for (const s of serversCache) {
       const g = s.group || UNGROUPED;
@@ -1099,7 +1099,6 @@
     const groupNames = [...buckets.keys()].sort(
       (a, b) => (a === UNGROUPED) - (b === UNGROUPED) || idx(a) - idx(b) || a.localeCompare(b, coll)
     );
-    const active = activeTermSession();
     menu.innerHTML = '';
     for (const g of groupNames) {
       const grp = document.createElement('div');
@@ -1114,13 +1113,13 @@
       for (const s of buckets.get(g)) {
         const b = document.createElement('button');
         b.type = 'button';
-        b.className = 'tsm-srv' + (active && s.id === active.serverId ? ' active' : '');
+        b.className = 'tsm-srv' + (activeId != null && s.id === activeId ? ' active' : '');
         const dot = document.createElement('span');
         dot.className = 'tsm-dot ' + (s.online ? 'on' : 'off');
         const nm = document.createElement('span');
         nm.textContent = s.name;
         b.append(dot, nm);
-        if (active && s.id === active.serverId) {
+        if (activeId != null && s.id === activeId) {
           const tick = document.createElement('span');
           tick.className = 'tick';
           tick.textContent = '✓';
@@ -1129,7 +1128,7 @@
         b.onclick = (e) => {
           e.stopPropagation();
           menu.classList.add('hidden');
-          openTerminal(s.id, s.name);
+          onPick(s.id, s.name);
         };
         sub.appendChild(b);
       }
@@ -1137,13 +1136,25 @@
       menu.appendChild(grp);
     }
   }
-  $('#term-server-btn').onclick = (e) => {
-    e.stopPropagation();
-    const menu = $('#term-server-menu');
-    if (!menu.classList.contains('hidden')) { menu.classList.add('hidden'); return; }
-    buildTermServerMenu();
-    menu.classList.remove('hidden');
-  };
+  // 各弹窗的按钮：开菜单前构建（数据实时），再开即收起
+  function bindServerSwitch(btnSel, menuSel, getActiveId, onPick) {
+    $(btnSel).onclick = (e) => {
+      e.stopPropagation();
+      const menu = $(menuSel);
+      if (!menu.classList.contains('hidden')) { menu.classList.add('hidden'); return; }
+      buildServerSwitchMenu(menu, getActiveId(), onPick);
+      menu.classList.remove('hidden');
+    };
+  }
+  bindServerSwitch('#term-server-btn', '#term-server-menu',
+    () => { const a = activeTermSession(); return a ? a.serverId : null; },
+    (id, name) => openTerminal(id, name));
+  bindServerSwitch('#mon-server-btn', '#mon-server-menu',
+    () => (monitorState ? monitorState.serverId : null),
+    (id, name) => showMonitor(id, name, monitorState ? monitorState.range : '12h'));
+  bindServerSwitch('#stats-server-btn', '#stats-server-menu',
+    () => (statsState ? statsState.serverId : null),
+    (id, name) => showStats(id, name, statsState ? statsState.days : 30));
 
   // ---------- 文件管理（目录浏览 / 上传 / 下载；连接/协议/状态机在 api.js 的 FileSession） ----------
   let fileServerId = 0;      // 当前文件会话所属服务器（断线重连用）
@@ -2904,8 +2915,12 @@
     if (!e.target.closest('.card-menu')) {
       document.querySelectorAll('#servers .card-menu').forEach((m) => m.classList.add('hidden'));
     }
-    if (!e.target.closest('#term-server-menu') && !e.target.closest('#term-server-btn')) {
-      $('#term-server-menu').classList.add('hidden');
+    for (const [menuSel, btnSel] of [
+      ['#term-server-menu', '#term-server-btn'],
+      ['#mon-server-menu', '#mon-server-btn'],
+      ['#stats-server-menu', '#stats-server-btn'],
+    ]) {
+      if (!e.target.closest(menuSel) && !e.target.closest(btnSel)) $(menuSel).classList.add('hidden');
     }
   });
   // 语言菜单：由已注册的语言包动态生成（i18n 框架不内置语言——支持哪些

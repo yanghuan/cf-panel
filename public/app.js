@@ -1043,7 +1043,10 @@
       // 不 fit 的话终端会保持"隐藏时"的错误行列数（表现为内容错位/不换行）
       try { cur.fit.fit(); } catch { /* ignore */ }
       cur.term.focus();
-      $('#term-title').textContent = t('term.titleWith', { name: cur.serverName });
+      // 标题 = 固定「终端」+ 可点击的服务器名按钮（切换入口随活动标签变化）
+      $('#term-title').textContent = t('term.title');
+      $('#term-server-name').textContent = cur.serverName;
+      $('#term-server-btn').classList.remove('hidden');
     }
     syncRendererBtn();
   }
@@ -1079,6 +1082,68 @@
     unlockScroll();
     syncRendererBtn();
   }
+
+  // ---------- 终端标题：服务器切换（两级下拉：一级分组 / 二级服务器） ----------
+  // 数据源 serversCache 与列表页同源（推送驱动，在线状态实时）；组序沿用 groupOrder
+  // 规则（未分组恒最后）。点击服务器项复用 openTerminal：已开则切既有标签，否则新建。
+  function buildTermServerMenu() {
+    const menu = $('#term-server-menu');
+    const buckets = new Map();
+    for (const s of serversCache) {
+      const g = s.group || UNGROUPED;
+      if (!buckets.has(g)) buckets.set(g, []);
+      buckets.get(g).push(s);
+    }
+    const idx = (g) => { const i = groupOrder.indexOf(g); return i < 0 ? groupOrder.length : i; };
+    const coll = CfI18n.locale || 'zh';
+    const groupNames = [...buckets.keys()].sort(
+      (a, b) => (a === UNGROUPED) - (b === UNGROUPED) || idx(a) - idx(b) || a.localeCompare(b, coll)
+    );
+    const active = activeTermSession();
+    menu.innerHTML = '';
+    for (const g of groupNames) {
+      const grp = document.createElement('div');
+      grp.className = 'tsm-group';
+      const head = document.createElement('div');
+      head.className = 'tsm-group-name';
+      head.textContent = groupLabel(g);
+      // 触屏无 hover：点击组名切换展开（桌面端 hover 已展开，click 不冲突）
+      head.onclick = () => grp.classList.toggle('open');
+      const sub = document.createElement('div');
+      sub.className = 'tsm-sub';
+      for (const s of buckets.get(g)) {
+        const b = document.createElement('button');
+        b.type = 'button';
+        b.className = 'tsm-srv' + (active && s.id === active.serverId ? ' active' : '');
+        const dot = document.createElement('span');
+        dot.className = 'tsm-dot ' + (s.online ? 'on' : 'off');
+        const nm = document.createElement('span');
+        nm.textContent = s.name;
+        b.append(dot, nm);
+        if (active && s.id === active.serverId) {
+          const tick = document.createElement('span');
+          tick.className = 'tick';
+          tick.textContent = '✓';
+          b.append(tick);
+        }
+        b.onclick = (e) => {
+          e.stopPropagation();
+          menu.classList.add('hidden');
+          openTerminal(s.id, s.name);
+        };
+        sub.appendChild(b);
+      }
+      grp.append(head, sub);
+      menu.appendChild(grp);
+    }
+  }
+  $('#term-server-btn').onclick = (e) => {
+    e.stopPropagation();
+    const menu = $('#term-server-menu');
+    if (!menu.classList.contains('hidden')) { menu.classList.add('hidden'); return; }
+    buildTermServerMenu();
+    menu.classList.remove('hidden');
+  };
 
   // ---------- 文件管理（目录浏览 / 上传 / 下载；连接/协议/状态机在 api.js 的 FileSession） ----------
   let fileServerId = 0;      // 当前文件会话所属服务器（断线重连用）
@@ -2838,6 +2903,9 @@
     if (!e.target.closest('#dropdown') && !e.target.closest('#btn-menu')) $('#dropdown').classList.add('hidden');
     if (!e.target.closest('.card-menu')) {
       document.querySelectorAll('#servers .card-menu').forEach((m) => m.classList.add('hidden'));
+    }
+    if (!e.target.closest('#term-server-menu') && !e.target.closest('#term-server-btn')) {
+      $('#term-server-menu').classList.add('hidden');
     }
   });
   // 语言菜单：由已注册的语言包动态生成（i18n 框架不内置语言——支持哪些

@@ -564,7 +564,88 @@ button.danger:hover { background: rgba(248, 113, 113, .12); }
   width: 100%;
   margin-left: auto;
   margin-right: auto;
+  position: relative;
 }
+
+/* ---------------- 终端标题：服务器切换（下划线按钮 + 两级下拉） ---------------- */
+.term-server-btn {
+  text-decoration: underline;
+  text-underline-offset: 3px;
+  text-decoration-color: var(--muted);
+}
+.term-server-btn:hover { color: var(--text); text-decoration-color: var(--accent); }
+.term-server-btn .caret { font-size: 10px; color: var(--muted); margin-left: 4px; }
+#term-server-menu {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  z-index: 40;
+  min-width: 230px;
+  max-width: 76vw;
+  max-height: min(62vh, 440px);
+  overflow-y: auto;
+  background: var(--panel-solid);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 6px;
+  box-shadow: 0 12px 32px var(--shadow-lg);
+}
+.tsm-group { position: relative; }
+.tsm-group-name {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 7px 10px;
+  font-size: 12px;
+  color: var(--muted);
+  cursor: pointer;
+  border-radius: 6px;
+  user-select: none;
+  white-space: nowrap;
+}
+.tsm-group-name::after { content: '▸'; font-size: 10px; margin-left: auto; }
+.tsm-group:hover > .tsm-group-name,
+.tsm-group.open > .tsm-group-name { color: var(--text); background: rgba(99, 102, 241, .12); }
+.tsm-sub {
+  display: none;
+  position: absolute;
+  left: calc(100% + 4px);
+  top: -6px;
+  min-width: 210px;
+  max-height: min(54vh, 380px);
+  overflow-y: auto;
+  flex-direction: column;
+  background: var(--panel-solid);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 6px;
+  box-shadow: 0 12px 32px var(--shadow-lg);
+}
+.tsm-group:hover > .tsm-sub,
+.tsm-group.open > .tsm-sub { display: flex; }
+.tsm-srv {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 6px 10px;
+  background: transparent;
+  border: none;
+  border-radius: 6px;
+  color: var(--text);
+  font-size: 13px;
+  line-height: 1.4;
+  cursor: pointer;
+  text-align: left;
+  white-space: nowrap;
+}
+.tsm-srv:hover { background: rgba(99, 102, 241, .12); }
+.tsm-dot { width: 8px; height: 8px; border-radius: 50%; flex: none; }
+.tsm-dot.on { background: var(--ok); }
+.tsm-dot.off { background: var(--muted); }
+.tsm-srv.active { color: var(--accent); }
+.tsm-srv .tick { margin-left: auto; font-size: 12px; }
 /* 标题栏宽度跟随各弹窗内容容器（settings-body 640 / dialog-body 560 / file-body 760） */
 .modal:has(.settings-body) .modal-head { max-width: 640px; }
 .modal:has(.dialog-body) .modal-head { max-width: 560px; }

@@ -264,7 +264,7 @@
   // ---------------- Terminal ----------------
   const term = {
     'term.title': 'Terminal',
-    'term.titleWith': 'Terminal · {name}',
+    'term.switchServer': 'Switch server',
     'term.newTab': 'Open another terminal for this server',
     'term.closeAll': 'Close all',
     'term.rendererTip': 'Switch renderer',

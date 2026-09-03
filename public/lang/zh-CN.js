@@ -401,7 +401,8 @@
 
   // ---------------- 监控 ----------------
   const monitor = {
-    'monitor.title': '监控 · {name}（{label}，{n} 点{ds}{custom}）',
+    'monitor.titlePre': '监控 ·',
+    'monitor.titleSuffix': '（{label}，{n} 点{ds}{custom}）',
     'monitor.downsampled': '，降采样',
     'monitor.customSuffix': ' +{n} 自定义',
     'monitor.cpu': 'CPU（%）',
@@ -450,8 +451,7 @@
 
   // ---------------- 流量 / 可用率 ----------------
   const stats = {
-    'stats.title': '流量 / 可用率',
-    'stats.titleWith': '流量 / 可用率 · {name}',
+    'stats.title': '流量 / 可用率 ·',
     'stats.inTotal': '入站合计',
     'stats.outTotal': '出站合计',
     'stats.total': '总流量',

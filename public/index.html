@@ -81,8 +81,11 @@
   <div id="monitor-modal" class="monitor-modal hidden">
     <div class="modal-head">
       <div class="term-head-group">
-        <span id="monitor-title"></span>
-        <button id="mon-server-btn" class="ghost icon srv-switch-btn" aria-haspopup="menu" title="切换服务器" data-i18n-title="common.switchServer">▾</button>
+        <span id="monitor-title-pre" data-i18n="monitor.titlePre">监控 ·</span>
+        <button id="mon-server-btn" class="ghost icon term-server-btn hidden" aria-haspopup="menu" title="切换服务器" data-i18n-title="common.switchServer">
+          <span id="mon-server-name"></span><span class="caret">▾</span>
+        </button>
+        <span id="monitor-title-suffix"></span>
       </div>
       <button id="btn-monitor-close" class="ghost icon" data-close aria-label="关闭" title="关闭" data-i18n-aria="common.close" data-i18n-title="common.close">✕</button>
       <div id="mon-server-menu" class="srv-switch-menu hidden"></div>
@@ -102,7 +105,9 @@
     <div class="modal-head">
       <div class="term-head-group">
         <span id="stats-title" data-i18n="stats.title">流量 / 可用率</span>
-        <button id="stats-server-btn" class="ghost icon srv-switch-btn" aria-haspopup="menu" title="切换服务器" data-i18n-title="common.switchServer">▾</button>
+        <button id="stats-server-btn" class="ghost icon term-server-btn hidden" aria-haspopup="menu" title="切换服务器" data-i18n-title="common.switchServer">
+          <span id="stats-server-name"></span><span class="caret">▾</span>
+        </button>
       </div>
       <button id="btn-stats-close" class="ghost icon" data-close aria-label="关闭" title="关闭" data-i18n-aria="common.close" data-i18n-title="common.close">✕</button>
       <div id="stats-server-menu" class="srv-switch-menu hidden"></div>

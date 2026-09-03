@@ -402,7 +402,8 @@
 
   // ---------------- Monitoring ----------------
   const monitor = {
-    'monitor.title': 'Monitoring · {name} ({label}, {n} points{ds}{custom})',
+    'monitor.titlePre': 'Monitoring ·',
+    'monitor.titleSuffix': ' ({label}, {n} points{ds}{custom})',
     'monitor.downsampled': ', downsampled',
     'monitor.customSuffix': ' +{n} custom',
     'monitor.cpu': 'CPU (%)',
@@ -451,8 +452,7 @@
 
   // ---------------- Traffic / uptime ----------------
   const stats = {
-    'stats.title': 'Traffic / Uptime',
-    'stats.titleWith': 'Traffic / Uptime · {name}',
+    'stats.title': 'Traffic / Uptime ·',
     'stats.inTotal': 'Total in',
     'stats.outTotal': 'Total out',
     'stats.total': 'Total traffic',

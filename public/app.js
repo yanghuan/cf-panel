@@ -1849,7 +1849,10 @@
       const label = t('monitor.range.' + range);
       const cCount = Object.keys(custom).length;
       const downsampled = rows.length > MONITOR_STEP_MAX;
-      $('#monitor-title').textContent = t('monitor.title', { name: serverName, label, n: rows.length, ds: downsampled ? t('monitor.downsampled') : '', custom: cCount ? t('monitor.customSuffix', { n: cCount }) : '' });
+      // 标题三段：固定前缀 + 可点击服务器名按钮（切换入口）+ 动态后缀（范围/点数）
+      $('#mon-server-name').textContent = serverName;
+      $('#mon-server-btn').classList.remove('hidden');
+      $('#monitor-title-suffix').textContent = t('monitor.titleSuffix', { label, n: rows.length, ds: downsampled ? t('monitor.downsampled') : '', custom: cCount ? t('monitor.customSuffix', { n: cCount }) : '' });
       if (null === await chartReady) return; // 图表库加载失败（toast 已提示），数据请求不再渲染
       if (seq !== monitorReqSeq) return; // 等待期间已切换 range
       renderMonitorChart(downsample(rows), custom, downsampled);
@@ -2405,7 +2408,8 @@
     try {
       data = await api(`/api/stats?server_id=${serverId}&days=${days}`);
     } catch (e) { toast(e.message); return; }
-    $('#stats-title').textContent = t('stats.titleWith', { name: serverName });
+    $('#stats-server-name').textContent = serverName;
+    $('#stats-server-btn').classList.remove('hidden');
     renderStatsSummary(data);
     // Chart.js 与监控弹窗共用本地 vendor（已缓存则零开销）
     try {

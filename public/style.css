@@ -568,12 +568,7 @@ button.danger:hover { background: rgba(248, 113, 113, .12); }
 }
 
 /* ---------------- 终端标题：服务器切换（下划线按钮 + 两级下拉） ---------------- */
-.term-server-btn {
-  text-decoration: underline;
-  text-underline-offset: 3px;
-  text-decoration-color: var(--muted);
-}
-.term-server-btn:hover { color: var(--text); text-decoration-color: var(--accent); }
+.term-server-btn:hover { color: var(--text); }
 .term-server-btn .caret { font-size: 10px; color: var(--muted); margin-left: 4px; }
 #term-server-menu {
   position: absolute;

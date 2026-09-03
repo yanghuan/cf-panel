@@ -580,10 +580,10 @@ button.danger:hover { background: rgba(248, 113, 113, .12); }
   top: calc(100% + 6px);
   left: 0;
   z-index: 40;
-  min-width: 230px;
-  max-width: 76vw;
-  max-height: min(62vh, 440px);
-  overflow-y: auto;
+  /* 不设 overflow/max-height：二级子菜单定位在容器右侧外部，
+     任何 overflow 裁剪都会把它剪没（宽度由内容撑开，天然无滚动条） */
+  width: max-content;
+  min-width: 200px;
   background: var(--panel-solid);
   border: 1px solid var(--border);
   border-radius: 10px;
@@ -610,7 +610,7 @@ button.danger:hover { background: rgba(248, 113, 113, .12); }
 .tsm-sub {
   display: none;
   position: absolute;
-  left: calc(100% + 4px);
+  left: 100%;
   top: -6px;
   min-width: 210px;
   max-height: min(54vh, 380px);
@@ -621,6 +621,15 @@ button.danger:hover { background: rgba(248, 113, 113, .12); }
   border-radius: 10px;
   padding: 6px;
   box-shadow: 0 12px 32px var(--shadow-lg);
+}
+/* 透明桥：覆盖组行与子菜单之间的缝隙，鼠标横移时不中断 hover（子菜单不闪没） */
+.tsm-sub::before {
+  content: '';
+  position: absolute;
+  left: -8px;
+  top: 0;
+  bottom: 0;
+  width: 8px;
 }
 .tsm-group:hover > .tsm-sub,
 .tsm-group.open > .tsm-sub { display: flex; }

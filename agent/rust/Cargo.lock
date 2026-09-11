@@ -58,6 +58,7 @@ dependencies = [
 name = "cf-panel-agent"
 version = "0.3.0"
 dependencies = [
+ "bytes",
  "futures-util",
  "libc",
  "portable-pty",

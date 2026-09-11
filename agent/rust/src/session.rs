@@ -1,5 +1,6 @@
 // 会话：终端 PTY（双向透传 + resize + 进程组清理）与文件管理（JSON 行协议）
 use crate::{Config, log};
+use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use std::io::{Read, Write};
@@ -183,8 +184,9 @@ async fn run_terminal_inner(cfg: &Config, term: &Arc<TermSession>) {
     // tungstenite 0.24+ WebSocketConfig 为 non_exhaustive：default() 后逐字段赋值
     let mut cfg_ws = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default();
     cfg_ws.max_message_size = Some(TERM_MSG_LIMIT);
-    let (ws, _) = match tokio_tungstenite::connect_async_with_config(req, Some(cfg_ws), false).await
-    {
+    // 连接统一走 crate::connect_ws（带 TCP/TLS/握手总超时）：裸 connect 在静默丢包下
+    // 会永久挂住，PTY 与 sessions 条目随之永不回收
+    let ws = match crate::connect_ws(req, Some(cfg_ws)).await {
         Ok(x) => x,
         Err(e) => {
             log(format!("terminal {} connect failed: {e}", term.sid));
@@ -220,7 +222,9 @@ async fn run_terminal_inner(cfg: &Config, term: &Arc<TermSession>) {
     // 单帧最大 1MB 的大粘贴足以挂住 async worker 数秒；多会话并发即饥饿整个 runtime）。
     // channel 容量 64 + try_send：写线程阻塞时输入满即丢弃（XOFF 恢复后剩余缓冲仍写入），
     // 绝不反向阻塞主循环；写线程退出（pty 关闭）由 send_task 的 reader EOF 兜底关闭会话
-    let (in_tx, in_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(64);
+    // 输入通道传 Bytes（= WS 帧载荷本身）：入站帧零拷贝直达 pty 写线程。
+    // 此前传 Vec<u8> 需要每次 to_vec()——单次 1MB 粘贴即多一次整块复制
+    let (in_tx, in_rx) = std::sync::mpsc::sync_channel::<Bytes>(64);
     {
         let writer = term.writer.lock().await.take();
         if let Some(mut w) = writer {
@@ -311,10 +315,11 @@ async fn run_terminal_inner(cfg: &Config, term: &Arc<TermSession>) {
                 };
                 match msg {
                     Message::Text(t) => {
-                        let _ = in_tx.try_send(t.as_str().as_bytes().to_vec());
+                        // Utf8Bytes 内部就是 Bytes：clone 只加引用计数，不复制数据
+                        let _ = in_tx.try_send(AsRef::<Bytes>::as_ref(&t).clone());
                     }
                     Message::Binary(b) => {
-                        let _ = in_tx.try_send(b.to_vec());
+                        let _ = in_tx.try_send(b);
                     }
                     // Ping/Pong 由 tungstenite 协议层处理；入站活动本身已重置空闲计时
                     _ => {}
@@ -347,8 +352,8 @@ pub async fn run_file_session(cfg: Config, sid: String) {
     // 限制入站消息大小，防恶意超大 data 整包占内存
     let mut cfg_ws = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default();
     cfg_ws.max_message_size = Some(WS_MSG_LIMIT);
-    let (ws, _) = match tokio_tungstenite::connect_async_with_config(req, Some(cfg_ws), false).await
-    {
+    // 同终端：连接建立必须带超时（见 crate::connect_ws 注释）
+    let ws = match crate::connect_ws(req, Some(cfg_ws)).await {
         Ok(x) => x,
         Err(e) => {
             log(format!("file {sid} connect failed: {e}"));
@@ -377,9 +382,8 @@ pub async fn run_file_session(cfg: Config, sid: String) {
                 //（JSON 头 + '\n' + 原始字节）。响应按内容区分 Text/Binary
                 let reply = match msg {
                     Message::Text(t) => handle_file_cmd(t.as_str(), &sid, &cfg.tmp_dir).await,
-                    Message::Binary(b) => {
-                        handle_file_cmd_binary(b.to_vec(), created.clone()).await
-                    }
+                    // 直接移交帧载荷（Bytes），不再 to_vec() 复制 512KB 块
+                    Message::Binary(b) => handle_file_cmd_binary(b, created.clone()).await,
                     _ => continue, // Ping/Pong 协议层处理，入站活动已重置空闲计时
                 };
                 let sent = match reply {
@@ -1390,11 +1394,13 @@ async fn handle_file_cmd(line: &str, sid: &str, tmp_dir: &str) -> FileReply {
 }
 
 // Binary 混合帧：'\n' 前为 JSON 元数据（write 命令），'\n' 后为原始文件字节
-// Binary 混合帧（owned Vec，直接来自 tungstenite 分配）：'\n' 前 JSON 头，后为原始文件字节。
+// Binary 混合帧（Bytes = tungstenite 分配的帧载荷本体）：'\n' 前 JSON 头，后为原始文件字节。
 // 拆分与写入都在 spawn_blocking 闭包内完成，数据切片直接写、无二次拷贝——
-// 内存 = 入站帧本身（512KB 块 + JSON 头），不随块大小额外放大
+// 内存 = 入站帧本身（512KB 块 + JSON 头），不随块大小额外放大。
+// 取 Bytes 而非 Vec<u8>：闭包要求 'static，Bytes 本身即 'static + Send，
+// 无需调用方 to_vec() 复制整个 512KB 块
 async fn handle_file_cmd_binary(
-    frame: Vec<u8>,
+    frame: Bytes,
     created: Arc<std::sync::Mutex<Vec<String>>>,
 ) -> FileReply {
     match crate::blocking::file_blocking(30, move || {

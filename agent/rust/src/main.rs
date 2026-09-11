@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
+use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::{Mutex, Notify};
 use tokio::time::sleep;
@@ -21,7 +22,73 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
 type WsStream =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
-type Sink = futures_util::stream::SplitSink<WsStream, Message>;
+
+// 连接建立统一封装（控制通道 + 终端/文件会话共用）：TCP connect、TLS 握手、HTTP 101 升级
+// 三段都必须带超时。任一段静默丢包（IPv6 路径 MTU 黑洞、边缘接受 TCP 但不下发 101、
+// 中间设备黑洞）时，裸 await 会永久挂起——无日志、无重试，进程看起来"活着"但彻底失联
+//（2026-09-09 生产事故：残留 ESTAB 连接 + 日志静默 3 天）。
+pub(crate) async fn connect_ws(
+    req: tokio_tungstenite::tungstenite::handshake::client::Request,
+    cfg: Option<tokio_tungstenite::tungstenite::protocol::WebSocketConfig>,
+) -> Result<WsStream, Box<dyn Error + Send + Sync>> {
+    connect_ws_within(req, cfg, Duration::from_secs(CONNECT_TIMEOUT_S)).await
+}
+
+// 超时可注入版本：生产统一 15s，测试用短超时验证"握手卡住必然返回错误"
+async fn connect_ws_within(
+    req: tokio_tungstenite::tungstenite::handshake::client::Request,
+    cfg: Option<tokio_tungstenite::tungstenite::protocol::WebSocketConfig>,
+    timeout: Duration,
+) -> Result<WsStream, Box<dyn Error + Send + Sync>> {
+    tokio::time::timeout(
+        timeout,
+        tokio_tungstenite::connect_async_with_config(req, cfg, false),
+    )
+    .await
+    .map_err(|_| "connect timeout (tcp/tls/ws handshake)")?
+    .map(|(ws, _resp)| ws)
+    .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)
+}
+
+// 控制通道写任务：独占 Sink，从有界队列取帧发送，单帧带超时。
+// 超时或错误即返回，读循环 select 到本任务结束就断开重连——因此"发不出去"的链路
+// 不会把任何锁或队列永久占住。（此前 Arc<Mutex<Sink>> 跨 send().await 持锁：半开连接
+// 下写侧卡死会让上报与指令回执全部永久排队，读循环一旦需要该锁也再无法回到
+// read.next()，180s 半开检测被绕过。）
+async fn control_writer<S>(
+    mut write: S,
+    mut rx: tokio::sync::mpsc::Receiver<Message>,
+    drained: Arc<Notify>,
+    send_timeout: Duration,
+) where
+    S: futures_util::Sink<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
+{
+    while let Some(msg) = rx.recv().await {
+        match tokio::time::timeout(send_timeout, write.send(msg)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                log(format!("control send failed: {e}"));
+                return;
+            }
+            Err(_) => {
+                log("control send timeout (half-open connection)");
+                return;
+            }
+        }
+        // 队列排空 → 通知等待者（self-update 回执需要"已交给 socket"再退出进程）
+        if rx.is_empty() {
+            drained.notify_one();
+        }
+    }
+}
+
+// 控制通道入队（非阻塞）：队列满或写任务已退出时只记日志，不阻塞调用方。
+// 回执丢失由 DO 侧超时兜底（open 确认重发 / exec·upload·update 等待超时）。
+fn ctrl_enqueue(tx: &tokio::sync::mpsc::Sender<Message>, msg: Message, what: &str) {
+    if let Err(e) = tx.try_send(msg) {
+        log(format!("control enqueue {what} rejected: {e}"));
+    }
+}
 
 // ---------------- 配置 ----------------
 #[derive(Clone)]
@@ -233,6 +300,11 @@ const INSTANCE_LOCK_WAIT_MS: u64 = 20_000; // 单实例锁交接窗口：self-re
 const MIN_UPTIME_RESET_SECS: u64 = 10; // 存活 ≥10s 才算"健康连接"，才重置退避（防秒断风暴）
 const CONTROL_READ_TIMEOUT_S: u64 = 180; // 读循环超时：180s 无任何消息判定半开（健康连接有 30s 心跳）
 const CTRL_MSG_LIMIT: usize = 64 * 1024; // 控制通道入站消息上限 64KB（指令/心跳远小于此）
+const CONNECT_TIMEOUT_S: u64 = 15; // 连接建立（TCP+TLS+WS 升级）总超时，见 connect_ws 注释
+const CTRL_SEND_TIMEOUT_S: u64 = 10; // 控制通道单帧发送超时：超时即判定链路故障 → 断开重连
+const CTRL_SEND_QUEUE: usize = 256; // 控制通道出站队列：生产者只入队，写任务独占 Sink
+const DISPATCH_TIMEOUT_S: u64 = 30; // 指令处理兜底：handler 卡住不能绕过半开检测（见读循环注释）
+const UPLOAD_HANDLE_TIMEOUT_S: u64 = 45; // 上传帧处理兜底（内部 file_blocking 30s + 余量）
 
 // 面板替换关闭（close 4001）：同 key 的另一实例连上时，DO 主动关闭旧通道。收到后
 // 走长退避而非常规秒级重连——双开场景下立即重连会再次抢回连接、与新实例互踢，
@@ -316,27 +388,40 @@ async fn control_conn(
     // tungstenite 0.24+ WebSocketConfig 为 non_exhaustive：default() 后逐字段赋值
     let mut cfg_ws = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default();
     cfg_ws.max_message_size = Some(CTRL_MSG_LIMIT);
-    let (ws, _) = tokio_tungstenite::connect_async_with_config(req, Some(cfg_ws), false).await?;
+    let ws = connect_ws(req, Some(cfg_ws)).await?;
     log("control channel connected");
     let (write, mut read) = ws.split();
-    let write = Arc::new(Mutex::new(write));
+
+    // 出站单通道：所有生产者（上报/指令回执/上传·exec·更新结果）只往有界队列入队，
+    // 由写任务独占 Sink 串行发送并带单帧超时（见 control_writer 注释）。
+    let (tx, rx) = tokio::sync::mpsc::channel::<Message>(CTRL_SEND_QUEUE);
+    let drained = Arc::new(Notify::new());
+    let mut writer_task = tokio::spawn(control_writer(
+        write,
+        rx,
+        drained.clone(),
+        Duration::from_secs(CTRL_SEND_TIMEOUT_S),
+    ));
 
     // 上报任务（动态间隔，分段等待，间隔变更 ≤5s 生效）。
     // 持有句柄：读循环退出（正常关闭/错误/半开超时）时 abort，防僵尸任务累积
     let interval = Arc::new(AtomicU64::new(cfg.report_interval));
     let note = Arc::new(Notify::new());
     let report_task = {
-        let write = write.clone();
+        let tx = tx.clone();
         let cfg2 = cfg.clone();
         let interval = interval.clone();
         let note = note.clone();
         tokio::spawn(async move {
-            report_loop(&cfg2, &write, &interval, &note).await;
+            report_loop(&cfg2, &tx, &interval, &note).await;
         })
     };
 
     // 读循环：指令分发（180s 无任何消息判定半开连接，断开触发重连——
     // NAT/防火墙静默断链不再依赖 TCP keepalive 2h 才发现；健康连接有服务端 30s 心跳必有下行）
+    // 三重退出条件：读侧超时/错误、写任务结束（发送失败或超时）、服务端 close。
+    // 指令处理另加兜底超时：handler 卡住（挂死文件系统、异常 PTY spawn 等）时也必须
+    // 能退回重连，否则 180s 半开检测形同虚设（读循环停在 handler 里就不会再走 read.next()）。
     // 控制连接级上传状态：本连接创建的 upload 临时文件（断开时清理）+ 已失败 upload（跳过后续帧）
     let created: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
     let failed_uploads: Arc<std::sync::Mutex<std::collections::HashSet<String>>> =
@@ -344,38 +429,58 @@ async fn control_conn(
     // 自更新状态仅属于当前控制连接；断连时 abort 清 staging，重连后从头开始（offset=0）。
     let update_manager = Arc::new(update::UpdateManager::new());
     let result: Result<(), Box<dyn Error + Send + Sync>> = loop {
-        let msg =
-            match tokio::time::timeout(Duration::from_secs(CONTROL_READ_TIMEOUT_S), read.next())
-                .await
-            {
-                Ok(Some(Ok(m))) => m,
-                Ok(Some(Err(e))) => break Err(Box::new(e)),
-                Ok(None) => break Ok(()), // 服务端正常关闭
-                Err(_) => break Err("control read timeout (half-open connection)".into()),
-            };
+        let msg = tokio::select! {
+            // 写任务结束 = 链路发不出去（发送超时/错误）：立刻断开重连，不等读侧超时
+            _ = &mut writer_task => {
+                break Err("control writer stopped (send failed/timeout)".into());
+            }
+            r = tokio::time::timeout(Duration::from_secs(CONTROL_READ_TIMEOUT_S), read.next()) => {
+                match r {
+                    Ok(Some(Ok(m))) => m,
+                    Ok(Some(Err(e))) => break Err(Box::new(e)),
+                    Ok(None) => break Ok(()), // 服务端正常关闭
+                    Err(_) => break Err("control read timeout (half-open connection)".into()),
+                }
+            }
+        };
         match msg {
             Message::Text(t) => {
-                if let Err(e) = dispatch(
-                    cfg,
-                    sessions,
-                    file_sessions,
-                    &write,
-                    &interval,
-                    &note,
-                    t.as_str(),
+                let handled = tokio::time::timeout(
+                    Duration::from_secs(DISPATCH_TIMEOUT_S),
+                    dispatch(
+                        cfg,
+                        sessions,
+                        file_sessions,
+                        &tx,
+                        &interval,
+                        &note,
+                        t.as_str(),
+                    ),
                 )
-                .await
-                {
-                    break Err(e);
+                .await;
+                match handled {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => break Err(e),
+                    Err(_) => break Err("control dispatch timeout".into()),
                 }
             }
             // Binary 混合帧：普通文件上传或专用 Agent 更新（JSON 头 type 区分）。
             // 更新必须独立协议，禁止借普通 upload 任意覆盖当前可执行文件。
             Message::Binary(b) => {
+                // 两条分支都直接移交帧载荷（Bytes，零拷贝）：帧本体即 tungstenite 的分配
                 let handled = if update::is_update_frame(&b) {
-                    handle_update_frame(cfg, b.to_vec(), &update_manager, &write, shutdown).await
+                    // self-update 不套外层超时：staging 大文件最长 120s（file_blocking 内已有界）
+                    handle_update_frame(cfg, b, &update_manager, &tx, &drained, shutdown).await
                 } else {
-                    handle_upload_frame(cfg, &b, &created, &failed_uploads, &write).await
+                    match tokio::time::timeout(
+                        Duration::from_secs(UPLOAD_HANDLE_TIMEOUT_S),
+                        handle_upload_frame(cfg, b, &created, &failed_uploads, &tx),
+                    )
+                    .await
+                    {
+                        Ok(r) => r,
+                        Err(_) => Err("upload handling timeout".into()),
+                    }
                 };
                 if let Err(e) = handled {
                     break Err(e);
@@ -393,7 +498,8 @@ async fn control_conn(
             _ => {}
         }
     };
-    // 读循环退出（任何路径）：终止上报任务 + 清理本连接创建的上传临时文件（防中断残留），防僵尸累积
+    // 读循环退出（任何路径）：终止写/上报任务 + 清理本连接创建的上传临时文件（防中断残留），防僵尸累积
+    writer_task.abort();
     report_task.abort();
     if let Ok(tmps) = created.lock() {
         for p in tmps.iter() {
@@ -408,9 +514,10 @@ async fn control_conn(
 // 优雅清理 PTY 并退出，由 systemd/launchd/Windows supervisor 拉起磁盘上的新版本。
 async fn handle_update_frame(
     cfg: &Config,
-    frame: Vec<u8>,
+    frame: Bytes,
     manager: &Arc<update::UpdateManager>,
-    write: &Arc<Mutex<Sink>>,
+    tx: &tokio::sync::mpsc::Sender<Message>,
+    drained: &Arc<Notify>,
     shutdown: &Arc<Notify>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let update_id = update::frame_update_id(&frame);
@@ -458,22 +565,20 @@ async fn handle_update_frame(
     if ready {
         RESTART_AFTER_UPDATE.store(cfg.self_restart_after_update, Ordering::SeqCst);
     }
-    let send_result = async {
-        let mut w = write.lock().await;
-        w.send(Message::Text(response.to_string().into())).await?;
-        w.flush().await?;
-        Ok::<(), tokio_tungstenite::tungstenite::Error>(())
-    }
-    .await;
+    let send_result = tx
+        .send(Message::Text(response.to_string().into()))
+        .await
+        .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>);
     if ready {
         log(if cfg.self_restart_after_update {
             "agent update installed; shutting down and starting replacement"
         } else {
             "agent update installed; shutting down for supervisor restart"
         });
-        // 回执成功时给帧短暂传输窗口；失败也继续退出（DO 会以断线失败，重连首报可确认版本）。
+        // 入队成功后等写任务排空（回执已交给 socket）；超时也继续退出——
+        // 替换成功就必须跑新版本，退出不能依赖回执送达（DO 断线同样能确认版本）。
         if send_result.is_ok() {
-            sleep(Duration::from_millis(200)).await;
+            let _ = tokio::time::timeout(Duration::from_secs(2), drained.notified()).await;
         }
         shutdown.notify_waiters();
         return Ok(());
@@ -487,10 +592,10 @@ async fn handle_update_frame(
 // 失败（系统路径/目标已存在/写错误）回执 upload_result{ok:false} 并记入 failed_uploads，后续帧直接跳过。
 async fn handle_upload_frame(
     cfg: &Config,
-    frame: &[u8],
+    frame: Bytes,
     created: &Arc<std::sync::Mutex<Vec<String>>>,
     failed: &Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
-    write: &Arc<Mutex<Sink>>,
+    tx: &tokio::sync::mpsc::Sender<Message>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let Some(nl) = frame.iter().position(|&b| b == b'\n') else {
         return Ok(()); // 无 JSON 头：忽略
@@ -521,8 +626,9 @@ async fn handle_upload_frame(
     if path.is_empty() || upload_id.is_empty() {
         return Ok(());
     }
-    // 数据转 owned：spawn_blocking 闭包需 'static（块 ≤48KB，拷贝可接受）
-    let data = frame[nl + 1..].to_vec();
+    // 数据切片走 Bytes::slice（O(1) 引用计数）：闭包需 'static，Bytes 本身满足，
+    // 无需 to_vec() 复制——此前每个 48KB 块都要整块拷贝一次
+    let data = frame.slice(nl + 1..);
     // 该 upload 已失败（首帧拒绝后跳过后续帧，避免重复回执/写入）。
     // Mutex poison 容忍（与其余处 if let Ok 风格一致）：poison 视为未失败继续处理，
     // async 读循环里 panic 会杀进程，不能 unwrap
@@ -533,23 +639,19 @@ async fn handle_upload_frame(
     {
         return Ok(());
     }
-    let reject = |write: &Arc<Mutex<Sink>>, msg: &str| {
+    let reject = |msg: &str| {
         let resp = serde_json::json!({
             "type": "upload_result", "upload_id": upload_id, "path": path, "ok": false, "error": msg,
         });
-        // 不 await：写入锁内的短消息发送失败（连接已断）时读循环自然退出
-        let w = write.clone();
-        tokio::spawn(async move {
-            let mut w = w.lock().await;
-            let _ = w.send(Message::Text(resp.to_string().into())).await;
-        });
+        // 只入队不 await：队列满/写任务已退出时记日志即可，回执丢失由 DO 侧上传超时兜底
+        ctrl_enqueue(tx, Message::Text(resp.to_string().into()), "upload_result");
     };
     // DISABLE_EXEC=1：上传属命令执行类写操作，与终端/文件管理一致拒绝
     if cfg.disable_exec {
         if let Ok(mut f) = failed.lock() {
             f.insert(upload_id.clone());
         }
-        reject(write, "exec disabled (DISABLE_EXEC=1)");
+        reject("exec disabled (DISABLE_EXEC=1)");
         return Ok(());
     }
     // 系统路径保护：写操作拒绝系统目录（/proc /sys /etc /usr /var /root 等，与文件会话一致）
@@ -557,7 +659,7 @@ async fn handle_upload_frame(
         if let Ok(mut f) = failed.lock() {
             f.insert(upload_id.clone());
         }
-        reject(write, session::SYSTEM_PATH_ERR);
+        reject(session::SYSTEM_PATH_ERR);
         return Ok(());
     }
     // 复用文件会话的原子写：临时文件 {path}.upload.{upload_id}，offset 严格校验，commit 时 fsync+rename。
@@ -616,8 +718,7 @@ async fn handle_upload_frame(
             })
         }
     };
-    let mut w = write.lock().await;
-    let _ = w.send(Message::Text(r.to_string().into())).await;
+    ctrl_enqueue(tx, Message::Text(r.to_string().into()), "upload_result");
     Ok(())
 }
 
@@ -643,7 +744,7 @@ async fn dispatch(
     cfg: &Config,
     sessions: &Arc<Mutex<std::collections::HashMap<String, Arc<session::TermSession>>>>,
     file_sessions: &Arc<Mutex<std::collections::HashSet<String>>>,
-    write: &Arc<Mutex<Sink>>,
+    tx: &tokio::sync::mpsc::Sender<Message>,
     interval: &Arc<AtomicU64>,
     note: &Arc<Notify>,
     text: &str,
@@ -679,16 +780,17 @@ async fn dispatch(
                 let mut map = sessions.lock().await;
                 if let Some(existing) = map.get(&sid) {
                     if existing.is_alive() {
-                        // 先释放 sessions 锁再发送：控制通道拥塞时 send 可能长时间 pending，
-                        // 持锁 await 会连坐 resize 等所有会话操作
+                        // 先释放 sessions 锁再入队：入队本身不阻塞，但持锁做 I/O 类操作
+                        // 会连坐 resize 等所有会话操作（保持原有顺序约定）
                         drop(map);
-                        let mut w = write.lock().await;
-                        let _ = w
-                            .send(Message::Text(
+                        ctrl_enqueue(
+                            tx,
+                            Message::Text(
                                 format!(r#"{{"type":"terminal_ready","stream_id":"{sid}"}}"#)
                                     .into(),
-                            ))
-                            .await;
+                            ),
+                            "terminal_ready",
+                        );
                         return Ok(());
                     }
                     map.remove(&sid); // 僵尸会话：移除，走重建
@@ -705,13 +807,11 @@ async fn dispatch(
             let term = Arc::new(term);
             sessions.lock().await.insert(sid.clone(), term.clone());
             // 回执 terminal_ready：停止 DO 的 open_terminal 确认重发
-            let mut w = write.lock().await;
-            let _ = w
-                .send(Message::Text(
-                    format!(r#"{{"type":"terminal_ready","stream_id":"{sid}"}}"#).into(),
-                ))
-                .await;
-            drop(w);
+            ctrl_enqueue(
+                tx,
+                Message::Text(format!(r#"{{"type":"terminal_ready","stream_id":"{sid}"}}"#).into()),
+                "terminal_ready",
+            );
             // 启动数据流（独立任务；结束时自动 cleanup + 从 sessions 移除）
             let cfg2 = cfg.clone();
             let sessions2 = sessions.clone();
@@ -733,23 +833,20 @@ async fn dispatch(
             }
             // 幂等——确认重发场景（回执在重连窗口丢失导致 DO 重发）已存在则不重复启动
             if !file_sessions.lock().await.insert(sid.clone()) {
-                let mut w = write.lock().await;
-                let _ = w
-                    .send(Message::Text(
-                        format!(r#"{{"type":"file_ready","stream_id":"{sid}"}}"#).into(),
-                    ))
-                    .await;
+                ctrl_enqueue(
+                    tx,
+                    Message::Text(format!(r#"{{"type":"file_ready","stream_id":"{sid}"}}"#).into()),
+                    "file_ready",
+                );
                 return Ok(());
             }
             log(format!("open_file sid={sid}"));
             // 回执 file_ready，停止 DO 的 open_file 确认重发
-            let mut w = write.lock().await;
-            let _ = w
-                .send(Message::Text(
-                    format!(r#"{{"type":"file_ready","stream_id":"{sid}"}}"#).into(),
-                ))
-                .await;
-            drop(w);
+            ctrl_enqueue(
+                tx,
+                Message::Text(format!(r#"{{"type":"file_ready","stream_id":"{sid}"}}"#).into()),
+                "file_ready",
+            );
             let cfg2 = cfg.clone();
             let fs2 = file_sessions.clone();
             tokio::spawn(async move {
@@ -799,14 +896,14 @@ async fn dispatch(
                 .and_then(|x| x.as_u64())
                 .unwrap_or(25)
                 .clamp(1, 60);
-            let write = write.clone();
+            let tx = tx.clone();
             let cfg2 = cfg.clone();
             tokio::spawn(async move {
                 // DISABLE_EXEC=1：立即回执错误，不等 DO 侧 25s 超时（避免误导性超时提示）
                 if cfg2.disable_exec {
-                    let mut w = write.lock().await;
-                    let _ = w
-                        .send(Message::Text(
+                    ctrl_enqueue(
+                        &tx,
+                        Message::Text(
                             serde_json::json!({
                                 "type": "exec_result",
                                 "exec_id": exec_id,
@@ -818,8 +915,9 @@ async fn dispatch(
                             })
                             .to_string()
                             .into(),
-                        ))
-                        .await;
+                        ),
+                        "exec_result",
+                    );
                     return;
                 }
                 log(format!("exec {exec_id}: {command}"));
@@ -851,8 +949,7 @@ async fn dispatch(
                             "exit_code": -1,
                             "timed_out": false,
                         });
-                        let mut w = write.lock().await;
-                        let _ = w.send(Message::Text(msg.to_string().into())).await;
+                        ctrl_enqueue(&tx, Message::Text(msg.to_string().into()), "exec_result");
                         return;
                     }
                 };
@@ -928,8 +1025,7 @@ async fn dispatch(
                     "exit_code": exit_code,
                     "timed_out": timed_out,
                 });
-                let mut w = write.lock().await;
-                let _ = w.send(Message::Text(msg.to_string().into())).await;
+                ctrl_enqueue(&tx, Message::Text(msg.to_string().into()), "exec_result");
             });
         }
         _ => {}
@@ -960,7 +1056,8 @@ fn truncate_utf8(s: &str, max_bytes: usize) -> String {
 // + 丢掉已读输出且拖满超时窗口；drain 到真 EOF 让子进程自然退出，按截断语义上报
 //（持续输出的命令仍由外层超时兜底 kill 进程组）
 pub(crate) async fn read_limited(r: &mut (impl tokio::io::AsyncRead + Unpin), cap: u64) -> Vec<u8> {
-    let mut buf = Vec::new();
+    // 预留容量：read_to_end 否则会按倍增反复 realloc（48KB 需 4~5 次搬移）
+    let mut buf = Vec::with_capacity(cap as usize);
     let mut limited = tokio::io::AsyncReadExt::take(&mut *r, cap);
     let _ = tokio::io::AsyncReadExt::read_to_end(&mut limited, &mut buf).await;
     let mut sink = [0u8; 8 * 1024];
@@ -976,14 +1073,15 @@ pub(crate) async fn read_limited(r: &mut (impl tokio::io::AsyncRead + Unpin), ca
 // 上报循环：立即上报 + 分段等待（每 5s 重读间隔，interval 变更立即生效）
 async fn report_loop(
     cfg: &Config,
-    write: &Arc<Mutex<Sink>>,
+    tx: &tokio::sync::mpsc::Sender<Message>,
     interval: &Arc<AtomicU64>,
     note: &Arc<Notify>,
 ) {
     loop {
         if let Some(r) = metrics::collect_report(cfg).await {
-            let mut w = write.lock().await;
-            if w.send(Message::Text(r.into())).await.is_err() {
+            if tx.try_send(Message::Text(r.into())).is_err() {
+                // 队列满/写任务已退出 = 链路不可用（写任务会在发送超时后结束，
+                // 读循环随之断开重连）：本任务停止采集，避免继续占用配额
                 log("report send failed, control channel closed");
                 return;
             }
@@ -1346,5 +1444,102 @@ mod tests {
             .await
             .expect("写端应能写完退出")
             .expect("writer join ok");
+    }
+
+    // 回归防护（2026-09-09 生产事故）：TCP 已建立但 WS/TLS 握手被静默丢弃时，
+    // 裸 connect_async 会永久挂起（无日志、无重试、ESTAB 残留数天）。
+    #[tokio::test]
+    async fn connect_ws_times_out_on_stalled_handshake() {
+        // 只 accept TCP、永不回 101：模拟边缘接受连接但握手不完成
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            drop(sock);
+        });
+        let req = format!("ws://{addr}/control")
+            .into_client_request()
+            .unwrap();
+        let started = std::time::Instant::now();
+        let r = connect_ws_within(req, None, Duration::from_millis(300)).await;
+        assert!(r.is_err(), "握手卡住必须返回错误而非永久挂起");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "必须在超时窗口内返回"
+        );
+        server.abort();
+    }
+
+    // 写侧可控的 Sink：stuck=true 时 flush 永不就绪（模拟半开连接）
+    struct MockSink {
+        stuck: bool,
+    }
+    impl futures_util::Sink<Message> for MockSink {
+        type Error = tokio_tungstenite::tungstenite::Error;
+        fn poll_ready(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn start_send(self: std::pin::Pin<&mut Self>, _item: Message) -> Result<(), Self::Error> {
+            Ok(())
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            if self.stuck {
+                std::task::Poll::Pending
+            } else {
+                std::task::Poll::Ready(Ok(()))
+            }
+        }
+        fn poll_close(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    // 回归防护（事故根因之一）：发送永久 pending 时写任务必须自行退出，
+    // 否则读循环 select 不到"写侧已死"，整条控制通道僵死且不重连。
+    #[tokio::test]
+    async fn control_writer_exits_on_send_timeout() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<Message>(4);
+        tx.send(Message::Text("x".into())).await.unwrap();
+        let drained = Arc::new(Notify::new());
+        let done = tokio::time::timeout(
+            Duration::from_secs(5),
+            control_writer(
+                MockSink { stuck: true },
+                rx,
+                drained,
+                Duration::from_millis(100),
+            ),
+        )
+        .await;
+        assert!(done.is_ok(), "写任务必须在发送超时后自行结束");
+    }
+
+    #[tokio::test]
+    async fn control_writer_notifies_drained_queue() {
+        // 正常 Sink：入队一帧 → 写任务发送并排空 → drained 通知（self-update 退出前等待用）
+        let (tx, rx) = tokio::sync::mpsc::channel::<Message>(4);
+        tx.send(Message::Text("hello".into())).await.unwrap();
+        drop(tx); // 关闭入队端：写任务发完最后一帧即退出
+        let drained = Arc::new(Notify::new());
+        let task = tokio::spawn(control_writer(
+            MockSink { stuck: false },
+            rx,
+            drained.clone(),
+            Duration::from_secs(1),
+        ));
+        tokio::time::timeout(Duration::from_secs(2), drained.notified())
+            .await
+            .expect("队列排空后必须通知 drained");
+        task.await.expect("写任务正常结束");
     }
 }

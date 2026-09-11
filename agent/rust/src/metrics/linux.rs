@@ -120,12 +120,25 @@ pub fn collect_temp() -> Option<f64> {
     None
 }
 
-// TCP/UDP 连接数（BufReader 流式计数，不物化全文件——50 万连接不再一次性分配 ~75MB String）
+// TCP/UDP 连接数（BufReader 流式计数，不物化全文件——50 万连接不再一次性分配 ~75MB String）。
+// 逐行计数用 read_until + 复用缓冲：BufRead::lines() 每行都要分配一个 String，
+// 万级连接即每帧万级小分配；这里只数换行符，缓冲跨行复用
 fn count_lines(path: &str) -> u64 {
     use std::io::BufRead;
-    std::fs::File::open(path)
-        .map(|f| std::io::BufReader::new(f).lines().count().saturating_sub(1) as u64)
-        .unwrap_or(0)
+    let Ok(f) = std::fs::File::open(path) else {
+        return 0;
+    };
+    let mut reader = std::io::BufReader::new(f);
+    let mut buf: Vec<u8> = Vec::with_capacity(256);
+    let mut lines = 0u64;
+    loop {
+        buf.clear();
+        match reader.read_until(b'\n', &mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => lines += 1,
+        }
+    }
+    lines.saturating_sub(1) // 首行是表头
 }
 // IPv4 + IPv6 合计（仅读 tcp/udp 会让 IPv6-only 主机连接数恒为 0；
 // 文件不存在（老内核）时 count_lines 返回 0，天然兼容）
@@ -660,6 +673,19 @@ mod tests {
             disk_io_diff(&cur, &DiskIoState { ts: 1010, ..cur }),
             json!({})
         );
+    }
+
+    #[test]
+    fn count_lines_skips_header_and_handles_missing_file() {
+        // /proc/net/tcp 形态：首行表头 + 每行一条连接
+        let path = std::env::temp_dir().join(format!("cfp-count-lines-{}", std::process::id()));
+        std::fs::write(&path, "header\n1\n2\n3\n").unwrap();
+        assert_eq!(count_lines(path.to_string_lossy().as_ref()), 3);
+        // 无结尾换行的最后一行也要计入
+        std::fs::write(&path, "header\n1\n2").unwrap();
+        assert_eq!(count_lines(path.to_string_lossy().as_ref()), 2);
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(count_lines("/nonexistent/proc/net/tcp"), 0);
     }
 
     #[test]

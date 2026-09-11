@@ -289,6 +289,17 @@ Rust 版以 `#[cfg(unix)]` / `#[cfg(windows)]` 条件编译实现三平台（平
 
 > **跨平台验证边界（如实标注）**：`cargo check --all-targets` 三平台全绿 + Windows CI 真机测试；macOS 指标（sysinfo 数值/温度）与 ConPTY 交互体验建议发布后真机冒烟。
 
+**连接韧性（2026-09-12，生产事故修复）**：事故形态为「残留 ESTAB 连接 + 日志静默 3 天 + 不重试」，根因是**全链路缺少时间上界**——`tokio-tungstenite` / `tungstenite` 源码中不存在任何 timeout 配置（`WebSocketConfig` 只有缓冲/大小字段），TCP 层也只在「有未确认数据」时才放弃（`tcp_retries2`≈15min），而 keepalive 默认关闭。因此：
+
+| 环节 | 措施 |
+| --- | --- |
+| 连接建立 | `connect_ws` 统一封装：DNS + TCP + TLS + HTTP 101 共 15s 总超时（控制通道与终端/文件会话共用），超时即按退避重连 |
+| 控制通道出站 | 专用写任务 + 有界队列（256）替代 `Arc<Mutex<Sink>>`：生产者只 `try_send`（不阻塞、不持锁跨 await），写任务单帧 10s 超时，超时即结束任务 |
+| 读循环 | 三重退出：读侧 180s 半开超时、写任务结束（发送失败/超时）、服务端 close |
+| 指令处理 | 兜底超时：`dispatch` 30s、上传帧 45s（self-update 例外，内部 `file_blocking` 120s 已界）；handler 卡住也必须能退回重连，否则 180s 半开检测形同虚设 |
+
+> 未采纳项：TCP keepalive / `set_nodelay` 需要自建 `TcpStream`（`connect_async` 不暴露 socket），且 keepalive 需显式设 `keepidle/keepintvl/keepcnt`（内核默认 2h 无意义）；`disable_nagle` 对指令往返的几十毫秒延迟不敏感，保持默认。
+
 #### 3.5.3 Agent 自更新（Worker 中转 + self-replace）
 
 设计目标：被控机只需访问面板、不要求能直连 GitHub；保持 Agent 无通用 HTTP 客户端的小体积；更新操作与普通文件上传完全隔离。

@@ -25,6 +25,9 @@ tokio-tungstenite = { version = "0.30", default-features = false, features = ["c
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 futures-util = "0.3"
 serde_json = "1"
+# Bytes：WS 帧载荷类型（tungstenite 的 Message::Binary/Text 内部即 Bytes）。
+# 数据面（终端/文件/上传/自更新）直接持有 Bytes 并做 O(1) 切片，替代 Vec::to_vec() 整块复制。
+bytes = "1"
 portable-pty = "0.9"
 libc = "0.2"
 # 自更新：SHA-256 流式校验 + 跨平台替换当前可执行文件（Windows 运行中 exe 特殊处理）

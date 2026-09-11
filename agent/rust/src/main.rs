@@ -50,42 +50,65 @@ async fn connect_ws_within(
     .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)
 }
 
-// 控制通道写任务：独占 Sink，从有界队列取帧发送，单帧带超时。
+// 控制通道出站消息：普通帧 + 显式排空屏障。
+// 屏障用于 self-update：回执入队后紧跟一个屏障，写任务按序处理到屏障时，前面的回执
+// 必然已经 send + flush 到 socket（进程随后清理 PTY 并退出，写任务会随之消失）。
+// 不用 Notify 广播"队列排空"：Notify 的 permit 会跨时间残留（无等待者时 notify_one
+// 存一个 permit，之后的 notified() 直接消费），而队列排空是常态事件——那样"等排空"
+// 会在回执真正发出前就返回，语义形同虚设。
+enum OutMsg {
+    Frame(Message),
+    Barrier(tokio::sync::oneshot::Sender<()>),
+}
+
+// 控制通道写任务：独占 Sink，从有界队列取消息，单帧发送带超时。
 // 超时或错误即返回，读循环 select 到本任务结束就断开重连——因此"发不出去"的链路
 // 不会把任何锁或队列永久占住。（此前 Arc<Mutex<Sink>> 跨 send().await 持锁：半开连接
 // 下写侧卡死会让上报与指令回执全部永久排队，读循环一旦需要该锁也再无法回到
 // read.next()，180s 半开检测被绕过。）
 async fn control_writer<S>(
     mut write: S,
-    mut rx: tokio::sync::mpsc::Receiver<Message>,
-    drained: Arc<Notify>,
+    mut rx: tokio::sync::mpsc::Receiver<OutMsg>,
     send_timeout: Duration,
 ) where
     S: futures_util::Sink<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
 {
     while let Some(msg) = rx.recv().await {
-        match tokio::time::timeout(send_timeout, write.send(msg)).await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => {
-                log(format!("control send failed: {e}"));
-                return;
-            }
-            Err(_) => {
-                log("control send timeout (half-open connection)");
-                return;
-            }
-        }
-        // 队列排空 → 通知等待者（self-update 回执需要"已交给 socket"再退出进程）
-        if rx.is_empty() {
-            drained.notify_one();
+        match msg {
+            OutMsg::Frame(m) => match tokio::time::timeout(send_timeout, write.send(m)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    log(format!("control send failed: {e}"));
+                    return;
+                }
+                Err(_) => {
+                    log("control send timeout (half-open connection)");
+                    return;
+                }
+            },
+            // 屏障：再 flush 一次（send 本身已 flush，此处是"此前帧都已落到 socket"的显式确认），
+            // 成功即回执；失败/超时与发送失败同语义——结束任务让读循环断开重连
+            OutMsg::Barrier(ack) => match tokio::time::timeout(send_timeout, write.flush()).await {
+                Ok(Ok(())) => {
+                    let _ = ack.send(());
+                }
+                Ok(Err(e)) => {
+                    log(format!("control flush failed: {e}"));
+                    return;
+                }
+                Err(_) => {
+                    log("control flush timeout (half-open connection)");
+                    return;
+                }
+            },
         }
     }
 }
 
 // 控制通道入队（非阻塞）：队列满或写任务已退出时只记日志，不阻塞调用方。
 // 回执丢失由 DO 侧超时兜底（open 确认重发 / exec·upload·update 等待超时）。
-fn ctrl_enqueue(tx: &tokio::sync::mpsc::Sender<Message>, msg: Message, what: &str) {
-    if let Err(e) = tx.try_send(msg) {
+fn ctrl_enqueue(tx: &tokio::sync::mpsc::Sender<OutMsg>, msg: Message, what: &str) {
+    if let Err(e) = tx.try_send(OutMsg::Frame(msg)) {
         log(format!("control enqueue {what} rejected: {e}"));
     }
 }
@@ -394,12 +417,10 @@ async fn control_conn(
 
     // 出站单通道：所有生产者（上报/指令回执/上传·exec·更新结果）只往有界队列入队，
     // 由写任务独占 Sink 串行发送并带单帧超时（见 control_writer 注释）。
-    let (tx, rx) = tokio::sync::mpsc::channel::<Message>(CTRL_SEND_QUEUE);
-    let drained = Arc::new(Notify::new());
+    let (tx, rx) = tokio::sync::mpsc::channel::<OutMsg>(CTRL_SEND_QUEUE);
     let mut writer_task = tokio::spawn(control_writer(
         write,
         rx,
-        drained.clone(),
         Duration::from_secs(CTRL_SEND_TIMEOUT_S),
     ));
 
@@ -445,6 +466,8 @@ async fn control_conn(
         };
         match msg {
             Message::Text(t) => {
+                // 注意：timeout 只能在 await 点抢占——dispatch 内部的同步段
+                //（PTY spawn、JSON 解析、纯计算）不受此超时保护，仅用于兜住会挂起的 await
                 let handled = tokio::time::timeout(
                     Duration::from_secs(DISPATCH_TIMEOUT_S),
                     dispatch(
@@ -470,7 +493,7 @@ async fn control_conn(
                 // 两条分支都直接移交帧载荷（Bytes，零拷贝）：帧本体即 tungstenite 的分配
                 let handled = if update::is_update_frame(&b) {
                     // self-update 不套外层超时：staging 大文件最长 120s（file_blocking 内已有界）
-                    handle_update_frame(cfg, b, &update_manager, &tx, &drained, shutdown).await
+                    handle_update_frame(cfg, b, &update_manager, &tx, shutdown).await
                 } else {
                     match tokio::time::timeout(
                         Duration::from_secs(UPLOAD_HANDLE_TIMEOUT_S),
@@ -516,8 +539,7 @@ async fn handle_update_frame(
     cfg: &Config,
     frame: Bytes,
     manager: &Arc<update::UpdateManager>,
-    tx: &tokio::sync::mpsc::Sender<Message>,
-    drained: &Arc<Notify>,
+    tx: &tokio::sync::mpsc::Sender<OutMsg>,
     shutdown: &Arc<Notify>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let update_id = update::frame_update_id(&frame);
@@ -565,8 +587,11 @@ async fn handle_update_frame(
     if ready {
         RESTART_AFTER_UPDATE.store(cfg.self_restart_after_update, Ordering::SeqCst);
     }
+    // 入队用阻塞式 send（其余生产者一律 try_send）：这里需要"入队成功"的确定信号。
+    // 队列满（256，几乎不可能，回执帧极小）时最坏阻塞到写任务超时退出（≤10s）后返回 Err；
+    // 本函数无外层超时，故该上界即读循环的最坏等待时间。
     let send_result = tx
-        .send(Message::Text(response.to_string().into()))
+        .send(OutMsg::Frame(Message::Text(response.to_string().into())))
         .await
         .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>);
     if ready {
@@ -575,10 +600,14 @@ async fn handle_update_frame(
         } else {
             "agent update installed; shutting down for supervisor restart"
         });
-        // 入队成功后等写任务排空（回执已交给 socket）；超时也继续退出——
-        // 替换成功就必须跑新版本，退出不能依赖回执送达（DO 断线同样能确认版本）。
+        // 紧跟一个排空屏障：写任务处理到屏障时，前面的回执必然已 send + flush 到 socket
+        //（排队序保证）。等屏障回执（≤2s）再通知退出，确保 DO 能拿到"更新成功"而不是断线。
+        // 超时/失败也继续退出——替换成功就必须跑新版本，退出不能依赖回执送达。
         if send_result.is_ok() {
-            let _ = tokio::time::timeout(Duration::from_secs(2), drained.notified()).await;
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+            if tx.send(OutMsg::Barrier(ack_tx)).await.is_ok() {
+                let _ = tokio::time::timeout(Duration::from_secs(2), ack_rx).await;
+            }
         }
         shutdown.notify_waiters();
         return Ok(());
@@ -595,7 +624,7 @@ async fn handle_upload_frame(
     frame: Bytes,
     created: &Arc<std::sync::Mutex<Vec<String>>>,
     failed: &Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
-    tx: &tokio::sync::mpsc::Sender<Message>,
+    tx: &tokio::sync::mpsc::Sender<OutMsg>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let Some(nl) = frame.iter().position(|&b| b == b'\n') else {
         return Ok(()); // 无 JSON 头：忽略
@@ -744,7 +773,7 @@ async fn dispatch(
     cfg: &Config,
     sessions: &Arc<Mutex<std::collections::HashMap<String, Arc<session::TermSession>>>>,
     file_sessions: &Arc<Mutex<std::collections::HashSet<String>>>,
-    tx: &tokio::sync::mpsc::Sender<Message>,
+    tx: &tokio::sync::mpsc::Sender<OutMsg>,
     interval: &Arc<AtomicU64>,
     note: &Arc<Notify>,
     text: &str,
@@ -1073,13 +1102,13 @@ pub(crate) async fn read_limited(r: &mut (impl tokio::io::AsyncRead + Unpin), ca
 // 上报循环：立即上报 + 分段等待（每 5s 重读间隔，interval 变更立即生效）
 async fn report_loop(
     cfg: &Config,
-    tx: &tokio::sync::mpsc::Sender<Message>,
+    tx: &tokio::sync::mpsc::Sender<OutMsg>,
     interval: &Arc<AtomicU64>,
     note: &Arc<Notify>,
 ) {
     loop {
         if let Some(r) = metrics::collect_report(cfg).await {
-            if tx.try_send(Message::Text(r.into())).is_err() {
+            if tx.try_send(OutMsg::Frame(Message::Text(r.into()))).is_err() {
                 // 队列满/写任务已退出 = 链路不可用（写任务会在发送超时后结束，
                 // 读循环随之断开重连）：本任务停止采集，避免继续占用配额
                 log("report send failed, control channel closed");
@@ -1471,9 +1500,11 @@ mod tests {
         server.abort();
     }
 
-    // 写侧可控的 Sink：stuck=true 时 flush 永不就绪（模拟半开连接）
+    // 写侧可控的 Sink：stuck=true 时 flush 永不就绪（模拟半开连接）；
+    // sent 记录实际写出顺序，用于断言屏障的"此前帧已发出"语义
     struct MockSink {
         stuck: bool,
+        sent: Arc<std::sync::Mutex<Vec<String>>>,
     }
     impl futures_util::Sink<Message> for MockSink {
         type Error = tokio_tungstenite::tungstenite::Error;
@@ -1483,7 +1514,10 @@ mod tests {
         ) -> std::task::Poll<Result<(), Self::Error>> {
             std::task::Poll::Ready(Ok(()))
         }
-        fn start_send(self: std::pin::Pin<&mut Self>, _item: Message) -> Result<(), Self::Error> {
+        fn start_send(self: std::pin::Pin<&mut Self>, item: Message) -> Result<(), Self::Error> {
+            if let Message::Text(t) = item {
+                self.sent.lock().unwrap().push(t.to_string());
+            }
             Ok(())
         }
         fn poll_flush(
@@ -1504,42 +1538,89 @@ mod tests {
         }
     }
 
+    fn mock_sink(stuck: bool) -> (MockSink, Arc<std::sync::Mutex<Vec<String>>>) {
+        let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+        (
+            MockSink {
+                stuck,
+                sent: sent.clone(),
+            },
+            sent,
+        )
+    }
+
     // 回归防护（事故根因之一）：发送永久 pending 时写任务必须自行退出，
     // 否则读循环 select 不到"写侧已死"，整条控制通道僵死且不重连。
     #[tokio::test]
     async fn control_writer_exits_on_send_timeout() {
-        let (tx, rx) = tokio::sync::mpsc::channel::<Message>(4);
-        tx.send(Message::Text("x".into())).await.unwrap();
-        let drained = Arc::new(Notify::new());
+        let (tx, rx) = tokio::sync::mpsc::channel::<OutMsg>(4);
+        tx.send(OutMsg::Frame(Message::Text("x".into())))
+            .await
+            .unwrap();
+        let (sink, _) = mock_sink(true);
         let done = tokio::time::timeout(
             Duration::from_secs(5),
-            control_writer(
-                MockSink { stuck: true },
-                rx,
-                drained,
-                Duration::from_millis(100),
-            ),
+            control_writer(sink, rx, Duration::from_millis(100)),
         )
         .await;
         assert!(done.is_ok(), "写任务必须在发送超时后自行结束");
     }
 
+    // 屏障语义：屏障回执必须意味着"排在其前的帧都已写出"。
+    // 旧实现用 Notify 广播"队列排空"，permit 会跨时间残留（无等待者时 notify_one 存一个 permit，
+    // 之后 notified() 直接消费）——而排空是常态事件（每帧上报都会排空），于是 self-update 的
+    // "等回执交给 socket" 会在回执真正发出前就返回。本测试先制造一次排空再发屏障，锁死该回归。
     #[tokio::test]
-    async fn control_writer_notifies_drained_queue() {
-        // 正常 Sink：入队一帧 → 写任务发送并排空 → drained 通知（self-update 退出前等待用）
-        let (tx, rx) = tokio::sync::mpsc::channel::<Message>(4);
-        tx.send(Message::Text("hello".into())).await.unwrap();
-        drop(tx); // 关闭入队端：写任务发完最后一帧即退出
-        let drained = Arc::new(Notify::new());
-        let task = tokio::spawn(control_writer(
-            MockSink { stuck: false },
-            rx,
-            drained.clone(),
-            Duration::from_secs(1),
-        ));
-        tokio::time::timeout(Duration::from_secs(2), drained.notified())
+    async fn control_writer_barrier_acks_only_after_prior_frames() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<OutMsg>(4);
+        let (sink, sent) = mock_sink(false);
+        let task = tokio::spawn(control_writer(sink, rx, Duration::from_secs(1)));
+
+        // 第一帧：等它真的写出（等价于旧实现里"排空通知"已经发生过）
+        tx.send(OutMsg::Frame(Message::Text("first".into())))
             .await
-            .expect("队列排空后必须通知 drained");
+            .unwrap();
+        for _ in 0..100 {
+            if !sent.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(sent.lock().unwrap().len(), 1, "第一帧应已写出");
+
+        // 第二帧 + 屏障：回执必须晚于第二帧写出
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+        tx.send(OutMsg::Frame(Message::Text("second".into())))
+            .await
+            .unwrap();
+        tx.send(OutMsg::Barrier(ack_tx)).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), ack_rx)
+            .await
+            .expect("屏障必须在超时前回执")
+            .expect("屏障回执通道正常");
+        assert_eq!(
+            *sent.lock().unwrap(),
+            vec!["first".to_string(), "second".to_string()],
+            "屏障回执时第二帧必须已写出"
+        );
+        drop(tx);
         task.await.expect("写任务正常结束");
+    }
+
+    // 屏障失败路径：flush 永久 pending 时写任务按链路故障结束（读循环随之重连）
+    #[tokio::test]
+    async fn control_writer_barrier_flush_timeout_ends_task() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<OutMsg>(4);
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+        tx.send(OutMsg::Barrier(ack_tx)).await.unwrap();
+        drop(tx);
+        let (sink, _) = mock_sink(true);
+        let done = tokio::time::timeout(
+            Duration::from_secs(5),
+            control_writer(sink, rx, Duration::from_millis(100)),
+        )
+        .await;
+        assert!(done.is_ok(), "flush 超时后写任务必须结束");
+        assert!(ack_rx.await.is_err(), "失败路径不得回执成功");
     }
 }

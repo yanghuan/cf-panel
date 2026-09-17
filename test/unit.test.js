@@ -505,6 +505,16 @@ test('编辑器顶部/底部按钮与只读预览加载闸门（静态断言）'
   // 意图来源：滚轮上滚（Monaco 与 textarea 各一条）
   assert.match(app, /onMouseWheel\(/, 'Monaco 滚轮意图');
   assert.match(app, /'wheel', \(e\) => \{\s*\n\s*if \(e\.deltaY < 0\)/, 'textarea 滚轮意图');
+  // 标题栏布局：长绝对路径（如 /run/csi/... 的容器工作区）曾把按钮组挤成竖排——每个按钮
+  // 各占一行。两条约束缺一不可，且都是"删掉就静默失效"的类型，故锁住：
+  //   .modal-head-actions { flex: none }  按钮组不参与收缩（收缩即竖排）
+  //   标题 flex: 1 1 0 + text-overflow    单行截断；flex-basis 为 0 才能与按钮组同行
+  //（用默认 auto 时，换行判定拿标题的 max-content（近千像素）去比，按钮组会被挤到第二行）
+  const css = nodeFs.readFileSync(nodePath.join(root, 'public/style.css'), 'utf8');
+  assert.match(html, /class="modal-head-actions"/, '编辑器按钮组带类名（样式依赖它）');
+  assert.match(css, /\.modal-head-actions \{[^}]*flex: none/, '按钮组禁止收缩');
+  assert.match(css, /#file-editor-modal \.modal-head > span \{[^}]*flex: 1 1 0/, '标题基准尺寸为 0');
+  assert.match(css, /#file-editor-modal \.modal-head > span \{[^}]*text-overflow: ellipsis/, '标题单行截断');
 });
 
 test('normalizeFileEntry 收口恶意 Agent 文件条目', () => {

@@ -1615,6 +1615,8 @@
     $('#editor-md-preview').classList.add('hidden');
     $('#file-editor-title').textContent = editorReadonly
       ? t('file.previewTitle', { path }) : t('file.editorTitle', { path });
+    // 长绝对路径在标题栏会被 CSS 截断（否则会把按钮组挤成竖排），完整路径放 title 悬停可见
+    $('#file-editor-title').title = path;
     $('#file-editor-text').value = text; // textarea 始终持有内容（回退与保存兜底）
     $('#file-editor-modal').classList.remove('hidden');
     $('#file-editor-modal').classList.remove('expanded');

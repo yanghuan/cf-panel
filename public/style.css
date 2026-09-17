@@ -656,8 +656,26 @@ button.danger:hover { background: rgba(248, 113, 113, .12); }
 .modal:has(.dialog-body) .modal-head { max-width: 560px; }
 .modal:has(.file-body) .modal-head { max-width: 760px; }
 /* 编辑器弹窗（file-editor-modal 也用 .file-body，但标题栏须跟随其自身宽度） */
-#file-editor-modal .modal-head { max-width: 760px; }
+#file-editor-modal .modal-head { max-width: 760px; gap: 8px; }
 #file-editor-modal.expanded .modal-head { max-width: none; }
+/* 标题可能是很长的绝对路径（如 /run/csi/... 的容器工作区）：必须截断成单行。
+   否则它会把按钮组挤成竖排——flex 项默认 min-width:auto = 内容宽度，长路径撑爆后
+   按钮组可收缩到几十像素，每个按钮各占一行。
+   flex: 1 1 0 是关键：baseline 为 0 才能与按钮组同行（若用默认的 auto，
+   换行判定会拿标题的 max-content（近千像素）去比，直接把按钮组挤到第二行）。
+   min-width: 0 让省略号在收缩后生效；完整路径由 JS 写进 title 属性，悬停可见。 */
+#file-editor-modal .modal-head > span {
+  flex: 1 1 0;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-align: left;
+}
+
+/* 弹窗头部按钮组：flex:none 禁止收缩（收缩就会竖排），gap 统一间距
+   （改成 flex 后 HTML 里的空白换行不再产生间距，必须显式给 gap） */
+.modal-head-actions { display: flex; align-items: center; gap: 8px; flex: none; }
 .modal-head span { font-weight: 600; }
 .term { flex: 1; background: var(--term-bg); border: 1px solid var(--border); border-radius: 12px; padding: 8px; overflow: hidden; box-shadow: 0 0 40px rgba(99, 102, 241, .08); }
 .term .xterm { height: 100%; }

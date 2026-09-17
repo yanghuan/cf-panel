@@ -13,7 +13,7 @@
   <!-- CSP 与点击劫持防护由 public/_headers 以 HTTP 响应头下发；frame-ancestors 在 meta 中不会生效。 -->
   <!-- 依赖本地化（public/vendor，避免外部 CDN 不可达/供应链风险）；xterm/Chart.js 首次使用时由 JS 懒加载 -->
   <script src="/theme-init.js"></script>
-  <link rel="stylesheet" href="/style.css?v=41" />
+  <link rel="stylesheet" href="/style.css?v=42" />
 </head>
 <body>
   <div id="app" class="hidden">
@@ -235,7 +235,7 @@
   <div id="file-editor-modal" class="modal hidden">
     <div class="modal-head">
       <span id="file-editor-title" data-i18n="common.edit">编辑</span>
-      <div>
+      <div class="modal-head-actions">
         <button id="btn-editor-top" class="ghost" data-i18n="file.editorTop">顶部</button>
         <button id="btn-editor-bottom" class="ghost" data-i18n="file.editorBottom">底部</button>
         <button id="btn-editor-save" class="ghost" data-i18n="common.save">保存</button>

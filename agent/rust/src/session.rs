@@ -437,12 +437,28 @@ const SYSTEM_PATHS: &[&str] = &[
     "/efi",  // Arch/openSUSE 惯例：EFI 独立挂载（/boot/efi 已被 /boot 前缀覆盖）
     "/snap", // Ubuntu snap 系统
     "/root",
-    "/run",
+    // /run 不再整体拦截：容器/Serverless 平台把工作区挂在其下（实测
+    // /run/csi/mount-root/nas/<id>/workspaces/default/deploy），整体前缀拦截会让这些
+    // 部署目录里的配置文件无法在线编辑——与 /opt /srv 放行第三方部署目录的取舍自相矛盾。
+    // 改列 systemd 自管的运行态子树，其余放行；/run 目录本身仍拦（见 SYSTEM_PATHS_EXACT）。
+    "/run/systemd",
+    "/run/lock",
+    "/run/user",
+    "/run/initramfs",
+    "/run/credentials",
+    "/run/secrets", // k8s 挂载的 Secret（只读卷，但显式拦避免误删挂载点）
     "/lost+found",
     // 注：/opt /srv 不拦——第三方软件部署目录（自编译服务/手动安装二进制的常规位置），
     // 删错顶多重装软件不毁系统；拦截会挡住"上传可执行软件部署"的正常流程。
     // 恶意场景（传二进制+执行）走终端 shell 本就可行，拦截不增加安全性（防误操作威胁模型）
 ];
+
+// 仅拦截路径本身、不拦子树（挂载点）。根目录由 lexical_system_hit 的空串分支处理
+//（Unix normalize_abs("/") → ""），故此处只列 /run：
+// /run 下的工作区要放行，但目录本身必须留拦——删除走 remove_dir_all 会先递归清空
+// 其内容再 rmdir，虽最后因挂载点失败，运行态（socket/PID 文件/systemd 状态）已被破坏。
+#[cfg(unix)]
+const SYSTEM_PATHS_EXACT: &[&str] = &["/run"];
 
 // Windows：驱动器根下的一级目录黑名单（任意盘符；大小写不敏感比较）。
 // 语义与 Unix 黑名单对齐：系统目录/程序目录拦截，用户目录（C:\Users\...，等同 /home）放行。
@@ -553,6 +569,9 @@ pub const SYSTEM_PATH_ERR: &str =
 fn lexical_system_hit(norm: &str) -> bool {
     if norm.is_empty() {
         return true; // 根目录
+    }
+    if SYSTEM_PATHS_EXACT.contains(&norm) {
+        return true; // 仅路径本身（挂载点），子树放行
     }
     SYSTEM_PATHS
         .iter()
@@ -1796,6 +1815,23 @@ mod tests {
         assert!(!is_system_path("/opt"));
         assert!(!is_system_path("/opt/myapp/bin/run"));
         assert!(!is_system_path("/srv/www"));
+        // /run：目录本身与 systemd 自管子树拦截，容器/Serverless 工作区放行
+        assert!(is_system_path("/run"));
+        assert!(is_system_path("/run/systemd/system"));
+        assert!(is_system_path("/run/user/1000/bus"));
+        assert!(is_system_path("/run/lock/sub"));
+        assert!(is_system_path("/run/secrets/k8s"));
+        assert!(is_system_path("/run/credentials/unit"));
+        assert!(is_system_path("/run/initramfs/x"));
+        // 实测场景（阿里云 Serverless 工作区）：整体前缀拦截会让 config.json 无法在线编辑
+        assert!(!is_system_path(
+            "/run/csi/mount-root/nas/4079184d856ecc166ed19d4887083405/workspaces/default/deploy"
+        ));
+        assert!(!is_system_path(
+            "/run/csi/mount-root/nas/4079184d856ecc166ed19d4887083405/workspaces/default/deploy/config.json"
+        ));
+        // 但 /run 下非系统子目录仍需词法归一化把关（/run/x/../systemd 等价 /run/systemd）
+        assert!(is_system_path("/run/x/../systemd/y"));
         // 词法绕过全部拒绝（fail closed）：重复斜杠 / .. 回溯 / 相对路径 / 尾斜杠
         assert!(is_system_path("//etc/passwd"));
         assert!(is_system_path("/home/../etc/passwd"));

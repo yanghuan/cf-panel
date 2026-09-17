@@ -281,7 +281,8 @@ Rust 版以 `#[cfg(unix)]` / `#[cfg(windows)]` 条件编译实现三平台（平
 - **平台缺失项（如实上报空值，服务端白名单丢弃）**：磁盘 IO 差分与 TCP-UDP 连接数无跨平台 API（Windows/macOS 均为空）；macOS 系统信息 IP 为空（卡片展示走服务端 `wan_ip` 不受影响）。
 
 **路径模型**（文件管理协议从 Unix 绝对路径扩展）：
-- Unix：`/` 分隔 + FHS 系统目录黑名单（`/etc` `/usr` `/var` 等，fail closed）。
+- Unix：`/` 分隔 + FHS 系统目录黑名单（`/etc` `/usr` `/var` 等，fail closed）。黑名单分两档：**前缀档**（自身 + 子树，如 `/etc`）与**精确档**（仅自身，如 `/run`——挂载点，删除走 `remove_dir_all` 会先递归清空内容再 `rmdir`，必须留拦）。
+  - `/run` 仅精确档拦截自身，子树放行，其中 systemd 自管的运行态目录（`/run/systemd` `/run/lock` `/run/user` `/run/initramfs` `/run/credentials` `/run/secrets`）列前缀档；**容器 / Serverless 平台把工作区挂在其下**（实测 `/run/csi/mount-root/nas/<id>/workspaces/default/deploy`），整体前缀拦截会让这些部署目录里的配置文件无法在线编辑——与 `/opt` `/srv` 放行第三方部署目录的取舍自相矛盾。
 - Windows：盘符路径（`C:\...`，统一大写盘符 + `\` 分隔，大小写不敏感），驱动器根一级目录黑名单（`Windows` / `Program Files` / `ProgramData` / `$Recycle.Bin` 等，任意盘符生效）；`C:\Users` 放行（等同 `/home`）；UNC、保留字符、ADS、尾随点/空格及 `CON`/`NUL`/`COM1`/`LPT1` 等设备名均 fail closed；`canonicalize` 的 `\\?\` verbatim 前缀剥离（真实路径层防 symlink/junction 写穿）。
 - 前端 `utils.js` 的 `fileJoin` / `fileParent` / `fileBase` / `isSystemPath` 与 agent 端同步支持盘符路径（黑名单逐条对账）。
 

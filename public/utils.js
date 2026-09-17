@@ -293,9 +293,19 @@
   // 重命名菜单（下载保留）；agent 端为最终防线，此处仅为 UX 层。
   // Windows 盘符路径（C:\...）：归一化后按驱动器根一级目录黑名单（大小写不敏感，
   // 任意盘符；与 agent 端 WIN_SYSTEM_ROOT_DIRS 同规则）
+  //
+  // /run 只拦自身、放行子树：容器/Serverless 平台把工作区挂在其下（如
+  // /run/csi/mount-root/nas/<id>/workspaces/default/deploy），整体前缀拦截会让这些
+  // 部署目录里的配置文件无法在线编辑——与 /opt /srv 放行第三方部署目录的取舍自相矛盾。
+  // systemd 自管的运行态子树改列具体项（见下），其余放行。
+  // 目录本身必须留拦：删除走 remove_dir_all 会递归清空其内容（最后 rmdir 因挂载点失败，
+  // 但运行态已被破坏）。
+  const SYSTEM_PATH_EXACT = ['/run'];
   const SYSTEM_PATH_PREFIXES = [
     '/proc', '/sys', '/dev', '/etc', '/usr', '/var', '/boot', '/bin',
-    '/sbin', '/lib', '/lib64', '/efi', '/snap', '/root', '/run',
+    '/sbin', '/lib', '/lib64', '/efi', '/snap', '/root',
+    '/run/systemd', '/run/lock', '/run/user', '/run/initramfs',
+    '/run/credentials', '/run/secrets',
     '/lost+found', // 注：/opt /srv 不拦（第三方软件部署目录，与 agent 端黑名单同步）
   ];
   const WIN_SYSTEM_ROOT_DIRS = [
@@ -330,6 +340,7 @@
     }
     const norm = '/' + parts.join('/');
     if (norm === '/') return true;
+    if (SYSTEM_PATH_EXACT.includes(norm)) return true; // 仅路径本身（挂载点），子树放行
     return SYSTEM_PATH_PREFIXES.some((p) => norm === p || norm.startsWith(p + '/'));
   }
 

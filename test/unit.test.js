@@ -319,6 +319,20 @@ test('isSystemPath 词法归一化与黑名单（与 agent 同规则）', () => 
   assert.equal(CfUtils.isSystemPath('/opt/app/bin'), false); // 部署目录放行
   assert.equal(CfUtils.isSystemPath('/srv/www'), false);
   assert.equal(CfUtils.isSystemPath('/home/u/dir'), false);
+  // /run：目录本身与 systemd 自管子树拦截，容器/Serverless 工作区放行
+  //（与 agent 端 SYSTEM_PATHS / SYSTEM_PATHS_EXACT 同规则）
+  assert.equal(CfUtils.isSystemPath('/run'), true, '/run 目录本身留拦（删除会递归清空）');
+  assert.equal(CfUtils.isSystemPath('/run/systemd/system'), true);
+  assert.equal(CfUtils.isSystemPath('/run/user/1000/bus'), true);
+  assert.equal(CfUtils.isSystemPath('/run/lock/sub'), true);
+  assert.equal(CfUtils.isSystemPath('/run/secrets/k8s'), true);
+  assert.equal(CfUtils.isSystemPath('/run/credentials/unit'), true);
+  assert.equal(CfUtils.isSystemPath('/run/initramfs/x'), true);
+  // 实测场景（阿里云 Serverless 工作区）：整体前缀拦截会让 config.json 无法在线编辑
+  assert.equal(CfUtils.isSystemPath('/run/csi/mount-root/nas/4079184d856ecc166ed19d4887083405/workspaces/default/deploy'), false);
+  assert.equal(CfUtils.isSystemPath('/run/csi/mount-root/nas/4079184d856ecc166ed19d4887083405/workspaces/default/deploy/config.json'), false);
+  // 但 /run 下非系统子目录仍需归一化把关（/run/x/../systemd 等价 /run/systemd）
+  assert.equal(CfUtils.isSystemPath('/run/x/../systemd/y'), true);
 });
 
 test('normalizeFileEntry 收口恶意 Agent 文件条目', () => {

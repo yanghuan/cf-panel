@@ -558,7 +558,7 @@
     'file.previewTitle': 'Preview · {path}',
     'file.previewBanner': 'Read-only preview: file is {size}, over the {limit} inline-editing limit (cannot be saved)',
     'file.previewOmitted': 'first {omitted} omitted — scroll up to load earlier content',
-    'file.previewAllLoaded': 'reached the start of the file',
+    'file.previewAllLoaded': 'whole file loaded ("Top" jumps to the start)',
     'file.previewLoading': 'loading earlier content…',
     'file.editorTop': 'Top',
     'file.editorBottom': 'Bottom',

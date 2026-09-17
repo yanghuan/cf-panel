@@ -406,7 +406,11 @@ test('编辑读取：大文件尾部只读预览（1 次往返、丢弃半截首
   assert.equal(frames.length, before, '恰好 1 次往返——大文件不整份拉取（原路径 16 次）');
   assert.equal(loaded.length, 1);
   assert.equal(loaded[0].text, 'x'.repeat(tail - half.length), '首个换行前的不完整片段被丢弃');
-  assert.deepEqual(loaded[0].info, { omitted: size - tail, total: size }, 'info 供横幅说明省略量');
+  // omitted 必须是**模型内容的真实起点**（字节精确），不是请求区间的起点：
+  // 按字符裁 / 用请求起点当游标都会比真实起点差一行，下一次向上请求的末尾就落在行中间，
+  // 追加时把两行粘成一行（旧实现即如此）。此处块首半截行长度 = half.length 字节。
+  assert.deepEqual(loaded[0].info, { omitted: size - tail + half.length, total: size },
+    'omitted = 请求起点 + 裁掉的半截行字节数');
 
   // 3) 非尾部（完整加载）不得裁剪首行：offset=0 时保留原文（含开头即换行的情况）
   sess.editText('/home/u/b.txt', 3);
@@ -454,19 +458,23 @@ test('只读预览向上追加：已在开头不发请求、在途去重、半�
   sess._onReadResult({ path: '/var/log/big.log', got: blk / 2 }, new Uint8Array(1));
   assert.equal(frames[1].offset, 2 * blk + blk / 2, '续传偏移含起点');
 
-  // 收满：起点落在行中间 → 首个换行前是半截行，丢弃；nextFrom = 本块绝对起点
+  // 收满：起点落在行中间 → 首个换行前是半截行，丢弃；nextFrom = 内容的**字节精确起点**
   const half = enc.encode('半截行(起点落在行中间)\n');
   const body = new Uint8Array(blk - blk / 2 - half.length);
-  body.fill(0x78); // 'x'
+  body.fill(0x78);                  // 'x'
+  body[body.length - 1] = 0x0A;     // 真实数据必以换行结尾（下次请求末尾对齐行首）
   const rest = new Uint8Array(half.length + body.length);
   rest.set(half, 0);
   rest.set(body, half.length);
   sess._onReadResult({ path: '/var/log/big.log', got: rest.length }, rest);
   assert.equal(got.length, 1);
-  assert.equal(got[0].text, 'x'.repeat(body.length), '首个换行前的不完整片段被丢弃');
-  assert.equal(got[0].nextFrom, 2 * blk, 'nextFrom = 本块绝对起点（UI 据此继续往上翻）');
+  assert.equal(got[0].text, 'x'.repeat(body.length - 1) + '\n', '首个换行前的不完整片段被丢弃');
+  assert.ok(got[0].text.endsWith('\n'), '内容以换行结尾 → 追加到模型最前面不会把两行粘成一行');
+  // 游标必须等于内容的真实起点（本次裁掉了 1 字节前缀 + half.length 字节的半截行）。
+  // 用请求区间起点（旧实现）会差一行 → 下次请求末尾落在行中间 → 粘行
+  assert.equal(got[0].nextFrom, 2 * blk + 1 + half.length, 'nextFrom = 内容真实起点（字节精确）');
 
-  // 已到文件头（剩余不足一块）：从 0 读，nextFrom = 0 → UI 停止继续请求并提示"已到文件开头"
+  // 已到文件头（剩余不足一块）：从 0 读，nextFrom = 0 → UI 停止继续请求并提示"已加载全部内容"
   sess.prependMore('/var/log/big.log', blk / 4);
   assert.equal(frames[2].offset, 0, '剩余不足一块时从 0 读');
   assert.equal(frames[2].limit, blk);

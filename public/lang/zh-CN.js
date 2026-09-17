@@ -556,7 +556,7 @@
     'file.previewTitle': '预览 · {path}',
     'file.previewBanner': '只读预览：文件 {size}，超过在线编辑上限 {limit}（不支持保存）',
     'file.previewOmitted': '已省略前 {omitted}，向上滚动加载更早内容',
-    'file.previewAllLoaded': '已到文件开头',
+    'file.previewAllLoaded': '已加载全部内容（「顶部」可跳到开头）',
     'file.previewLoading': '正在加载更早内容…',
     'file.editorTop': '顶部',
     'file.editorBottom': '底部',

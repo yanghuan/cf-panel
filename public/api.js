@@ -308,25 +308,31 @@
         ed.parts.push(data);
         ed.received += j.got;
         if (ed.received >= ed.size) {
-          // 解码校验：UTF-8 替换字符占比 >1% 判定二进制（扩展名黑名单外的漏网：无扩展名/罕见类型）——
-          // 编辑保存会因替换字符永久损坏二进制，宁可不打开
           let all = new Uint8Array(ed.parts.reduce((n, p) => n + p.length, 0));
           let o = 0;
           for (const p of ed.parts) { all.set(p, o); o += p.length; }
-          let text = new TextDecoder().decode(all);
+          // 尾部预览：起点未必落在行首（也未必落在 UTF-8 字符边界），丢掉首个换行前的不完整
+          // 片段——否则首行是半截内容，看着像文件损坏。
+          // 必须在**字节**上裁：startByte 要作为继续向上翻页的游标，而多字节字符下解码后的
+          // 字符索引 ≠ 字节偏移；按字符裁会把游标算大，下一次请求的末尾就落在行中间，
+          // 追加时与已有内容粘成一行（首行被裁掉的片段，续读时也顺带消掉首部替换字符）。
+          let startByte = ed.offset;
+          if (ed.offset > 0) {
+            const nl = all.indexOf(10);
+            if (nl >= 0) { all = all.subarray(nl + 1); startByte = ed.offset + nl + 1; }
+          }
+          const text = new TextDecoder().decode(all);
+          // 解码校验：UTF-8 替换字符占比 >1% 判定二进制（扩展名黑名单外的漏网：无扩展名/罕见类型）——
+          // 编辑保存会因替换字符永久损坏二进制，宁可不打开
           const fffd = (text.match(/\uFFFD/g) || []).length;
           if (fffd > 0 && fffd / Math.max(all.length, 1) > 0.01) {
             this.editState = null;
             if (this.h.onError) this.h.onError(t('file.errBinary'));
             return;
           }
-          // 尾部预览：起点未必落在行首（也未必落在 UTF-8 字符边界，解码首部会多出一个替换字符），
-          // 丢弃首个换行前的不完整片段——否则首行是半截内容，看着像文件损坏
-          if (ed.offset > 0) {
-            const nl = text.indexOf('\n');
-            if (nl >= 0) text = text.slice(nl + 1);
-          }
-          const info = { omitted: ed.offset, total: ed.total };
+          // omitted 用 startByte（模型内容的真实起点）而非请求区间起点：差一行就会让
+          // 首次向上翻页的请求末尾落在行中间，见下方 prependState 分支同款注释
+          const info = { omitted: startByte, total: ed.total };
           this.editState = null;
           if (this.h.onEditLoaded) this.h.onEditLoaded(ed.path, text, info);
         } else {
@@ -349,16 +355,20 @@
           let all = new Uint8Array(pp.parts.reduce((n, p) => n + p.length, 0));
           let o = 0;
           for (const p of pp.parts) { all.set(p, o); o += p.length; }
-          let text = new TextDecoder().decode(all);
-          // 起点非 0 时首个换行前是半截行（含多字节字符边界），与尾部预览同口径丢弃。
+          // 起点非 0 时首个换行前是半截行，与尾部预览同口径丢弃；按字节裁（理由同 editState 分支）。
           // 不做二进制校验：内容与首次加载同一个文件，那次已校验过。
+          let startByte = pp.offset;
           if (pp.offset > 0) {
-            const nl = text.indexOf('\n');
-            if (nl >= 0) text = text.slice(nl + 1);
+            const nl = all.indexOf(10);
+            if (nl >= 0) { all = all.subarray(nl + 1); startByte = pp.offset + nl + 1; }
           }
-          const nextFrom = pp.offset;
+          const text = new TextDecoder().decode(all);
+          // 游标 = 本次内容在文件中的**真实起点**（字节精确），UI 下一次据此向上请求。
+          // 关键不变式：游标处在行首 ⇒ 下一次请求区间 [游标−块, 游标) 的末尾也落在行首，
+          // 返回文本必以 '\n' 结尾，追加到模型最前面时不会把两行粘成一行。
+          // 若改用请求区间起点（原实现），游标会比真实起点大一行，每次翻页都粘坏一行。
           this.prependState = null;
-          if (this.h.onPrepended) this.h.onPrepended(pp.path, text, nextFrom);
+          if (this.h.onPrepended) this.h.onPrepended(pp.path, text, startByte);
         } else {
           this.send({ type: 'read', path: pp.path, offset: pp.offset + pp.received, limit: FILE_CHUNK });
         }

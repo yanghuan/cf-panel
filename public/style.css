@@ -994,6 +994,19 @@ button.danger:hover { background: rgba(248, 113, 113, .12); }
    不加下划线——整页几十行全画线视觉太吵，悬停变色已足够表达可点 */
 .f-file.f-editable { cursor: pointer; }
 .f-file.f-editable:hover { color: var(--accent-2); }
+/* 超限文件（>EDIT_MAX_BYTES）：双击 = 只读尾部预览。用 warn 色区分"可编辑"（accent），
+   让用户一眼看出这里是"只看不改" */
+.f-file.f-preview { cursor: pointer; }
+.f-file.f-preview:hover { color: var(--warn); }
+
+/* 只读预览横幅（编辑器顶部）：说明省略了多少，与 .notice 同色系 */
+.editor-banner {
+  padding: 7px 16px;
+  background: rgba(251, 191, 36, .08);
+  border-bottom: 1px solid rgba(251, 191, 36, .18);
+  color: var(--warn);
+  font-size: 12px;
+}
 /* 行操作下拉菜单（⋯）：菜单右对齐，按钮悬停高亮
    注意：必须用 .file-table td.f-ops 提高特异性，否则被 .file-table td 的 text-align:left 覆盖 */
 .file-table td.f-ops { text-align: right; white-space: nowrap; }

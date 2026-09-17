@@ -550,6 +550,16 @@
     'file.errZipEmpty': '目录为空，无内容可打包',
     'file.errReadFail': '读取文件失败（为空或已变化）',
     'file.errBinary': '检测到二进制文件，不支持在线编辑（保存会损坏内容）',
+    'file.editTooLarge': '文件 {size}，超过在线编辑上限 {limit}，请下载后编辑',
+    'file.editProtected': '系统目录受保护，不支持在线编辑；如需修改请使用终端 Shell',
+    'file.preview': '预览',
+    'file.previewTitle': '预览 · {path}',
+    'file.previewBanner': '只读预览：文件 {size}，超过在线编辑上限 {limit}（不支持保存）',
+    'file.previewOmitted': '已省略前 {omitted}，向上滚动加载更早内容',
+    'file.previewAllLoaded': '已到文件开头',
+    'file.previewLoading': '正在加载更早内容…',
+    'file.editorTop': '顶部',
+    'file.editorBottom': '底部',
     'file.errShrunk': '文件已变化或缩短，中止下载（已完成 {done}/{size} 字节）',
   };
 

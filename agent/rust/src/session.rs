@@ -1582,9 +1582,12 @@ async fn file_read(path: String, offset: u64, limit: u64) -> Result<Vec<u8>, Str
             Err(_) => return Err("not a file or unreadable".to_string()),
         };
         let size = meta.len();
-        if size > FILE_LIMIT {
-            return Err("file exceeds 500MB limit".to_string());
-        }
+        // 此处不再按"文件总大小"拦截：read 是**分块**协议，单次最多返回 READ_BLOCK（1MB），
+        // 与文件有多大无关。原先 `size > FILE_LIMIT 一律拒绝` 会让 >500MB 的日志连末尾都读不到
+        // ——而尾部分块只读预览正是为这类文件准备的（前端按 offset 只取末尾 512KB）。
+        // "整份传输"的上限由前端把守（下载 FILE_MAX=500MB、在线编辑 EDIT_MAX_BYTES=2MB，
+        // 两者都在发起前拦下）；agent 侧真正有意义的约束是 READ_BLOCK 与 file_blocking
+        // 的超时/并发上限——它们对任意大小的文件一视同仁。
         if !meta.is_file() {
             return Err("not a file or unreadable".to_string());
         }
@@ -1914,6 +1917,55 @@ mod tests {
         // 标准测试向量：CRC32("123456789") = 0xCBF43926
         assert_eq!(crc32(b"123456789"), 0xCBF43926);
         assert_eq!(crc32(b""), 0);
+    }
+
+    // 超过 FILE_LIMIT 的文件必须仍能按 offset 读末尾：read 是分块协议（单次 ≤ READ_BLOCK），
+    // 与文件总大小无关。原先 file_read 开头 `size > FILE_LIMIT 直接拒绝`，让 >500MB 的日志
+    // 连"尾部只读预览"都做不了（前端正是按 offset 只取末尾 512KB）。回归锁。
+    // 仅 Unix：靠稀疏文件做到 501MB 而不实占磁盘（Windows 的 set_len 语义不同，跳过）。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_beyond_file_limit_by_offset() {
+        use std::io::{Seek, SeekFrom, Write};
+        let tmp = std::env::temp_dir().join(format!("cfp-bigread-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let path = tmp.join("big.log");
+        let total: u64 = FILE_LIMIT + 1024 * 1024; // 501MB，越过 FILE_LIMIT
+        let marker = b"TAIL-MARKER\n";
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            f.set_len(total).unwrap(); // 稀疏：逻辑 501MB，实占仅末尾写入的几个块
+            f.seek(SeekFrom::Start(total - marker.len() as u64))
+                .unwrap();
+            f.write_all(marker).unwrap();
+        }
+        let offset = total - 4096;
+        let frame = file_read(
+            path.to_string_lossy().into_owned(),
+            offset,
+            READ_BLOCK as u64,
+        )
+        .await
+        .expect("大文件必须能按 offset 读取（尾部预览依赖它）");
+        // 混合帧：JSON 头 + '\n' + 原始字节
+        let nl = frame.iter().position(|b| *b == b'\n').unwrap();
+        let head: serde_json::Value = serde_json::from_slice(&frame[..nl]).unwrap();
+        assert_eq!(
+            head["size"].as_u64().unwrap(),
+            total,
+            "size 超过 FILE_LIMIT 也要照常返回"
+        );
+        assert_eq!(
+            head["got"].as_u64().unwrap(),
+            4096,
+            "从 offset 到文件末尾的 4096 字节"
+        );
+        assert!(
+            frame[nl + 1..].ends_with(marker),
+            "末尾标记应出现在返回数据里"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]

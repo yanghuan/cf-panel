@@ -451,6 +451,32 @@
     return i > 0 && BINARY_EXTS.has('.' + name.slice(i + 1).toLowerCase());
   }
 
+  // 在线编辑的单文件大小上限：2MB（含）。
+  // 原为 1MB，过紧——2MB 上下的日志/配置文件恰是"远程看一眼"的最常见目标，却因阈值
+  // 被判为不可编辑（实测反馈：被误认为"面板不支持该文件格式"）。
+  // 传输层无此限制（编辑读走 512KB 分块循环，agent READ_BLOCK=1MB/次、总上限 500MB），
+  // 上限只约束浏览器与 Monaco，以及"打开要等几次往返"：2MB = 最多 4 次。
+  // 再大的文件不走全量加载，改走下面的只读尾部预览。
+  const EDIT_MAX_BYTES = 2 * 1024 * 1024;
+
+  // 超限文件的只读预览长度：只取末尾 512KB。
+  // 超过 EDIT_MAX_BYTES 不再整份拉取（越大越慢：N 次串行往返 + 浏览器三份副本），
+  // 只取末尾一段做只读预览——日志场景 99% 的需求就是看尾巴。
+  // 取 512KB 是有意的：等于 FILE_CHUNK，**恰好 1 次往返**（api.js 的读循环一轮即完成）。
+  const PREVIEW_TAIL_BYTES = 512 * 1024;
+
+  // 不可在线编辑的原因（null = 可编辑）。列表与搜索结果共用，双击时据此提示用户。
+  // 原实现只返回一个布尔 editable，被拦时静默无任何提示——用户无法区分"格式不支持"
+  // 与"文件过大"，只能靠猜（实测反馈正是把 2MB 日志当成格式问题）。
+  function editBlockReason(path, entry) {
+    if (isSystemPath(path)) return 'prot';
+    const e = entry || {};
+    if (e.type === 'dir') return 'dir';
+    if (isBinaryExt(e.name)) return 'binary';
+    if (Number(e.size) > EDIT_MAX_BYTES) return 'size';
+    return null;
+  }
+
   // ---------- 空闲观看保护（IdleGuard）：无操作计时 + 提示 + 自动暂停，动作经回调注入 ----------
   // 类似视频网站"继续观看？"：长时间无浏览器操作 → 提示 → 60s 无响应自动暂停；
   // 任何活动恢复。暂停/恢复/提示等 UI 动作由 handlers 提供（app.js 注入 stopPush/startPush/confirmDialog）
@@ -536,6 +562,8 @@
     $, escapeHtml, fmtBytes, normalizeFileEntry, fileJoin, fileParent, fileBase, downsample, modeText,
     lockScroll, unlockScroll,
     MONITOR_STEP_MAX, MONITOR_COLORS,
-    GEO_PRIVATE, geoLookup, flagHtml, osIconHtml, isSystemPath, isBinaryExt, loadScript, loadCss, loadMonaco, loadMarkdown, setGeoEnabled, IdleGuard,
+    GEO_PRIVATE, geoLookup, flagHtml, osIconHtml, isSystemPath, isBinaryExt,
+    EDIT_MAX_BYTES, PREVIEW_TAIL_BYTES, editBlockReason,
+    loadScript, loadCss, loadMonaco, loadMarkdown, setGeoEnabled, IdleGuard,
   };
 })();

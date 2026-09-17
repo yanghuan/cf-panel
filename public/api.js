@@ -46,6 +46,8 @@
       this._generation = 0;      // open/close 代际：丢弃乱序 API 响应与旧 WebSocket 事件
       this.uploadState = null;   // { file, size, sent, acked, uploadId, path, reader }
       this.downloadState = null; // { path, size, parts, received }
+      this.editState = null;     // { path, size, offset, total, parts, received }（editText / 尾部预览）
+      this.prependState = null;  // { path, offset, want, parts, received }（只读预览向上追加）
     }
     get connected() { return this.ws && this.ws.readyState === 1; }
 
@@ -158,6 +160,8 @@
         if (this.editState) this.editState = null;
         this.uploadState = null;
         this.downloadState = null;
+        // 必须一并清：残留会让后续"向上加载更早"永久静默（prependState 非空即直接 return）
+        this.prependState = null;
         // 通知 UI 隐藏取消按钮（复用 canceled 回调路径，语义为"传输已终止"）
         if (wasUploading && this.h.onUploadCanceled) this.h.onUploadCanceled();
         if (wasDownloading && this.h.onDownloadCanceled) this.h.onDownloadCanceled();
@@ -255,19 +259,36 @@
     copy(path, dest) { this.send({ type: 'copy', path, dest }); }
     // 权限修改：Unix 传 mode（如 0o755），Windows 传 readonly 布尔（无 POSIX mode）
     chmod(path, mode, readonly) { this.send({ type: 'chmod', path, mode, readonly }); }
-    // 在线编辑：分段拉取全文（≤1MB 由调用方限制），onEditLoaded(path, text) 回调。
+    // 在线编辑：分段拉取全文（≤EDIT_MAX_BYTES 由调用方限制），onEditLoaded(path, text, info) 回调。
+    // tailBytes > 0：大文件只读预览——只取末尾 tailBytes（默认取满一个 FILE_CHUNK，
+    // 即 1 次往返），info = { omitted, total } 供 UI 说明省略了多少。
+    // 复用同一条 read 协议（agent 本就支持任意 offset），无需 agent 侧改动。
     // 已有读取进行中：同文件视为重复点击静默忽略；不同文件顶替重开（旧读取的迟到响应
     // 会因 editState.path 不匹配而落到下载分支被丢弃，无副作用）
-    editText(path, size) {
+    editText(path, size, tailBytes = 0) {
       if (this.editState) {
         // 同文件且连接正常 → 重复点击忽略；否则（读取失败残留/断线残留/换文件）顶替重开
         if (this.editState.path === path && this.connected) return;
         this.editState = null;
       }
-      this.editState = { path, size, parts: [], received: 0 };
-      this.send({ type: 'read', path, offset: 0, limit: FILE_CHUNK });
+      const offset = tailBytes > 0 ? Math.max(0, size - tailBytes) : 0;
+      // size 语义是"本次要读取的字节数"（= 文件大小 − 起点偏移），完成判定 received >= size 依赖它
+      this.editState = { path, size: size - offset, offset, total: size, parts: [], received: 0 };
+      this.send({ type: 'read', path, offset, limit: FILE_CHUNK });
     }
     cancelEditText() { this.editState = null; }
+
+    // 只读预览向上追加更早内容：从 from 之前再取一块（默认 FILE_CHUNK），
+    // 完成回调 onPrepended(path, text, nextFrom)——nextFrom 为本次内容的绝对起点，
+    // 0 表示已到文件开头（UI 据此停止继续请求）。
+    // 与 editText 同样复用 read 协议（agent 本就支持任意 offset），agent 无感知。
+    prependMore(path, from) {
+      if (this.prependState || from <= 0) return; // 在途去重 + 已到开头不再请求
+      const offset = Math.max(0, from - FILE_CHUNK);
+      this.prependState = { path, offset, want: from - offset, parts: [], received: 0 };
+      this.send({ type: 'read', path, offset, limit: FILE_CHUNK });
+    }
+    cancelPrepend() { this.prependState = null; }
 
     _onReadResult(j, data) {
       // 编辑器全文读取（优先于下载状态机：editState 独立，完成即回调文本）
@@ -292,17 +313,54 @@
           let all = new Uint8Array(ed.parts.reduce((n, p) => n + p.length, 0));
           let o = 0;
           for (const p of ed.parts) { all.set(p, o); o += p.length; }
-          const text = new TextDecoder().decode(all);
+          let text = new TextDecoder().decode(all);
           const fffd = (text.match(/\uFFFD/g) || []).length;
           if (fffd > 0 && fffd / Math.max(all.length, 1) > 0.01) {
             this.editState = null;
             if (this.h.onError) this.h.onError(t('file.errBinary'));
             return;
           }
+          // 尾部预览：起点未必落在行首（也未必落在 UTF-8 字符边界，解码首部会多出一个替换字符），
+          // 丢弃首个换行前的不完整片段——否则首行是半截内容，看着像文件损坏
+          if (ed.offset > 0) {
+            const nl = text.indexOf('\n');
+            if (nl >= 0) text = text.slice(nl + 1);
+          }
+          const info = { omitted: ed.offset, total: ed.total };
           this.editState = null;
-          if (this.h.onEditLoaded) this.h.onEditLoaded(ed.path, text);
+          if (this.h.onEditLoaded) this.h.onEditLoaded(ed.path, text, info);
         } else {
-          this.send({ type: 'read', path: ed.path, offset: ed.received, limit: FILE_CHUNK });
+          // 续传偏移 = 起点 + 已收字节（尾部预览起点非 0；原实现固定用 received，仅在 offset=0 时正确）
+          this.send({ type: 'read', path: ed.path, offset: ed.offset + ed.received, limit: FILE_CHUNK });
+        }
+        return;
+      }
+      // 只读预览向上追加（与 editState 互斥：预览首次读已完成，此处是后续翻页）
+      const pp = this.prependState;
+      if (pp && j.path === pp.path) {
+        if (j.got === 0 || !data) {
+          this.prependState = null;
+          if (this.h.onError) this.h.onError(t('file.errReadFail'));
+          return;
+        }
+        pp.parts.push(data);
+        pp.received += j.got;
+        if (pp.received >= pp.want) {
+          let all = new Uint8Array(pp.parts.reduce((n, p) => n + p.length, 0));
+          let o = 0;
+          for (const p of pp.parts) { all.set(p, o); o += p.length; }
+          let text = new TextDecoder().decode(all);
+          // 起点非 0 时首个换行前是半截行（含多字节字符边界），与尾部预览同口径丢弃。
+          // 不做二进制校验：内容与首次加载同一个文件，那次已校验过。
+          if (pp.offset > 0) {
+            const nl = text.indexOf('\n');
+            if (nl >= 0) text = text.slice(nl + 1);
+          }
+          const nextFrom = pp.offset;
+          this.prependState = null;
+          if (this.h.onPrepended) this.h.onPrepended(pp.path, text, nextFrom);
+        } else {
+          this.send({ type: 'read', path: pp.path, offset: pp.offset + pp.received, limit: FILE_CHUNK });
         }
         return;
       }
@@ -495,5 +553,7 @@
     sync() { if (this.connected) this.ws.send('sync'); } // 拉最新列表
   }
 
-  window.CfApi = { api, setTokenGetter, FileSession, TermSession, PushSession };
+  // FILE_CHUNK 一并导出：尾部预览长度必须 ≤ 一个传输块（否则"1 次往返"不成立），
+  // 该不变式由测试断言，不导出就只能把 512KB 硬编码进测试，改了常量也测不出来
+  window.CfApi = { api, setTokenGetter, FileSession, TermSession, PushSession, FILE_CHUNK };
 })();

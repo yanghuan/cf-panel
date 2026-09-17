@@ -4,7 +4,8 @@
   // 工具函数与 <cf-ip> 组件从 utils.js 解构；api 层从 api.js 解构（index.html 中均须先加载）
   const { $, escapeHtml, fmtBytes, normalizeFileEntry, fileJoin, fileParent, fileBase, downsample, lockScroll, unlockScroll,
           MONITOR_STEP_MAX, MONITOR_COLORS,
-          GEO_PRIVATE, setGeoEnabled, flagHtml, osIconHtml, isSystemPath, isBinaryExt, modeText, loadScript, loadCss, loadMonaco, loadMarkdown, geoLookup, IdleGuard } = CfUtils;
+          GEO_PRIVATE, setGeoEnabled, flagHtml, osIconHtml, isSystemPath, modeText, loadScript, loadCss, loadMonaco, loadMarkdown, geoLookup, IdleGuard,
+          EDIT_MAX_BYTES, PREVIEW_TAIL_BYTES, editBlockReason } = CfUtils;
   const { api, setTokenGetter, FileSession, TermSession, PushSession } = CfApi;
   // i18n：所有面向用户的文案一律走 t(key)，代码里不留中文字面量。
   // 当前仅内置 zh-CN，但新增语言只需注册语言包（见 i18n.js），无需改本文件。
@@ -1226,7 +1227,21 @@
       fileFindState.scanned = scanned;
       renderFindResults(hits);
     },
-    onEditLoaded: (path, text) => openFileEditor(path, text),
+    onEditLoaded: (path, text, info) => openFileEditor(path, text, info),
+    // 只读预览向上追加一块更早的内容：nextFrom 是本次内容的绝对起点（0 = 已到文件开头）
+    onPrepended: (path, text, nextFrom) => {
+      previewLoading = false;
+      if (path !== editorPath || !editorReadonly) return; // 编辑器已切文件/已关闭：丢弃迟到响应
+      previewFrom = nextFrom;
+      prependEarlier(text);          // 内容必须先并入模型（无论视口落到哪里）
+      updatePreviewBanner();
+      if (previewJumpTop) {
+        // 「跳到顶部」发起的加载：落到新的顶部。此时 previewIntent 未被置位，
+        // 这次程序化归零不会被自动加载逻辑当成"用户想往上看"而续拉下一块
+        previewJumpTop = false;
+        scrollEditorTo('top');
+      }
+    },
     // 错误同时 toast：编辑器保存后弹窗已关闭、文件弹窗可能未开——仅写 file-msg 会零提示
     onError: (msg) => {
       $('#file-msg').textContent = t('file.errPrefix', { msg });
@@ -1327,13 +1342,13 @@
       const full = String(e.path || '');
       // 相对搜索根显示（完整路径放 title），否则深路径会挤爆名称列
       const rel = full.startsWith(root) ? full.slice(root.length).replace(/^[\\/]/, '') : full;
-      const editable = !isSystemPath(full) && e.type !== 'dir' && e.size <= 1024 * 1024 && !isBinaryExt(e.name);
+      const block = editBlockReason(full, e); // 准入判定与目录浏览共用（utils.js）
       const size = e.type === 'dir' ? '—' : fmtBytes(e.size);
       const perm = e.mode ? escapeHtml(modeText(e.mode)) : '—';
       const icon = e.type === 'dir' ? '📁' : '📄';
       return `<tr><td><span class="f-find-path" title="${escapeHtml(full)}">${icon} ${escapeHtml(rel || e.name)}</span></td>`
         + `<td>${size}</td><td>—</td><td class="f-perm">${perm}</td>`
-        + `<td class="f-ops">${rowOpsMenu(full, e.type, e.size, e.mode, editable)}</td></tr>`;
+        + `<td class="f-ops">${rowOpsMenu(full, e.type, e.size, e.mode, block)}</td></tr>`;
     });
     $('#file-list').innerHTML = rows.join('') || `<tr><td colspan="5" class="muted">${escapeHtml(t('file.findNoResult'))}</td></tr>`;
     const st = fileFindState || {};
@@ -1369,16 +1384,22 @@
     unlockScroll();
   }
 
-  // 行操作菜单（目录浏览与递归搜索共用）：full 为绝对路径，受保护系统路径只保留下载。
-  // 所有值都经数值收口与 escapeHtml——Agent 返回的文件名/路径一律视为不可信输入。
-  function rowOpsMenu(full, type, size, mode, editable) {
+  // 行操作菜单（目录浏览与递归搜索共用）：block 为不可编辑原因（null = 可编辑），
+  // 受保护系统路径只保留下载。所有值都经数值收口与 escapeHtml——Agent 返回的文件名/路径一律视为不可信输入。
+  function rowOpsMenu(full, type, size, mode, block) {
     const prot = isSystemPath(full);
     const e = escapeHtml;
+    // 超限文件给「预览」（只读尾部，不整份拉取）；二进制与系统目录不给——读操作走「下载」
+    const act = !block
+      ? `<button class="f-act-edit" type="button" data-path="${e(full)}" data-size="${e(size)}">${e(t('common.edit'))}</button>`
+      : block === 'size'
+        ? `<button class="f-act-preview" type="button" data-path="${e(full)}" data-size="${e(size)}">${e(t('file.preview'))}</button>`
+        : '';
     return `<div class="row-menu-wrap">
       <button class="row-menu" type="button" title="${e(t('server.nodeOps'))}" aria-label="${e(t('server.nodeOps'))}">⋯</button>
       <div class="row-menu-pop hidden">
         <button class="f-act-dl" type="button" data-path="${e(full)}" data-type="${e(type)}" data-size="${e(size)}">${e(t('file.dl'))}</button>
-        ${editable ? `<button class="f-act-edit" type="button" data-path="${e(full)}" data-size="${e(size)}">${e(t('common.edit'))}</button>` : ''}
+        ${act}
         ${prot ? '' : `<button class="f-act-mv" type="button" data-path="${e(full)}">${e(t('file.move'))}</button>
         <button class="f-act-cp" type="button" data-path="${e(full)}">${e(t('file.copy'))}</button>
         <button class="f-act-perm" type="button" data-path="${e(full)}" data-mode="${e(mode)}">${e(t('file.perm'))}</button>
@@ -1398,13 +1419,20 @@
       // 受保护系统路径（与 agent 黑名单同规则）：仅保留下载（读操作），隐藏全部写操作——
       // 系统目录的写操作请走终端 Shell；agent 端仍有最终防线，此处是 UX 层
       const prot = isSystemPath(path);
-      // 在线编辑：非目录 + ≤1MB + 非系统路径 + 非二进制扩展名（空文件也放行，编辑器当空文本）
-      const editable = !prot && e.type !== 'dir' && e.size <= 1024 * 1024 && !isBinaryExt(e.name);
-      // 可编辑文件带 data 属性：双击直接进入编辑器；悬停指针/提亮由 CSS 提供（条件与 ⋯ 菜单的「编辑」一致）
+      // 在线编辑准入（非目录 + ≤EDIT_MAX_BYTES + 非系统路径 + 非二进制扩展名；空文件放行，
+      // 编辑器当空文本）：判定与搜索结果共用 utils.js 的 editBlockReason，返回原因而非布尔
+      const block = editBlockReason(path, e);
+      const editable = !block;
+      const previewable = block === 'size'; // 超限 → 双击走只读尾部预览（不整份加载）
+      // 可编辑双击进编辑器；超限双击进只读预览；其余带 data-nonedit 原因，双击提示为何不能改
+      //（悬停指针/提亮由 CSS 提供，条件与 ⋯ 菜单一致）
+      const cls = editable ? 'f-file f-editable' : previewable ? 'f-file f-preview' : 'f-file';
+      const attrs = ` class="${cls}" data-path="${escapeHtml(path)}" data-size="${escapeHtml(e.size)}"`
+        + (editable ? '' : ` data-nonedit="${escapeHtml(block)}"`);
       const nameCell = e.type === 'dir'
         ? `<a class="f-dir" data-path="${escapeHtml(path)}">📁 ${escapeHtml(e.name)}</a>`
-        : `<span class="f-file${editable ? ' f-editable' : ''}"${editable ? ` data-path="${escapeHtml(path)}" data-size="${escapeHtml(e.size)}"` : ''}>📄 ${escapeHtml(e.name)}</span>`;
-      const menu = rowOpsMenu(path, e.type, e.size, e.mode, editable);
+        : `<span${attrs}>📄 ${escapeHtml(e.name)}</span>`;
+      const menu = rowOpsMenu(path, e.type, e.size, e.mode, block);
       const perm = e.mode ? escapeHtml(modeText(e.mode)) : '—';
       return `<tr><td>${nameCell}</td><td>${size}</td><td>${escapeHtml(time)}</td><td class="f-perm">${perm}</td><td class="f-ops">${menu}</td></tr>`;
     });
@@ -1507,6 +1535,14 @@
   let monacoEditor = null;  // Monaco 实例（null = textarea 回退模式）
   let monacoReady = false;  // 本会话 Monaco 是否可用（失败后本会话直接走 textarea，不反复重试）
   let editorPreviewing = false; // Markdown 预览模式（仅 md 文件显示切换按钮）
+  let editorReadonly = false;   // 只读预览（大文件尾部）——Monaco readOnly + 隐藏保存，见 openFileEditor
+  let previewFrom = 0;          // 只读预览已加载内容在文件中的起始偏移（0 = 已到文件开头，无更早内容）
+  let previewTotal = 0;         // 文件总大小（横幅显示用）
+  let previewLoading = false;   // 正在追加更早内容：防同刻重复请求（每次一趟 WS 往返）
+  let previewIntent = false;    // 用户真实的"要往上看"意图（滚轮上滚 / PageUp 等）。
+                                // 自动加载必须由它触发——仅凭"位置在顶部"会把程序化归零
+                                //（初始滚到底、按钮跳到顶部、追加后锚定）误判成用户意图
+  let previewJumpTop = false;   // 本次追加由「跳到顶部」发起：落位到新顶部，而非锚回原行
 
   // 后缀 → Monaco 语言 ID（均为 min 版内置 basic-languages，无需额外加载）
   const EDITOR_LANGS = {
@@ -1554,22 +1590,39 @@
     $('#file-editor-title').textContent = t('file.editorTitle', { path: editorPath }) + (dirty ? ' *' : '');
   }
 
-  async function openFileEditor(path, text) {
+  async function openFileEditor(path, text, info) {
+    // omitted > 0 = 大文件只读预览（仅末尾一段）。**必须禁保存**：内容不完整，写回会把
+    // 文件截断成只剩尾部——这是比"不能编辑"严重得多的数据损坏。
+    const omitted = (info && info.omitted) || 0;
+    editorReadonly = omitted > 0;
     editorPath = path;
     editorInitial = text;
     monacoEditor = null;
     setEditorDirty(false);
+    // 只读预览：隐藏保存按钮（置灰仍会暗示"可保存"），横幅说明省略了多少与能否继续往上加载
+    $('#btn-editor-save').classList.toggle('hidden', editorReadonly);
+    $('#file-editor-text').readOnly = editorReadonly;
+    previewFrom = omitted;                 // 已省略的字节数 = 当前内容的绝对起点（向上翻页的游标）
+    previewTotal = (info && info.total) || 0;
+    previewLoading = false;
+    previewIntent = false;                 // 意图不跨文件：上个文件的滚轮状态不得触发新文件的加载
+    previewJumpTop = false;
+    updatePreviewBanner();
     // Markdown 文件显示「预览」按钮；打开新文件时预览态复位
     editorPreviewing = false;
     $('#btn-editor-preview').classList.toggle('hidden', editorLang(path) !== 'markdown');
     $('#btn-editor-preview').textContent = t('file.editorPreview');
     $('#editor-md-preview').classList.add('hidden');
-    $('#file-editor-title').textContent = t('file.editorTitle', { path });
+    $('#file-editor-title').textContent = editorReadonly
+      ? t('file.previewTitle', { path }) : t('file.editorTitle', { path });
     $('#file-editor-text').value = text; // textarea 始终持有内容（回退与保存兜底）
     $('#file-editor-modal').classList.remove('hidden');
     $('#file-editor-modal').classList.remove('expanded');
     $('#btn-editor-expand').textContent = t('file.editorExpand');
     lockScroll();
+    // 只读预览：Monaco 懒加载期间 textarea 是可见的，先滚到底——否则先看到顶部、
+    // 加载完成后又跳到底部，观感上是闪一下
+    if (editorReadonly) setTimeout(scrollPreviewToBottom, 30);
     if (!monacoReady) {
       try {
         const monaco = await loadMonaco();
@@ -1579,6 +1632,7 @@
         // CDN 不可达（无网/被墙）：回退 textarea，本会话不再重试
         $('#file-editor-text').classList.remove('hidden');
         $('#editor-monaco-host').classList.add('hidden');
+        setTimeout(scrollPreviewToBottom, 30); // 元素刚可见，等一帧布局再测 scrollHeight
       }
       return;
     }
@@ -1599,19 +1653,139 @@
     const model = monaco.editor.createModel(text, editorLang(path), monaco.Uri.parse('file://' + path));
     monacoEditor = monaco.editor.create(host, {
       model,
+      readOnly: editorReadonly, // 只读预览：内容不完整，禁编辑（保存已隐藏，此处是第二道）
       theme: theme === 'light' ? 'vs' : 'vs-dark', fontSize: 13, automaticLayout: true,
       minimap: { enabled: false }, scrollBeyondLastLine: false, tabSize: 4,
       renderWhitespace: 'selection', wordWrap: 'on',
     });
-    model.onDidChangeContent(() => setEditorDirty(model.getValue() !== editorInitial));
-    setTimeout(() => monacoEditor && monacoEditor.focus(), 50);
+    // 只读预览会向上追加内容（编辑模型），那不是"用户改动"——不跟踪 dirty，
+    // 否则每追加一块就被标成"未保存"（保存入口已隐藏，纯属误导）
+    model.onDidChangeContent(() => {
+      if (!editorReadonly) setEditorDirty(model.getValue() !== editorInitial);
+    });
+    // 向上滚到顶 → 追加更早内容（textarea 回退路径用下面的 scroll 监听，两者只会命中一个）
+    monacoEditor.onDidScrollChange(() => maybeLoadEarlier());
+    // 滚轮上滚 = 用户"要往上看"的意图（Monaco 自行处理 wheel，DOM 事件不会带给外层）。
+    // 同时直接试一次加载：已贴在最顶部时上滚不改变 scrollTop，不会触发 scroll 事件。
+    // 键盘（PageUp / ↑ / Home）走弹窗上的 keydown 监听，Monaco 的隐藏 textarea 会冒泡上去。
+    monacoEditor.onMouseWheel((e) => {
+      if (e.browserEvent && e.browserEvent.deltaY < 0) {
+        previewIntent = true;
+        maybeLoadEarlier();
+      }
+    });
+    setTimeout(() => {
+      if (!monacoEditor) return;
+      // 等一帧布局：automaticLayout 是异步的，内容高度未定时 setScrollTop 无效
+      scrollPreviewToBottom();
+      monacoEditor.focus();
+    }, 50);
   }
 
   function editorGetValue() {
     return monacoEditor ? monacoEditor.getValue() : $('#file-editor-text').value;
   }
 
+  // 编辑器滚动定位（编辑与只读预览通用）：Monaco 与 textarea 回退两条渲染路径，
+  // 按当前可见的是哪一个来走；markdown 预览态下滚动的是预览容器本身。
+  // 滚动本身不受只读影响：Monaco 的 readOnly 只拦编辑，滚轮/选中/查找都正常。
+  function scrollEditorTo(pos) {
+    if (editorPreviewing) {
+      const md = $('#editor-md-preview');
+      md.scrollTop = pos === 'top' ? 0 : md.scrollHeight;
+      return;
+    }
+    const ta = $('#file-editor-text');
+    if (!ta.classList.contains('hidden')) {
+      ta.scrollTop = pos === 'top' ? 0 : ta.scrollHeight;
+      return;
+    }
+    if (monacoEditor) monacoEditor.setScrollTop(pos === 'top' ? 0 : monacoEditor.getScrollHeight());
+  }
+
+  // 只读预览打开即滚到底部：日志的现场在末尾，省去每次手动拉到底
+  function scrollPreviewToBottom() {
+    if (!editorReadonly) return;
+    scrollEditorTo('bottom');
+  }
+
+  // 「跳到顶部 / 底部」按钮（编辑与只读预览通用）。
+  // 只读预览还有更早内容时，「顶部」要**先加载再落位**：只把位置归零会被自动加载逻辑
+  // 当成"用户滚到顶"，它加载一块后又把视口锚回原处——用户点了「顶部」却看着没动。
+  // 故由按钮自己发起加载，落位后靠 previewIntent（未被置位）自然不会再触发。
+  function editorJump(pos) {
+    if (pos === 'top' && editorReadonly && previewFrom > 0) {
+      previewJumpTop = true;
+      if (!previewLoading) {
+        previewLoading = true;
+        updatePreviewBanner();
+        fileSess.prependMore(editorPath, previewFrom);
+      }
+      return;
+    }
+    scrollEditorTo(pos);
+  }
+
+  // 只读预览的状态行：基础说明 + 当前进度（已省略多少 / 已到开头 / 正在加载更早内容）
+  function updatePreviewBanner() {
+    const banner = $('#editor-preview-banner');
+    if (!editorReadonly) { banner.classList.add('hidden'); return; }
+    banner.classList.remove('hidden');
+    banner.textContent = [
+      t('file.previewBanner', { size: fmtBytes(previewTotal), limit: fmtBytes(EDIT_MAX_BYTES) }),
+      previewLoading ? t('file.previewLoading')
+        : previewFrom > 0 ? t('file.previewOmitted', { omitted: fmtBytes(previewFrom) })
+          : t('file.previewAllLoaded'),
+    ].join(' · ');
+  }
+
+  // 向上滚到顶附近即追加更早内容（日志往回查历史）。四道闸：
+  //   previewIntent    —— 必须是用户真实的"想往上看"动作（滚轮上滚 / PageUp），**只看位置不够**。
+  //                       初始滚到底、按钮跳到顶部、追加后锚定都是程序化归零，只看位置会把它们
+  //                       当成用户意图，于是一边加载一边把位置归零 → 连环拉取整个文件。
+  //   previewFrom > 0  —— 还有更早的内容
+  //   previewLoading   —— 在途去重（滚动事件极密集，每次都是一趟 WS 往返）
+  //   位置 <= 阈值      —— 已经滚到顶部附近
+  const PREVIEW_LOAD_TRIGGER_PX = 240;
+  function maybeLoadEarlier() {
+    if (!previewIntent || !editorReadonly || previewLoading || previewFrom <= 0) return;
+    const ta = $('#file-editor-text');
+    const top = !ta.classList.contains('hidden') ? ta.scrollTop
+      : (monacoEditor ? monacoEditor.getScrollTop() : null);
+    if (top === null || top > PREVIEW_LOAD_TRIGGER_PX) return;
+    previewIntent = false; // 一次意图只换一块：否则滚轮连发会瞬间把历史拉光
+    previewLoading = true;
+    updatePreviewBanner();
+    fileSess.prependMore(editorPath, previewFrom);
+  }
+
+  // 追加更早内容后必须把视口锚回原来那一行：插入点在顶部，下方内容整体下移，
+  // 不补偿的话正在看的行会瞬间跳出视野。
+  function prependEarlier(text) {
+    const ta = $('#file-editor-text');
+    if (!ta.classList.contains('hidden')) {
+      const top = ta.scrollTop;
+      const h = ta.scrollHeight;
+      ta.value = text + ta.value;
+      // textarea 无行高 API：下移量 = 新增内容的渲染高度（换行已计入 scrollHeight）
+      ta.scrollTop = top + (ta.scrollHeight - h);
+      return;
+    }
+    if (!monacoEditor) return;
+    const model = monacoEditor.getModel();
+    const added = (text.match(/\n/g) || []).length; // 新增行数
+    const ranges = monacoEditor.getVisibleRanges();
+    const first = ranges.length ? ranges[0].startLineNumber : 1;
+    // 记住视口首行在编辑前的像素位置（含亚行偏移），编辑后按"首行 + 新增行数"还原
+    const off = monacoEditor.getScrollTop() - monacoEditor.getTopForLineNumber(first);
+    // 用 model.applyEdits 而非 editor.executeEdits：后者在 readOnly 下被拒
+    model.applyEdits([{ range: { startLineNumber: 1, startColumn: 1, endLineNumber: 1, endColumn: 1 }, text }]);
+    monacoEditor.setScrollTop(monacoEditor.getTopForLineNumber(first + added) + off);
+  }
+
   function saveFileEditor() {
+    // 只读预览绝不保存：内容只有文件末尾一段，写回会把文件截断（按钮已隐藏，此处兜住 Ctrl/Cmd+S）
+    if (editorReadonly) return;
     // 无改动不保存：与置灰按钮同语义（Ctrl/Cmd+S 不经按钮，这里统一拦截）
     if (!editorDirty) return;
     // 连接断开（文件弹窗被关/WS 掉线）时 upload 会静默丢弃发送帧——编辑内容丢失且零提示。
@@ -1660,6 +1834,13 @@
 
   function closeFileEditor() {
     fileSess.cancelEditText();
+    fileSess.cancelPrepend();   // 丢弃在途的"向上加载更早"，否则状态下发到已关闭的编辑器
+    editorReadonly = false;
+    previewFrom = 0;
+    previewTotal = 0;
+    previewLoading = false;
+    previewIntent = false;
+    previewJumpTop = false;
     editorPreviewing = false;
     $('#btn-editor-preview').classList.add('hidden');
     $('#btn-editor-preview').textContent = t('file.editorPreview');
@@ -3307,12 +3488,27 @@
     else closeFileEditor();
   };
   $('#btn-editor-expand').onclick = toggleEditorExpand;
+  $('#btn-editor-top').onclick = () => editorJump('top');
+  $('#btn-editor-bottom').onclick = () => editorJump('bottom');
   $('#file-editor-text').addEventListener('input', () => setEditorDirty($('#file-editor-text').value !== editorInitial));
-  // Ctrl/Cmd+S 保存
+  // textarea 回退路径的"向上滚到顶 → 加载更早"（Monaco 路径走 onDidScrollChange，两者只命中一个）
+  $('#file-editor-text').addEventListener('scroll', () => maybeLoadEarlier());
+  // 滚轮上滚 = 用户"要往上看"的意图。必须显式标记：只看滚动位置的话，程序化归零
+  //（初始滚到底 / 按钮跳到顶部 / 追加后锚定）会被误判成同一件事（见 previewIntent 注释）。
+  // 同时直接试一次加载：已贴在最顶部时上滚不会改变 scrollTop，不会触发 scroll 事件。
+  $('#file-editor-text').addEventListener('wheel', (e) => {
+    if (e.deltaY < 0) { previewIntent = true; maybeLoadEarlier(); }
+  });
+  // Ctrl/Cmd+S 保存；PageUp / ↑ / Home 也视为"要往上看"的意图（键盘滚动不产生 wheel 事件）
   $('#file-editor-modal').addEventListener('keydown', (e) => {
     if ((e.ctrlKey || e.metaKey) && e.key === 's') {
       e.preventDefault();
       saveFileEditor();
+      return;
+    }
+    if (e.key === 'PageUp' || e.key === 'ArrowUp' || e.key === 'Home') {
+      previewIntent = true;
+      maybeLoadEarlier();
     }
   });
   $('#btn-sel-close').onclick = closeFileSelector;
@@ -3394,6 +3590,13 @@
       fileSess.editText(ed.dataset.path, Number(ed.dataset.size) || 0);
       return;
     }
+    const pv = e.target.closest('.f-act-preview');
+    if (pv) {
+      closeRowMenus();
+      // 只读预览末尾一段：不整份拉取（文件越大，往返次数与浏览器内存副本越多）
+      fileSess.editText(pv.dataset.path, Number(pv.dataset.size) || 0, PREVIEW_TAIL_BYTES);
+      return;
+    }
     const del = e.target.closest('.f-act-del');
     if (del) {
       closeRowMenus();
@@ -3401,8 +3604,25 @@
       confirmDialog(`确认删除「${del.dataset.path}」${isDir ? t('file.confirmDeleteDir') : ''}？\n此操作不可恢复！`, () => fileSess.delete(del.dataset.path));
     }
   });
+  // 不可编辑的原因文案（双击提示）：size 带上实际大小与上限，便于判断要不要下载
+  function editBlockMsg(reason, size) {
+    if (reason === 'size') return t('file.editTooLarge', { size: fmtBytes(size), limit: fmtBytes(EDIT_MAX_BYTES) });
+    if (reason === 'binary') return t('file.errBinary');
+    return t('file.editProtected');
+  }
   // 双击可编辑文件直接进入编辑器（下划线即视觉提示；触摸设备走 ⋯ 菜单的「编辑」）
   $('#file-list').addEventListener('dblclick', (e) => {
+    // 超限文件：双击直接进只读预览（日志看尾巴是主要场景，值得给快捷入口）
+    const big = e.target.closest('.f-file[data-nonedit="size"]');
+    if (big) {
+      closeRowMenus();
+      fileSess.editText(big.dataset.path, Number(big.dataset.size) || 0, PREVIEW_TAIL_BYTES);
+      return;
+    }
+    // 其余不可编辑的文件：明确说出原因。原实现完全静默（菜单里也没有灰色项），
+    // 用户只能猜——实测就把"2MB 超过编辑上限"误判成了"面板不支持这个格式"
+    const no = e.target.closest('.f-file[data-nonedit]');
+    if (no) { toast(editBlockMsg(no.dataset.nonedit, Number(no.dataset.size) || 0)); return; }
     const f = e.target.closest('.f-editable');
     if (!f) return;
     closeRowMenus();

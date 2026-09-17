@@ -552,6 +552,16 @@
     'file.errZipEmpty': 'Directory is empty, nothing to zip',
     'file.errReadFail': 'Failed to read file (empty or changed)',
     'file.errBinary': 'Binary file detected — inline editing disabled (saving would corrupt it)',
+    'file.editTooLarge': 'File is {size}, over the {limit} inline-editing limit — download it to edit',
+    'file.editProtected': 'Protected system directory: inline editing disabled; use the terminal shell',
+    'file.preview': 'Preview',
+    'file.previewTitle': 'Preview · {path}',
+    'file.previewBanner': 'Read-only preview: file is {size}, over the {limit} inline-editing limit (cannot be saved)',
+    'file.previewOmitted': 'first {omitted} omitted — scroll up to load earlier content',
+    'file.previewAllLoaded': 'reached the start of the file',
+    'file.previewLoading': 'loading earlier content…',
+    'file.editorTop': 'Top',
+    'file.editorBottom': 'Bottom',
     'file.errShrunk': 'File changed or shrank — download aborted ({done}/{size} bytes done)',
   };
 

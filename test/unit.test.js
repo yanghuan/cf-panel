@@ -335,6 +335,178 @@ test('isSystemPath 词法归一化与黑名单（与 agent 同规则）', () => 
   assert.equal(CfUtils.isSystemPath('/run/x/../systemd/y'), true);
 });
 
+test('在线编辑准入：2MB 日志可编辑，超限/二进制/系统目录/目录给出原因', () => {
+  const f = (name, size) => ({ name, size, type: 'file' });
+  const r = (path, e) => CfUtils.editBlockReason(path, e);
+  const MB = 1024 * 1024;
+
+  // 实测回归：面板里 2.0MB 的 Orion.2026-09-17.log 双击无反应、菜单无「编辑」，
+  // 用户误判为"不支持该文件格式"——真因是旧的 1MB 阈值过紧（日志/配置恰是常见编辑目标）
+  assert.equal(r('/run/csi/mount-root/nas/x/workspaces/default/deploy/Orion.2026-09-17.log', f('Orion.2026-09-17.log', 2 * MB)), null);
+  assert.equal(r('/home/u/watchdog.log', f('watchdog.log', 2 * MB)), null);
+  assert.equal(r('/home/u/a.txt', f('a.txt', 0)), null, '空文件放行（编辑器当空文本）');
+
+  // 规格边界用**字面量**（需求指定"2MB 以内可编辑，超过只读预览"）：阈值被改动时这里必须红。
+  // 上下两侧都要锁——只锁下侧（2MB 可编辑）挡不住把上限改成 8MB。
+  assert.equal(CfUtils.EDIT_MAX_BYTES, 2 * 1024 * 1024, '编辑上限固定 2MB');
+  assert.equal(r('/home/u/a.log', f('a.log', 2 * MB)), null, '恰好 2MB 仍可编辑（"2MB 以内"）');
+  assert.equal(r('/home/u/a.log', f('a.log', 2 * MB + 1)), 'size', '超 2MB 即转只读预览');
+
+  // 逻辑边界用常量表达（与取值解耦）：恰好上限可编辑，超 1 字节即拦，
+  // 原因 size 供双击走只读预览、⋯ 菜单渲染「预览」项
+  assert.equal(r('/home/u/a.log', f('a.log', CfUtils.EDIT_MAX_BYTES)), null);
+  assert.equal(r('/home/u/a.log', f('a.log', CfUtils.EDIT_MAX_BYTES + 1)), 'size');
+  assert.equal(r('/home/u/a.log', f('a.log', 100 * MB)), 'size', '超大文件拦下改走只读预览');
+
+  // 阻止原因是具体字符串而非布尔：双击时据此给出可区分的提示（size 带大小与上限）
+  assert.equal(r('/home/u/a.png', f('a.png', 1024)), 'binary');
+  assert.equal(r('/etc/passwd', f('passwd', 1024)), 'prot', '系统目录优先判 prot');
+  assert.equal(r('/etc/huge.zip', f('huge.zip', 100 * MB)), 'prot', 'prot 优先于 size/binary');
+  assert.equal(r('/home/u/dir', { name: 'dir', type: 'dir' }), 'dir');
+  // 预览长度必须小于编辑上限：否则"超限才走预览"的语义不自洽
+  //（预览能给的比允许编辑的还少，等于超限文件反而看得更少）
+  assert.ok(CfUtils.PREVIEW_TAIL_BYTES < CfUtils.EDIT_MAX_BYTES,
+    `预览 ${CfUtils.PREVIEW_TAIL_BYTES} 应小于编辑上限 ${CfUtils.EDIT_MAX_BYTES}`);
+  // 尾部预览长度必须 ≤ 一个传输块：否则要多次往返，"1 次往返"的性能前提不成立
+  assert.ok(CfUtils.PREVIEW_TAIL_BYTES <= CfApi.FILE_CHUNK,
+    `尾部预览 ${CfUtils.PREVIEW_TAIL_BYTES} 应一帧取完（块 ${CfApi.FILE_CHUNK}）`);
+});
+
+test('编辑读取：大文件尾部只读预览（1 次往返、丢弃半截首行、续传偏移含起点）', () => {
+  const sess = new CfApi.FileSession({});
+  const frames = [];
+  sess.send = (o) => frames.push(o);
+  const loaded = [];
+  sess.h.onEditLoaded = (path, text, info) => loaded.push({ path, text, info });
+  const enc = new TextEncoder();
+
+  // 1) 普通全量读取（多块续传）：续传偏移 = 起点(0) + 已收字节。
+  //    仅靠这条无法区分新老实现，故紧接着用非 0 起点的尾部预览覆盖真正的回归面。
+  sess.editText('/home/u/a.log', 1024 * 1024);
+  assert.deepEqual(frames[0], { type: 'read', path: '/home/u/a.log', offset: 0, limit: 512 * 1024 });
+
+  // 2) 尾部预览：10MB 文件只请求末尾 PREVIEW_TAIL_BYTES，起点 = 大小 − 尾部长度
+  const size = 10 * 1024 * 1024;
+  const tail = CfUtils.PREVIEW_TAIL_BYTES;
+  sess.editState = null; // 换文件（真实路径由 editText 内部分支处理，此处直接重开）
+  sess.editText('/var/log/big.log', size, tail);
+  const req = frames[frames.length - 1];
+  assert.equal(req.offset, size - tail, '起点 = 文件大小 − 尾部长度（非 0，故续传偏移必须带起点）');
+  assert.equal(req.limit, 512 * 1024);
+
+  // agent 返回末尾一段：构造"起点落在行中间"的首行 + 正文，总长恰好等于请求量
+  const half = enc.encode('半截行(起点落在行中间，应被丢弃)\n');
+  const body = new Uint8Array(tail - half.length);
+  body.fill(0x78); // 'x'
+  const chunk = new Uint8Array(tail);
+  chunk.set(half, 0);
+  chunk.set(body, half.length);
+  const before = frames.length;
+  sess._onReadResult({ path: '/var/log/big.log', got: chunk.length }, chunk);
+  assert.equal(frames.length, before, '恰好 1 次往返——大文件不整份拉取（原路径 16 次）');
+  assert.equal(loaded.length, 1);
+  assert.equal(loaded[0].text, 'x'.repeat(tail - half.length), '首个换行前的不完整片段被丢弃');
+  assert.deepEqual(loaded[0].info, { omitted: size - tail, total: size }, 'info 供横幅说明省略量');
+
+  // 3) 非尾部（完整加载）不得裁剪首行：offset=0 时保留原文（含开头即换行的情况）
+  sess.editText('/home/u/b.txt', 3);
+  sess._onReadResult({ path: '/home/u/b.txt', got: 3 }, enc.encode('a\nb').slice(0, 3));
+  assert.equal(loaded[1].text, 'a\nb', '完整加载不做首行裁剪');
+  assert.deepEqual(loaded[1].info, { omitted: 0, total: 3 });
+
+  // 4) 起点非 0 **且需续传**：偏移必须累加起点，否则第二块会重复读起点处的内容（见下）。
+  //    默认 PREVIEW_TAIL_BYTES 恰好一帧，走不到这条分支——故显式传更长的 tail 锁住算术：
+  //    将来若调大预览长度（或改用更小的传输块），错位会立刻暴露而不是静默读重复数据
+  sess.editState = null;
+  const blk = CfApi.FILE_CHUNK;
+  sess.editText('/var/log/huge.log', 10 * blk, 3 * blk);
+  assert.equal(frames[frames.length - 1].offset, 7 * blk, '起点 = 10 块 − 3 块');
+  sess._onReadResult({ path: '/var/log/huge.log', got: blk }, new Uint8Array(1));
+  assert.equal(frames[frames.length - 1].offset, 8 * blk, '续传 = 起点 + 已收（错写成 received 会退回第 1 块）');
+  sess._onReadResult({ path: '/var/log/huge.log', got: blk }, new Uint8Array(1));
+  assert.equal(frames[frames.length - 1].offset, 9 * blk, '继续累加');
+  sess._onReadResult({ path: '/var/log/huge.log', got: blk }, new Uint8Array(1));
+  assert.equal(loaded[2].info.omitted, 7 * blk, '收满 3 块即完成，不再续传');
+});
+
+test('只读预览向上追加：已在开头不发请求、在途去重、半截首行丢弃、nextFrom 供继续上翻', () => {
+  const sess = new CfApi.FileSession({});
+  const frames = [];
+  sess.send = (o) => frames.push(o);
+  const got = [];
+  sess.h.onPrepended = (path, text, nextFrom) => got.push({ path, text, nextFrom });
+  const enc = new TextEncoder();
+  const blk = CfApi.FILE_CHUNK;
+
+  // 已在文件开头（from = 0）→ 一个字节都不该请求（UI 的 previewFrom 归 0 后即停在此）
+  sess.prependMore('/var/log/big.log', 0);
+  assert.equal(frames.length, 0, '已到开头不再请求');
+
+  // 从第 3 块处往前取一块：offset = 3 块 − 1 块
+  sess.prependMore('/var/log/big.log', 3 * blk);
+  assert.deepEqual(frames[0], { type: 'read', path: '/var/log/big.log', offset: 2 * blk, limit: blk });
+
+  // 在途期间重复触发直接忽略：滚动事件极密集，每次都是一趟 WS 往返
+  sess.prependMore('/var/log/big.log', 2 * blk);
+  assert.equal(frames.length, 1, '在途请求去重（防滚动事件连发）');
+
+  // 分块到达：续传偏移 = 起点 + 已收（非 0 起点；错写成 received 会退回第 1 块重复读）
+  sess._onReadResult({ path: '/var/log/big.log', got: blk / 2 }, new Uint8Array(1));
+  assert.equal(frames[1].offset, 2 * blk + blk / 2, '续传偏移含起点');
+
+  // 收满：起点落在行中间 → 首个换行前是半截行，丢弃；nextFrom = 本块绝对起点
+  const half = enc.encode('半截行(起点落在行中间)\n');
+  const body = new Uint8Array(blk - blk / 2 - half.length);
+  body.fill(0x78); // 'x'
+  const rest = new Uint8Array(half.length + body.length);
+  rest.set(half, 0);
+  rest.set(body, half.length);
+  sess._onReadResult({ path: '/var/log/big.log', got: rest.length }, rest);
+  assert.equal(got.length, 1);
+  assert.equal(got[0].text, 'x'.repeat(body.length), '首个换行前的不完整片段被丢弃');
+  assert.equal(got[0].nextFrom, 2 * blk, 'nextFrom = 本块绝对起点（UI 据此继续往上翻）');
+
+  // 已到文件头（剩余不足一块）：从 0 读，nextFrom = 0 → UI 停止继续请求并提示"已到文件开头"
+  sess.prependMore('/var/log/big.log', blk / 4);
+  assert.equal(frames[2].offset, 0, '剩余不足一块时从 0 读');
+  assert.equal(frames[2].limit, blk);
+  sess._onReadResult({ path: '/var/log/big.log', got: blk / 4 }, new Uint8Array(1));
+  assert.equal(got[1].nextFrom, 0, '已到文件开头');
+  assert.equal(sess.prependState, null, '完成后状态复位（否则后续请求被永久静默吞掉）');
+
+  // 错误复位：error 帧必须清 prependState
+  sess.prependMore('/var/log/big.log', 5 * blk);
+  assert.ok(sess.prependState, '在途');
+  sess._onMessage({ data: JSON.stringify({ type: 'error', message: 'boom' }) });
+  assert.equal(sess.prependState, null, 'error 后状态复位，可重试');
+});
+
+// app.js 无 DOM/Monaco 测试环境，这部分只能做源码级锁定。锁的是几处"删掉就会静默出错"的约束：
+// 编辑器导航入口、只读预览下「顶部」的先加载后落位、自动加载必须由用户意图驱动
+test('编辑器顶部/底部按钮与只读预览加载闸门（静态断言）', () => {
+  const root = nodePath.join(nodePath.dirname(fileURLToPath(import.meta.url)), '..');
+  const html = nodeFs.readFileSync(nodePath.join(root, 'public/index.html'), 'utf8');
+  const app = nodeFs.readFileSync(nodePath.join(root, 'public/app.js'), 'utf8');
+  // 入口与绑定
+  assert.match(html, /id="btn-editor-top"/);
+  assert.match(html, /id="btn-editor-bottom"/);
+  assert.match(app, /\$\('#btn-editor-top'\)\.onclick/);
+  assert.match(app, /\$\('#btn-editor-bottom'\)\.onclick/);
+  // 两条渲染路径 + markdown 预览态都要能定位，否则按钮在其中一种视图下静默失效
+  assert.match(app, /function scrollEditorTo\(pos\)/);
+  assert.match(app, /if \(editorPreviewing\)/, 'markdown 预览态滚动预览容器');
+  assert.match(app, /ta\.scrollTop = pos === 'top'/, 'textarea 回退路径');
+  assert.match(app, /monacoEditor\.setScrollTop\(pos === 'top'/, 'Monaco 路径');
+  // 只读预览点「顶部」：还有更早内容时必须先加载再落位。直接归零会被自动加载逻辑
+  // 当成"用户滚到顶"，它加载一块后把视口锚回原处——用户点了「顶部」却看着没动
+  assert.match(app, /previewJumpTop = true/, '「顶部」在只读预览下走"先加载再落位"');
+  // 自动加载必须以用户意图为前提：只看位置会把程序化归零误判成用户意图，连环拉取整个文件
+  assert.match(app, /if \(!previewIntent \|\| !editorReadonly/, '自动加载以用户意图为前提');
+  // 意图来源：滚轮上滚（Monaco 与 textarea 各一条）
+  assert.match(app, /onMouseWheel\(/, 'Monaco 滚轮意图');
+  assert.match(app, /'wheel', \(e\) => \{\s*\n\s*if \(e\.deltaY < 0\)/, 'textarea 滚轮意图');
+});
+
 test('normalizeFileEntry 收口恶意 Agent 文件条目', () => {
   assert.deepEqual(CfUtils.normalizeFileEntry({
     name: 'x"><img src=x onerror=alert(1)>',

@@ -495,16 +495,27 @@ test('编辑器顶部/底部按钮与只读预览加载闸门（静态断言）'
   // 两条渲染路径 + markdown 预览态都要能定位，否则按钮在其中一种视图下静默失效
   assert.match(app, /function scrollEditorTo\(pos\)/);
   assert.match(app, /if \(editorPreviewing\)/, 'markdown 预览态滚动预览容器');
-  assert.match(app, /ta\.scrollTop = pos === 'top'/, 'textarea 回退路径');
-  assert.match(app, /monacoEditor\.setScrollTop\(pos === 'top'/, 'Monaco 路径');
+  assert.match(app, /ta\.scrollTop = previewProgTop;/, 'textarea 回退路径');
+  assert.match(app, /monacoEditor\.setScrollTop\(previewProgTop\);/, 'Monaco 路径');
   // 只读预览点「顶部」：还有更早内容时必须先加载再落位。直接归零会被自动加载逻辑
   // 当成"用户滚到顶"，它加载一块后把视口锚回原处——用户点了「顶部」却看着没动
   assert.match(app, /previewJumpTop = true/, '「顶部」在只读预览下走"先加载再落位"');
-  // 自动加载必须以用户意图为前提：只看位置会把程序化归零误判成用户意图，连环拉取整个文件
-  assert.match(app, /if \(!previewIntent \|\| !editorReadonly/, '自动加载以用户意图为前提');
-  // 意图来源：滚轮上滚（Monaco 与 textarea 各一条）
+  // 自动加载的闸门必须能区分"用户滚到顶"与"我们把它放到顶"：
+  //   只看位置 → 程序化归零被误判成用户意图 → 边加载边归零 → 连环拉取整个文件；
+  //   只看输入事件（wheel/key） → 漏掉滚动条拖动与键盘滚动（实测反馈：拖到顶不加载）。
+  // 故判据是"当前位置是否等于我们最近一次程序化设置的位置"。
+  assert.match(app, /const programmatic = Math\.abs\(top - previewProgTop\)/, '按是否程序化落点判定');
+  assert.match(app, /if \(programmatic && !previewIntent\) return;/, '程序化落点不触发加载');
+  assert.match(app, /if \(!programmatic\) previewProgTop = PREVIEW_PROG_NONE;/, '用户滚离后清标记（拖走再拖回顶也能触发）');
+  // 意图来源只作补充：已贴最顶部时上滚不改变 scrollTop，没有 scroll 事件（Monaco 与 textarea 各一条）
   assert.match(app, /onMouseWheel\(/, 'Monaco 滚轮意图');
   assert.match(app, /'wheel', \(e\) => \{\s*\n\s*if \(e\.deltaY < 0\)/, 'textarea 滚轮意图');
+  // 每一处程序化落位都必须记录 previewProgTop——漏一处就会退化成"连环拉取"，且是静默的
+  assert.match(app, /previewProgTop = 0;\s+\/\/ 编辑器此刻就在顶部/, '开窗初始落点');
+  assert.match(app, /previewProgTop = pos === 'top' \? 0 : monacoEditor\.getScrollHeight\(\)/, '跳转按钮（Monaco）');
+  assert.match(app, /previewProgTop = pos === 'top' \? 0 : ta\.scrollHeight;/, '跳转按钮（textarea）');
+  assert.match(app, /previewProgTop = monacoEditor\.getTopForLineNumber\(first \+ added\) \+ off;/, '追加后锚定（Monaco）');
+  assert.match(app, /previewProgTop = top \+ \(ta\.scrollHeight - h\);/, '追加后锚定（textarea）');
   // 标题栏布局：长绝对路径（如 /run/csi/... 的容器工作区）曾把按钮组挤成竖排——每个按钮
   // 各占一行。两条约束缺一不可，且都是"删掉就静默失效"的类型，故锁住：
   //   .modal-head-actions { flex: none }  按钮组不参与收缩（收缩即竖排）
@@ -515,6 +526,9 @@ test('编辑器顶部/底部按钮与只读预览加载闸门（静态断言）'
   assert.match(css, /\.modal-head-actions \{[^}]*flex: none/, '按钮组禁止收缩');
   assert.match(css, /#file-editor-modal \.modal-head > span \{[^}]*flex: 1 1 0/, '标题基准尺寸为 0');
   assert.match(css, /#file-editor-modal \.modal-head > span \{[^}]*text-overflow: ellipsis/, '标题单行截断');
+  // 说明横幅必须与标题栏/编辑区同一居中列：作为 .modal 直系子元素它会撑满整个内容盒，
+  // 左右各比编辑区多出两百多像素（实测 head/body 260..1020、横幅 32..1248）
+  assert.match(css, /#file-editor-modal \.editor-banner \{[^}]*max-width: 760px/, '说明横幅同列对齐');
 });
 
 test('normalizeFileEntry 收口恶意 Agent 文件条目', () => {

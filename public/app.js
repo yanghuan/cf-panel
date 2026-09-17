@@ -1539,9 +1539,12 @@
   let previewFrom = 0;          // 只读预览已加载内容在文件中的起始偏移（0 = 已到文件开头，无更早内容）
   let previewTotal = 0;         // 文件总大小（横幅显示用）
   let previewLoading = false;   // 正在追加更早内容：防同刻重复请求（每次一趟 WS 往返）
-  let previewIntent = false;    // 用户真实的"要往上看"意图（滚轮上滚 / PageUp 等）。
-                                // 自动加载必须由它触发——仅凭"位置在顶部"会把程序化归零
-                                //（初始滚到底、按钮跳到顶部、追加后锚定）误判成用户意图
+  let previewIntent = false;    // 显式输入意图（滚轮上滚 / PageUp）。只用于"已贴在最顶部、上滚
+                                // 不改变 scrollTop 因此没有 scroll 事件"这一种情况——其余
+                                // 用户滚动（含滚动条拖动、键盘）由 previewProgTop 判定
+  let previewProgTop = 0;       // 最近一次**程序化**设置到的滚动位置。自动加载据此区分
+                                // "用户滚到顶"与"我们把它放到顶"（后者若被当成用户意图，
+                                // 会边加载边归零 → 连环拉取整个文件）
   let previewJumpTop = false;   // 本次追加由「跳到顶部」发起：落位到新顶部，而非锚回原行
 
   // 后缀 → Monaco 语言 ID（均为 min 版内置 basic-languages，无需额外加载）
@@ -1606,6 +1609,8 @@
     previewTotal = (info && info.total) || 0;
     previewLoading = false;
     previewIntent = false;                 // 意图不跨文件：上个文件的滚轮状态不得触发新文件的加载
+    previewProgTop = 0;                    // 编辑器此刻就在顶部（尚未滚到底），视作程序化落点，
+                                           // 免得开窗瞬间的滚动事件被当成"用户滚到顶"而提前加载
     previewJumpTop = false;
     updatePreviewBanner();
     // Markdown 文件显示「预览」按钮；打开新文件时预览态复位
@@ -1691,18 +1696,24 @@
   // 编辑器滚动定位（编辑与只读预览通用）：Monaco 与 textarea 回退两条渲染路径，
   // 按当前可见的是哪一个来走；markdown 预览态下滚动的是预览容器本身。
   // 滚动本身不受只读影响：Monaco 的 readOnly 只拦编辑，滚轮/选中/查找都正常。
+  // 每条路径都要先把目标位置记进 previewProgTop（在设置之前记，防滚动事件同步触发）。
   function scrollEditorTo(pos) {
     if (editorPreviewing) {
       const md = $('#editor-md-preview');
-      md.scrollTop = pos === 'top' ? 0 : md.scrollHeight;
+      previewProgTop = pos === 'top' ? 0 : md.scrollHeight;
+      md.scrollTop = previewProgTop;
       return;
     }
     const ta = $('#file-editor-text');
     if (!ta.classList.contains('hidden')) {
-      ta.scrollTop = pos === 'top' ? 0 : ta.scrollHeight;
+      previewProgTop = pos === 'top' ? 0 : ta.scrollHeight;
+      ta.scrollTop = previewProgTop;
       return;
     }
-    if (monacoEditor) monacoEditor.setScrollTop(pos === 'top' ? 0 : monacoEditor.getScrollHeight());
+    if (monacoEditor) {
+      previewProgTop = pos === 'top' ? 0 : monacoEditor.getScrollHeight();
+      monacoEditor.setScrollTop(previewProgTop);
+    }
   }
 
   // 只读预览打开即滚到底部：日志的现场在末尾，省去每次手动拉到底
@@ -1742,19 +1753,30 @@
   }
 
   // 向上滚到顶附近即追加更早内容（日志往回查历史）。四道闸：
-  //   previewIntent    —— 必须是用户真实的"想往上看"动作（滚轮上滚 / PageUp），**只看位置不够**。
-  //                       初始滚到底、按钮跳到顶部、追加后锚定都是程序化归零，只看位置会把它们
-  //                       当成用户意图，于是一边加载一边把位置归零 → 连环拉取整个文件。
   //   previewFrom > 0  —— 还有更早的内容
   //   previewLoading   —— 在途去重（滚动事件极密集，每次都是一趟 WS 往返）
   //   位置 <= 阈值      —— 已经滚到顶部附近
+  //   非程序化落点      —— **只看位置不够**：初始滚到底、按钮跳到顶部、追加后锚定都会把位置
+  //                       设到顶部附近，不看来源就会边加载边归零 → 连环拉取整个文件。
+  //                       判据是"当前位置是否等于我们最近一次程序化设置的位置"，而不是
+  //                       "有没有滚轮事件"——滚动条拖动与键盘滚动都不产生 wheel 事件，
+  //                       按输入事件判定会把这两条路漏掉（实测反馈：拖滚动条到顶不加载）。
   const PREVIEW_LOAD_TRIGGER_PX = 240;
+  const PREVIEW_TOLERANCE_PX = 2;   // 浮点误差容差
+  const PREVIEW_PROG_NONE = -1e9;   // 无程序化落点：远离任何真实像素值，勿用 -1 这类哨兵
   function maybeLoadEarlier() {
-    if (!previewIntent || !editorReadonly || previewLoading || previewFrom <= 0) return;
+    if (!editorReadonly || previewLoading || previewFrom <= 0) return;
     const ta = $('#file-editor-text');
     const top = !ta.classList.contains('hidden') ? ta.scrollTop
       : (monacoEditor ? monacoEditor.getScrollTop() : null);
-    if (top === null || top > PREVIEW_LOAD_TRIGGER_PX) return;
+    if (top === null) return;
+    const programmatic = Math.abs(top - previewProgTop) <= PREVIEW_TOLERANCE_PX;
+    // 用户把位置滚离了程序化落点：此后一律按用户滚动看待（清掉标记，否则"滚走再滚回顶部"
+    // 会因为位置又等于旧落点而被误判成程序化设置）
+    if (!programmatic) previewProgTop = PREVIEW_PROG_NONE;
+    // 停在程序化落点上且没有滚轮/键盘输入 → 不是用户想往上看（见上方注释）
+    if (programmatic && !previewIntent) return;
+    if (top > PREVIEW_LOAD_TRIGGER_PX) return;
     previewIntent = false; // 一次意图只换一块：否则滚轮连发会瞬间把历史拉光
     previewLoading = true;
     updatePreviewBanner();
@@ -1770,7 +1792,9 @@
       const h = ta.scrollHeight;
       ta.value = text + ta.value;
       // textarea 无行高 API：下移量 = 新增内容的渲染高度（换行已计入 scrollHeight）
-      ta.scrollTop = top + (ta.scrollHeight - h);
+      // 记进 previewProgTop：这是程序化落位，不得被当成"用户滚到顶"（会连环拉取）
+      previewProgTop = top + (ta.scrollHeight - h);
+      ta.scrollTop = previewProgTop;
       return;
     }
     if (!monacoEditor) return;
@@ -1782,7 +1806,8 @@
     const off = monacoEditor.getScrollTop() - monacoEditor.getTopForLineNumber(first);
     // 用 model.applyEdits 而非 editor.executeEdits：后者在 readOnly 下被拒
     model.applyEdits([{ range: { startLineNumber: 1, startColumn: 1, endLineNumber: 1, endColumn: 1 }, text }]);
-    monacoEditor.setScrollTop(monacoEditor.getTopForLineNumber(first + added) + off);
+    previewProgTop = monacoEditor.getTopForLineNumber(first + added) + off; // 同上：程序化落位
+    monacoEditor.setScrollTop(previewProgTop);
   }
 
   function saveFileEditor() {
@@ -1842,6 +1867,7 @@
     previewTotal = 0;
     previewLoading = false;
     previewIntent = false;
+    previewProgTop = 0;
     previewJumpTop = false;
     editorPreviewing = false;
     $('#btn-editor-preview').classList.add('hidden');

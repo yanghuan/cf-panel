@@ -1025,6 +1025,11 @@ button.danger:hover { background: rgba(248, 113, 113, .12); }
   color: var(--warn);
   font-size: 12px;
 }
+/* 横幅必须与标题栏/编辑区同一居中列（都是 max-width 760 + margin auto）：
+   作为 .modal 的直系子元素它会撑满整个内容盒，左右两侧比编辑区各多出两百多像素，
+   看着像"没对齐"（实测 head/body 260..1020，横幅 32..1248） */
+#file-editor-modal .editor-banner { width: 100%; max-width: 760px; margin-left: auto; margin-right: auto; }
+#file-editor-modal.expanded .editor-banner { max-width: none; }
 /* 行操作下拉菜单（⋯）：菜单右对齐，按钮悬停高亮
    注意：必须用 .file-table td.f-ops 提高特异性，否则被 .file-table td 的 text-align:left 覆盖 */
 .file-table td.f-ops { text-align: right; white-space: nowrap; }

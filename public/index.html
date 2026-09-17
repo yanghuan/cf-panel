@@ -13,7 +13,7 @@
   <!-- CSP 与点击劫持防护由 public/_headers 以 HTTP 响应头下发；frame-ancestors 在 meta 中不会生效。 -->
   <!-- 依赖本地化（public/vendor，避免外部 CDN 不可达/供应链风险）；xterm/Chart.js 首次使用时由 JS 懒加载 -->
   <script src="/theme-init.js"></script>
-  <link rel="stylesheet" href="/style.css?v=42" />
+  <link rel="stylesheet" href="/style.css?v=43" />
 </head>
 <body>
   <div id="app" class="hidden">
@@ -560,7 +560,7 @@
   <script src="/lang/en-US.js?v=1"></script>
   <script src="/utils.js?v=11"></script>
   <script src="/api.js?v=7"></script>
-  <script src="/app.js?v=60"></script>
+  <script src="/app.js?v=61"></script>
 
   <!-- Cloudflare Web Analytics：手动嵌入（而非 Zone 级 Automatic Setup 自动注入）。
        自动注入会在边缘改写 HTML 塞入内联启动代码，与严格 CSP 的 script-src 冲突

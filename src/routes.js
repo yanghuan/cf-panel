@@ -185,7 +185,7 @@ const MCP_TOOLS = [
         site_name: { type: 'string', description: '站点名称（留空用默认）' },
         notice: { type: 'string', description: '公告（留空隐藏）' },
         geo_lookup: { type: 'boolean', description: 'IP 归属地查询（将公网 IP 发送到第三方地理服务）' },
-        alerts: { type: 'object', description: '告警配置对象（enabled/method/url/token/body/content_type/headers/cpu/mem/disk/load/cooldown_min/offline_after_s/mute_until）。mute_until 为免打扰截止的 unix 秒（计划内重启/割接前设置，到期自动恢复）；阈值类维度还支持逐机覆盖，见 update_server 的 alert_override' },
+        alerts: { type: 'object', description: '告警配置对象。注意是**整体替换**而非合并：请先 get_settings 取当前 alerts，改完整体回传——漏传的字段会丢失（漏传 webhook_url 等于停用告警）。字段名：webhook_url（留空即停用告警，无单独的 enabled 开关）/ webhook_token / method（GET|POST|PUT）/ body_template / content_type / headers / cpu_pct / mem_pct / disk_pct / load（可设 0 关闭该维度）/ cooldown_min / offline_after_s / mute_until（免打扰截止的 unix 秒，到期自动恢复）。阈值类维度还支持逐机覆盖，见 update_server 的 alert_override' },
       },
       required: [],
     },
@@ -1057,6 +1057,7 @@ async function handleApiInner(request, env) {
     try {
       await doMetrics(env).fetch('https://do.internal/rpc/clear_settings_cache', { method: 'POST' });
     } catch { /* 清缓存失败：MetricsDO 侧按 300s TTL 自然过期 */ }
+    await auditSettingsUpdate(env, user, clientIp(request), body, next);
     return json(next);
   }
 
@@ -1585,12 +1586,29 @@ async function mcpGetUsage(user, env) {
   return collectUsageView(env);
 }
 
+// 设置变更审计（REST PUT /api/settings 与 MCP update_settings 共用）。
+// detail 只记改动了哪些字段 + 告警开关状态：**绝不记 webhook_url / webhook_token**，
+// 两者都是敏感值（webhook URL 常把密钥放在路径里），而 detail 会在审计页明文展示。
+// 设置存 KV、审计存 D1，无法同一事务；审计失败不抛——设置已经生效，
+// 不能因留痕失败让调用方误以为没改（与 exec.command 同口径）。
+async function auditSettingsUpdate(env, user, ip, submitted, next) {
+  const changed = ['site_name', 'notice', 'alerts', 'geo_lookup'].filter((k) => submitted[k] !== undefined);
+  if (!changed.length) return;
+  const alertState = next.alerts && next.alerts.webhook_url ? '开' : '关';
+  const detail = `字段：${changed.join('/')}${submitted.alerts !== undefined ? `（告警${alertState}）` : ''}`;
+  try {
+    await env.DB.prepare('INSERT INTO audit_logs (user_id, username, client_ip, action, target_server_id, detail) VALUES (?,?,?,?,?,?)')
+      .bind(user.id, user.username, ip, 'settings.update', null, detail)
+      .run();
+  } catch { /* 审计失败不影响设置生效 */ }
+}
+
 async function mcpGetSettings(user, env) {
   requireAdmin(user);
   return (await kvGet(env, 'settings', {})) || {};
 }
 
-async function mcpUpdateSettings(user, env, args) {
+async function mcpUpdateSettings(user, env, args, ip) {
   requireAdmin(user);
   const current = (await kvGet(env, 'settings', {})) || {};
   const next = {
@@ -1604,6 +1622,7 @@ async function mcpUpdateSettings(user, env, args) {
   try {
     await doMetrics(env).fetch('https://do.internal/rpc/clear_settings_cache', { method: 'POST' });
   } catch { /* 清缓存失败：MetricsDO 侧按 300s TTL 自然过期 */ }
+  await auditSettingsUpdate(env, user, ip, args, next);
   return next;
 }
 
@@ -1744,7 +1763,7 @@ async function handleMcpInner(request, env) {
         else if (params.name === 'get_audit_logs') content = await mcpGetAuditLogs(user, env, params.arguments || {});
         else if (params.name === 'get_usage') content = await mcpGetUsage(user, env);
         else if (params.name === 'get_settings') content = await mcpGetSettings(user, env);
-        else if (params.name === 'update_settings') content = await mcpUpdateSettings(user, env, params.arguments || {});
+        else if (params.name === 'update_settings') content = await mcpUpdateSettings(user, env, params.arguments || {}, clientIp(request));
         return reply(id, { content: [{ type: 'text', text: JSON.stringify(content) }], isError: false });
       } catch (e) {
         // 工具执行错误作为 isError 结果返回（MCP 客户端可读）

@@ -1295,6 +1295,17 @@ test('MCP：tools/list 与 tools/call', async () => {
     'get_audit_logs', 'get_usage', 'get_settings', 'update_settings',
   ]);
 
+  // update_settings 的 alerts 字段名必须与 sanitizeAlerts / 前端表单一致。
+  // 描述曾写成 enabled/url/token/body/cpu/mem/disk 等错名：调用方（尤其是 AI）照描述传参 →
+  // 键被白名单静默丢弃 → alerts 落库为 {}，连 webhook_url 一起没了 = 告警静默失效、接口还返回成功。
+  const updTool = list.result.tools.find((t) => t.name === 'update_settings');
+  for (const k of ['webhook_url', 'webhook_token', 'body_template', 'cpu_pct', 'mem_pct', 'disk_pct']) {
+    assert.ok(updTool.inputSchema.properties.alerts.description.includes(k),
+      `alerts 描述须列出真实字段名 ${k}`);
+  }
+  assert.match(updTool.inputSchema.properties.alerts.description, /整体替换/,
+    '须写明 alerts 是整体替换（漏传字段即丢失）');
+
   // create_upload：签发签名 URL（结构 + 权限 + 绑定字段）
   const cu = await (await mcp(env, { token, body: { jsonrpc: '2.0', id: 12, method: 'tools/call', params: { name: 'create_upload', arguments: { server_name: 'web-1', path: '/opt/app.tar.gz' } } } })).json();
   assert.equal(cu.result.isError, false);
@@ -1463,6 +1474,54 @@ test('MCP：tools/list 与 tools/call', async () => {
   assert.equal(us2Res.site_name, 'MCP 面板');
   const gs2 = await (await mcp(env, { token, body: { jsonrpc: '2.0', id: 29, method: 'tools/call', params: { name: 'get_settings', arguments: {} } } })).json();
   assert.equal(JSON.parse(gs2.result.content[0].text).site_name, 'MCP 面板');
+
+  // 全局告警设置：走 update_settings.alerts（与 REST PUT /api/settings 同一 sanitizeAlerts）。
+  // 此前只测过 site_name，alerts 这条路径完全没有覆盖。
+  const usAlerts = await (await mcp(env, { token, body: { jsonrpc: '2.0', id: 280, method: 'tools/call', params: { name: 'update_settings', arguments: { alerts: {
+    webhook_url: 'https://hook.example/x', webhook_token: 'tok', method: 'post',
+    body_template: '{"t":"{title}"}', content_type: 'application/json', headers: { 'x-a': '1' },
+    cpu_pct: 85, mem_pct: 80, disk_pct: 70, load: 0, cooldown_min: 10, offline_after_s: 120,
+  } } } } })).json();
+  assert.equal(usAlerts.result.isError, false);
+  const alertCfg = JSON.parse(usAlerts.result.content[0].text).alerts;
+  assert.equal(alertCfg.webhook_url, 'https://hook.example/x', 'webhook_url 是真实键名（不是 url）');
+  assert.equal(alertCfg.webhook_token, 'tok');
+  assert.equal(alertCfg.method, 'POST', 'method 归一化为大写');
+  assert.equal(alertCfg.body_template, '{"t":"{title}"}', 'body_template 是真实键名（不是 body）');
+  assert.deepEqual(alertCfg.headers, { 'x-a': '1' });
+  assert.equal(alertCfg.cpu_pct, 85, 'cpu_pct 是真实键名（不是 cpu）');
+  assert.equal(alertCfg.mem_pct, 80);
+  assert.equal(alertCfg.disk_pct, 70);
+  assert.equal(alertCfg.load, 0, 'load=0 是"关闭该维度"的合法值，须保留');
+  assert.equal(alertCfg.cooldown_min, 10);
+  assert.equal(alertCfg.offline_after_s, 120);
+
+  // alerts 是**整体替换**而非合并：只传 cpu_pct 会把 webhook_url 一起丢掉
+  const usWipe = await (await mcp(env, { token, body: { jsonrpc: '2.0', id: 281, method: 'tools/call', params: { name: 'update_settings', arguments: { alerts: { cpu_pct: 60 } } } } })).json();
+  const wiped = JSON.parse(usWipe.result.content[0].text).alerts;
+  assert.equal(wiped.cpu_pct, 60);
+  assert.equal(wiped.webhook_url, undefined, '整体替换：漏传 webhook_url = 停用告警（描述已写明）');
+
+  // 未在白名单里的键被静默丢弃——这正是"描述写错名"能清空整份告警的原因，工具描述必须列对名字
+  const usBad = await (await mcp(env, { token, body: { jsonrpc: '2.0', id: 282, method: 'tools/call', params: { name: 'update_settings', arguments: { alerts: { url: 'https://x', token: 't', cpu: 50 } } } } })).json();
+  assert.deepEqual(JSON.parse(usBad.result.content[0].text).alerts, {}, '错名键全部被丢弃，落库为空配置');
+
+  // 设置变更必须留痕：MCP 与 REST 两条入口都要写 settings.update（此前只有写操作没审计的一条漏网）
+  const alAudit = JSON.parse((await (await mcp(env, { token, body: { jsonrpc: '2.0', id: 283, method: 'tools/call', params: { name: 'get_audit_logs', arguments: { action: 'settings.update' } } } })).json()).result.content[0].text);
+  assert.ok(alAudit.rows.length >= 4, `设置变更应有审计记录（实际 ${alAudit.rows.length} 条）`);
+  assert.ok(alAudit.rows.every((r) => r.action === 'settings.update'));
+  assert.equal(alAudit.rows[0].target_server_id, null, '全局设置无目标服务器');
+  assert.ok(alAudit.rows.some((r) => /字段：/.test(r.detail || '')), 'detail 记录改动了哪些字段');
+  // detail 会明文展示在审计页：webhook URL（常把密钥放路径里）与令牌**绝不能**入库
+  assert.ok(alAudit.rows.every((r) => !/hook\.example|\btok\b/.test(r.detail || '')),
+    'detail 不得包含 webhook_url / webhook_token');
+  assert.ok(alAudit.rows.some((r) => /告警[开关]/.test(r.detail || '')), '改告警时附带开关状态');
+
+  // REST 入口同样留痕（与 MCP 共用 auditSettingsUpdate）
+  await call(env, { method: 'PUT', path: '/api/settings', token, body: { alerts: { webhook_url: 'https://hook.example/rest', cpu_pct: 70 } } });
+  const alAudit2 = JSON.parse((await (await mcp(env, { token, body: { jsonrpc: '2.0', id: 284, method: 'tools/call', params: { name: 'get_audit_logs', arguments: { action: 'settings.update' } } } })).json()).result.content[0].text);
+  assert.equal(alAudit2.rows.length, alAudit.rows.length + 1, 'REST 路径也写审计');
+  assert.ok(!/hook\.example/.test(alAudit2.rows[0].detail || ''), 'REST 路径的 detail 同样不落 URL');
 
   // get_usage：结构完整
   const gu = await (await mcp(env, { token, body: { jsonrpc: '2.0', id: 30, method: 'tools/call', params: { name: 'get_usage', arguments: {} } } })).json();

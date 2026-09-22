@@ -68,8 +68,28 @@ AGENT_KEY=<面板添加服务器时生成的 key> \
 | `AGENT_LOG_MAX` | 262144 | 日志轮转上限字节 |
 | `ALLOW_SELF_UPDATE` | 0 | =1 允许管理员经面板更新 Agent；安装目录必须可写，默认关闭 |
 | `AGENT_SELF_RESTART` | 0 | =1 在更新并清理会话后主动启动新版本；使用 systemd/launchd/服务包装器时保持 0 |
+| `AGENT_DNS_MODE` | auto | 域名解析方式：`auto`（自建解析优先、失败回落系统）/ `udp`（只用自建，失败不回落）/ `system`（只用系统解析器） |
+| `AGENT_WSS_IP` | 空 | 直接连接该 IP、跳过 DNS；`AGENT_WSS_URL` 仍用于 TLS 的 SNI 与证书校验 |
 
 > 探活暂不支持 `https://`（http/tcp 支持）；wss 连接不受影响。
+
+### 为什么自建 DNS 解析（`AGENT_DNS_MODE`）
+
+Linux 产物是 **musl 全静态**二进制，域名解析走 musl 自带解析器，其 UDP 发送用的是
+**未连接 socket + `sendmsg` 带 `msg_name`**（等价 `sendto`）。部分沙箱/受限网络把"未连接 UDP
+发包"一律判 `EPERM`，于是解析必然失败（日志表现为 `failed to lookup address information:
+Try again`），再叠加断线退避就成了"半天连不上"。glibc 的解析器用 `connect(名字服务器) + send()`，
+能通过同一策略。
+
+因此 agent 默认先走**自建解析**（`src/dns.rs`：`UdpSocket::bind → connect → send`，与 glibc 同模式），
+任一步失败即回落到 `getaddrinfo`——**自建路径不是单点**，正常环境行为与改造前完全一致。
+连上之后 TLS 的 SNI 与证书校验仍按 URL 里的域名，所以"连 IP"不削弱校验。
+
+- 排障时 `AGENT_DNS_MODE=udp` 可让失败直接暴露（不回落）；`AGENT_DNS_MODE=system` 一键退回旧行为。
+- 连名字服务器都不可达的环境，可用 `AGENT_WSS_IP` 完全跳过 DNS（注意面板域名的解析 IP 变化时需同步更新）。
+- A 与 AAAA **并行查询、A 优先**：受限网络常整段禁掉 IPv6 出口，若优先用 AAAA，连接会直接失败
+  （连接层不做 v4/v6 回退）。IPv6-only 域名没有 A 记录，会自然回退到 AAAA。
+  与系统解析器（`getaddrinfo` 通常按 RFC 6724 优先 IPv6）的顺序不同，这是有意的。
 
 ## 面板自更新
 

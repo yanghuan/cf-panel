@@ -37,23 +37,20 @@ async fn http_probe(url: &str, timeout_secs: u64) -> Option<(u16, u128)> {
         _ => (hostport.to_string(), 80u16),
     };
     let path = if path.is_empty() { "/" } else { path };
-    // 域名兜底：IP 字面量直接解析；否则 lookup_host DNS（与 tcp_probe 对齐），
-    // 修复 http://域名/ 探活永远 DOWN（此前仅 IP 字面量，域名场景持续误告警）。
-    // DNS 解析必须纳入 timeout 作用域：glibc resolver 默认 5s×2 次，DNS 故障时
+    // 域名兜底：IP 字面量直接解析；否则走与连接同一套解析（自建优先、失败回落 libc，
+    // 见 main.rs 的 resolve_host_for_probe），修复 http://域名/ 探活永远 DOWN。
+    // DNS 解析必须纳入 timeout 作用域：解析器默认 5s×2 次，DNS 故障时
     // 每个探活额外多挂 10s+ 且无上界（timeout 只包 connect+请求的旧实现形同虚设）
     let addr: SocketAddr = match format!("{host}:{port}").parse() {
         Ok(a) => a,
         Err(_) => {
             match tokio::time::timeout(
                 Duration::from_secs(timeout_secs),
-                tokio::net::lookup_host((host.as_str(), port)),
+                crate::resolve_host_for_probe(host.as_str(), port),
             )
             .await
             {
-                Ok(Ok(mut it)) => match it.next() {
-                    Some(a) => a,
-                    None => return None,
-                },
+                Ok(Some(a)) => a,
                 _ => return None,
             }
         }
@@ -94,14 +91,11 @@ async fn tcp_probe(target: &str, timeout_secs: u64) -> bool {
                 let p = p.parse().unwrap();
                 match tokio::time::timeout(
                     Duration::from_secs(timeout_secs),
-                    tokio::net::lookup_host((h, p)),
+                    crate::resolve_host_for_probe(h, p),
                 )
                 .await
                 {
-                    Ok(Ok(mut it)) => match it.next() {
-                        Some(a) => a,
-                        None => return false,
-                    },
+                    Ok(Some(a)) => a,
                     _ => return false,
                 }
             }

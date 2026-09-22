@@ -2,6 +2,7 @@
 // 功能：控制通道（断线重连）→ 监控上报 + 终端 PTY + 文件管理；信号清理
 // 跨平台：Linux 原生 /proc 指标；Windows/macOS 经 sysinfo（见 metrics/ 子模块与 platform.rs）
 mod blocking;
+mod dns;
 mod metrics;
 mod platform;
 mod session;
@@ -40,14 +41,134 @@ async fn connect_ws_within(
     cfg: Option<tokio_tungstenite::tungstenite::protocol::WebSocketConfig>,
     timeout: Duration,
 ) -> Result<WsStream, Box<dyn Error + Send + Sync>> {
-    tokio::time::timeout(
-        timeout,
-        tokio_tungstenite::connect_async_with_config(req, cfg, false),
-    )
-    .await
-    .map_err(|_| "connect timeout (tcp/tls/ws handshake)")?
-    .map(|(ws, _resp)| ws)
-    .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)
+    tokio::time::timeout(timeout, connect_ws_inner(req, cfg))
+        .await
+        .map_err(|_| "connect timeout (dns/tcp/tls/ws handshake)")?
+}
+
+// 解析路径。默认 Auto：先自建解析（成因见 dns.rs），任一步失败回落 libc；
+// AGENT_DNS_MODE=udp 强制自建（失败不再回落，便于排障）、=system 强制 libc（一键退路）。
+#[derive(Clone, Copy, PartialEq)]
+enum DnsMode {
+    Auto,
+    Own,
+    System,
+}
+
+fn dns_mode() -> DnsMode {
+    static MODE: OnceLock<DnsMode> = OnceLock::new();
+    *MODE.get_or_init(|| {
+        match std::env::var("AGENT_DNS_MODE")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "system" | "libc" => DnsMode::System,
+            "udp" | "own" => DnsMode::Own,
+            _ => DnsMode::Auto,
+        }
+    })
+}
+
+/// 服务探活用的解析：与连接同一套策略——自建优先、失败回落 libc；
+/// `AGENT_DNS_MODE=system` 时直接用 libc。探活的域名此前只走 `lookup_host`，
+/// 在"禁未连接 UDP"的环境里会持续误报 DOWN。
+pub(crate) async fn resolve_host_for_probe(host: &str, port: u16) -> Option<std::net::SocketAddr> {
+    if dns_mode() != DnsMode::System {
+        if let Some(a) = dns::resolve(host, port).await {
+            return Some(a);
+        }
+    }
+    tokio::net::lookup_host((host, port)).await.ok()?.next()
+}
+
+async fn connect_ws_inner(
+    req: tokio_tungstenite::tungstenite::handshake::client::Request,
+    cfg: Option<tokio_tungstenite::tungstenite::protocol::WebSocketConfig>,
+) -> Result<WsStream, Box<dyn Error + Send + Sync>> {
+    let mode = dns_mode();
+    if mode != DnsMode::System {
+        // req 只在回退分支还要用；握手请求很小，克隆成本可忽略
+        match connect_via_own_resolver(req.clone(), cfg).await {
+            Ok(ws) => return Ok(ws),
+            Err(e) => {
+                if mode == DnsMode::Own {
+                    return Err(e);
+                }
+                // 回落是常态路径（无 /etc/resolv.conf、无 A 记录、名字服务器不可达…），
+                // 只记一行，避免每次重连刷屏
+                log(format!(
+                    "own resolver unavailable ({e}), using libc resolver"
+                ));
+            }
+        }
+    }
+    let (ws, _resp) = tokio_tungstenite::connect_async_with_config(req, cfg, false).await?;
+    Ok(ws)
+}
+
+/// 自建流建连：解析（或直接用 `AGENT_WSS_IP`）→ `TcpStream::connect(IP)` → 把已连好的流交给
+/// tungstenite 完成 TLS + WS 握手。
+///
+/// 为什么这样能对齐 glibc 而绕开 musl 的问题：libc 的 `getaddrinfo` 只在第一步被用到，换成
+/// dns.rs 的 `connect(名字服务器)+send()` 后，链路上再无"未连接 UDP 发包"。
+/// TLS 的 SNI 与证书校验仍按 URL 里的域名（`client_async_tls_with_config` 从 request 取
+/// domain），所以"连 IP"不削弱校验——只是把解析换掉了。
+pub(crate) async fn connect_via_own_resolver(
+    req: tokio_tungstenite::tungstenite::handshake::client::Request,
+    cfg: Option<tokio_tungstenite::tungstenite::protocol::WebSocketConfig>,
+) -> Result<WsStream, Box<dyn Error + Send + Sync>> {
+    let pinned = std::env::var("AGENT_WSS_IP").unwrap_or_default();
+    connect_via_own_resolver_with(req, cfg, &pinned).await
+}
+
+/// `pinned_ip` 非空时跳过 DNS 直连该 IP（`AGENT_WSS_IP` 的落地实现）。
+/// 环境变量读取刻意放在外层：测试并行执行，改环境变量会互相污染
+///（已实测：非法取值会让并发跑的其它用例一起失败），注入形参后测试无需碰环境。
+async fn connect_via_own_resolver_with(
+    req: tokio_tungstenite::tungstenite::handshake::client::Request,
+    cfg: Option<tokio_tungstenite::tungstenite::protocol::WebSocketConfig>,
+    pinned_ip: &str,
+) -> Result<WsStream, Box<dyn Error + Send + Sync>> {
+    let uri = req.uri().clone();
+    let host = uri
+        .host()
+        .ok_or("url has no host")?
+        .trim_end_matches('.')
+        .to_string();
+    let scheme = uri.scheme_str().unwrap_or_default().to_ascii_lowercase();
+    let port = uri
+        .port_u16()
+        .unwrap_or(if scheme == "wss" { 443 } else { 80 });
+    let addr = if pinned_ip.trim().is_empty() {
+        dns::resolve(&host, port)
+            .await
+            .ok_or("dns resolve failed")?
+    } else {
+        // parse_ip 容忍方括号与空白（"[::1]" / "::1" / " 127.0.0.1 " 都收）
+        let ip = dns::parse_ip(pinned_ip).ok_or("AGENT_WSS_IP must be a literal IP")?;
+        std::net::SocketAddr::new(ip, port)
+    };
+    // 解析结果先落日志再连：连不上时也要能看出"域名解析成了什么"
+    //（排查解析类问题全指望这一行；放在 connect 之后的话，连不上就什么都不剩）
+    log(format!("resolve {host}:{port} -> {addr}"));
+    let tcp = tokio::net::TcpStream::connect(addr).await?;
+    if scheme == "wss" {
+        let (ws, _resp) =
+            tokio_tungstenite::client_async_tls_with_config(req, tcp, cfg, None).await?;
+        Ok(ws)
+    } else {
+        // 明文 ws://（仅本地回环或 ALLOW_INSECURE_WS=1，启动时已校验）：手工包一层
+        // MaybeTlsStream::Plain，使返回类型与 TLS 分支一致（WsStream 定义如此）
+        let (ws, _resp) = tokio_tungstenite::client_async_with_config(
+            req,
+            tokio_tungstenite::MaybeTlsStream::Plain(tcp),
+            cfg,
+        )
+        .await?;
+        Ok(ws)
+    }
 }
 
 // 控制通道出站消息：普通帧 + 显式排空屏障。
@@ -1169,6 +1290,12 @@ fn print_help() {
     println!(
         "  AGENT_SELF_RESTART 默认 0   无 supervisor 时设为 1，更新后主动启动新进程（与 systemd/launchd 二选一）"
     );
+    println!(
+        "  AGENT_DNS_MODE    默认 auto 域名解析：auto（自建优先、失败回落系统）/ udp（只用自建）/ system（只用系统）"
+    );
+    println!(
+        "  AGENT_WSS_IP      默认 空   直接连该 IP、跳过 DNS（AGENT_WSS_URL 仍用于 TLS 的 SNI 与证书校验）"
+    );
 }
 
 #[tokio::main]
@@ -1498,6 +1625,107 @@ mod tests {
             "必须在超时窗口内返回"
         );
         server.abort();
+    }
+
+    // 起一个最小 WS 服务端：accept 后完成 101 升级，并保持连接数秒
+    async fn spawn_ws_server() -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let h = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            let _ = tokio_tungstenite::accept_async(sock).await;
+            tokio::time::sleep(Duration::from_secs(3)).await;
+        });
+        (addr, h)
+    }
+
+    // 自建流路径（dns.rs 解析 → 自己 connect → 把流交给 tungstenite）必须能完成握手：
+    // 用 IP 字面量绕开真实 DNS，验证 client_async_with_config 那条分支拼得通，
+    // 且返回类型与 connect_async_with_config 一致（WsStream）。
+    #[tokio::test]
+    async fn connect_via_own_resolver_handshakes() {
+        let (addr, server) = spawn_ws_server().await;
+        let req = format!("ws://{addr}/control")
+            .into_client_request()
+            .unwrap();
+        // 传 "": 不做 IP 覆盖，走着真实解析路径（IP 字面量会短路，不产生 DNS 流量）
+        let ws = connect_via_own_resolver_with(req, None, "")
+            .await
+            .expect("自建路径应完成 TCP + WS 握手");
+        drop(ws);
+        server.abort();
+    }
+
+    // URL 里的 IPv6 字面量必须走自建路径直连，而不是因方括号解析失败退回落 libc
+    //（只有 IPv6 的环境里，回退等于本模块完全失效）。这条同时记录一个事实：
+    // http::Uri::host() 对 IPv6 返回**带方括号**的形式（RFC 3986），即 dns::strip_brackets 的由来。
+    #[tokio::test]
+    async fn ipv6_literal_url_connects_via_own_resolver() {
+        let listener = match tokio::net::TcpListener::bind("[::1]:0").await {
+            Ok(l) => l,
+            Err(_) => return, // 宿主/CI 无 IPv6：跳过（本用例不负责测"无 IPv6"的表现）
+        };
+        let addr = listener.local_addr().unwrap(); // Display 形如 [::1]:port
+        let server = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            let _ = tokio_tungstenite::accept_async(sock).await;
+            tokio::time::sleep(Duration::from_secs(3)).await;
+        });
+        let req = format!("ws://{addr}/control")
+            .into_client_request()
+            .unwrap();
+        assert_eq!(
+            req.uri().host(),
+            Some("[::1]"),
+            "Uri::host() 对 IPv6 字面量带方括号——strip_brackets 的存在理由"
+        );
+        match connect_via_own_resolver_with(req, None, "").await {
+            Ok(ws) => drop(ws),
+            Err(e) => panic!("IPv6 字面量应能直连：{e}"),
+        }
+        server.abort();
+    }
+
+    // AGENT_WSS_IP 的两条语义（非法值报错 / 合法值跳过 DNS）。取值以形参注入，不改环境变量：
+    // 测试并行执行，改环境会污染并发用例（实测过一次：非法取值让握手用例一起失败）。
+    #[tokio::test]
+    async fn agent_wss_ip_pin_semantics() {
+        // 1) 非法值必须报错，而不是静默回退 DNS——静默回退会让"设了没生效"极难排查
+        let req = "ws://127.0.0.1:9/control".into_client_request().unwrap();
+        let e = connect_via_own_resolver_with(req, None, "not-an-ip.example")
+            .await
+            .unwrap_err();
+        assert!(
+            e.to_string().contains("AGENT_WSS_IP"),
+            "错误信息要指名配置项，实际：{e}"
+        );
+
+        // 2) 合法 IP 优先于 DNS：URL 里放一个**解析不了**的域名，只有覆盖生效才能连上。
+        //    这是"被控机无法解析域名"时的运维兜底。
+        let (addr, server) = spawn_ws_server().await;
+        let req = format!("ws://panel.invalid:{}/control", addr.port())
+            .into_client_request()
+            .unwrap();
+        match connect_via_own_resolver_with(req, None, "127.0.0.1").await {
+            Ok(ws) => drop(ws),
+            Err(e) => panic!("有 IP 覆盖时不应依赖 DNS：{e}"),
+        }
+        server.abort();
+    }
+
+    // 域名解析不了时（own 与 libc 都失败）必须返回错误而非挂起——Auto 模式的回落路径
+    #[tokio::test]
+    async fn unresolvable_host_errors_without_hanging() {
+        let req = "ws://no-such-host.invalid/control"
+            .into_client_request()
+            .unwrap();
+        let started = std::time::Instant::now();
+        let r = connect_ws_within(req, None, Duration::from_secs(10)).await;
+        assert!(r.is_err(), "解析不了必须报错");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "必须在上界内返回"
+        );
     }
 
     // 写侧可控的 Sink：stuck=true 时 flush 永不就绪（模拟半开连接）；

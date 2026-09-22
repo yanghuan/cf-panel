@@ -294,7 +294,8 @@ Rust 版以 `#[cfg(unix)]` / `#[cfg(windows)]` 条件编译实现三平台（平
 
 | 环节 | 措施 |
 | --- | --- |
-| 连接建立 | `connect_ws` 统一封装：DNS + TCP + TLS + HTTP 101 共 15s 总超时（控制通道与终端/文件会话共用），超时即按退避重连 |
+| 连接建立 | `connect_ws` 统一封装：解析 + TCP + TLS + HTTP 101 共 15s 总超时（控制通道与终端/文件会话共用），超时即按退避重连 |
+| 域名解析 | 默认先用自建解析（`src/dns.rs`：`UdpSocket::bind → connect(名字服务器) → send`，与 glibc 同模式），失败回落 `getaddrinfo`。原因：musl 静态二进制的 `getaddrinfo` 用"未连接 UDP + `sendmsg` 带 `msg_name`"，沙箱类环境会把该模式判 `EPERM` 导致解析恒失败；`AGENT_DNS_MODE=system` 可一键退回，`AGENT_WSS_IP` 可跳过 DNS（仍按 URL 域名做 SNI/证书校验）。探活解析复用同一套 |
 | 控制通道出站 | 专用写任务 + 有界队列（256）替代 `Arc<Mutex<Sink>>`：生产者只 `try_send`（不阻塞、不持锁跨 await），写任务单帧 10s 超时，超时即结束任务 |
 | 读循环 | 三重退出：读侧 180s 半开超时、写任务结束（发送失败/超时）、服务端 close |
 | 指令处理 | 兜底超时：`dispatch` 30s、上传帧 45s（self-update 例外，内部 `file_blocking` 120s 已界）；handler 卡住也必须能退回重连，否则 180s 半开检测形同虚设 |

@@ -1,5 +1,6 @@
 // cf-panel — Durable Object：WebSocket 中转核心（分片实例 TerminalDO）
 import { json, err, doPanel, sha256Hex, verifySecretHash } from './utils.js';
+import { EXEC_CMD_MAX_BYTES, execCommandBytes, execTooLongError } from './config.js';
 import { authIdentityByToken, authUserByIdentity, isAdmin, canExec } from './auth.js';
 import { handleReport } from './report.js';
 
@@ -150,6 +151,10 @@ export class TerminalDO {
       const serverId = Number(body.serverId) || 0;
       const command = String(body.command || '').trim();
       if (!command) return err('empty command');
+      // 长度最终防线（与 Worker 侧同一常量）：超限帧会让 agent 判 Capacity 断开控制通道，
+      // 命令不执行而调用方只见误导性超时。Worker 已前置拒绝，此处兜住将来新增的调用方
+      const cmdBytes = execCommandBytes(command);
+      if (cmdBytes > EXEC_CMD_MAX_BYTES) return err(execTooLongError(cmdBytes), 413);
       if (this.updating.has(serverId)) return json({ error: 'agent update in progress' }, 409);
       const timeoutMs = Math.min(Math.max(Number(body.timeoutMs) || EXEC_DEFAULT_TIMEOUT_MS, 1000), EXEC_MAX_TIMEOUT_MS);
       const agentWs = this.agents.get(serverId);

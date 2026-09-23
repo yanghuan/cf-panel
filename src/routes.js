@@ -1,6 +1,7 @@
 // cf-panel — 路由层：REST API（handleApi）+ MCP（handleMcp）+ WebSocket 路由（handleWs）
 import {
   SCOPE_READ, SCOPE_EXEC, SCOPE_AGENT_UPDATE, PAT_PREFIX, SHARDS, parsePanelUsers, statsTzOffsetSec,
+  EXEC_CMD_MAX_BYTES, execCommandBytes, execTooLongError,
 } from './config.js';
 
 // 本模块专用常量（PAT scope 白名单 / MCP 协议与工具，就近定义便于对照使用代码）
@@ -28,7 +29,7 @@ const MCP_TOOLS = [
   },
   {
     name: 'exec_command',
-    description: '在指定服务器上通过 agent 执行一次 shell 命令并返回输出（一次性执行、非交互、无 PTY，经控制通道直达；适合只读查询、进程/服务管理、快速运维）。需要 exec 权限（管理员或带 server:exec scope 的 PAT）。提供 server_id 或 server_name 之一；command 必填；timeout 可选（秒，默认 25，最大 25）；输出上限约 44KB（stdout）。',
+    description: `在指定服务器上通过 agent 执行一次 shell 命令并返回输出（一次性执行、非交互、无 PTY，经控制通道直达；适合只读查询、进程/服务管理、快速运维）。需要 exec 权限（管理员或带 server:exec scope 的 PAT）。提供 server_id 或 server_name 之一；command 必填；timeout 可选（秒，默认 25，最大 25）；输出上限约 44KB（stdout）。命令长度上限 ${EXEC_CMD_MAX_BYTES} 字节（JSON 转义后的字节数：中文 3 字节/字符、换行转义为 \\n 占 2 字节）——更长的脚本请先用 create_upload 上传成文件再执行该文件。`,
     inputSchema: {
       type: 'object',
       properties: {
@@ -1290,6 +1291,11 @@ async function mcpExecCommand(user, env, args, ip) {
   const serverId = Number(args.server_id) || 0;
   const command = String(args.command || '').trim();
   if (!command) throw new Error('command is required');
+  // 长度前置拒绝（先于任何 DB/RPC 动作）：超限帧会被 agent 判 Capacity 并断开控制通道，
+  // 命令不会执行、调用方只看到误导性的 "command timed out"（见 config.js 注释）。
+  // 此处明确报错，AI 客户端可据错误信息自纠（改用 create_upload 或拆短）
+  const cmdBytes = execCommandBytes(command);
+  if (cmdBytes > EXEC_CMD_MAX_BYTES) throw new Error(execTooLongError(cmdBytes));
   let server = null;
   if (serverId) {
     server = await env.DB.prepare('SELECT * FROM servers WHERE id = ?').bind(serverId).first();

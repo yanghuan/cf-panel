@@ -6,6 +6,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import worker, { __internals as I } from '../src/index.js';
+import { EXEC_CMD_MAX_BYTES } from '../src/config.js';
 import { makeEnv, makePanelStub, makeMetricsStub, requestBuilder } from './helpers.js';
 
 const call = requestBuilder(worker);
@@ -1391,6 +1392,20 @@ test('MCP：tools/list 与 tools/call', async () => {
   // 用 server_id 仍可精确执行（不歧义）
   const exId = await (await mcp(env, { token, body: { jsonrpc: '2.0', id: 10, method: 'tools/call', params: { name: 'exec_command', arguments: { server_id: 1, command: 'echo hi' } } } })).json();
   assert.equal(exId.result.isError, false);
+
+  // exec_command：命令超长 → 前置拒绝。超限帧不会报错而是让 agent 断开控制通道
+  //（调用方只看到误导性的"超时"，且命令根本没执行），故必须在发起端拦下
+  const exLong = await (await mcp(env, { token, body: { jsonrpc: '2.0', id: 12, method: 'tools/call', params: { name: 'exec_command', arguments: { server_id: 1, command: 'x'.repeat(EXEC_CMD_MAX_BYTES + 1) } } } })).json();
+  assert.equal(exLong.result.isError, true);
+  assert.match(exLong.result.content[0].text, /command too long/);
+  assert.match(exLong.result.content[0].text, /create_upload/, '错误信息要含替代方案，AI 客户端才能自纠');
+  // 恰好上限：放行（边界闭区间；DO 桩返回 200 说明走到了下发环节）
+  const exMax = await (await mcp(env, { token, body: { jsonrpc: '2.0', id: 13, method: 'tools/call', params: { name: 'exec_command', arguments: { server_id: 1, command: 'x'.repeat(EXEC_CMD_MAX_BYTES) } } } })).json();
+  assert.equal(exMax.result.isError, false, '恰好上限仍放行');
+  // 多字节按 UTF-8 计量：中文 3 字节/字符 → 原始字符数只有 1/3 上限时即应拒绝
+  //（若按字符数校验，这类命令会被漏放行，然后在 agent 侧断连）
+  const exCn = await (await mcp(env, { token, body: { jsonrpc: '2.0', id: 14, method: 'tools/call', params: { name: 'exec_command', arguments: { server_id: 1, command: '中'.repeat(Math.floor(EXEC_CMD_MAX_BYTES / 3) + 1) } } } })).json();
+  assert.equal(exCn.result.isError, true, '中文按 3 字节/字符计量，不数原始字符');
   // get_monitor 重名同样歧义
   const gmAmb = await (await mcp(env, { token, body: { jsonrpc: '2.0', id: 11, method: 'tools/call', params: { name: 'get_monitor', arguments: { server_name: 'web-1', range: '1h' } } } })).json();
   assert.equal(gmAmb.result.isError, true);

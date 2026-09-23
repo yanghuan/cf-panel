@@ -6,6 +6,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { MetricsDO, PanelDO, TerminalDO, __internals as I } from '../src/index.js';
+import { EXEC_CMD_MAX_BYTES } from '../src/config.js';
 import { makeEnv, makePanelStub, captureFetch } from './helpers.js';
 
 function mockState(store = {}) {
@@ -1647,6 +1648,24 @@ test('TerminalDO: /rpc/exec 超时未收到结果 → 返回超时错误并清�
   const body = await res.json();
   assert.match(body.error, /timed out after 1s/);
   assert.equal(inst.pendingExec.size, 0, '超时后清理 pending');
+});
+
+test('TerminalDO: /rpc/exec 命令超长 → 413，且不向 agent 下发超限帧', async () => {
+  const env = makeEnv();
+  const sent = [];
+  const inst = new TerminalDO(mockState(), env);
+  inst.agents.set(1, { send: (m) => sent.push(m), readyState: 1 });
+  const res = await inst.fetch(new Request('https://do.internal/rpc/exec', {
+    method: 'POST',
+    body: JSON.stringify({ serverId: 1, command: 'x'.repeat(EXEC_CMD_MAX_BYTES + 1), timeoutMs: 5000 }),
+  }));
+  assert.equal(res.status, 413);
+  const body = await res.json();
+  assert.match(body.error, /command too long/);
+  // 关键：不能下发。超限帧会被 agent 判 Capacity 并断开整条控制通道（连带清掉活跃终端会话），
+  // 而调用方只看得到误导性的"超时"——宁可在发送前拒绝
+  assert.equal(sent.length, 0, '超限帧不得下发');
+  assert.equal(inst.pendingExec.size, 0, '拒绝时不应留下 pending');
 });
 
 test('TerminalDO: 僵尸会话超 TTL 由 alarm 清理，未到期安排下次 alarm', async () => {

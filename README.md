@@ -405,7 +405,7 @@ Webhook 出站安全：仅允许 HTTP(S)，拒绝 URL 内嵌凭据、本地域�
 | --- | --- |
 | `list_servers` | 服务器列表 + 实时状态 + 系统信息 |
 | `get_monitor` | 监控历史（`range`：1h/12h/3d/7d/30d） |
-| `exec_command` | 执行一次性 shell 命令（`timeout` 1~25s，stdout 上限约 44KB）；**写操作**，需 exec 权限，超时 kill 进程组 |
+| `exec_command` | 执行一次性 shell 命令（`timeout` 1~25s，命令长度 ≤65408 字节（JSON 转义后；中文 3 字节/字符），stdout 上限约 44KB）；**写操作**，需 exec 权限，超时 kill 进程组。超长命令请先用 `create_upload` 上传脚本再执行 |
 | `create_upload` | 签发一次性上传**签名 URL**（HMAC 绑定 server/path/overwrite，10 分钟过期，无需 Bearer）——大文件 / 二进制不经 LLM 上下文 |
 | `add_server` / `update_server` / `delete_server` | 服务器增删改（仅管理员） |
 | `rotate_agent_key` | 轮换 agent key（仅管理员，历史保留） |

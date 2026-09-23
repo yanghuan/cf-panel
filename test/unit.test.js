@@ -8,6 +8,7 @@ import nodeFs from 'node:fs';
 import nodePath from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { __internals as I } from '../src/index.js';
+import { CTRL_MSG_LIMIT, EXEC_FRAME_OVERHEAD, EXEC_CMD_MAX_BYTES, execCommandBytes } from '../src/config.js';
 import { makeEnv } from './helpers.js';
 
 const env = { JWT_SECRET: 'unit-secret' };
@@ -960,4 +961,48 @@ test('PWA：manifest 声明与图标文件齐备（支持"添加到主屏幕"）
   // CSP 未显式声明 manifest-src → 回落 default-src 'self'，同源 manifest 与图标不受阻
   const headers = nodeFs.readFileSync(nodePath.join(root, 'public/_headers'), 'utf8');
   assert.doesNotMatch(headers, /manifest-src/, '未设 manifest-src 时回落 default-src（self 已覆盖同源）');
+});
+
+// MCP exec_command 的硬约束在 agent 控制通道（单帧 64KiB）：超限帧不报错，而是被 tungstenite
+// 判 Capacity → agent 断开整条控制通道 → 命令没执行、调用方只看到误导性的"超时"。
+// 这种"静默 + 症状误导"的边界必须锁住（计量口径错了会漏放行，等于校验形同虚设）。
+test('exec 命令长度计量与上限（含与 agent 侧 CTRL_MSG_LIMIT 的跨语言同步）', () => {
+  const root = nodePath.join(nodePath.dirname(fileURLToPath(import.meta.url)), '..');
+
+  // 1) 计量必须按 JSON 转义后的 UTF-8 字节数。直接数原始字符会低估——正是这种低估
+  //    让"看起来没超"的命令在 agent 侧触发断连（中文 3 倍；换行/引号/反斜杠翻倍）
+  assert.equal(execCommandBytes('echo hi'), 7, '纯 ASCII：字节数 = 字符数');
+  assert.equal(execCommandBytes('中文'), 6, '中文 3 字节/字符');
+  assert.equal(execCommandBytes('a\nb'), 4, '换行在帧里是 \\n 两个字节');
+  assert.equal(execCommandBytes('a"b'), 4, '双引号转义为 \\" 两个字节');
+  assert.equal(execCommandBytes('a\\b'), 4, '反斜杠转义为 \\\\ 两个字节');
+
+  // 2) 与 DO 实际构造的帧对照：帧长 = 命令载荷 + 固定开销，必须 ≤ 控制通道上限。
+  //    留白必须覆盖实测开销，否则"恰好放行"的命令发出去仍会被 agent 断连
+  //（校验与真实帧必须同一口径——这是本条断言存在的意义）
+  const cmd = '多行\n脚本 "quoted" \\ backslash';
+  const frame = JSON.stringify({ type: 'exec', exec_id: `e-${'0'.repeat(36)}`, command: cmd, timeout_s: 25 });
+  const frameBytes = new TextEncoder().encode(frame).length;
+  const overhead = frameBytes - execCommandBytes(cmd);
+  assert.equal(overhead, 94, 'command 之外的帧固定开销（实测；字段增删/变长会改变它）');
+  assert.ok(EXEC_FRAME_OVERHEAD >= overhead, `留白 ${EXEC_FRAME_OVERHEAD} 必须覆盖帧开销 ${overhead}`);
+  assert.equal(EXEC_CMD_MAX_BYTES, CTRL_MSG_LIMIT - EXEC_FRAME_OVERHEAD);
+  assert.ok(EXEC_CMD_MAX_BYTES < CTRL_MSG_LIMIT, '命令上限必须给帧头留出空间');
+
+  // 3) 跨语言同步：上限的真相在 agent（rust），JS 侧只是复刻。agent 侧改了这个常量而
+  //    这边没跟，校验就会漂移——放行必然触发断连的命令，或误拒本来能跑的命令
+  const rust = nodeFs.readFileSync(nodePath.join(root, 'agent/rust/src/main.rs'), 'utf8');
+  const m = rust.match(/const CTRL_MSG_LIMIT:\s*usize\s*=\s*([^;]+);/);
+  assert.ok(m, 'agent 侧应存在 CTRL_MSG_LIMIT（两侧同步的锚点）');
+  const parts = m[1].trim().replace(/_/g, '').split('*').map((s) => Number(s.trim()));
+  assert.ok(parts.length <= 2 && parts.every((n) => Number.isFinite(n)),
+    `无法解析 agent 常量表达式 ${m[1]}（若改成别的写法，请同步更新本断言）`);
+  assert.equal(CTRL_MSG_LIMIT, parts.reduce((a, b) => a * b, 1),
+    'JS 侧上限必须等于 agent 的 CTRL_MSG_LIMIT');
+
+  // 4) README 工具表把这个上限写成了具体数字：文档漂移会让使用者/AI 按错的值规划命令
+  //    （MCP 工具 description 用模板字符串插值，不在此列）
+  const readme = nodeFs.readFileSync(nodePath.join(root, 'README.md'), 'utf8');
+  assert.match(readme, new RegExp(`exec_command.*${EXEC_CMD_MAX_BYTES} 字节`),
+    'README 工具表的上限应与 EXEC_CMD_MAX_BYTES 一致');
 });

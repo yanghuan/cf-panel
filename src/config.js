@@ -9,6 +9,36 @@ export const SCOPE_READ = 'server:read';
 export const SCOPE_EXEC = 'server:exec';
 export const SCOPE_AGENT_UPDATE = 'agent:update';
 
+// ---- MCP exec 命令长度上限 ----
+// agent 控制通道的入站单帧上限（rust 侧同名常量 CTRL_MSG_LIMIT，同步关系由测试锁定）：
+// 超限帧被 tungstenite 判 Capacity，agent 读循环随即断开重连——命令**不会执行**，
+// 调用方只看到误导性的 "command timed out after 25s"（进而去调 timeout，而它上限就是
+// 25s，无济于事）。故在发起端（Worker + DO）前置拒绝，错误信息给出可自纠的替代方案。
+export const CTRL_MSG_LIMIT = 64 * 1024;
+// exec 帧内 command 之外的固定开销：{"type":"exec","exec_id":"e-<uuid36>","command":"","timeout_s":25}
+// = 94 字节（26 + 38 + 13 + 17，实测值由测试锁定）。留白到 128：字段增删/顺序变化会让
+// 开销浮动，贴边会误放行（放行必然触发断连，等于校验失效）。
+export const EXEC_FRAME_OVERHEAD = 128;
+// 命令（JSON 转义后 + UTF-8 编码）的字节上限，即 MCP exec_command 的实际上限
+export const EXEC_CMD_MAX_BYTES = CTRL_MSG_LIMIT - EXEC_FRAME_OVERHEAD;
+
+const UTF8_ENC = new TextEncoder();
+
+// 命令在 exec 帧里占用的字节数。必须按 **JSON 转义后** 计量：转义会让引号/反斜杠翻倍、
+// 换行变 \n（2 字节），非 ASCII 按 UTF-8 编码（中文 3 字节/字符）——直接数原始字符会低估，
+// 正是这种低估会让"看起来没超"的命令在 agent 侧触发断连。
+export function execCommandBytes(command) {
+  return UTF8_ENC.encode(JSON.stringify(String(command))).length - 2; // 减首尾引号
+}
+
+// 超限错误文案（Worker 的 tool error 与 DO 的 413 共用，保证两处措辞一致）
+export function execTooLongError(bytes) {
+  return `command too long: ${bytes} bytes (JSON-escaped) exceeds the ${EXEC_CMD_MAX_BYTES}-byte limit `
+    + `(agent control-channel frame cap ${CTRL_MSG_LIMIT} bytes). An oversized frame makes the agent drop `
+    + 'the connection, so the command never runs and the caller only sees a misleading "command timed out". '
+    + 'Upload the script via create_upload and exec the file, or split the command into shorter ones.';
+}
+
 // 监控时序：超过 1 小时的旧数据才归档/可淘汰（db 监控查询 + do-metrics 归档共用）
 export const ARCHIVE_AFTER_MIN = 60;
 

@@ -36,6 +36,47 @@ fn err_json(msg: &str) -> String {
 }
 
 // ---------------- 终端会话 ----------------
+
+// 上次终端会话的工作目录：前端断线重连会新建会话（新 PTY/新 shell，cwd 回到 HOME/agent cwd），
+// 目录信息本身不随断线保留 → 会话存活期间采样 `/proc/<shell_pid>/cwd` 记住最后目录，
+// 新会话以其为初始 cwd，避免重连后需要重新 cd。
+// 全局单槽：同一机器同一时刻通常只有一个终端会话，多会话并发时以最后采样者为准（可接受）。
+// 仅 Unix（Windows 无 /proc，ConPTY 子进程 cwd 需额外 API，暂不启用）。
+#[cfg(unix)]
+static LAST_TERM_CWD: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// 采样终端 shell 的当前目录（pid 为 0 或进程已退出时返回 false，采样任务据此结束）。
+#[cfg(unix)]
+fn remember_term_cwd(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    let Ok(dir) = std::fs::read_link(format!("/proc/{pid}/cwd")) else {
+        return false; // shell 已退出：PID 记录不再可用
+    };
+    let dir = dir.to_string_lossy();
+    if !dir.starts_with('/') {
+        return true; // 非绝对路径属异常值，但进程仍在——继续采样（不写入缓存）
+    }
+    if let Ok(mut g) = LAST_TERM_CWD.lock()
+        && g.as_deref() != Some(dir.as_ref())
+    {
+        *g = Some(dir.into_owned());
+    }
+    true
+}
+
+/// 上次终端的工作目录；目录已被删除/替换时返回 None（否则 spawn 会直接失败）。
+#[cfg(unix)]
+fn last_term_cwd() -> Option<String> {
+    let dir = LAST_TERM_CWD.lock().ok()?.clone()?;
+    if std::path::Path::new(&dir).is_dir() {
+        Some(dir)
+    } else {
+        None
+    }
+}
+
 pub struct TermSession {
     pub sid: String,
     master: Arc<Mutex<Box<dyn portable_pty::MasterPty + Send>>>,
@@ -54,7 +95,24 @@ impl TermSession {
         // openpty + spawn_command 为同步 fork/exec：内存紧张时 fork 可达几十 ms，
         // 直接在 async 上下文执行会阻塞 worker 与控制读循环 → 放 blocking 线程（信号量限并发）
         match crate::blocking::run_blocking(10, move || TermSession::spawn_sync(&sid)).await {
-            Some(r) => r,
+            Some(Ok(term)) => {
+                // 会话存活期间每 2s 采样 shell 的 cwd（单次 readlink，开销可忽略），
+                // 供断线重连后的新会话继承；shell 退出后 readlink 失败，任务自行结束
+                #[cfg(unix)]
+                {
+                    let pid = term.child_pid;
+                    tokio::spawn(async move {
+                        loop {
+                            tokio::time::sleep(Duration::from_secs(2)).await;
+                            if !remember_term_cwd(pid) {
+                                break;
+                            }
+                        }
+                    });
+                }
+                Ok(term)
+            }
+            Some(Err(e)) => Err(e),
             None => Err("terminal spawn timeout".into()),
         }
     }
@@ -73,6 +131,12 @@ impl TermSession {
         let mut cmd = CommandBuilder::new(&shell);
         for a in crate::platform::terminal_shell_args() {
             cmd.arg(a);
+        }
+        // 断线重连会新建会话：沿用上次终端的工作目录（否则新 shell 落在 HOME/agent cwd）。
+        // 目录存在性已在 last_term_cwd 内校验，避免 cwd 不存在导致 spawn 失败。
+        #[cfg(unix)]
+        if let Some(dir) = last_term_cwd() {
+            cmd.cwd(&dir);
         }
         cmd.env("TERM", "xterm-256color");
         // HOME/SHELL 兜底：systemd 服务（未指定 User=）不注入这两个变量，PTY 子 shell
@@ -120,6 +184,9 @@ impl TermSession {
             return;
         }
         self.alive.store(false, std::sync::atomic::Ordering::SeqCst); // 会话结束标记
+        // 结束前补采样：最后一次 cd 可能落在周期采样的间隔内（此时 shell 仍存活，可读到 cwd）
+        #[cfg(unix)]
+        remember_term_cwd(self.child_pid);
         crate::platform::hangup_tree(self.child_pid);
         let mut child = self.child.lock().await;
         if let Some(c) = child.take() {
@@ -1747,6 +1814,23 @@ mod tests {
         assert_eq!(v["type"], "error");
         assert_eq!(v["ok"], false);
         assert_eq!(v["message"], "boom");
+    }
+
+    // 断线重连后的目录继承依赖 /proc/<shell_pid>/cwd 可读：锁定采样路径与无效 pid 语义
+    #[cfg(unix)]
+    #[test]
+    fn remember_term_cwd_samples_live_process() {
+        assert!(!remember_term_cwd(0), "pid=0 应视为无效");
+        assert!(
+            remember_term_cwd(std::process::id()),
+            "存活进程（本进程）应采样成功"
+        );
+        let dir = last_term_cwd().expect("采样后应能取回工作目录");
+        assert!(dir.starts_with('/'), "工作目录应为绝对路径: {dir}");
+        assert!(
+            std::path::Path::new(&dir).is_dir(),
+            "取回的目录应存在: {dir}"
+        );
     }
 
     #[test]

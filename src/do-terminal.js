@@ -16,6 +16,8 @@ const REPORT_SLOW_INTERVAL_S = 120; // 无人查看：120 秒上报
 const EXEC_DEFAULT_TIMEOUT_MS = 25 * 1000; // MCP exec 默认超时（须 < DO fetch 默认 30s 超时，由内部先返回）
 const EXEC_MAX_TIMEOUT_MS = 25 * 1000;
 const EXEC_TIMEOUT_GRACE_MS = 5 * 1000; // DO 兜底定时器比 agent 实际超时晚 5s：agent 先回执（含部分 stdout），DO 定时器仅兜底防悬挂
+const EXEC_ROUNDTRIP_TTL_MS = 30 * 1000; // exec 前探活缓存：近期已有成功往返（exec_result/probe）则跳过探活，频繁 exec 零新增延迟
+const EXEC_PROBE_TIMEOUT_MS = 300; // exec 前探活等待上限（健康往返通常 <50ms）；超时即判下行不可达
 const UPLOAD_CHUNK_BYTES = 48 * 1024; // /api/file_upload 分片帧数据上限（控制通道入站 64KB，留 JSON 头/边界余量）
 const UPLOAD_TIMEOUT_MS = 120 * 1000; // 上传总超时（流式转发 + agent 写盘；agent 失联时兜底返回，防悬挂）
 const UPLOAD_MAX_DEFAULT = 100 * 1024 * 1024; // 单次上传大小上限默认 100MB（磁盘耗尽防护；agent 端 FILE_LIMIT 500MB 兜底）
@@ -31,11 +33,15 @@ export class TerminalDO {
     this.agentInterval = new Map(); // serverId -> 当前下发的上报间隔（秒），避免重复下发
     this.pendingOpen = new Map(); // streamId -> {tries, timer, type} open_terminal/open_file 确认重发
     this.pendingExec = new Map(); // execId -> {resolve, timer, serverId} MCP 一次性命令等待
-    this.pendingUpload = new Map(); // uploadId -> {resolve, timer} /api/file_upload 等待 upload_result
+    this.pendingUpload = new Map(); // uploadId -> {resolve, timer, serverId} /api/file_upload 等待 upload_result
     this.pendingUpdate = new Map(); // updateId -> {resolve,timer,serverId} Agent 更新等待最终校验/替换回执
+    this.pendingProbe = new Map(); // probeId -> {resolve, timer, serverId} exec 前往返探活等待 pong
     this.uploading = new Set(); // serverId -> 普通文件上传进行中（控制通道单 WS，防并发帧交错）
     this.updating = new Set(); // serverId -> Agent 更新进行中（与上传/更新互斥，防 Binary 帧交错）
     this.lastPingAt = new Map(); // serverId -> 上次心跳时间（控制通道保活，防健康连接被 read -t 180 误判半开）
+    this.lastRoundTripAt = new Map(); // serverId -> 上次确认双向可达时间（exec_result/pong），exec 前探活据此跳过
+    this.probeCapable = new Set(); // serverId -> agent 已回 pong（支持 exec 前探活）；未支持则 exec 直接下发（向后兼容旧 agent）
+    this.rebuilt = false; // 本实例是否已按附件重建过索引（唤醒后只重建一次，见 rebuildIndex）
   }
 
   async fetch(request) {
@@ -159,12 +165,26 @@ export class TerminalDO {
       const timeoutMs = Math.min(Math.max(Number(body.timeoutMs) || EXEC_DEFAULT_TIMEOUT_MS, 1000), EXEC_MAX_TIMEOUT_MS);
       const agentWs = this.agents.get(serverId);
       if (!agentWs) return json({ error: 'agent offline', code: 'AGENT_OFFLINE' }, 502);
+      // T1：report 只证明「上行通」，exec 依赖「下行通」，两者不等价（非对称半开时索引正确也发不出去）。
+      // 往返缓存过期时先做一次探活：失败即判下行不可达 → 快速失败（不再空等 25s），且命令未下发，
+      // 调用方重试绝对安全（避免「已执行但回执丢失 → 重试重复执行」）。频繁 exec 命中缓存则零新增延迟。
+      // 仅对已证明支持 probe 的 agent 启用（probeCapable）：旧 agent 不回 pong，保持直接下发，避免升级期 exec 全废。
+      if (this.probeCapable.has(serverId)) {
+        const rttFresh = Date.now() - (this.lastRoundTripAt.get(serverId) || 0) < EXEC_ROUNDTRIP_TTL_MS;
+        if (!rttFresh && !(await this.probeAgent(agentWs, serverId, EXEC_PROBE_TIMEOUT_MS))) {
+          try { agentWs.close(4002, 'exec probe failed'); } catch { /* ignore */ } // 4002 → agent 正常退避重连
+          return json({ error: 'agent unreachable', code: 'AGENT_OFFLINE' }, 502);
+        }
+      }
       const execId = `e-${crypto.randomUUID()}`;
       const result = await new Promise((resolve) => {
         // 兜底定时器晚于 agent 实际超时（EXEC_TIMEOUT_GRACE_MS）：正常路径 agent 先回执
         // exec_result（超时=无输出，agent 侧已 kill 进程组），此处仅防 agent 失联/回执丢失导致的悬挂。
         const timer = setTimeout(() => {
           this.pendingExec.delete(execId);
+          // 兜底超时只在 agent 未按自身超时回执时触发（健康 agent 必先回 exec_result）→ 判链路故障，
+          // 主动关闭触发重连自愈；否则降级路径（旧 agent / 唤醒后未协商 probe）每次 exec 都会空等。
+          try { agentWs.close(4002, 'exec timeout'); } catch { /* ignore */ }
           resolve({ error: `command timed out after ${Math.floor(timeoutMs / 1000)}s` });
         }, timeoutMs + EXEC_TIMEOUT_GRACE_MS);
         this.pendingExec.set(execId, { resolve, timer, serverId });
@@ -291,7 +311,11 @@ export class TerminalDO {
       }
       this.agents.set(server.id, pair[1]);
       // 附件随连接持久化：休眠唤醒后靠它重建 agents 索引（role 区分控制通道与会话流）
-      pair[1].serializeAttachment({ role: 'control', serverId: server.id });
+      pair[1].serializeAttachment({ role: 'control', serverId: server.id, ts: Date.now() });
+      // T1 能力协商：连接建立后主动探活一次，agent 回 pong 即标记支持（后续 exec 才启用
+      // 「探活快速失败」）。旧 agent 忽略未知类型不回包 → 保持直接下发，升级期 exec 不受影响。
+      // 一次连接只探测一次；失败/超时不重试（降级为直接下发，由 exec 超时兜底自愈）。
+      this.probeAgent(pair[1], server.id, 2000).then((ok) => { if (ok) this.probeCapable.add(server.id); });
       // 记录节点公网出口 IP（CF-Connecting-IP，Cloudflare 注入；本地 dev 回退 X-Forwarded-For）
       try {
         const wanIp = request.headers.get('cf-connecting-ip') || (request.headers.get('x-forwarded-for') || '').split(',')[0].trim();
@@ -435,7 +459,8 @@ export class TerminalDO {
       this.pendingUpload.delete(uploadId);
       resolveResult({ ok: false, error: 'upload timed out' });
     }, UPLOAD_TIMEOUT_MS);
-    this.pendingUpload.set(uploadId, { resolve: resolveResult, timer });
+    // serverId 用于 cleanup：agent 断连时立即失败该上传，而非空等 UPLOAD_TIMEOUT_MS(120s) 兜底
+    this.pendingUpload.set(uploadId, { resolve: resolveResult, timer, serverId: this.wsServerId(agentWs) });
     // 大小上限：优先环境变量 UPLOAD_MAX_MB（磁盘耗尽防护）。
     // 显式解析：0/非数字回退默认 100MB（不支持 0=无限）；上限钳到 agent 端 FILE_LIMIT
     //（500MB 绝对硬上限，README/routes.js 工具描述同口径——UPLOAD_MAX_DEFAULT 是默认值
@@ -609,10 +634,14 @@ export class TerminalDO {
 
   // Hibernation：DO 实例空闲冻结后，WebSocket 连接由 workerd 托管持久，但本类
   // 实例的 sessions/agents 内存 Map 会随冻结全部丢失。附件（serializeAttachment）
-  // 随连接持久化，唤醒后据此惰性重建索引，避免误判 "agent offline" / "session not found"。
-  // 活跃态（索引已非空）跳过，避免每次消息 O(N) 遍历。
+  // 随连接持久化，唤醒后据此重建索引，避免误判 "agent offline" / "session not found"。
+  // 本实例只在唤醒后重建一次（this.rebuilt）：既避免每次消息 O(N) 遍历，也不会因
+  // 「某个 Map 恰好为空」而反复重建——后者会把已 close（半开残留）的会话/控制连接从
+  // 附件里复活（如 drop_server 后 sessions 已清、socket 仍在 getWebSockets 的窗口）。
+  // 运行期索引由各 handler 维护；死连接由入站消息（A）覆盖、同 serverId 多余连接在此关闭。
   rebuildIndex() {
-    if (this.sessions.size > 0 || this.agents.size > 0) return;
+    if (this.rebuilt) return;
+    this.rebuilt = true;
     const socks = this.state.getWebSockets?.() || [];
     for (const ws of socks) {
       const att = ws.deserializeAttachment();
@@ -620,12 +649,27 @@ export class TerminalDO {
       if (typeof att === 'string') {
         // 兼容旧格式：控制通道附件为 String(server.id)
         const serverId = Number(att);
-        if (Number.isInteger(serverId) && serverId > 0) this.agents.set(serverId, ws);
+        if (Number.isInteger(serverId) && serverId > 0) {
+          const prev = this.agents.get(serverId);
+          if (prev && prev !== ws) { try { prev.close(4001, 'superseded on rebuild'); } catch { /* ignore */ } }
+          this.agents.set(serverId, ws);
+        }
         continue;
       }
       if (typeof att !== 'object') continue;
       if (att.role === 'control') {
-        if (Number(att.serverId) > 0) this.agents.set(Number(att.serverId), ws);
+        const sid = Number(att.serverId);
+        if (sid > 0) {
+          // 同 serverId 多条控制连接（冻结唤醒后旧半开连接与新连接并存）：保留最新（ts 最大）
+          // 者、关闭其余，收敛到「一服务器一活连接」，避免 exec/更新发往死连接。
+          const prev = this.agents.get(sid);
+          if (prev && prev !== ws && this.wsAttTs(prev) > (Number(att.ts) || 0)) {
+            try { ws.close(4001, 'superseded on rebuild'); } catch { /* ignore */ }
+          } else {
+            if (prev && prev !== ws) { try { prev.close(4001, 'superseded on rebuild'); } catch { /* ignore */ } }
+            this.agents.set(sid, ws);
+          }
+        }
       } else if (att.role === 'user' || att.role === 'agent') {
         let sess = this.sessions.get(att.sid);
         if (!sess) {
@@ -667,11 +711,43 @@ export class TerminalDO {
 
   // 从连接附件解析 serverId（兼容旧字符串格式与新对象格式）
   wsServerId(ws) {
-    const att = ws.deserializeAttachment();
+    const att = ws.deserializeAttachment?.();
     if (att === null || att === undefined) return 0;
     if (typeof att === 'string') return Number(att) || 0;
     if (typeof att === 'object') return Number(att.serverId) || 0;
     return 0;
+  }
+
+  // 控制连接附件的建立时间戳：唤醒重建时同 serverId 多条连接取最新者（旧格式无 ts 记 0）
+  wsAttTs(ws) {
+    try {
+      const att = ws.deserializeAttachment();
+      if (att && typeof att === 'object') return Number(att.ts) || 0;
+    } catch { /* ignore */ }
+    return 0;
+  }
+
+  // T1：向候选控制连接发一次带 id 的探活，等 agent 回 pong（走与 exec_result 完全相同的回程）。
+  // 收到 → 双向可用；超时/发送异常 → 下行不可达。resolve 幂等，只会生效一次。
+  probeAgent(ws, serverId, timeoutMs) {
+    return new Promise((resolve) => {
+      const id = `p-${crypto.randomUUID()}`;
+      const timer = setTimeout(() => {
+        this.pendingProbe.delete(id);
+        resolve(false);
+      }, timeoutMs);
+      this.pendingProbe.set(id, {
+        serverId,
+        resolve: (ok) => { clearTimeout(timer); this.pendingProbe.delete(id); resolve(ok); },
+      });
+      try {
+        ws.send(JSON.stringify({ type: 'probe', id }));
+      } catch {
+        clearTimeout(timer);
+        this.pendingProbe.delete(id);
+        resolve(false);
+      }
+    });
   }
 
   // Hibernation：消息转发（双向对拷 + resize 走控制通道）
@@ -739,6 +815,19 @@ export class TerminalDO {
       if (typeof message === 'string') {
         try {
           const j = JSON.parse(message);
+          // A：入站即存活。控制通道来消息说明该连接仍活，用它刷新 agents 索引，天然淘汰
+          // 「唤醒后可能被 rebuildIndex 选中的半开死连接」（0 额外消息/请求）。
+          // 仅认控制附件，避免会话流失配时把数据流 WS 误登记为控制通道。
+          if (att && (typeof att === 'string' || att.role === 'control')) {
+            const cid = this.wsServerId(ws);
+            if (cid) this.agents.set(cid, ws);
+          }
+          // T1 探活回执：证明该控制连接双向可用 → resolve 探活并刷新往返时间
+          if (j && j.type === 'pong') {
+            const p = this.pendingProbe.get(j.id);
+            if (p) p.resolve(true);
+            return;
+          }
           if (j && (j.type === 'terminal_ready' || j.type === 'file_ready')) {
             // agent 已收到 open_terminal/open_file 并开始启动 → 停止确认重发（file_ready 补齐）
             const r = this.pendingOpen.get(j.stream_id);
@@ -760,6 +849,9 @@ export class TerminalDO {
                 error: j.error || null,
               });
             }
+            // 成功回执即最强双向存活证明 → 刷新往返时间，使后续 exec 走快路径（零新增延迟）
+            const esid = this.wsServerId(ws);
+            if (esid) this.lastRoundTripAt.set(esid, Date.now());
             return;
           }
           if (j && j.type === 'upload_result') {
@@ -791,8 +883,18 @@ export class TerminalDO {
             return;
           }
           if (j && j.type === 'report') {
+            const serverId = this.wsServerId(ws);
+            // E：保活心跳先于上报落库发送（30s 限频）。agent 端 read -t 180 只依赖下行流量，
+            // 不能因 handleReport 抛错（D1 配额/写入失败）而连带停发心跳 → 误判半开 → 重连循环。
+            if (serverId) {
+              const nowP = Date.now();
+              const lastP = this.lastPingAt.get(serverId) || 0;
+              if (nowP - lastP > 30000) {
+                this.lastPingAt.set(serverId, nowP);
+                try { ws.send(JSON.stringify({ type: 'ping' })); } catch { /* ignore */ }
+              }
+            }
             try {
-              const serverId = this.wsServerId(ws);
               if (serverId) {
                 await handleReport(this.env, {
                   serverId,
@@ -807,14 +909,6 @@ export class TerminalDO {
                   custom: j.custom,
                 });
                 await this.syncAgentInterval(ws, serverId);
-                // 控制通道保活心跳（30s 限频）：agent 端 read -t 180 需要周期性下行流量，
-                // 否则健康但安静（无指令下发）时会被误判半开而每 ~180s 重连
-                const nowP = Date.now();
-                const lastP = this.lastPingAt.get(serverId) || 0;
-                if (nowP - lastP > 30000) {
-                  this.lastPingAt.set(serverId, nowP);
-                  try { ws.send(JSON.stringify({ type: 'ping' })); } catch { /* ignore */ }
-                }
               }
             } catch (e) { console.error('handleReport failed:', e); }
           }
@@ -964,6 +1058,13 @@ export class TerminalDO {
     for (const [serverId, w] of this.agents) {
       if (w === ws) {
         this.agents.delete(serverId);
+        // 控制连接已断 → 作废该 serverId 的往返/探活能力记录（新连接会重新协商 probe），
+        // 并立即失败在途探活（否则 /rpc/exec 的探活要等 300ms 超时才返回）
+        this.lastRoundTripAt.delete(serverId);
+        this.probeCapable.delete(serverId);
+        for (const [, r] of [...this.pendingProbe]) {
+          if (r.serverId === serverId) r.resolve(false);
+        }
         // 控制通道断开 → 仅清理该 agent（serverId）的待确认，不影响其他服务器/会话
         for (const [sid, r] of [...this.pendingOpen]) {
           if (r.serverId === serverId) {
@@ -977,6 +1078,14 @@ export class TerminalDO {
             if (r.timer) clearTimeout(r.timer);
             this.pendingExec.delete(execId);
             r.resolve({ error: 'agent disconnected' });
+          }
+        }
+        // 未完成的上传一并失败返回（此前缺 serverId 只能等 120s 兜底）
+        for (const [uploadId, r] of [...this.pendingUpload]) {
+          if (r.serverId === serverId) {
+            if (r.timer) clearTimeout(r.timer);
+            this.pendingUpload.delete(uploadId);
+            r.resolve({ ok: false, error: 'agent disconnected during upload' });
           }
         }
         // 更新成功会先回 agent_update_result 再主动退出；若结果未到就断线则明确失败，

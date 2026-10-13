@@ -1976,6 +1976,127 @@ test('TerminalDO: agent 流挂接前浏览器输入缓冲，挂接后按序补�
   assert.equal(sess.agentBuf.length, 0, '补发后清空');
 });
 
+// ---------------- A~E + T1：控制连接索引自愈 / 断连清理 / exec 探活 ----------------
+
+test('TerminalDO: 上报入站即刷新 agents 索引（活连接覆盖死连接）', async () => {
+  const env = makeEnv();
+  await insertServer(env, 'k1', 'srv1');
+  const deadWs = { send() {}, readyState: 1 };
+  const liveWs = { deserializeAttachment: () => ({ role: 'control', serverId: 1 }), send() {}, readyState: 1 };
+  const inst = new TerminalDO(mockState(), env);
+  inst.agents.set(1, deadWs); // 索引指向死连接（唤醒重建后可能出现的错误条目）
+  await inst.webSocketMessage(liveWs, JSON.stringify({ type: 'report', cpu: 1 }));
+  assert.equal(inst.agents.get(1), liveWs, '上报入站把索引刷成能收到消息的活连接');
+});
+
+test('TerminalDO: 唤醒重建索引时同 serverId 保留最新控制连接、关闭旧连接', () => {
+  const env = makeEnv();
+  const mk = (ts) => ({
+    closed: false, code: 0,
+    deserializeAttachment: () => ({ role: 'control', serverId: 1, ts }),
+    close(c) { this.closed = true; this.code = c; }, send() {},
+  });
+  const oldWs = mk(100);
+  const newWs = mk(200);
+  const inst = new TerminalDO({ getWebSockets: () => [newWs, oldWs] }, env);
+  inst.rebuildIndex();
+  assert.equal(inst.agents.get(1), newWs, '保留 ts 最新的控制连接');
+  assert.equal(oldWs.closed, true, '旧连接被关闭');
+  assert.equal(oldWs.code, 4001, '旧连接以 4001 superseded 关闭（agent 长退避，不互踢）');
+  assert.equal(newWs.closed, false, '最新连接保留');
+});
+
+test('TerminalDO: rebuildIndex 唤醒后只重建一次（不复活已摘除的连接）', () => {
+  const env = makeEnv();
+  const ws = {
+    deserializeAttachment: () => ({ role: 'control', serverId: 1, ts: 1 }),
+    close() {}, send() {},
+  };
+  const inst = new TerminalDO({ getWebSockets: () => [ws] }, env);
+  inst.rebuildIndex();
+  assert.equal(inst.agents.get(1), ws, '首次重建生效');
+  inst.agents.delete(1); // 模拟 cleanup 摘除（连接已断）
+  inst.rebuildIndex();
+  assert.equal(inst.agents.has(1), false, '已摘除的连接不会被再次重建复活');
+});
+
+test('TerminalDO: 控制通道断开时未完成上传立即失败（不再等 120s 兜底）', () => {
+  const env = makeEnv();
+  const agentWs = { deserializeAttachment: () => ({ role: 'control', serverId: 1 }), send() {}, readyState: 1 };
+  const inst = new TerminalDO(mockState(), env);
+  inst.agents.set(1, agentWs);
+  let resolved = null;
+  const timer = setTimeout(() => {}, 100000);
+  inst.pendingUpload.set('u-1', { resolve: (r) => { resolved = r; }, timer, serverId: 1 });
+  inst.cleanup(agentWs);
+  assert.deepEqual(resolved, { ok: false, error: 'agent disconnected during upload' });
+  assert.equal(inst.pendingUpload.size, 0, 'pending 已清理');
+});
+
+test('TerminalDO: exec 探活——已协商 probe 时先探活，pong 后正常下发', async () => {
+  const env = makeEnv();
+  const sent = [];
+  const agentWs = { send: (m) => sent.push(m), readyState: 1 };
+  const inst = new TerminalDO(mockState(), env);
+  inst.agents.set(1, agentWs);
+  inst.probeCapable.add(1); // agent 已证明支持 probe
+  const pending = inst.fetch(new Request('https://do.internal/rpc/exec', {
+    method: 'POST',
+    body: JSON.stringify({ serverId: 1, command: 'echo hi', timeoutMs: 5000 }),
+  }));
+  await new Promise((r) => setTimeout(r, 0));
+  const probe = JSON.parse(sent[0]);
+  assert.equal(probe.type, 'probe', '先发探活而非 exec');
+  await inst.webSocketMessage(agentWs, JSON.stringify({ type: 'pong', id: probe.id }));
+  await new Promise((r) => setTimeout(r, 0));
+  const cmd = JSON.parse(sent[1]);
+  assert.equal(cmd.type, 'exec', 'pong 后下发 exec');
+  await inst.webSocketMessage(agentWs, JSON.stringify({
+    type: 'exec_result', exec_id: cmd.exec_id, stdout: 'hi\n', stderr: '', exit_code: 0, timed_out: false,
+  }));
+  assert.equal((await pending).status, 200);
+});
+
+test('TerminalDO: exec 探活失败（下行不可达）→ 立即 502 并关闭连接', async () => {
+  const env = makeEnv();
+  const sent = [];
+  const agentWs = {
+    send: (m) => sent.push(m), readyState: 1, closed: false, code: 0,
+    close(c) { this.closed = true; this.code = c; },
+  };
+  const inst = new TerminalDO(mockState(), env);
+  inst.agents.set(1, agentWs);
+  inst.probeCapable.add(1);
+  const res = await inst.fetch(new Request('https://do.internal/rpc/exec', {
+    method: 'POST',
+    body: JSON.stringify({ serverId: 1, command: 'echo hi', timeoutMs: 5000 }),
+  }));
+  assert.equal(res.status, 502);
+  assert.equal((await res.json()).error, 'agent unreachable');
+  assert.equal(sent.length, 1, '只发探活，未把命令发进虚空');
+  assert.equal(JSON.parse(sent[0]).type, 'probe');
+  assert.equal(agentWs.closed, true, '下行不可达 → 关闭连接触发重连');
+  assert.equal(agentWs.code, 4002);
+});
+
+test('TerminalDO: 未协商 probe 的 agent（旧版）exec 直接下发，不做探活', async () => {
+  const env = makeEnv();
+  const sent = [];
+  const agentWs = { send: (m) => sent.push(m), readyState: 1 };
+  const inst = new TerminalDO(mockState(), env);
+  inst.agents.set(1, agentWs); // 未 add probeCapable → 旧 agent
+  const pending = inst.fetch(new Request('https://do.internal/rpc/exec', {
+    method: 'POST',
+    body: JSON.stringify({ serverId: 1, command: 'echo hi', timeoutMs: 5000 }),
+  }));
+  await new Promise((r) => setTimeout(r, 0));
+  assert.equal(JSON.parse(sent[0]).type, 'exec', '未协商 → 直接下发，保持向后兼容');
+  await inst.webSocketMessage(agentWs, JSON.stringify({
+    type: 'exec_result', exec_id: JSON.parse(sent[0]).exec_id, stdout: '', stderr: '', exit_code: 0, timed_out: false,
+  }));
+  assert.equal((await pending).status, 200);
+});
+
 test('MetricsDO: 归档超过 100 行分批 batch 落 D1', async () => {
   const env = makeEnv();
   const st = mockState();

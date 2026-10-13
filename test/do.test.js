@@ -2160,6 +2160,53 @@ test('TerminalDO: 旧 agent 上报无 probe_proto → 不登记能力（exec 永
   assert.equal(inst.probeCapable.has(1), false, '旧 agent 不登记探活能力 → 直接下发，永不误关');
 });
 
+test('TerminalDO: 探活成功（pong）刷新往返时间 → 紧邻 exec 不再重复探活', async () => {
+  const env = makeEnv();
+  const sent = [];
+  const agentWs = { send: (m) => sent.push(m), readyState: 1 };
+  const inst = new TerminalDO(mockState(), env);
+  inst.agents.set(1, agentWs);
+  inst.probeCapable.add(1);
+  // 单独触发一次探活并回 pong（不经 exec）
+  const probe = inst.probeAgent(agentWs, 1, 1000);
+  await new Promise((r) => setTimeout(r, 0));
+  await inst.webSocketMessage(agentWs, JSON.stringify({ type: 'pong', id: JSON.parse(sent[0]).id }));
+  assert.equal(await probe, true);
+  assert.ok(inst.lastRoundTripAt.has(1), 'pong 刷新往返时间');
+
+  // 紧邻的 exec：往返缓存新鲜 → 直接下发，不重复探活
+  const pending = inst.fetch(new Request('https://do.internal/rpc/exec', {
+    method: 'POST', body: JSON.stringify({ serverId: 1, command: 'echo hi', timeoutMs: 5000 }),
+  }));
+  await new Promise((r) => setTimeout(r, 0));
+  assert.equal(JSON.parse(sent[1]).type, 'exec', 'pong 已刷新往返 → exec 直接下发（不再探活）');
+  await inst.webSocketMessage(agentWs, JSON.stringify({
+    type: 'exec_result', exec_id: JSON.parse(sent[1]).exec_id, stdout: '', stderr: '', exit_code: 0, timed_out: false,
+  }));
+  assert.equal((await pending).status, 200);
+});
+
+test('TerminalDO: agent 降级不再声明 probe_proto → 清除能力与附件标记', async () => {
+  const env = makeEnv();
+  await insertServer(env, 'k1', 'srv1');
+  let att = { role: 'control', serverId: 1, ts: 1 };
+  const ws = {
+    deserializeAttachment: () => att,
+    serializeAttachment: (a) => { att = a; },
+    send() {}, readyState: 1,
+  };
+  const inst = new TerminalDO(mockState(), env);
+  inst.agents.set(1, ws);
+  await inst.webSocketMessage(ws, JSON.stringify({ type: 'report', cpu: 1, info: { probe_proto: 1 } }));
+  assert.equal(inst.probeCapable.has(1), true, '声明后登记');
+  assert.equal(att.probe, true, '附件标记已写');
+
+  // agent 回滚到旧版：info 不再含 probe_proto
+  await inst.webSocketMessage(ws, JSON.stringify({ type: 'report', cpu: 1, info: { os: 'Linux' } }));
+  assert.equal(inst.probeCapable.has(1), false, '不再声明 → 清除能力（避免 evict 后从附件误恢复）');
+  assert.equal(att.probe, undefined, '附件标记同步清除');
+});
+
 test('MetricsDO: 归档超过 100 行分批 batch 落 D1', async () => {
   const env = makeEnv();
   const st = mockState();

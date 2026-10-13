@@ -761,6 +761,21 @@ export class TerminalDO {
     } catch { /* ignore */ }
   }
 
+  // 清除探活能力（agent 降级/回滚后不再声明 probe_proto）：同时去掉附件标记，
+  // 否则 evict 后 rebuildIndex 会从附件恢复能力 → 对旧 agent 探活 → 1s 超时 → 误关。
+  clearProbeCapable(ws, serverId) {
+    this.probeCapable.delete(serverId);
+    this.lastRoundTripAt.delete(serverId);
+    try {
+      const a = ws.deserializeAttachment?.();
+      if (a && typeof a === 'object' && a.role === 'control' && a.probe) {
+        const next = { ...a };
+        delete next.probe;
+        ws.serializeAttachment(next);
+      }
+    } catch { /* ignore */ }
+  }
+
   // Hibernation：消息转发（双向对拷 + resize 走控制通道）
   async webSocketMessage(ws, message) {
     this.rebuildIndex(); // 休眠唤醒后索引可能已丢，先按附件重建
@@ -838,7 +853,11 @@ export class TerminalDO {
             const p = this.pendingProbe.get(j.id);
             if (p) {
               p.resolve(true);
-              if (p.serverId) this.markProbeCapable(ws, p.serverId);
+              if (p.serverId) {
+                // 探活成功即一次有效往返（与 exec_result 同等效力），刷新缓存使紧邻的 exec 走快路径
+                this.lastRoundTripAt.set(p.serverId, Date.now());
+                this.markProbeCapable(ws, p.serverId);
+              }
             }
             return;
           }
@@ -901,8 +920,12 @@ export class TerminalDO {
             // ② 能力门控：agent 自声明支持探活（info.probe_proto，随上报免费到达）才启用 exec 前探活。
             // 旧 agent 不报该字段 → 永不探活、永不误关；声明后探活失败必为真断链 → 可安全 close(4002)。
             // 已登记则跳过（避免每帧都序列化附件）；evict 后由附件恢复，故仅在丢失时重写。
-            if (serverId && j.info && Number(j.info.probe_proto) >= 1 && !this.probeCapable.has(serverId)) {
-              this.markProbeCapable(ws, serverId);
+            // 反向：info 存在但不含 probe_proto（agent 降级/回滚）→ 主动清除，否则残留能力会在
+            // evict 后从附件恢复，对不支持探活的旧 agent 发 probe → 1s 超时 → 误关。
+            if (serverId && j.info) {
+              const declared = Number(j.info.probe_proto) >= 1;
+              if (declared && !this.probeCapable.has(serverId)) this.markProbeCapable(ws, serverId);
+              else if (!declared && this.probeCapable.has(serverId)) this.clearProbeCapable(ws, serverId);
             }
             // E：保活心跳先于上报落库发送（30s 限频）。agent 端 read -t 180 只依赖下行流量，
             // 不能因 handleReport 抛错（D1 配额/写入失败）而连带停发心跳 → 误判半开 → 重连循环。
@@ -1079,7 +1102,7 @@ export class TerminalDO {
       if (w === ws) {
         this.agents.delete(serverId);
         // 控制连接已断 → 作废该 serverId 的往返/探活能力记录（新连接会重新协商 probe），
-        // 并立即失败在途探活（否则 /rpc/exec 的探活要等 300ms 超时才返回）
+        // 并立即失败在途探活（否则 /rpc/exec 的探活要等 EXEC_PROBE_TIMEOUT_MS 超时才返回）
         this.lastRoundTripAt.delete(serverId);
         this.probeCapable.delete(serverId);
         for (const [, r] of [...this.pendingProbe]) {

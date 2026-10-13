@@ -2097,6 +2097,42 @@ test('TerminalDO: 未协商 probe 的 agent（旧版）exec 直接下发，不�
   assert.equal((await pending).status, 200);
 });
 
+test('TerminalDO: 上报处理抛错（D1 故障）仍发送保活心跳（E）', async () => {
+  const env = makeEnv();
+  env.DB.prepare = () => { throw new Error('D1 quota exceeded'); }; // 模拟 handleReport 抛错
+  const sent = [];
+  const ws = { deserializeAttachment: () => ({ role: 'control', serverId: 1 }), send: (m) => sent.push(m), readyState: 1 };
+  const inst = new TerminalDO(mockState(), env);
+  inst.agents.set(1, ws);
+  await inst.webSocketMessage(ws, JSON.stringify({ type: 'report', cpu: 1 }));
+  const pingCount = sent.filter((m) => { try { return JSON.parse(m).type === 'ping'; } catch { return false; } }).length;
+  assert.equal(pingCount, 1, 'handleReport 抛错不应连带停发心跳（否则 agent 180s 误判半开重连）');
+});
+
+test('TerminalDO: 探活能力写入连接附件，唤醒重建后恢复（evict 后 T1 不失效）', async () => {
+  const env = makeEnv();
+  const sent = [];
+  const att = { role: 'control', serverId: 1, ts: 1 };
+  const ws = {
+    deserializeAttachment: () => att,
+    serializeAttachment: (a) => { Object.assign(att, a); },
+    send: (m) => sent.push(m), readyState: 1,
+  };
+  const inst = new TerminalDO(mockState(), env);
+  inst.agents.set(1, ws);
+  inst.probeCapable.add(1);
+  const pending = inst.probeAgent(ws, 1, 1000);
+  await new Promise((r) => setTimeout(r, 0));
+  await inst.webSocketMessage(ws, JSON.stringify({ type: 'pong', id: JSON.parse(sent[0]).id }));
+  await pending;
+  assert.equal(att.probe, true, 'pong 后能力写入连接附件');
+
+  // 模拟 evict 唤醒：新实例据附件恢复 probeCapable
+  const inst2 = new TerminalDO({ getWebSockets: () => [ws] }, env);
+  inst2.rebuildIndex();
+  assert.equal(inst2.probeCapable.has(1), true, '唤醒重建从附件恢复探活能力');
+});
+
 test('MetricsDO: 归档超过 100 行分批 batch 落 D1', async () => {
   const env = makeEnv();
   const st = mockState();

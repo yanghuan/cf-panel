@@ -17,7 +17,7 @@ const EXEC_DEFAULT_TIMEOUT_MS = 25 * 1000; // MCP exec 默认超时（须 < DO f
 const EXEC_MAX_TIMEOUT_MS = 25 * 1000;
 const EXEC_TIMEOUT_GRACE_MS = 5 * 1000; // DO 兜底定时器比 agent 实际超时晚 5s：agent 先回执（含部分 stdout），DO 定时器仅兜底防悬挂
 const EXEC_ROUNDTRIP_TTL_MS = 30 * 1000; // exec 前探活缓存：近期已有成功往返（exec_result/probe）则跳过探活，频繁 exec 零新增延迟
-const EXEC_PROBE_TIMEOUT_MS = 300; // exec 前探活等待上限（健康往返通常 <50ms）；超时即判下行不可达
+const EXEC_PROBE_TIMEOUT_MS = 1000; // exec 前探活等待上限；跨区 agent RTT 可达数百 ms，取 1s 防误判下行不可达而误断连
 const UPLOAD_CHUNK_BYTES = 48 * 1024; // /api/file_upload 分片帧数据上限（控制通道入站 64KB，留 JSON 头/边界余量）
 const UPLOAD_TIMEOUT_MS = 120 * 1000; // 上传总超时（流式转发 + agent 写盘；agent 失联时兜底返回，防悬挂）
 const UPLOAD_MAX_DEFAULT = 100 * 1024 * 1024; // 单次上传大小上限默认 100MB（磁盘耗尽防护；agent 端 FILE_LIMIT 500MB 兜底）
@@ -660,6 +660,7 @@ export class TerminalDO {
       if (att.role === 'control') {
         const sid = Number(att.serverId);
         if (sid > 0) {
+          if (att.probe) this.probeCapable.add(sid); // 附件标记支持探活 → 唤醒后恢复能力（见 pong 分支）
           // 同 serverId 多条控制连接（冻结唤醒后旧半开连接与新连接并存）：保留最新（ts 最大）
           // 者、关闭其余，收敛到「一服务器一活连接」，避免 exec/更新发往死连接。
           const prev = this.agents.get(sid);
@@ -721,7 +722,7 @@ export class TerminalDO {
   // 控制连接附件的建立时间戳：唤醒重建时同 serverId 多条连接取最新者（旧格式无 ts 记 0）
   wsAttTs(ws) {
     try {
-      const att = ws.deserializeAttachment();
+      const att = ws.deserializeAttachment?.();
       if (att && typeof att === 'object') return Number(att.ts) || 0;
     } catch { /* ignore */ }
     return 0;
@@ -825,7 +826,15 @@ export class TerminalDO {
           // T1 探活回执：证明该控制连接双向可用 → resolve 探活并刷新往返时间
           if (j && j.type === 'pong') {
             const p = this.pendingProbe.get(j.id);
-            if (p) p.resolve(true);
+            if (p) {
+              p.resolve(true);
+              // 能力写进连接附件：唤醒重建时据此恢复 probeCapable（serializeAttachment 为本地
+              // 序列化，零网络/存储开销），避免 evict 后长连接上 T1 永久失效直到下次重连。
+              try {
+                const a = ws.deserializeAttachment?.();
+                if (a && typeof a === 'object' && a.role === 'control') ws.serializeAttachment({ ...a, probe: true });
+              } catch { /* ignore */ }
+            }
             return;
           }
           if (j && (j.type === 'terminal_ready' || j.type === 'file_ready')) {

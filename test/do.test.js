@@ -2207,6 +2207,47 @@ test('TerminalDO: agent 降级不再声明 probe_proto → 清除能力与附件
   assert.equal(att.probe, undefined, '附件标记同步清除');
 });
 
+test('TerminalDO: 探活期间连接被重连替换 → 拒绝下发（不让命令进虚空）', async () => {
+  const env = makeEnv();
+  const sent = [];
+  const oldWs = { send: (m) => sent.push(m), readyState: 1 };
+  const newWs = { send: () => {}, readyState: 1 };
+  const inst = new TerminalDO(mockState(), env);
+  inst.agents.set(1, oldWs);
+  inst.probeCapable.add(1);
+  const pending = inst.fetch(new Request('https://do.internal/rpc/exec', {
+    method: 'POST', body: JSON.stringify({ serverId: 1, command: 'echo hi', timeoutMs: 5000 }),
+  }));
+  await new Promise((r) => setTimeout(r, 0));
+  assert.equal(JSON.parse(sent[0]).type, 'probe');
+  inst.agents.set(1, newWs); // 探活期间发生重连：索引被替换
+  await inst.webSocketMessage(oldWs, JSON.stringify({ type: 'pong', id: JSON.parse(sent[0]).id }));
+  const res = await pending;
+  assert.equal(res.status, 502);
+  assert.equal((await res.json()).error, 'agent reconnected, please retry');
+  assert.equal(sent.length, 1, '未把命令发往已失效的旧连接');
+});
+
+test('TerminalDO: 探活期间开始 Agent 更新 → exec 让路（409）', async () => {
+  const env = makeEnv();
+  const sent = [];
+  const agentWs = { send: (m) => sent.push(m), readyState: 1 };
+  const inst = new TerminalDO(mockState(), env);
+  inst.agents.set(1, agentWs);
+  inst.probeCapable.add(1);
+  const pending = inst.fetch(new Request('https://do.internal/rpc/exec', {
+    method: 'POST', body: JSON.stringify({ serverId: 1, command: 'echo hi', timeoutMs: 5000 }),
+  }));
+  await new Promise((r) => setTimeout(r, 0));
+  assert.equal(JSON.parse(sent[0]).type, 'probe');
+  inst.updating.add(1); // 探活期间开始更新（探活时 pendingExec 尚无记录，更新检查会放行）
+  await inst.webSocketMessage(agentWs, JSON.stringify({ type: 'pong', id: JSON.parse(sent[0]).id }));
+  const res = await pending;
+  assert.equal(res.status, 409);
+  assert.equal((await res.json()).error, 'agent update in progress');
+  assert.equal(sent.length, 1, '未与二进制更新帧交错');
+});
+
 test('MetricsDO: 归档超过 100 行分批 batch 落 D1', async () => {
   const env = makeEnv();
   const st = mockState();

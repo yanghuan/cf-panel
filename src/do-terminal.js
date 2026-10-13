@@ -171,9 +171,19 @@ export class TerminalDO {
       // 仅对已证明支持 probe 的 agent 启用（probeCapable）：旧 agent 不回 pong，保持直接下发，避免升级期 exec 全废。
       if (this.probeCapable.has(serverId)) {
         const rttFresh = Date.now() - (this.lastRoundTripAt.get(serverId) || 0) < EXEC_ROUNDTRIP_TTL_MS;
-        if (!rttFresh && !(await this.probeAgent(agentWs, serverId, EXEC_PROBE_TIMEOUT_MS))) {
-          try { agentWs.close(4002, 'exec probe failed'); } catch { /* ignore */ } // 4002 → agent 正常退避重连
-          return json({ error: 'agent unreachable', code: 'AGENT_OFFLINE' }, 502);
+        if (!rttFresh) {
+          const ok = await this.probeAgent(agentWs, serverId, EXEC_PROBE_TIMEOUT_MS);
+          // 探活期间（≤1s）状态可能已变，必须重校验，否则会把命令发往失效连接或与更新帧交错：
+          // ① 连接被重连替换 → 让调用方重试（此时旧 agentWs 已 close，send 会失败/进虚空）
+          if (this.agents.get(serverId) !== agentWs) {
+            return json({ error: 'agent reconnected, please retry', code: 'AGENT_OFFLINE' }, 502);
+          }
+          // ② 期间开始了 Agent 更新 → 让路（否则命令帧与二进制更新帧交错，且兜底超时 close 会误杀更新链路）
+          if (this.updating.has(serverId)) return json({ error: 'agent update in progress' }, 409);
+          if (!ok) {
+            try { agentWs.close(4002, 'exec probe failed'); } catch { /* ignore */ } // 4002 → agent 正常退避重连
+            return json({ error: 'agent unreachable', code: 'AGENT_OFFLINE' }, 502);
+          }
         }
       }
       const execId = `e-${crypto.randomUUID()}`;

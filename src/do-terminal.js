@@ -312,10 +312,9 @@ export class TerminalDO {
       this.agents.set(server.id, pair[1]);
       // 附件随连接持久化：休眠唤醒后靠它重建 agents 索引（role 区分控制通道与会话流）
       pair[1].serializeAttachment({ role: 'control', serverId: server.id, ts: Date.now() });
-      // T1 能力协商：连接建立后主动探活一次，agent 回 pong 即标记支持（后续 exec 才启用
-      // 「探活快速失败」）。旧 agent 忽略未知类型不回包 → 保持直接下发，升级期 exec 不受影响。
-      // 一次连接只探测一次；失败/超时不重试（降级为直接下发，由 exec 超时兜底自愈）。
-      this.probeAgent(pair[1], server.id, 2000).then((ok) => { if (ok) this.probeCapable.add(server.id); });
+      // T1 能力来源：不在此处探活——建连时能力未知，探活失败无法安全处理（分不清旧 agent 与真断链）。
+      // 改为由 agent 在上报里自声明（info.probe_proto，见 report 分支）；声明后 exec 前探活失败
+      // 即可安全 close(4002)，旧 agent 不声明 → 永不探活、永不误关。
       // 记录节点公网出口 IP（CF-Connecting-IP，Cloudflare 注入；本地 dev 回退 X-Forwarded-For）
       try {
         const wanIp = request.headers.get('cf-connecting-ip') || (request.headers.get('x-forwarded-for') || '').split(',')[0].trim();
@@ -751,6 +750,17 @@ export class TerminalDO {
     });
   }
 
+  // 标记该 serverId 支持探活，并把能力写进连接附件：唤醒重建时据此恢复 probeCapable
+  // （serializeAttachment 为本地序列化，零网络/存储开销）。能力来源：agent 自声明（report 的
+  // info.probe_proto）或探活成功（pong）。
+  markProbeCapable(ws, serverId) {
+    this.probeCapable.add(serverId);
+    try {
+      const a = ws.deserializeAttachment?.();
+      if (a && typeof a === 'object' && a.role === 'control') ws.serializeAttachment({ ...a, probe: true });
+    } catch { /* ignore */ }
+  }
+
   // Hibernation：消息转发（双向对拷 + resize 走控制通道）
   async webSocketMessage(ws, message) {
     this.rebuildIndex(); // 休眠唤醒后索引可能已丢，先按附件重建
@@ -823,17 +833,12 @@ export class TerminalDO {
             const cid = this.wsServerId(ws);
             if (cid) this.agents.set(cid, ws);
           }
-          // T1 探活回执：证明该控制连接双向可用 → resolve 探活并刷新往返时间
+          // T1 探活回执：证明该控制连接双向可用 → resolve 探活、刷新往返时间并落能力
           if (j && j.type === 'pong') {
             const p = this.pendingProbe.get(j.id);
             if (p) {
               p.resolve(true);
-              // 能力写进连接附件：唤醒重建时据此恢复 probeCapable（serializeAttachment 为本地
-              // 序列化，零网络/存储开销），避免 evict 后长连接上 T1 永久失效直到下次重连。
-              try {
-                const a = ws.deserializeAttachment?.();
-                if (a && typeof a === 'object' && a.role === 'control') ws.serializeAttachment({ ...a, probe: true });
-              } catch { /* ignore */ }
+              if (p.serverId) this.markProbeCapable(ws, p.serverId);
             }
             return;
           }
@@ -893,6 +898,12 @@ export class TerminalDO {
           }
           if (j && j.type === 'report') {
             const serverId = this.wsServerId(ws);
+            // ② 能力门控：agent 自声明支持探活（info.probe_proto，随上报免费到达）才启用 exec 前探活。
+            // 旧 agent 不报该字段 → 永不探活、永不误关；声明后探活失败必为真断链 → 可安全 close(4002)。
+            // 已登记则跳过（避免每帧都序列化附件）；evict 后由附件恢复，故仅在丢失时重写。
+            if (serverId && j.info && Number(j.info.probe_proto) >= 1 && !this.probeCapable.has(serverId)) {
+              this.markProbeCapable(ws, serverId);
+            }
             // E：保活心跳先于上报落库发送（30s 限频）。agent 端 read -t 180 只依赖下行流量，
             // 不能因 handleReport 抛错（D1 配额/写入失败）而连带停发心跳 → 误判半开 → 重连循环。
             if (serverId) {

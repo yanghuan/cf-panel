@@ -2133,6 +2133,33 @@ test('TerminalDO: 探活能力写入连接附件，唤醒重建后恢复（evict
   assert.equal(inst2.probeCapable.has(1), true, '唤醒重建从附件恢复探活能力');
 });
 
+test('TerminalDO: agent 经上报自声明 probe 能力（info.probe_proto）→ 登记并写附件', async () => {
+  const env = makeEnv();
+  await insertServer(env, 'k1', 'srv1');
+  const att = { role: 'control', serverId: 1, ts: 1 };
+  const ws = {
+    deserializeAttachment: () => att,
+    serializeAttachment: (a) => { Object.assign(att, a); },
+    send() {}, readyState: 1,
+  };
+  const inst = new TerminalDO(mockState(), env);
+  inst.agents.set(1, ws);
+  assert.equal(inst.probeCapable.has(1), false, '初始未登记');
+  await inst.webSocketMessage(ws, JSON.stringify({ type: 'report', cpu: 1, info: { probe_proto: 1 } }));
+  assert.equal(inst.probeCapable.has(1), true, '上报声明能力后登记');
+  assert.equal(att.probe, true, '能力写入连接附件（evict 后可恢复）');
+});
+
+test('TerminalDO: 旧 agent 上报无 probe_proto → 不登记能力（exec 永不探活）', async () => {
+  const env = makeEnv();
+  await insertServer(env, 'k1', 'srv1');
+  const ws = { deserializeAttachment: () => ({ role: 'control', serverId: 1 }), send() {}, readyState: 1 };
+  const inst = new TerminalDO(mockState(), env);
+  inst.agents.set(1, ws);
+  await inst.webSocketMessage(ws, JSON.stringify({ type: 'report', cpu: 1, info: { os: 'Linux' } }));
+  assert.equal(inst.probeCapable.has(1), false, '旧 agent 不登记探活能力 → 直接下发，永不误关');
+});
+
 test('MetricsDO: 归档超过 100 行分批 batch 落 D1', async () => {
   const env = makeEnv();
   const st = mockState();

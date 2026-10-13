@@ -1274,6 +1274,11 @@ pub const VERSION: &str = match option_env!("AGENT_BUILD_TS") {
     _ => env!("CARGO_PKG_VERSION"),
 };
 
+// 控制通道能力版本：DO 据此判断本 agent 是否支持 exec 前探活（probe → pong）。
+// 与 update::UPDATE_PROTOCOL 同范式：能力随系统信息上报（info.probe_proto），
+// 旧 agent 不报该字段 → DO 永不探活、永不误关（向后兼容）。
+pub const PROBE_PROTO: u64 = 1;
+
 fn print_version() {
     println!("cf-panel-agent {VERSION}");
 }

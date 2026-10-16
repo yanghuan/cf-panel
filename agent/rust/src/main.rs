@@ -159,16 +159,118 @@ async fn connect_via_own_resolver_with(
             tokio_tungstenite::client_async_tls_with_config(req, tcp, cfg, None).await?;
         Ok(ws)
     } else {
-        // 明文 ws://（仅本地回环或 ALLOW_INSECURE_WS=1，启动时已校验）：手工包一层
-        // MaybeTlsStream::Plain，使返回类型与 TLS 分支一致（WsStream 定义如此）
-        let (ws, _resp) = tokio_tungstenite::client_async_with_config(
-            req,
-            tokio_tungstenite::MaybeTlsStream::Plain(tcp),
-            cfg,
-        )
-        .await?;
+        // 明文 ws://（仅本地回环或 ALLOW_INSECURE_WS=1，启动时已校验）：
+        // 用宽松握手（兼容 Cloudflare 剥掉 101 响应的 Connection/Upgrade 头），
+        // tungstenite 的严格校验会误报 MissingConnectionUpgradeHeader。
+        let ws = lenient_ws_handshake(req, tcp, cfg).await?;
         Ok(ws)
     }
+}
+
+/// 宽松 WebSocket 握手：手动发送 HTTP 升级请求，只校验 101 状态码和
+/// Sec-WebSocket-Accept，不强制要求 Connection/Upgrade 响应头。
+/// 背景：Cloudflare 边缘会剥掉 101 响应的 Connection/Upgrade 头，
+/// tungstenite 的严格 RFC 校验（MissingConnectionUpgradeHeader）会误杀。
+async fn lenient_ws_handshake(
+    req: tokio_tungstenite::tungstenite::handshake::client::Request,
+    tcp: tokio::net::TcpStream,
+    cfg: Option<tokio_tungstenite::tungstenite::protocol::WebSocketConfig>,
+) -> Result<WsStream, Box<dyn Error + Send + Sync>> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // 生成 Sec-WebSocket-Key（16 随机字节 → base64）
+    let mut key_bytes = [0u8; 16];
+    getrandom::getrandom(&mut key_bytes).map_err(|e| format!("getrandom failed: {}", e))?;
+    let key_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, key_bytes);
+    // 计算期望的 Sec-WebSocket-Accept
+    let accept_expected = {
+        use sha1::{Digest, Sha1};
+        let mut hasher = Sha1::new();
+        hasher.update(key_b64.as_bytes());
+        hasher.update(b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
+        base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            hasher.finalize(),
+        )
+    };
+
+    // 构建 HTTP 请求（跳过 tungstenite 已自动加的头，避免重复）
+    let uri = req.uri().clone();
+    let path = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
+    let host = uri.host().unwrap_or("");
+    let mut http_req = format!(
+        "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: {}\r\n",
+        path, host, key_b64
+    );
+    for (name, value) in req.headers() {
+        let n = name.as_str().to_ascii_lowercase();
+        if n == "host"
+            || n == "connection"
+            || n == "upgrade"
+            || n == "sec-websocket-version"
+            || n == "sec-websocket-key"
+        {
+            continue;
+        }
+        http_req.push_str(&format!("{}: {}\r\n", name, value.to_str().unwrap_or("")));
+    }
+    http_req.push_str("\r\n");
+
+    let mut stream = tcp;
+    stream.write_all(http_req.as_bytes()).await?;
+    stream.flush().await?;
+
+    // 读响应头（最多 16KB）
+    let mut resp_buf = Vec::with_capacity(4096);
+    let mut tmp = [0u8; 4096];
+    loop {
+        let n = stream.read(&mut tmp).await?;
+        if n == 0 {
+            return Err("connection closed during WebSocket handshake".into());
+        }
+        resp_buf.extend_from_slice(&tmp[..n]);
+        if resp_buf.windows(4).any(|w| w == b"\r\n\r\n") {
+            break;
+        }
+        if resp_buf.len() > 16384 {
+            return Err("WebSocket handshake response too large".into());
+        }
+    }
+    let resp_str = String::from_utf8_lossy(&resp_buf);
+    let mut lines = resp_str.lines();
+    let status_line = lines.next().ok_or("empty WebSocket handshake response")?;
+    // 只校验 101，不校验 Connection/Upgrade 头（Cloudflare 会剥掉）
+    if !status_line.contains("101") {
+        return Err(format!("WebSocket handshake failed: {}", status_line).into());
+    }
+    // Sec-WebSocket-Accept 必须校验（防中间人劫持握手）
+    let mut accept_ok = false;
+    for line in lines {
+        if line.is_empty() {
+            break;
+        }
+        if let Some((name, value)) = line.split_once(':') {
+            if name.trim().eq_ignore_ascii_case("sec-websocket-accept")
+                && value.trim() == accept_expected
+            {
+                accept_ok = true;
+                break;
+            }
+        }
+    }
+    if !accept_ok {
+        return Err("WebSocket Sec-WebSocket-Accept mismatch".into());
+    }
+
+    // 升级为 WebSocketStream（from_raw_socket 不做二次握手）
+    let ws_cfg = cfg.unwrap_or_default();
+    let ws = tokio_tungstenite::WebSocketStream::from_raw_socket(
+        tokio_tungstenite::MaybeTlsStream::Plain(stream),
+        tokio_tungstenite::tungstenite::protocol::Role::Client,
+        Some(ws_cfg),
+    )
+    .await;
+    Ok(ws)
 }
 
 // 控制通道出站消息：普通帧 + 显式排空屏障。

@@ -14,7 +14,7 @@ description = "cf-panel agent（Rust 版）：控制通道 + 监控上报 + 终�
 
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal", "process", "fs", "net", "io-util", "sync"] }
-tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "handshake", "rustls-tls-webpki-roots"] }
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "handshake", "rustls-tls-native-roots"] }
 # crypto provider 必须显式启用：tungstenite 对 rustls 声明 default-features=false 且有意
 # 不带任何 provider（provider-agnostic 设计）——漏配时编译通过、运行期首个真实 wss 连接
 # 才 panic "Could not automatically determine the process-level CryptoProvider"
@@ -49,3 +49,4 @@ opt-level = "z"
 codegen-units = 1
 lto = true
 strip = true
+

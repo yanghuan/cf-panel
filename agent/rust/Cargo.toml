@@ -33,6 +33,11 @@ libc = "0.2"
 # 自更新：SHA-256 流式校验 + 跨平台替换当前可执行文件（Windows 运行中 exe 特殊处理）
 sha2 = "0.10"
 self-replace = "1.5"
+# WebSocket 手动握手（兼容 Cloudflare 剥掉 101 响应的 Connection/Upgrade 头）：
+# base64 编解码 Sec-WebSocket-Key，sha1 计算 Sec-WebSocket-Accept，getrandom 生成随机 key
+base64 = "0.22"
+sha1 = "0.10"
+getrandom = "0.2"
 
 # 非 Linux 平台的指标采集（Windows/macOS：CPU/内存/磁盘/网络经 sysinfo）；
 # Linux 保留原生 /proc、/sys 实现零额外依赖，sysinfo 不进入 Linux 依赖树

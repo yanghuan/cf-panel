@@ -157,10 +157,27 @@ async fn connect_via_own_resolver_with(
     if scheme == "wss" {
         // AGENT_TLS_ROOTS=webpki|native（默认 webpki，各平台统一）：运行时选择 TLS 根证书来源。
         // native 走系统证书池（含 SSL_CERT_FILE），webpki 用硬编码 Mozilla 根。
-        let connector = build_tls_connector()?;
-        let (ws, _resp) =
-            tokio_tungstenite::client_async_tls_with_config(req, tcp, cfg, connector).await?;
-        Ok(ws)
+        // AGENT_LENIENT_WS=1 时 wss 也用宽松握手（MITM 代理会剥 101 的 Connection/Upgrade 头）。
+        let use_lenient = std::env::var("AGENT_LENIENT_WS")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        if use_lenient {
+            // 手动 TLS + 宽松 WS 握手（tungstenite 的 client_async_tls_with_config 不支持宽松）
+            let tls_stream = tls_handshake(req.uri(), tcp).await?;
+            let stream = lenient_ws_handshake(req, tls_stream, cfg).await?;
+            let ws = tokio_tungstenite::WebSocketStream::from_raw_socket(
+                tokio_tungstenite::MaybeTlsStream::Rustls(stream),
+                tokio_tungstenite::tungstenite::protocol::Role::Client,
+                cfg,
+            )
+            .await;
+            Ok(ws)
+        } else {
+            let connector = build_tls_connector()?;
+            let (ws, _resp) =
+                tokio_tungstenite::client_async_tls_with_config(req, tcp, cfg, connector).await?;
+            Ok(ws)
+        }
     } else {
         // 明文 ws://（仅本地回环或 ALLOW_INSECURE_WS=1，启动时已校验）。
         // AGENT_LENIENT_WS=1 时用宽松握手：只校验 101 + Sec-WebSocket-Accept，
@@ -169,7 +186,13 @@ async fn connect_via_own_resolver_with(
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
         if use_lenient {
-            let ws = lenient_ws_handshake(req, tcp, cfg).await?;
+            let stream = lenient_ws_handshake(req, tcp, cfg).await?;
+            let ws = tokio_tungstenite::WebSocketStream::from_raw_socket(
+                tokio_tungstenite::MaybeTlsStream::Plain(stream),
+                tokio_tungstenite::tungstenite::protocol::Role::Client,
+                cfg,
+            )
+            .await;
             Ok(ws)
         } else {
             let (ws, _resp) = tokio_tungstenite::client_async_with_config(
@@ -226,16 +249,59 @@ fn build_tls_connector()
     }
 }
 
+/// 构建 rustls ClientConfig（供手动 TLS 握手用，与 build_tls_connector 同源）。
+fn build_rustls_config()
+-> Result<std::sync::Arc<rustls::ClientConfig>, Box<dyn Error + Send + Sync>> {
+    let mode = std::env::var("AGENT_TLS_ROOTS").unwrap_or_else(|_| "webpki".to_string());
+    let mut root_store = rustls::RootCertStore::empty();
+    if mode.eq_ignore_ascii_case("native") {
+        let result = rustls_native_certs::load_native_certs();
+        if result.certs.is_empty() {
+            return Err(format!("no native certs loaded, errors: {:?}", result.errors).into());
+        }
+        for cert in result.certs {
+            root_store
+                .add(cert)
+                .map_err(|e| format!("add native cert failed: {}", e))?;
+        }
+    } else {
+        // webpki：硬编码 Mozilla 根（与 tokio-tungstenite feature 一致）
+        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    }
+    let config = rustls::ClientConfig::builder()
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+    Ok(std::sync::Arc::new(config))
+}
+
+/// 手动 TLS 握手（wss:// + AGENT_LENIENT_WS=1 时用）。
+/// 返回已完成 TLS 握手的流，调用方再做宽松 WS 握手。
+async fn tls_handshake(
+    uri: &tokio_tungstenite::tungstenite::http::Uri,
+    tcp: tokio::net::TcpStream,
+) -> Result<tokio_rustls::client::TlsStream<tokio::net::TcpStream>, Box<dyn Error + Send + Sync>> {
+    let host = uri.host().ok_or("wss URL missing host")?;
+    let config = build_rustls_config()?;
+    let connector = tokio_rustls::TlsConnector::from(config);
+    let server_name = rustls::pki_types::ServerName::try_from(host.to_string())
+        .map_err(|e| format!("invalid SNI host {}: {}", host, e))?;
+    let tls_stream = connector.connect(server_name, tcp).await?;
+    Ok(tls_stream)
+}
+
 /// 宽松 WebSocket 握手：手动发送 HTTP 升级请求，只校验 101 状态码和
 /// Sec-WebSocket-Accept，不强制要求 Connection/Upgrade 响应头。
 /// 背景：沙箱 egress 代理做 TLS MITM 时会重组 HTTP，把 101 响应的
 /// Connection/Upgrade 头弄丢，tungstenite 的严格 RFC 校验
 ///（MissingConnectionUpgradeHeader）会误杀。
-async fn lenient_ws_handshake(
+async fn lenient_ws_handshake<S>(
     req: tokio_tungstenite::tungstenite::handshake::client::Request,
-    tcp: tokio::net::TcpStream,
+    stream: S,
     cfg: Option<tokio_tungstenite::tungstenite::protocol::WebSocketConfig>,
-) -> Result<WsStream, Box<dyn Error + Send + Sync>> {
+) -> Result<S, Box<dyn Error + Send + Sync>>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     // 生成 Sec-WebSocket-Key（16 随机字节 → base64）
@@ -276,7 +342,7 @@ async fn lenient_ws_handshake(
     }
     http_req.push_str("\r\n");
 
-    let mut stream = tcp;
+    let mut stream = stream;
     stream.write_all(http_req.as_bytes()).await?;
     stream.flush().await?;
 
@@ -322,15 +388,8 @@ async fn lenient_ws_handshake(
         return Err("WebSocket Sec-WebSocket-Accept mismatch".into());
     }
 
-    // 升级为 WebSocketStream（from_raw_socket 不做二次握手）
-    let ws_cfg = cfg.unwrap_or_default();
-    let ws = tokio_tungstenite::WebSocketStream::from_raw_socket(
-        tokio_tungstenite::MaybeTlsStream::Plain(stream),
-        tokio_tungstenite::tungstenite::protocol::Role::Client,
-        Some(ws_cfg),
-    )
-    .await;
-    Ok(ws)
+    // 返回已完成 HTTP 101 握手的流，调用方再包成 WebSocketStream
+    Ok(stream)
 }
 
 // 控制通道出站消息：普通帧 + 显式排空屏障。
@@ -1478,7 +1537,7 @@ fn print_help() {
         "  AGENT_TLS_ROOTS   默认 webpki（各平台统一） TLS 根证书来源：native（系统证书池，认 SSL_CERT_FILE）/ webpki（硬编码 Mozilla 根）"
     );
     println!(
-        "  AGENT_LENIENT_WS  默认 0   设为 1 时 ws:// 用宽松握手（只校验 101 + Sec-WebSocket-Accept，兼容 MITM 代理剥头）"
+        "  AGENT_LENIENT_WS  默认 0   设为 1 时用宽松握手（ws:// 与 wss:// 均适用）（只校验 101 + Sec-WebSocket-Accept，兼容 MITM 代理剥头）"
     );
 }
 

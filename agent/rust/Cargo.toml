@@ -24,10 +24,14 @@ tokio-tungstenite = { version = "0.30", default-features = false, features = ["c
 # std/tls12 恢复升级前（rustls 0.22 时代默认开启）的兼容性。
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 # TLS 根证书运行时切换（AGENT_TLS_ROOTS=webpki|native，默认 webpki 各平台统一）：
-# 同时引入两个 crate，多占约 200KB（二进制从 2.4MB 到 2.6MB，可接受）。
-# native 走系统证书池（含 SSL_CERT_FILE），webpki 用硬编码 Mozilla 根。
+# 默认走 tokio-tungstenite 的 webpki-roots feature；设为 native 时手动用
+# rustls-native-certs 组装（读系统池，+几KB，可接受）。
 rustls-native-certs = "0.8"
+# wss:// 手动 TLS 时需要 webpki_roots crate 来组装 Mozilla 根（默认路径）
 webpki-roots = "0.26"
+# wss:// + AGENT_LENIENT_WS=1 时手动做 TLS 握手（tungstenite 的 client_async_tls_with_config
+# 不支持宽松 WS 握手，需拆开：先 TLS，再 lenient HTTP 升级）
+tokio-rustls = "0.26"
 futures-util = "0.3"
 serde_json = "1"
 # Bytes：WS 帧载荷类型（tungstenite 的 Message::Binary/Text 内部即 Bytes）。

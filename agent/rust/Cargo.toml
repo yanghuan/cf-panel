@@ -23,7 +23,7 @@ tokio-tungstenite = { version = "0.30", default-features = false, features = ["c
 # 四个目标平台（musl x64/ARM64、macOS、Windows-MSVC）此前均已验证可行。
 # std/tls12 恢复升级前（rustls 0.22 时代默认开启）的兼容性。
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
-# TLS 根证书运行时切换（AGENT_TLS_ROOTS=native|webpki，默认 native）：
+# TLS 根证书运行时切换（AGENT_TLS_ROOTS=webpki|native，默认 webpki 各平台统一）：
 # 同时引入两个 crate，多占约 200KB（二进制从 2.4MB 到 2.6MB，可接受）。
 # native 走系统证书池（含 SSL_CERT_FILE），webpki 用硬编码 Mozilla 根。
 rustls-native-certs = "0.8"

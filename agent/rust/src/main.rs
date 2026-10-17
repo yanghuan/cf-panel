@@ -164,7 +164,7 @@ async fn connect_via_own_resolver_with(
         if use_lenient {
             // 手动 TLS + 宽松 WS 握手（tungstenite 的 client_async_tls_with_config 不支持宽松）
             let tls_stream = tls_handshake(req.uri(), tcp).await?;
-            let stream = lenient_ws_handshake(req, tls_stream, cfg).await?;
+            let stream = lenient_ws_handshake(req, tls_stream).await?;
             let ws = tokio_tungstenite::WebSocketStream::from_raw_socket(
                 tokio_tungstenite::MaybeTlsStream::Rustls(stream),
                 tokio_tungstenite::tungstenite::protocol::Role::Client,
@@ -186,7 +186,7 @@ async fn connect_via_own_resolver_with(
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
         if use_lenient {
-            let stream = lenient_ws_handshake(req, tcp, cfg).await?;
+            let stream = lenient_ws_handshake(req, tcp).await?;
             let ws = tokio_tungstenite::WebSocketStream::from_raw_socket(
                 tokio_tungstenite::MaybeTlsStream::Plain(stream),
                 tokio_tungstenite::tungstenite::protocol::Role::Client,
@@ -297,7 +297,6 @@ async fn tls_handshake(
 async fn lenient_ws_handshake<S>(
     req: tokio_tungstenite::tungstenite::handshake::client::Request,
     stream: S,
-    cfg: Option<tokio_tungstenite::tungstenite::protocol::WebSocketConfig>,
 ) -> Result<S, Box<dyn Error + Send + Sync>>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,

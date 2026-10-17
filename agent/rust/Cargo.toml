@@ -31,7 +31,9 @@ rustls-native-certs = "0.8"
 webpki-roots = "0.26"
 # wss:// + AGENT_LENIENT_WS=1 时手动做 TLS 握手（tungstenite 的 client_async_tls_with_config
 # 不支持宽松 WS 握手，需拆开：先 TLS，再 lenient HTTP 升级）
-tokio-rustls = "0.26"
+# 注意：必须 default-features=false + ring，否则 tokio-rustls 默认带 aws-lc-rs，
+# 与主 rustls 的 ring 冲突导致 "Could not automatically determine CryptoProvider"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 futures-util = "0.3"
 serde_json = "1"
 # Bytes：WS 帧载荷类型（tungstenite 的 Message::Binary/Text 内部即 Bytes）。

@@ -155,7 +155,7 @@ async fn connect_via_own_resolver_with(
     log(format!("resolve {host}:{port} -> {addr}"));
     let tcp = tokio::net::TcpStream::connect(addr).await?;
     if scheme == "wss" {
-        // AGENT_TLS_ROOTS=webpki|native（默认 native）：运行时选择 TLS 根证书来源。
+        // AGENT_TLS_ROOTS=webpki|native（默认 webpki，各平台统一）：运行时选择 TLS 根证书来源。
         // native 走系统证书池（含 SSL_CERT_FILE），webpki 用硬编码 Mozilla 根。
         let connector = build_tls_connector()?;
         let (ws, _resp) =
@@ -184,26 +184,44 @@ async fn connect_via_own_resolver_with(
 }
 
 /// 按 AGENT_TLS_ROOTS 环境变量构建 TLS connector。
-/// - "webpki"（或未设置时默认？不，默认 native）：用硬编码 Mozilla 根
-/// - "native"（默认）：读系统证书池（含 SSL_CERT_FILE）
-/// 返回 None 表示用 tokio-tungstenite 的默认（feature 决定的，此处为 native-roots）。
+///
+/// - "webpki"（默认）：用硬编码 Mozilla 根（各平台统一）
+/// - "native"：读系统证书池（含 SSL_CERT_FILE）
+///
+/// 返回 None 表示用 tokio-tungstenite 的默认（feature 决定的，此处为 webpki-roots）。
 fn build_tls_connector()
 -> Result<Option<tokio_tungstenite::Connector>, Box<dyn Error + Send + Sync>> {
-    let mode = std::env::var("AGENT_TLS_ROOTS").unwrap_or_else(|_| "native".to_string());
-    if mode.eq_ignore_ascii_case("webpki") {
-        // 手动组装 webpki 根的 ClientConfig
+    let mode = std::env::var("AGENT_TLS_ROOTS").unwrap_or_else(|_| "webpki".to_string());
+    if mode.eq_ignore_ascii_case("native") {
+        // 手动组装 native 根的 ClientConfig（读系统池）
         let mut root_store = rustls::RootCertStore::empty();
-        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        let result = rustls_native_certs::load_native_certs();
+        if !result.errors.is_empty() {
+            // 有错误但也有证书时继续（部分失败可接受），全失败才报错
+            log(format!(
+                "load native certs: {} loaded, {} errors",
+                result.certs.len(),
+                result.errors.len()
+            ));
+        }
+        if result.certs.is_empty() {
+            return Err(format!("no native certs loaded, errors: {:?}", result.errors).into());
+        }
+        for cert in result.certs {
+            root_store
+                .add(cert)
+                .map_err(|e| format!("add native cert failed: {}", e))?;
+        }
         let config = rustls::ClientConfig::builder()
             .with_root_certificates(root_store)
             .with_no_client_auth();
-        log("TLS roots: webpki (Mozilla bundled)".to_string());
+        log("TLS roots: native (system store)");
         Ok(Some(tokio_tungstenite::Connector::Rustls(
             std::sync::Arc::new(config),
         )))
     } else {
-        // native：用 tokio-tungstenite 自带的 native-roots（feature 已配），传 None
-        log("TLS roots: native (system store)".to_string());
+        // webpki：用 tokio-tungstenite 自带的 webpki-roots（feature 已配），传 None
+        log("TLS roots: webpki (Mozilla bundled)");
         Ok(None)
     }
 }
@@ -1457,7 +1475,7 @@ fn print_help() {
         "  AGENT_WSS_IP      默认 空   直接连该 IP、跳过 DNS（AGENT_WSS_URL 仍用于 TLS 的 SNI 与证书校验）"
     );
     println!(
-        "  AGENT_TLS_ROOTS   默认 native  TLS 根证书来源：native（系统证书池，认 SSL_CERT_FILE）/ webpki（硬编码 Mozilla 根）"
+        "  AGENT_TLS_ROOTS   默认 webpki（各平台统一） TLS 根证书来源：native（系统证书池，认 SSL_CERT_FILE）/ webpki（硬编码 Mozilla 根）"
     );
     println!(
         "  AGENT_LENIENT_WS  默认 0   设为 1 时 ws:// 用宽松握手（只校验 101 + Sec-WebSocket-Accept，兼容 MITM 代理剥头）"

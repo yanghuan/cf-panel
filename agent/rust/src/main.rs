@@ -155,22 +155,64 @@ async fn connect_via_own_resolver_with(
     log(format!("resolve {host}:{port} -> {addr}"));
     let tcp = tokio::net::TcpStream::connect(addr).await?;
     if scheme == "wss" {
+        // AGENT_TLS_ROOTS=webpki|native（默认 native）：运行时选择 TLS 根证书来源。
+        // native 走系统证书池（含 SSL_CERT_FILE），webpki 用硬编码 Mozilla 根。
+        let connector = build_tls_connector()?;
         let (ws, _resp) =
-            tokio_tungstenite::client_async_tls_with_config(req, tcp, cfg, None).await?;
+            tokio_tungstenite::client_async_tls_with_config(req, tcp, cfg, connector).await?;
         Ok(ws)
     } else {
-        // 明文 ws://（仅本地回环或 ALLOW_INSECURE_WS=1，启动时已校验）：
-        // 用宽松握手（兼容 Cloudflare 剥掉 101 响应的 Connection/Upgrade 头），
-        // tungstenite 的严格校验会误报 MissingConnectionUpgradeHeader。
-        let ws = lenient_ws_handshake(req, tcp, cfg).await?;
-        Ok(ws)
+        // 明文 ws://（仅本地回环或 ALLOW_INSECURE_WS=1，启动时已校验）。
+        // AGENT_LENIENT_WS=1 时用宽松握手：只校验 101 + Sec-WebSocket-Accept，
+        // 不强制要求 Connection/Upgrade 响应头（兼容 MITM 代理剥头）。
+        let use_lenient = std::env::var("AGENT_LENIENT_WS")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        if use_lenient {
+            let ws = lenient_ws_handshake(req, tcp, cfg).await?;
+            Ok(ws)
+        } else {
+            let (ws, _resp) = tokio_tungstenite::client_async_with_config(
+                req,
+                tokio_tungstenite::MaybeTlsStream::Plain(tcp),
+                cfg,
+            )
+            .await?;
+            Ok(ws)
+        }
+    }
+}
+
+/// 按 AGENT_TLS_ROOTS 环境变量构建 TLS connector。
+/// - "webpki"（或未设置时默认？不，默认 native）：用硬编码 Mozilla 根
+/// - "native"（默认）：读系统证书池（含 SSL_CERT_FILE）
+/// 返回 None 表示用 tokio-tungstenite 的默认（feature 决定的，此处为 native-roots）。
+fn build_tls_connector()
+-> Result<Option<tokio_tungstenite::Connector>, Box<dyn Error + Send + Sync>> {
+    let mode = std::env::var("AGENT_TLS_ROOTS").unwrap_or_else(|_| "native".to_string());
+    if mode.eq_ignore_ascii_case("webpki") {
+        // 手动组装 webpki 根的 ClientConfig
+        let mut root_store = rustls::RootCertStore::empty();
+        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        let config = rustls::ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+        log("TLS roots: webpki (Mozilla bundled)".to_string());
+        Ok(Some(tokio_tungstenite::Connector::Rustls(
+            std::sync::Arc::new(config),
+        )))
+    } else {
+        // native：用 tokio-tungstenite 自带的 native-roots（feature 已配），传 None
+        log("TLS roots: native (system store)".to_string());
+        Ok(None)
     }
 }
 
 /// 宽松 WebSocket 握手：手动发送 HTTP 升级请求，只校验 101 状态码和
 /// Sec-WebSocket-Accept，不强制要求 Connection/Upgrade 响应头。
-/// 背景：Cloudflare 边缘会剥掉 101 响应的 Connection/Upgrade 头，
-/// tungstenite 的严格 RFC 校验（MissingConnectionUpgradeHeader）会误杀。
+/// 背景：沙箱 egress 代理做 TLS MITM 时会重组 HTTP，把 101 响应的
+/// Connection/Upgrade 头弄丢，tungstenite 的严格 RFC 校验
+///（MissingConnectionUpgradeHeader）会误杀。
 async fn lenient_ws_handshake(
     req: tokio_tungstenite::tungstenite::handshake::client::Request,
     tcp: tokio::net::TcpStream,
@@ -1413,6 +1455,12 @@ fn print_help() {
     );
     println!(
         "  AGENT_WSS_IP      默认 空   直接连该 IP、跳过 DNS（AGENT_WSS_URL 仍用于 TLS 的 SNI 与证书校验）"
+    );
+    println!(
+        "  AGENT_TLS_ROOTS   默认 native  TLS 根证书来源：native（系统证书池，认 SSL_CERT_FILE）/ webpki（硬编码 Mozilla 根）"
+    );
+    println!(
+        "  AGENT_LENIENT_WS  默认 0   设为 1 时 ws:// 用宽松握手（只校验 101 + Sec-WebSocket-Accept，兼容 MITM 代理剥头）"
     );
 }
 

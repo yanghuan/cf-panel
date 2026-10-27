@@ -362,11 +362,15 @@
       ? `<button data-act="agent-update" data-id="${s.id}" data-name="${escapeHtml(s.name)}" title="${escapeHtml(t('server.updateTip', { from: info.agent_version, to: latestAgent.build_id }))}" ${updatingAgents.has(s.id) ? 'disabled' : ''}>${updatingAgents.has(s.id) ? escapeHtml(t('server.updating')) : escapeHtml(t('server.updateAgent'))}</button>`
       : '';
     const sel = selectedServers.has(s.id);
+    // 有描述 → 名字可点击查看（文本从 serversCache 现取，不内嵌进 DOM：描述可达 500 字，
+    // 每 5s 重建卡片时内嵌会白白序列化一遍）
+    const hasDesc = !!(s.description && s.description.trim());
+    const nameAttrs = hasDesc ? ` data-desc-id="${s.id}" role="button" tabindex="0"` : '';
     return `
       <div class="card${sel ? ' selected' : ''}" data-id="${s.id}"${isAdmin ? ' draggable="true"' : ''}>
         <div class="card-head">
           <div class="card-title">
-            <span class="name"><span class="flag" data-flag="${escapeHtml(ip)}"></span>${osIconHtml(s.info && s.info.os)}${escapeHtml(s.name)}</span>
+            <span class="name${hasDesc ? ' has-desc' : ''}"${nameAttrs}><span class="flag" data-flag="${escapeHtml(ip)}"></span>${osIconHtml(s.info && s.info.os)}${escapeHtml(s.name)}</span>
             <button class="more-btn" title="${escapeHtml(t('server.nodeOps'))}">⋯</button>
             <div class="card-menu hidden">
               ${canExec ? `<button data-act="term" data-id="${s.id}" data-name="${escapeHtml(s.name)}">${escapeHtml(t('server.term'))}</button>
@@ -527,6 +531,9 @@
     // 推送数据已更新：关闭可能过期的指标 tooltip 静态快照（数据时点已变）
     metricTip.classList.remove('show');
     tipSource = null;
+    // 描述浮层同理：下方可能触发卡片全量重建，锚点元素会脱离文档
+    descTip.classList.remove('show');
+    descSource = null;
     // 服务器增删或分组结构变化 → 低频全量重建
     const domIds = new Set([...box.querySelectorAll('.card')].map((c) => Number(c.dataset.id)));
     // 用过滤后列表比对：否则搜索期间 dom 数恒小于全量，每次推送都触发全量重建（抖动 + 无谓开销）
@@ -598,13 +605,22 @@
   // 服务器表单双模式：editServerId = null 添加，否则为修改中的服务器 id
   let editServerId = null;
 
+  // 描述字数提示（与后端同口径：UTF-16 码元；上限由 textarea 的 maxlength 兜住）
+  function updateDescCount() {
+    const el = $('#inp-desc');
+    const cnt = $('#inp-desc-count');
+    if (!el || !cnt) return;
+    cnt.textContent = `${el.value.length}/${el.maxLength}`;
+  }
+
   async function addServer() {
     const name = $('#inp-name').value.trim();
     const group = $('#inp-group').value.trim();
     const sortOrder = Number($('#inp-order').value) || 0;
+    const description = $('#inp-desc').value;
     if (!name) return toast(t('server.nameRequired'));
     try {
-      const cfg = await api('/api/servers', { method: 'POST', body: JSON.stringify({ name, group, sort_order: sortOrder }) });
+      const cfg = await api('/api/servers', { method: 'POST', body: JSON.stringify({ name, group, sort_order: sortOrder, description }) });
       const text = `${t('server.addedBody', { wss: cfg.wss_base, key: cfg.agent_key })}`;
       $('#add-modal').classList.add('hidden');
       unlockScroll();
@@ -643,6 +659,9 @@
     $('#inp-name').value = name || '';
     $('#inp-group').value = group || '';
     $('#inp-order').value = order != null ? String(order) : '';
+    // 描述不在卡片点击参数里（太长，塞进 data-* 会把 DOM 撑大），统一从缓存取
+    $('#inp-desc').value = (serversCache.find((x) => x.id === id) || {}).description || '';
+    updateDescCount();
     const ov = (serversCache.find((x) => x.id === id) || {}).alert_override || {};
     // 未设置/继承全局的输入框留空（placeholder 随后细化为"全局 N"）；load=0 是"关闭该维度"的显式值，要显示 0
     $('#ao-cpu').value = ov.cpu_pct != null ? ov.cpu_pct : '';
@@ -688,7 +707,7 @@
     try {
       await api(`/api/servers/${editServerId}`, {
         method: 'PATCH',
-        body: JSON.stringify({ name, group, sort_order: sortOrder, alert_override: collectAlertOverride() }),
+        body: JSON.stringify({ name, group, sort_order: sortOrder, description: $('#inp-desc').value, alert_override: collectAlertOverride() }),
       });
       $('#add-modal').classList.add('hidden');
       unlockScroll();
@@ -2715,6 +2734,8 @@
     $('#inp-name').value = '';
     $('#inp-group').value = '';
     $('#inp-order').value = '';
+    $('#inp-desc').value = '';
+    updateDescCount();
     $('#alert-override-box').classList.add('hidden'); // 新增模式无覆盖可言（key 尚未生成）
     $('#rotate-row').classList.add('hidden'); // 轮换仅对已存在的服务器有意义
     $('#add-modal').classList.remove('hidden');
@@ -3240,6 +3261,53 @@
     tipSource = null;
   });
 
+  // 服务器描述浮层：点击服务器名展开（再次点击 / 点外部 / Esc 关闭）。
+  // 正文用 textContent 写入——描述是用户自由文本，绝不能走 innerHTML。
+  const descTip = document.createElement('div');
+  descTip.className = 'm-tip d-tip';
+  document.body.appendChild(descTip);
+  let descSource = null;
+  document.addEventListener('click', (e) => {
+    const nameEl = e.target.closest('.name[data-desc-id]');
+    if (nameEl) {
+      if (descSource === nameEl && descTip.classList.contains('show')) {
+        descTip.classList.remove('show');
+        descSource = null;
+        return;
+      }
+      const s = serversCache.find((x) => x.id === Number(nameEl.dataset.descId));
+      if (!s || !s.description) return;
+      descSource = nameEl;
+      const nameRow = document.createElement('div');
+      nameRow.className = 'd-name';
+      nameRow.textContent = s.name;
+      const body = document.createElement('div');
+      body.className = 'd-body';
+      body.textContent = s.description;
+      descTip.replaceChildren(nameRow, body);
+      descTip.classList.add('show');
+      positionTipForMetric(descTip, nameEl);
+      return;
+    }
+    if (e.target.closest('.d-tip')) return; // 浮层内可滚动选中文本
+    descTip.classList.remove('show');
+    descSource = null;
+  });
+  // 键盘可达：Enter/Space 打开（无键盘支持就不该给 role=button/tabindex），Esc 关闭
+  $('#servers').addEventListener('keydown', (e) => {
+    const nameEl = e.target.closest('.name[data-desc-id]');
+    if (nameEl && (e.key === 'Enter' || e.key === ' ')) {
+      e.preventDefault();
+      nameEl.click();
+    }
+  });
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && descTip.classList.contains('show')) {
+      descTip.classList.remove('show');
+      descSource = null;
+    }
+  });
+
   // 下拉菜单：切换 / 点击外部关闭 / 菜单项路由
   $('#btn-menu').onclick = (e) => { e.stopPropagation(); $('#dropdown').classList.toggle('hidden'); };
   document.addEventListener('click', (e) => {
@@ -3333,6 +3401,7 @@
   };
   $('#btn-add-server-plus').onclick = openAddModal; // toolbar「＋」入口与菜单「添加服务器」同入口
   $('#btn-add-close').onclick = () => { $('#add-modal').classList.add('hidden'); unlockScroll(); };
+  $('#inp-desc').addEventListener('input', updateDescCount); // 字数提示（上限由 maxlength 兜住）
   $('#inp-name').addEventListener('keydown', (e) => { if (e.key === 'Enter') submitServerForm(); });
 
   // 站点信息弹窗

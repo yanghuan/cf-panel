@@ -333,6 +333,7 @@ Webhook 出站安全：仅允许 HTTP(S)，拒绝 URL 内嵌凭据、本地域�
 - **主题**：顶栏 ☀️/🌙 切换深浅主题（持久化，终端配色与图表同步热更新）。
 - **IdleGuard**：长时间无操作会提示并自动暂停推送（省配额），任何操作即恢复。
 - **IP 归属地**：开启后卡片与审计日志显示旗帜（第三方地理服务查询，默认关闭；旗帜渲染能力运行时检测，不支持时回退图片）。
+- **服务器描述**：添加/修改服务器时可填多行描述（可选，≤500 字）。有描述时卡片上的服务器名带虚线下划线，**点击（或回车）弹出浮层**显示全文；描述同时随 MCP `list_servers` 下发，便于 AI 判断机器用途。
 - **PWA**：支持「添加到主屏幕」（manifest + SVG 图标，未接入 Service Worker——离线缓存会与实时推送的时效性冲突）。
 - **国际化**：界面文案全部走 `t(key)`，语言包在 `public/lang/<语言代码>.js`（内置 `zh-CN`、`en-US`）。☰ 菜单底部可切换语言，即时生效并持久化；未手动选择时跟随浏览器语言。
   > 新增语言 = 加一个 `public/lang/xx.js` + 在 `index.html` 加一行 `<script>`（零构建下无法扫描目录，显式引入是刻意取舍），业务代码零改动。缺失的 key 会**原样显示 key 本身**，开发期一眼看出未翻译项，线上也不会出现界面空白。
@@ -365,8 +366,8 @@ Webhook 出站安全：仅允许 HTTP(S)，拒绝 URL 内嵌凭据、本地域�
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | GET | `/api/servers` | 服务器列表（含分组、序号，按权限过滤） |
-| POST | `/api/servers` | 添加服务器，返回一次性 agent 配置 |
-| PATCH | `/api/servers/:id` | 改名称 / 分组 / 序号 / 告警阈值覆盖（`alert_override` 传 `null` 清除） |
+| POST | `/api/servers` | 添加服务器（`name` 必填，`group`/`sort_order`/`description` 可选），返回一次性 agent 配置 |
+| PATCH | `/api/servers/:id` | 改名称 / 分组 / 描述 / 序号 / 告警阈值覆盖（`description` 传空串清除、`alert_override` 传 `null` 清除） |
 | POST | `/api/servers/:id/rotate-key` | 轮换 agent key（旧 key 立即失效并断连，历史保留） |
 | POST | `/api/servers/:id/agent-update` | 流式更新 Agent（需节点 `ALLOW_SELF_UPDATE=1`） |
 | POST | `/api/servers/batch` | 批量操作：`op=update-group`（单事务）或 `delete`（逐台级联），`ids` 上限 100 |
@@ -415,7 +416,7 @@ Webhook 出站安全：仅允许 HTTP(S)，拒绝 URL 内嵌凭据、本地域�
 | `get_monitor` | 监控历史（`range`：1h/12h/3d/7d/30d） |
 | `exec_command` | 执行一次性 shell 命令（`timeout` 1~25s，命令长度 ≤65408 字节（JSON 转义后；中文 3 字节/字符），stdout 上限约 44KB）；**写操作**，需 exec 权限，超时 kill 进程组。超长命令请先用 `create_upload` 上传脚本再执行 |
 | `create_upload` | 签发一次性上传**签名 URL**（HMAC 绑定 server/path/overwrite，10 分钟过期，无需 Bearer）——大文件 / 二进制不经 LLM 上下文 |
-| `add_server` / `update_server` / `delete_server` | 服务器增删改（仅管理员） |
+| `add_server` / `update_server` / `delete_server` | 服务器增删改（仅管理员）；支持 `description`（多行运维备注，≤500 字，随 `list_servers` 返回） |
 | `rotate_agent_key` | 轮换 agent key（仅管理员，历史保留） |
 | `list_tokens` / `create_token` / `revoke_token` | PAT 生命周期（仅管理员，明文只返回一次） |
 | `get_audit_logs` / `get_usage` | 审计日志 / 用量观测（仅管理员；PAT 需 `panel:admin`） |

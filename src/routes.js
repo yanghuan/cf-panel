@@ -1,7 +1,7 @@
 // cf-panel — 路由层：REST API（handleApi）+ MCP（handleMcp）+ WebSocket 路由（handleWs）
 import {
   SCOPE_READ, SCOPE_EXEC, SCOPE_AGENT_UPDATE, SCOPE_ADMIN, PAT_PREFIX, SHARDS, parsePanelUsers, statsTzOffsetSec,
-  EXEC_CMD_MAX_BYTES, execCommandBytes, execTooLongError,
+  EXEC_CMD_MAX_BYTES, execCommandBytes, execTooLongError, SERVER_DESC_MAX,
 } from './config.js';
 
 // 本模块专用常量（PAT scope 白名单 / MCP 协议与工具，就近定义便于对照使用代码）
@@ -11,7 +11,7 @@ const MCP_VERSION = '2025-11-25'; // 服务器声明支持的协议版本（缺�
 const MCP_TOOLS = [
   {
     name: 'list_servers',
-    description: '列出面板中所有可访问的服务器，返回每台的状态：在线与否、实时 CPU%/内存/负载，以及系统信息（OS/内核/IP）。',
+    description: '列出面板中所有可访问的服务器，返回每台的分组、描述（运维备注，可用于判断该机器用途）、在线状态、实时 CPU%/内存/负载，以及系统信息（OS/内核/IP）。',
     inputSchema: { type: 'object', properties: {}, required: [] },
   },
   {
@@ -75,6 +75,7 @@ const MCP_TOOLS = [
       properties: {
         name: { type: 'string', description: '服务器名称（必填）' },
         group: { type: 'string', description: '分组（可选，默认空=未分组）' },
+        description: { type: 'string', description: `服务器描述（可选，多行自由文本，最多 ${SERVER_DESC_MAX} 字符）：用途/负责人/机房等运维备注，会随 list_servers 返回` },
         sort_order: { type: 'integer', description: '组内排序序号（可选）' },
       },
       required: ['name'],
@@ -94,7 +95,7 @@ const MCP_TOOLS = [
   },
   {
     name: 'update_server',
-    description: '修改服务器名称/分组/排序/告警阈值覆盖。仅管理员（或带 panel:admin 权限的 PAT）。提供 server_id 或 server_name 之一（重名时须用 server_id）；只需传要修改的字段。alert_override 用于逐机覆盖告警阈值（不传=保持不变，传 null=清除覆盖回退全局）。',
+    description: '修改服务器名称/分组/描述/排序/告警阈值覆盖。仅管理员（或带 panel:admin 权限的 PAT）。提供 server_id 或 server_name 之一（重名时须用 server_id）；只需传要修改的字段。description 传空串可清除描述；alert_override 用于逐机覆盖告警阈值（不传=保持不变，传 null=清除覆盖回退全局）。',
     inputSchema: {
       type: 'object',
       properties: {
@@ -102,6 +103,7 @@ const MCP_TOOLS = [
         server_name: { type: 'string', description: '服务器名称（重名时拒绝，须用 server_id）' },
         name: { type: 'string', description: '新名称（可选）' },
         group: { type: 'string', description: '新分组（可选）' },
+        description: { type: 'string', description: `新描述（可选，多行自由文本，最多 ${SERVER_DESC_MAX} 字符；空串=清除）` },
         sort_order: { type: 'integer', description: '新排序序号（可选）' },
         alert_override: {
           type: 'object',
@@ -347,6 +349,17 @@ function publicOrigin(url) {
 }
 function agentWssBase(url) {
   return `${url.protocol === 'http:' ? 'ws' : 'wss'}://${url.host}/ws/agent`;
+}
+
+// 服务器描述归一化（REST 与 MCP 共用）：统一换行符、去首尾空白，空串 → null
+//（不存空串，避免"有描述但显示空白"）。长度按 UTF-16 码元计，与前端 textarea 的
+// maxlength 同口径；返回 { value } 或 { error }，由调用方决定 400 / throw。
+function normalizeServerDesc(v) {
+  if (v === null || v === undefined) return { value: null };
+  const s = String(v).replace(/\r\n?/g, '\n').trim();
+  if (!s) return { value: null };
+  if (s.length > SERVER_DESC_MAX) return { error: `description too long (max ${SERVER_DESC_MAX} chars)` };
+  return { value: s };
 }
 
 // 通用审计写入（best-effort）：审计是旁路留痕，写入失败绝不得改变主流程结果——
@@ -617,21 +630,23 @@ async function handleApiInner(request, env) {
     return agentUpdateCore(env, user, Number(updateMatch[1]) || 0, clientIp(request));
   }
 
-  // POST /api/servers —— 注册一台服务器（name + 可选 group + 可选序号；仅管理员）
+  // POST /api/servers —— 注册一台服务器（name + 可选 group/描述/序号；仅管理员）
   if (method === 'POST' && path === '/api/servers') {
     if (!isAdmin(user)) return err('forbidden', 403, 'FORBIDDEN');
     const body = await request.json().catch(() => ({}));
     const name = String(body.name || '').trim();
     if (!name) return err('name required', 400, 'NAME_REQUIRED');
     const group = String(body.group || '').trim();
+    const desc = normalizeServerDesc(body.description);
+    if (desc.error) return err(desc.error, 400, 'DESCRIPTION_TOO_LONG');
     const displayIndex = Number(body.sort_order) || 0;
     const key = randomHex(32); // key 即唯一身份 + 凭证，agent 侧只保留这一个
     const keyId = await sha256Hex(key);
     const hash = await hashSecret(key, env);
     // 服务器 + 审计同一事务（D1 batch 原子）：audit 失败时整体回滚，不再"操作已生效但返回 500"
     await env.DB.batch([
-      env.DB.prepare('INSERT INTO servers (agent_key_id, name, "group", display_index, user_id, agent_key_hash) VALUES (?,?,?,?,?,?)')
-        .bind(keyId, name, group, displayIndex, user.id, hash),
+      env.DB.prepare('INSERT INTO servers (agent_key_id, name, "group", display_index, user_id, agent_key_hash, description) VALUES (?,?,?,?,?,?,?)')
+        .bind(keyId, name, group, displayIndex, user.id, hash, desc.value),
       env.DB.prepare('INSERT INTO audit_logs (user_id, username, client_ip, action) VALUES (?,?,?,?)')
         .bind(user.id, user.username, clientIp(request), 'server.create'),
     ]);
@@ -737,13 +752,20 @@ async function handleApiInner(request, env) {
   if (method === 'PATCH' && path.startsWith('/api/servers/')) {
     if (!isAdmin(user)) return err('forbidden', 403, 'FORBIDDEN');
     const id = Number(path.split('/')[3]) || 0;
-    const server = await env.DB.prepare('SELECT name, "group", display_index, alert_override FROM servers WHERE id = ?').bind(id).first();
+    const server = await env.DB.prepare('SELECT name, "group", display_index, alert_override, description FROM servers WHERE id = ?').bind(id).first();
     if (!server) return err('not found', 404, 'NOT_FOUND');
     const body = await request.json().catch(() => ({}));
     const name = body.name !== undefined ? String(body.name).trim() : server.name;
     if (!name) return err('name required', 400, 'NAME_REQUIRED');
     const group = body.group !== undefined ? String(body.group).trim() : server.group;
     const displayIndex = body.sort_order !== undefined ? Number(body.sort_order) || 0 : server.display_index;
+    // 描述：不传该字段 = 保持原值；传空串/null = 清除（归一成 NULL）
+    let description = server.description;
+    if (body.description !== undefined) {
+      const desc = normalizeServerDesc(body.description);
+      if (desc.error) return err(desc.error, 400, 'DESCRIPTION_TOO_LONG');
+      description = desc.value;
+    }
     // alert_override：传 null/空对象 = 清除覆盖回退全局；不传该字段 = 保持原值不变。
     // 清洗后全非法 → null（不存噪音，按全局阈值判定）
     let overrideJson = server.alert_override;
@@ -753,8 +775,8 @@ async function handleApiInner(request, env) {
     }
     // 更新 + 审计同一事务（D1 batch 原子）
     await env.DB.batch([
-      env.DB.prepare('UPDATE servers SET name = ?, "group" = ?, display_index = ?, alert_override = ? WHERE id = ?')
-        .bind(name, group, displayIndex, overrideJson, id),
+      env.DB.prepare('UPDATE servers SET name = ?, "group" = ?, display_index = ?, alert_override = ?, description = ? WHERE id = ?')
+        .bind(name, group, displayIndex, overrideJson, description, id),
       env.DB.prepare('INSERT INTO audit_logs (user_id, username, client_ip, action, target_server_id, detail) VALUES (?,?,?,?,?,?)')
         .bind(user.id, user.username, clientIp(request), 'server.update', id, `${server.name} → ${name}`),
     ]);
@@ -762,7 +784,8 @@ async function handleApiInner(request, env) {
     // 覆盖值随上报帧下发（report.js 行缓存），显式清缓存使它立即生效而非等 60s TTL
     serverRowCache.delete(id);
     return json({
-      ok: true, id, name, group, display_index: displayIndex, alert_override: safeJson(overrideJson),
+      // 响应统一用空串表示"无描述"（与列表/MCP 一致；库里存 NULL）
+      ok: true, id, name, group, display_index: displayIndex, alert_override: safeJson(overrideJson), description: description || '',
     });
   }
 
@@ -1225,6 +1248,7 @@ async function mcpListServers(user, env) {
     id: s.id,
     name: s.name,
     group: s.group || '',
+    description: s.description || '',
     online: s.online,
     wan_ip: s.wan_ip || '',
     info: s.info,
@@ -1526,14 +1550,16 @@ async function mcpAddServer(user, env, args, ip, url) {
   const name = String(args.name || '').trim();
   if (!name) throw new Error('name required');
   const group = String(args.group || '').trim();
+  const desc = normalizeServerDesc(args.description);
+  if (desc.error) throw new Error(desc.error);
   const displayIndex = Number(args.sort_order) || 0;
   const key = randomHex(32);
   const keyId = await sha256Hex(key);
   const hash = await hashSecret(key, env);
   // 服务器 + 审计同一事务（D1 batch 原子）
   await env.DB.batch([
-    env.DB.prepare('INSERT INTO servers (agent_key_id, name, "group", display_index, user_id, agent_key_hash) VALUES (?,?,?,?,?,?)')
-      .bind(keyId, name, group, displayIndex, user.id, hash),
+    env.DB.prepare('INSERT INTO servers (agent_key_id, name, "group", display_index, user_id, agent_key_hash, description) VALUES (?,?,?,?,?,?,?)')
+      .bind(keyId, name, group, displayIndex, user.id, hash, desc.value),
     env.DB.prepare('INSERT INTO audit_logs (user_id, username, client_ip, action) VALUES (?,?,?,?)')
       .bind(user.id, user.username, ip, 'server.create'),
   ]);
@@ -1544,6 +1570,7 @@ async function mcpAddServer(user, env, args, ip, url) {
   return {
     server_id: id,
     name,
+    description: desc.value || '',
     agent_key: key, // 明文只返回一次
     wss_base: agentWssBase(url), // agent 部署地址（与 REST 版一致，协议跟随访问协议）
   };
@@ -1566,6 +1593,13 @@ async function mcpUpdateServer(user, env, args, ip) {
   if (!name) throw new Error('name required');
   const group = args.group !== undefined ? String(args.group).trim() : server.group;
   const displayIndex = args.sort_order !== undefined ? Number(args.sort_order) || 0 : server.display_index;
+  // 描述：不传 = 保持原值；传空串 = 清除（与 REST PATCH 同语义）
+  let description = server.description;
+  if (args.description !== undefined) {
+    const desc = normalizeServerDesc(args.description);
+    if (desc.error) throw new Error(desc.error);
+    description = desc.value;
+  }
   // alert_override：null/空对象 = 清除覆盖回退全局；不传 = 保持原值（与 REST PATCH 同语义）
   let overrideJson = server.alert_override;
   if (args.alert_override !== undefined) {
@@ -1573,15 +1607,16 @@ async function mcpUpdateServer(user, env, args, ip) {
     overrideJson = cleaned ? JSON.stringify(cleaned) : null;
   }
   await env.DB.batch([
-    env.DB.prepare('UPDATE servers SET name = ?, "group" = ?, display_index = ?, alert_override = ? WHERE id = ?')
-      .bind(name, group, displayIndex, overrideJson, server.id),
+    env.DB.prepare('UPDATE servers SET name = ?, "group" = ?, display_index = ?, alert_override = ?, description = ? WHERE id = ?')
+      .bind(name, group, displayIndex, overrideJson, description, server.id),
     env.DB.prepare('INSERT INTO audit_logs (user_id, username, client_ip, action, target_server_id, detail) VALUES (?,?,?,?,?,?)')
       .bind(user.id, user.username, ip, 'server.update', server.id, `${server.name} → ${name}`),
   ]);
   serverListCacheClear();
   serverRowCache.delete(server.id); // 覆盖值随上报帧下发，清缓存立即生效
   return {
-    ok: true, server_id: server.id, name, group, display_index: displayIndex, alert_override: safeJson(overrideJson),
+    ok: true, server_id: server.id, name, group, display_index: displayIndex,
+    alert_override: safeJson(overrideJson), description: description || '',
   };
 }
 

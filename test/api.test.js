@@ -6,7 +6,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import worker, { __internals as I } from '../src/index.js';
-import { EXEC_CMD_MAX_BYTES } from '../src/config.js';
+import { EXEC_CMD_MAX_BYTES, SERVER_DESC_MAX } from '../src/config.js';
 import { makeEnv, makePanelStub, makeMetricsStub, requestBuilder } from './helpers.js';
 
 const call = requestBuilder(worker);
@@ -175,6 +175,57 @@ test('服务器：管理员添加/列表/删除 + 分组排序', async () => {
   assert.equal(del.status, 200);
   const after = await (await call(env, { path: '/api/servers', token })).json();
   assert.deepEqual(after.map((s) => s.name), ['web-01', 'db-01']);
+});
+
+// 服务器描述：可选多行文本，随列表（及 MCP list_servers）下发，长度受 SERVER_DESC_MAX 限制
+test('服务器描述：多行保存 + CRLF 归一 + 未传保持 + 空串清除 + 长度上限', async () => {
+  const env = makeEnv();
+  const token = await login(env);
+  const multi = '用于生产数据库\n负责人：ops\n机房：BJ-3';
+  await addServer(env, token, { name: 'db', description: multi });
+  let list = await (await call(env, { path: '/api/servers', token })).json();
+  assert.equal(list[0].description, multi, '多行描述原样保存');
+  const id = list[0].id;
+
+  // 前后空白裁剪 + CRLF 归一为 LF
+  await call(env, { method: 'PATCH', path: `/api/servers/${id}`, token, body: { description: '  a\r\nb  ' } });
+  list = await (await call(env, { path: '/api/servers', token })).json();
+  assert.equal(list[0].description, 'a\nb', 'CRLF 归一且去首尾空白');
+
+  // 未传该字段 = 保持原值（PATCH 语义）
+  await call(env, { method: 'PATCH', path: `/api/servers/${id}`, token, body: { name: 'db2' } });
+  list = await (await call(env, { path: '/api/servers', token })).json();
+  assert.equal(list[0].name, 'db2');
+  assert.equal(list[0].description, 'a\nb', '未传 description 时保持原值');
+
+  // 空白/空串 = 清除（归一成 NULL，不存空串）
+  await call(env, { method: 'PATCH', path: `/api/servers/${id}`, token, body: { description: '   ' } });
+  list = await (await call(env, { path: '/api/servers', token })).json();
+  assert.equal(list[0].description, '', '空白描述归一为空（库里存 NULL，接口统一返回空串）');
+
+  // 长度上限（UTF-16 码元，与前端 maxlength 同口径）
+  const tooLong = 'x'.repeat(SERVER_DESC_MAX + 1);
+  assert.equal((await call(env, { method: 'POST', path: '/api/servers', token, body: { name: 'big', description: tooLong } })).status, 400);
+  assert.equal((await call(env, { method: 'PATCH', path: `/api/servers/${id}`, token, body: { description: tooLong } })).status, 400);
+  assert.equal((await call(env, { method: 'PATCH', path: `/api/servers/${id}`, token, body: { description: 'x'.repeat(SERVER_DESC_MAX) } })).status, 200, '正好等于上限可通过');
+});
+
+test('MCP：add_server/update_server 支持 description，list_servers 返回它', async () => {
+  const env = makeEnv();
+  const token = await login(env);
+  const as = await (await mcp(env, { token, body: { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'add_server', arguments: { name: 'mcp-desc', description: '备份机 · 每日 2:00 全量' } } } })).json();
+  assert.equal(as.result.isError, false);
+  assert.equal(JSON.parse(as.result.content[0].text).description, '备份机 · 每日 2:00 全量');
+
+  const ls = await (await mcp(env, { token, body: { jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'list_servers', arguments: {} } } })).json();
+  assert.equal(JSON.parse(ls.result.content[0].text)[0].description, '备份机 · 每日 2:00 全量', 'list_servers 带出描述');
+
+  const up = await (await mcp(env, { token, body: { jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'update_server', arguments: { server_id: 1, description: '改了' } } } })).json();
+  assert.equal(JSON.parse(up.result.content[0].text).description, '改了');
+  const clr = await (await mcp(env, { token, body: { jsonrpc: '2.0', id: 4, method: 'tools/call', params: { name: 'update_server', arguments: { server_id: 1, description: '' } } } })).json();
+  assert.equal(JSON.parse(clr.result.content[0].text).description, '', '空串清除');
+  const after = await (await call(env, { path: '/api/servers', token })).json();
+  assert.equal(after[0].description, '', '清除后接口返回空串');
 });
 
 // 面板生成给外部抄写的绝对 URL（agent 控制通道 wss_base、MCP 签名上传 URL）：

@@ -216,7 +216,7 @@ main { max-width: 1000px; width: 100%; margin: 24px auto; padding: 0 24px; flex:
 }
 .toolbar-add:hover { color: var(--text); border-color: var(--accent); transform: translateY(-1px); }
 
-input[type="text"], input[type="password"], input[type="number"] {
+input[type="text"], input[type="password"], input[type="number"], textarea {
   background: var(--input-bg);
   border: 1px solid var(--border);
   color: var(--text);
@@ -226,7 +226,7 @@ input[type="text"], input[type="password"], input[type="number"] {
   outline: none;
   transition: border-color .15s ease, box-shadow .15s ease;
 }
-input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(99, 102, 241, .15); }
+input:focus, textarea:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(99, 102, 241, .15); }
 
 button {
   background: var(--grad);
@@ -399,6 +399,14 @@ button.danger:hover { background: rgba(248, 113, 113, .12); }
   overflow-y: auto;
 }
 .m-tip.show { display: block; }
+/* 有描述的服务器名：可点击查看。虚线下划线做可交互提示（不加图标，避免卡片标题区噪声） */
+.card-title .name.has-desc { cursor: pointer; border-bottom: 1px dashed var(--muted); }
+.card-title .name.has-desc:hover { color: var(--accent); border-bottom-color: var(--accent); }
+.card-title .name.has-desc:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 3px; }
+/* 描述浮层：复用 .m-tip 的定位/配色，正文保留换行（描述是多行输入） */
+.d-tip { width: 340px; max-height: 260px; overflow: auto; }
+.d-tip .d-name { font-size: 12px; font-weight: 600; margin-bottom: 6px; }
+.d-tip .d-body { font-size: 12px; line-height: 1.6; color: var(--muted); white-space: pre-wrap; word-break: break-word; }
 .mt-title { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .5px; margin-bottom: 6px; }
 .mt-row { display: flex; justify-content: space-between; gap: 12px; font-size: 12px; padding: 3px 0; }
 .mt-row span { color: var(--muted); white-space: nowrap; }
@@ -818,6 +826,17 @@ button.danger:hover { background: rgba(248, 113, 113, .12); }
   white-space: nowrap;
 }
 .field input:placeholder-shown ~ .field-tag { display: none; }
+/* 服务器描述：多行输入。field-tag 的垂直居中在 textarea 上会压住正文，这里改用右下角字数 */
+.field-desc textarea { width: 100%; min-height: 68px; resize: vertical; line-height: 1.5; padding-bottom: 18px; }
+.desc-count {
+  position: absolute;
+  right: 10px;
+  bottom: 6px;
+  font-size: 11px;
+  color: var(--muted);
+  pointer-events: none;
+  font-variant-numeric: tabular-nums;
+}
 /* PAT 有效天数：右侧常驻「截止时间」标签（复用 field-tag 槽位，见 app.js
    syncTokenExpiryPreview）。预留出标签宽度防止盖住输入的数字，并隐藏 number
    输入自带的步进按钮（与标签叠放；键盘 ↑↓ 仍可增减） */

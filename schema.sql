@@ -17,6 +17,7 @@ CREATE TABLE IF NOT EXISTS servers (
   info_json      TEXT,                      -- 系统信息 JSON（OS/内核/IP，变更时更新）
   probe_json     TEXT,                      -- 服务探活结果 JSON（[{name,ok,code,ms}]，变更时更新）
   alert_override TEXT,                      -- 逐机告警阈值覆盖 JSON（迁移 0012；缺省继承全局 settings.alerts）
+  description    TEXT,                      -- 服务器描述（迁移 0014；可选运维备注，长度受 SERVER_DESC_MAX 限制）
   created_at     TEXT    NOT NULL DEFAULT (datetime('now'))
 );
 

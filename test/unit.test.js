@@ -8,7 +8,7 @@ import nodeFs from 'node:fs';
 import nodePath from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { __internals as I } from '../src/index.js';
-import { CTRL_MSG_LIMIT, EXEC_FRAME_OVERHEAD, EXEC_CMD_MAX_BYTES, execCommandBytes } from '../src/config.js';
+import { CTRL_MSG_LIMIT, EXEC_FRAME_OVERHEAD, EXEC_CMD_MAX_BYTES, execCommandBytes, SERVER_DESC_MAX } from '../src/config.js';
 import { makeEnv } from './helpers.js';
 
 const env = { JWT_SECRET: 'unit-secret' };
@@ -874,6 +874,15 @@ test('i18n：zh-CN 与 en-US 语言包 key 结构完全同构', () => {
   const onlyEn = [...en].filter((k) => !zh.has(k));
   assert.deepEqual(onlyZh, [], `以下 key 缺英文翻译：${onlyZh.join(', ')}`);
   assert.deepEqual(onlyEn, [], `以下 key 中文包没有（疑似拼写不一致）：${onlyEn.join(', ')}`);
+});
+
+test('服务器描述：前端 textarea 的 maxlength 必须与后端 SERVER_DESC_MAX 一致', () => {
+  const root = nodePath.join(nodePath.dirname(fileURLToPath(import.meta.url)), '..');
+  const html = nodeFs.readFileSync(nodePath.join(root, 'public/index.html'), 'utf8');
+  const m = html.match(/id="inp-desc"[^>]*maxlength="(\d+)"/);
+  assert.ok(m, 'index.html 应有 #inp-desc 的 maxlength（描述输入框）');
+  // 两处漂移的后果：前端放行 → 提交才 400（用户白写一屏字），或前端过严 → 描述被无谓截断
+  assert.equal(Number(m[1]), SERVER_DESC_MAX, '前端上限须与 config.js 的 SERVER_DESC_MAX 一致');
 });
 
 test('i18n：index.html 引用的 data-i18n key 必须都在语言包中定义', () => {

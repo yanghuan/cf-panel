@@ -73,6 +73,7 @@
     'server.name': 'Server name',
     'server.group': 'Group',
     'server.groupOptional': 'Group (optional)',
+    'server.descPlaceholder': 'Description (optional, max 500 chars): purpose / owner / rack',
     'server.order': 'Order',
     'server.orderOptional': 'Order (optional)',
     'server.batchGroup': 'Set group',

@@ -72,6 +72,7 @@
     'server.name': '服务器名称',
     'server.group': '分组',
     'server.groupOptional': '分组(可选)',
+    'server.descPlaceholder': '描述（可选，最多 500 字）：用途/负责人/机房等',
     'server.order': '序号',
     'server.orderOptional': '序号(可选)',
     'server.batchGroup': '修改分组',

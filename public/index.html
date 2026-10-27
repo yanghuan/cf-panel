@@ -299,6 +299,14 @@
           <span class="field-tag" data-i18n="server.group">分组</span>
         </div>
       </div>
+      <!-- 服务器描述（可选，多行）：点击卡片上的服务器名可查看；也随 list_servers 下发给 MCP。
+           maxlength 必须与 config.js 的 SERVER_DESC_MAX 一致（test/unit.test.js 锁定）。 -->
+      <div class="settings-row">
+        <div class="field field-desc">
+          <textarea id="inp-desc" rows="3" maxlength="500" placeholder="描述（可选，最多 500 字）" data-i18n-ph="server.descPlaceholder"></textarea>
+          <span class="desc-count" id="inp-desc-count">0/500</span>
+        </div>
+      </div>
       <div class="settings-row">
         <div class="field">
           <input id="inp-order" type="number" placeholder="序号(可选)" data-i18n-ph="server.orderOptional" />

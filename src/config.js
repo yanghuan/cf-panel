@@ -14,6 +14,11 @@ export const SCOPE_AGENT_UPDATE = 'agent:update';
 // 唯一收窄：该 scope 只能由 JWT 管理员签发（见 routes.js 的 create_token），admin PAT 无法再造 admin PAT。
 export const SCOPE_ADMIN = 'panel:admin';
 
+// ---- 服务器描述 ----
+// 可选自由文本（用途/负责人/机房等），会随 list_servers 下发给 MCP 客户端。
+// 前端 textarea 的 maxlength 必须与本值一致（由 test/unit.test.js 断言，防两边漂移）。
+export const SERVER_DESC_MAX = 500;
+
 // ---- MCP exec 命令长度上限 ----
 // agent 控制通道的入站单帧上限（rust 侧同名常量 CTRL_MSG_LIMIT，同步关系由测试锁定）：
 // 超限帧被 tungstenite 判 Capacity，agent 读循环随即断开重连——命令**不会执行**，

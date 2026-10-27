@@ -211,6 +211,7 @@ export async function listServersWithState(env, user) {
     id: s.id,
     name: s.name,
     group: s.group || '',
+    description: s.description || '', // 服务器描述（迁移 0014；空串而非 null，前端/ MCP 都按"无描述"判断）
     display_index: s.display_index || 0,
     // 在线判定优先用 MetricsDO 秒级 last_seen_s（内存热区实时）；D1 last_seen 节流写，仅冷启动兜底
     online: nowSec - (latest[s.id]?.last_seen_s || s.last_seen || 0) < grace,

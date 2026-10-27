@@ -210,6 +210,10 @@
     'token.hint': 'server_id reference: {list}',
     'token.hintEmpty': 'No servers yet',
     'token.pickDate': 'This browser cannot open a date picker; type the expiry directly (e.g. 2026/9/5 14:00)',
+    'token.adminTip': 'Full admin: grants every management endpoint (server CRUD, tokens, settings, audit). Ignores the server_ids whitelist and other scopes; can only be issued by a logged-in admin',
+    'token.adminNoWhitelist': 'panel:admin selected: the server_ids whitelist is ignored (full access to all servers)',
+    'token.idsNone': 'ids=empty set (no server accessible)',
+    'token.badServerIds': 'server_ids must be comma-separated positive integers',
   };
 
   // ---------------- Audit log ----------------

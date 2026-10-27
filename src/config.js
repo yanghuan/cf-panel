@@ -8,6 +8,11 @@ export const PAT_PREFIX = 'cfp_'; // PAT token 前缀（auth 鉴权 + routes 创
 export const SCOPE_READ = 'server:read';
 export const SCOPE_EXEC = 'server:exec';
 export const SCOPE_AGENT_UPDATE = 'agent:update';
+// PAT 全权 scope：勾选后与 JWT 管理员等价（可使用全部管理工具/REST 管理接口，
+// 且**忽略 server_ids 白名单与其它 scope**——isAdmin 在 canAccessServer/canExec 中最先短路）。
+// 设计动机：MCP 客户端只适合配置长期凭据，而 JWT 仅 24h 有效，否则管理类工具在 MCP 中不可用。
+// 唯一收窄：该 scope 只能由 JWT 管理员签发（见 routes.js 的 create_token），admin PAT 无法再造 admin PAT。
+export const SCOPE_ADMIN = 'panel:admin';
 
 // ---- MCP exec 命令长度上限 ----
 // agent 控制通道的入站单帧上限（rust 侧同名常量 CTRL_MSG_LIMIT，同步关系由测试锁定）：

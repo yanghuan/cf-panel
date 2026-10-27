@@ -53,7 +53,8 @@
   }
   setTokenGetter(() => token); // api 层通过 getter 读取当前 token
   let canExec = true; // 当前用户是否有 exec 权限（PAT 按 scopes，admin 恒有；控制终端/文件菜单显隐）
-  let isAdmin = true; // 当前用户是否面板管理员（JWT 登录；PAT 恒 false；控制修改/删除等管理菜单显隐）
+  let isAdmin = true; // 当前用户是否面板管理员（JWT，或带 panel:admin 的 PAT；控制修改/删除等管理菜单显隐）
+  let sessionIsPat = false; // 当前会话是否 PAT：panel:admin 只能由 JWT 管理员签发，PAT 下禁用该勾选
   let serversCache = [];
   let latestAgent = null; // {build_id,platforms}：管理员登录后一次获取，卡片按 agent capability 显示更新按钮
   const updatingAgents = new Set(); // server id：防重复点击，更新期间按钮置禁用
@@ -102,9 +103,12 @@
     $('#auth').classList.add('hidden');
     $('#app').classList.remove('hidden');
     $('#whoami').textContent = user.is_pat ? t('user.tokenWith', { name: escapeHtml(user.username) }) : escapeHtml(user.username || 'admin');
-    // PAT：exec 权限决定终端/文件菜单显隐（admin 恒有 exec）；修改/删除等管理操作仅 admin（PAT 恒隐藏）
-    canExec = user.role === 1 || (user.scopes && user.scopes.includes('server:exec'));
-    isAdmin = !user.is_pat;
+    // PAT：exec 权限决定终端/文件菜单显隐（admin 恒有 exec）；管理操作需 admin
+    // （JWT 管理员，或带 panel:admin 全权 scope 的 PAT——与后端 isAdmin 判定保持一致）
+    const scopes = user.scopes || [];
+    sessionIsPat = !!user.is_pat;
+    isAdmin = !user.is_pat || scopes.includes('panel:admin');
+    canExec = user.role === 1 || isAdmin || scopes.includes('server:exec');
     // 头部下拉菜单的管理项（添加服务器/站点/告警/自定义指标/服务监控/令牌/审计/用量）按 isAdmin 隐藏，
     // PAT 用户不再看到点击后 403 的入口（退出保留）
     const ADMIN_MENUS = new Set(['add-server', 'site', 'alerts', 'custom-setup', 'service-setup', 'tokens', 'audit-logs', 'usage']);
@@ -2756,6 +2760,9 @@
   function openTokensModal() {
     $('#tokens-modal').classList.remove('hidden');
     lockScroll();
+    // panel:admin 只能由 JWT 管理员签发：PAT 会话下禁用该勾选（后端也会拒绝，此处提前避免无效操作）
+    $('#tok-admin').disabled = sessionIsPat;
+    if (sessionIsPat) $('#tok-admin').checked = false;
     loadTokens();
     loadTokenServerHint();
   }
@@ -2887,16 +2894,101 @@
     if (at <= Math.floor(Date.now() / 1000)) throw new Error(t('token.errPast'));
     return { expires_at: at };
   }
+  // 令牌列表：GET /api/tokens 返回的是 D1 原始行，scopes/server_ids 为 JSON 字符串，这里解析成数组
+  const TOKEN_SCOPES = ['server:read', 'server:exec', 'agent:update', 'panel:admin'];
+  function tokenArr(v) {
+    if (Array.isArray(v)) return v;
+    if (!v) return [];
+    try { const a = JSON.parse(v); return Array.isArray(a) ? a : []; } catch { return []; }
+  }
+  let tokenRows = [];
+  let editingTokenId = 0; // 0 = 无编辑态
+
+  function renderTokenList() {
+    const box = $('#token-list');
+    if (!tokenRows.length) { box.innerHTML = `<li class="muted">${t('token.empty')}</li>`; return; }
+    box.innerHTML = tokenRows.map((r) => {
+      const scopes = tokenArr(r.scopes);
+      const ids = tokenArr(r.server_ids);
+      // server_ids 三态：null=全量 / [] =空集（禁止访问任何服务器）/ 有值=白名单。
+      // 列表必须把「空集」显示出来，否则与「全量」看起来一样，管理员会误判令牌权限。
+      const idsLabel = (r.server_ids === null || r.server_ids === undefined)
+        ? '' : (ids.length ? `ids=${ids.join(',')}` : t('token.idsNone'));
+      if (r.id === editingTokenId) {
+        // 编辑态：勾选框 + 白名单 + 有效期（清空有效期=改回永久）。校验在 saveToken 里做
+        return `<li>
+            <div class="settings-row">
+              <strong>${escapeHtml(r.name)}</strong>
+              ${TOKEN_SCOPES.map((s) => `<label class="chk"><input type="checkbox" data-edit-scope="${s}" ${scopes.includes(s) ? 'checked' : ''} /> ${s}</label>`).join('')}
+            </div>
+            <div class="settings-row">
+              <input data-edit-servers data-orig="${escapeHtml(ids.join(','))}" type="text" value="${escapeHtml(ids.join(','))}" placeholder="${escapeHtml(t('token.serverIds'))}" />
+              <input data-edit-expires type="text" value="${r.expires_at ? toLocalInput(r.expires_at) : ''}" placeholder="${escapeHtml(t('token.expiryShort'))}" title="${escapeHtml(t('token.expiryTip'))}" />
+              <button data-tok-save="${r.id}">${escapeHtml(t('common.save'))}</button>
+              <button data-tok-cancel="${r.id}" class="ghost">${escapeHtml(t('common.cancel'))}</button>
+            </div>
+          </li>`;
+      }
+      const meta = [
+        scopes.join(',') || '-',
+        idsLabel,
+        t('token.expiresAt', { time: fmtTokenExpiry(r.expires_at) }),
+        r.last_used_at ? t('token.lastUsed', { time: new Date(r.last_used_at * 1000).toLocaleString() }) : t('token.neverUsed'),
+      ].filter(Boolean).map((s) => escapeHtml(s)).join(' · ');
+      // 改权限范围仅 JWT 管理员：PAT 会话下隐藏「编辑」（后端同样 403），避免点了才失败
+      const editBtn = sessionIsPat ? '' : `<button data-tok-edit="${r.id}" class="ghost">${escapeHtml(t('common.edit'))}</button>`;
+      return `<li>${escapeHtml(r.name)} · ${meta}
+            ${editBtn}
+            <button data-tok-del="${r.id}" class="danger">${escapeHtml(t('common.delete'))}</button></li>`;
+    }).join('');
+  }
+
   async function loadTokens() {
     try {
-      const rows = await api('/api/tokens');
-      $('#token-list').innerHTML = rows.length
-        ? rows.map((r) => `
-            <li>${escapeHtml(r.name)} · ${escapeHtml(r.scopes)}${r.server_ids ? ' · ids=' + escapeHtml(r.server_ids) : ''} · 到期：${escapeHtml(fmtTokenExpiry(r.expires_at))} · ${r.last_used_at ? `最近使用：${escapeHtml(new Date(r.last_used_at * 1000).toLocaleString())}` : t('token.neverUsed')}
-              <button data-tok-del="${r.id}" class="danger">${escapeHtml(t('common.delete'))}</button></li>`).join('')
-        : `<li class="muted">${t('token.empty')}</li>`;
+      tokenRows = await api('/api/tokens');
+      editingTokenId = 0;
+      renderTokenList();
     } catch (e) {
       $('#token-list').innerHTML = `<li class="muted">${escapeHtml(e.message)}</li>`;
+    }
+  }
+
+  // 保存权限变更（PATCH /api/tokens/:id）。只提交这三个字段；其余保持原值。
+  // 校验前置：scopes 至少一个；server_ids 空=全部；有效期留空=改为永久（显式语义）。
+  async function saveToken(btn) {
+    const id = Number(btn.dataset.tokSave);
+    const li = btn.closest('li');
+    const scopes = [...li.querySelectorAll('input[data-edit-scope]:checked')].map((el) => el.dataset.editScope);
+    if (!scopes.length) return toast(t('token.needScope'));
+    const serversEl = li.querySelector('[data-edit-servers]');
+    const idsText = serversEl.value.trim();
+    const parts = idsText ? idsText.split(',').map((s) => s.trim()).filter(Boolean) : [];
+    const nums = parts.map(Number);
+    if (nums.some((n) => !Number.isInteger(n) || n <= 0)) return toast(t('token.badServerIds'));
+    const expRaw = li.querySelector('[data-edit-expires]').value.trim();
+    const payload = { scopes, expires_at: null };
+    // 只有真的改过才提交 server_ids：空集令牌在编辑框里同样显示为空串，
+    // 若无条件提交「空串→null(全量)」，一次无关的 scopes 调整就会把它静默放开到所有服务器。
+    if (idsText !== (serversEl.dataset.orig || '')) payload.server_ids = nums.length ? nums : null;
+    if (expRaw) {
+      // 与创建弹窗同语义：纯数字=相对天数，否则按日期时间解析
+      const asNum = Number(expRaw);
+      if (Number.isFinite(asNum) && asNum > 0) {
+        payload.expires_at = Math.floor(Date.now() / 1000 + asNum * 86400);
+      } else {
+        const ts = Date.parse(expRaw);
+        if (!Number.isFinite(ts)) return toast(t('token.errExpiry'));
+        if (ts <= Date.now()) return toast(t('token.errPast'));
+        payload.expires_at = Math.floor(ts / 1000);
+      }
+    }
+    btn.disabled = true;
+    try {
+      await api(`/api/tokens/${id}`, { method: 'PATCH', body: JSON.stringify(payload) });
+      await loadTokens();
+    } catch (e) {
+      toast(e.message);
+      btn.disabled = false;
     }
   }
 
@@ -2907,8 +2999,13 @@
     if ($('#tok-read').checked) scopes.push('server:read');
     if ($('#tok-exec').checked) scopes.push('server:exec');
     if ($('#tok-agent-update').checked) scopes.push('agent:update');
+    const adminScope = $('#tok-admin').checked;
+    if (adminScope) scopes.push('panel:admin');
     if (!scopes.length) return toast(t('token.needScope'));
-    const serverIDs = $('#tok-servers').value.split(',').map((s) => Number(s.trim())).filter((n) => n > 0);
+    // panel:admin 全权：后端 isAdmin 短路在白名单之前，server_ids 不再生效——显式忽略并提示，
+    // 避免"填了白名单却仍能操作全部服务器"的误解（后端不会报错，静默放行）。
+    if (adminScope) toast(t('token.adminNoWhitelist'));
+    const serverIDs = adminScope ? [] : $('#tok-servers').value.split(',').map((s) => Number(s.trim())).filter((n) => n > 0);
     const expDays = Number($('#tok-expires').value);
     tokenCreateBusy = true;
     const btn = $('#btn-create-token');
@@ -3296,8 +3393,14 @@
   // 用量观测弹窗
   $('#btn-usage-close').onclick = () => { $('#usage-modal').classList.add('hidden'); unlockScroll(); };
   $('#token-list').addEventListener('click', (e) => {
-    const btn = e.target.closest('button[data-tok-del]');
-    if (btn) deleteToken(Number(btn.dataset.tokDel));
+    const del = e.target.closest('button[data-tok-del]');
+    if (del) { deleteToken(Number(del.dataset.tokDel)); return; }
+    const edit = e.target.closest('button[data-tok-edit]');
+    if (edit) { editingTokenId = Number(edit.dataset.tokEdit); renderTokenList(); return; }
+    const save = e.target.closest('button[data-tok-save]');
+    if (save) { saveToken(save); return; }
+    const cancel = e.target.closest('button[data-tok-cancel]');
+    if (cancel) { editingTokenId = 0; renderTokenList(); }
   });
 
   $('#servers').addEventListener('click', (e) => {

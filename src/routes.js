@@ -1,11 +1,11 @@
 // cf-panel — 路由层：REST API（handleApi）+ MCP（handleMcp）+ WebSocket 路由（handleWs）
 import {
-  SCOPE_READ, SCOPE_EXEC, SCOPE_AGENT_UPDATE, PAT_PREFIX, SHARDS, parsePanelUsers, statsTzOffsetSec,
+  SCOPE_READ, SCOPE_EXEC, SCOPE_AGENT_UPDATE, SCOPE_ADMIN, PAT_PREFIX, SHARDS, parsePanelUsers, statsTzOffsetSec,
   EXEC_CMD_MAX_BYTES, execCommandBytes, execTooLongError,
 } from './config.js';
 
 // 本模块专用常量（PAT scope 白名单 / MCP 协议与工具，就近定义便于对照使用代码）
-const ALLOWED_SCOPES = [SCOPE_READ, SCOPE_EXEC, SCOPE_AGENT_UPDATE]; // PAT 合法 scope 白名单
+const ALLOWED_SCOPES = [SCOPE_READ, SCOPE_EXEC, SCOPE_AGENT_UPDATE, SCOPE_ADMIN]; // PAT 合法 scope 白名单
 const TOKEN_NAME_UNIQUE_RE = /UNIQUE constraint failed: api_tokens\.name/; // D1 唯一索引（迁移 0010）约束冲突标识
 const MCP_VERSION = '2025-11-25'; // 服务器声明支持的协议版本（缺失头时客户端按 2025-03-26 兼容）
 const MCP_TOOLS = [
@@ -69,7 +69,7 @@ const MCP_TOOLS = [
   },
   {
     name: 'add_server',
-    description: '注册一台新服务器（面板 D1 记录 + 生成一次性 agent key）。仅管理员。返回 agent_key（明文只返回一次，请妥善保存）与 wss_base 部署信息。',
+    description: '注册一台新服务器（面板 D1 记录 + 生成一次性 agent key）。仅管理员（或带 panel:admin 权限的 PAT）。返回 agent_key（明文只返回一次，请妥善保存）与 wss_base 部署信息。',
     inputSchema: {
       type: 'object',
       properties: {
@@ -82,7 +82,7 @@ const MCP_TOOLS = [
   },
   {
     name: 'delete_server',
-    description: '删除一台服务器（清历史监控数据 + 审计 + 断开其 agent 连接）。仅管理员。提供 server_id 或 server_name 之一（重名时须用 server_id）。',
+    description: '删除一台服务器（清历史监控数据 + 审计 + 断开其 agent 连接）。仅管理员（或带 panel:admin 权限的 PAT）。提供 server_id 或 server_name 之一（重名时须用 server_id）。',
     inputSchema: {
       type: 'object',
       properties: {
@@ -94,7 +94,7 @@ const MCP_TOOLS = [
   },
   {
     name: 'update_server',
-    description: '修改服务器名称/分组/排序/告警阈值覆盖。仅管理员。提供 server_id 或 server_name 之一（重名时须用 server_id）；只需传要修改的字段。alert_override 用于逐机覆盖告警阈值（不传=保持不变，传 null=清除覆盖回退全局）。',
+    description: '修改服务器名称/分组/排序/告警阈值覆盖。仅管理员（或带 panel:admin 权限的 PAT）。提供 server_id 或 server_name 之一（重名时须用 server_id）；只需传要修改的字段。alert_override 用于逐机覆盖告警阈值（不传=保持不变，传 null=清除覆盖回退全局）。',
     inputSchema: {
       type: 'object',
       properties: {
@@ -125,17 +125,17 @@ const MCP_TOOLS = [
   },
   {
     name: 'list_tokens',
-    description: '列出全部访问令牌（PAT）概要（id/名称/scopes/server_ids/创建时间，不含哈希与明文）。仅管理员。',
+    description: '列出全部访问令牌（PAT）概要（id/名称/scopes/server_ids/创建时间，不含哈希与明文）。仅管理员（或带 panel:admin 权限的 PAT）。',
     inputSchema: { type: 'object', properties: {}, required: [] },
   },
   {
     name: 'create_token',
-    description: '创建访问令牌（PAT）。仅管理员。返回明文 token（只显示一次，请妥善保存）。scopes 合法值：server:read / server:exec（默认 server:read）；server_ids 为空=全部服务器；有效期二选一：expires_in_days（可小数天）或 expires_at（unix 秒，须在未来），均空=永久有效。名称不可与现有令牌重复（同名返回错误）。',
+    description: '创建访问令牌（PAT）。仅管理员（或带 panel:admin 权限的 PAT）。返回明文 token（只显示一次，请妥善保存）。scopes 合法值：server:read / server:exec / agent:update / panel:admin（默认 server:read）；服务端按白名单过滤。server_ids 为空=全部服务器；有效期二选一：expires_in_days（可小数天）或 expires_at（unix 秒，须在未来），均空=永久有效。名称不可与现有令牌重复（同名返回错误）。注意：panel:admin 等价全权管理员（忽略 server_ids 白名单），只能由 JWT 管理员签发——用 admin PAT 调用本工具创建 panel:admin 会被拒绝。',
     inputSchema: {
       type: 'object',
       properties: {
         name: { type: 'string', description: '令牌名称（必填）' },
-        scopes: { type: 'array', items: { type: 'string' }, description: '权限 scope，如 ["server:read"] 或 ["server:read","server:exec"]' },
+        scopes: { type: 'array', items: { type: 'string' }, description: '权限 scope，如 ["server:read"] 或 ["server:read","server:exec"]；panel:admin = 全权管理员（仅 JWT 管理员可签发）' },
         server_ids: { type: 'array', items: { type: 'integer' }, description: '服务器白名单（空=全部）' },
         expires_in_days: { type: 'number', description: '有效天数（可小数，0.5=12 小时；可选；缺省=永久有效）' },
         expires_at: { type: 'integer', description: '截止时间 unix 秒（须在未来；与 expires_in_days 二选一，优先）' },
@@ -145,7 +145,7 @@ const MCP_TOOLS = [
   },
   {
     name: 'revoke_token',
-    description: '删除（撤销）访问令牌，立即失效（已建连接 ≤5s 内关闭）。仅管理员。',
+    description: '删除（撤销）访问令牌，立即失效（已建连接 ≤5s 内关闭）。仅管理员（或带 panel:admin 权限的 PAT）。',
     inputSchema: {
       type: 'object',
       properties: { token_id: { type: 'integer', description: '令牌 ID（见 list_tokens）' } },
@@ -154,7 +154,7 @@ const MCP_TOOLS = [
   },
   {
     name: 'get_audit_logs',
-    description: '查询审计日志（倒序，保留 90 天）：谁在何时对哪台机器做了什么操作。支持按动作/用户/服务器筛选与分页。仅管理员。',
+    description: '查询审计日志（倒序，保留 90 天）：谁在何时对哪台机器做了什么操作。支持按动作/用户/服务器筛选与分页。仅管理员（或带 panel:admin 权限的 PAT）。',
     inputSchema: {
       type: 'object',
       properties: {
@@ -169,17 +169,17 @@ const MCP_TOOLS = [
   },
   {
     name: 'get_usage',
-    description: '用量观测：近 24h 上报帧 / DO 事件 / D1 写行估算与当日 API 计数（额度评估参考）。仅管理员。',
+    description: '用量观测：近 24h 上报帧 / DO 事件 / D1 写行估算与当日 API 计数（额度评估参考）。仅管理员（或带 panel:admin 权限的 PAT）。',
     inputSchema: { type: 'object', properties: {}, required: [] },
   },
   {
     name: 'get_settings',
-    description: '读取面板设置：站点名称/公告/IP 归属地开关/告警 Webhook 配置。仅管理员。',
+    description: '读取面板设置：站点名称/公告/IP 归属地开关/告警 Webhook 配置。仅管理员（或带 panel:admin 权限的 PAT）。',
     inputSchema: { type: 'object', properties: {}, required: [] },
   },
   {
     name: 'update_settings',
-    description: '更新面板设置（只传要修改的字段）：site_name（站点名）/notice（公告）/geo_lookup（IP 归属地第三方查询开关）/alerts（告警配置，见 get_settings 当前结构）。仅管理员。',
+    description: '更新面板设置（只传要修改的字段）：site_name（站点名）/notice（公告）/geo_lookup（IP 归属地第三方查询开关）/alerts（告警配置，见 get_settings 当前结构）。仅管理员（或带 panel:admin 权限的 PAT）。',
     inputSchema: {
       type: 'object',
       properties: {
@@ -192,6 +192,14 @@ const MCP_TOOLS = [
     },
   },
 ];
+// 管理类工具（requireAdmin 守卫）：tools/list 对非管理员隐藏。
+// 此前无条件返回全部工具 → PAT 客户端看到 11 个调用必 403 的工具，AI 客户端会反复重试/猜参数，
+// 而 scopes 白名单里根本没有、也不会有 admin 项，用户只能误判为"权限配置错了"。
+const MCP_ADMIN_TOOLS = new Set([
+  'add_server', 'delete_server', 'update_server', 'rotate_agent_key',
+  'list_tokens', 'create_token', 'revoke_token',
+  'get_audit_logs', 'get_usage', 'get_settings', 'update_settings',
+]);
 import {
   json, err, requireJwtSecret, signJwt, randomHex, sha256Hex, hashSecret, safeJson,
   kvGet, kvPut, sanitizeAlerts, sanitizeAlertOverride, parseRangeHours, sendWebhookRaw,
@@ -199,7 +207,7 @@ import {
   signUploadToken, verifyUploadToken,
 } from './utils.js';
 import { queryMonitorRows, queryCustomMetrics, queryDayStats, kvClearCache } from './db.js';
-import { authUser, isAdmin, canAccessServer, canExec, canUpdateAgent, listServersWithState, serverListCache } from './auth.js';
+import { authUser, isAdmin, isJwtAdmin, canAccessServer, canExec, canUpdateAgent, listServersWithState, serverListCache } from './auth.js';
 import { serverRowCache, lastSeenWrite, customWritten } from './report.js';
 
 // ---------------- Agent Release / 更新清单 ----------------
@@ -871,13 +879,18 @@ async function handleApiInner(request, env) {
       // 同名令牌拒绝：前置查询快速失败 + 唯一索引（迁移 0010）兜底并发竞态；与 MCP create_token 一致
       const dup = await env.DB.prepare('SELECT id FROM api_tokens WHERE name = ?').bind(name).first();
       if (dup) return err('token name already exists', 409, 'TOKEN_NAME_EXISTS');
-      // scopes 白名单校验：只允许 server:read / server:exec，非法值直接拒绝
+      // scopes 白名单校验：只允许 ALLOWED_SCOPES，非法值直接拒绝
       let scopes;
       if (Array.isArray(body.scopes) && body.scopes.length) {
         scopes = [...new Set(body.scopes.filter((s) => ALLOWED_SCOPES.includes(s)))];
         if (!scopes.length) return err(`invalid scope, allowed: ${ALLOWED_SCOPES.join(', ')}`, 400);
       } else {
         scopes = [SCOPE_READ];
+      }
+      // 提权链熔断：panel:admin 等价全权管理员，只允许 JWT 管理员签发。
+      // 否则一个泄露的 admin PAT 可无限铸造新的永久 admin PAT（管理员登录一次即可换新令牌）。
+      if (scopes.includes(SCOPE_ADMIN) && !isJwtAdmin(user)) {
+        return err('panel:admin 只能由管理员登录（JWT）签发，PAT 不能授予该权限', 403, 'FORBIDDEN');
       }
       const serverIDs = Array.isArray(body.server_ids) ? body.server_ids.map(Number).filter((n) => n > 0) : null;
       // 有效期二选一：expires_at（unix 秒绝对截止，须在未来，优先）或 expires_in_days
@@ -915,6 +928,75 @@ async function handleApiInner(request, env) {
       await doPanel(env).fetch('https://do.internal/rpc/clear_auth_cache', { method: 'POST' });
     } catch { /* 清缓存失败由 authCache 30s TTL 兜底 */ }
     return json({ ok: true });
+  }
+  // PATCH /api/tokens/:id —— 修改已创建令牌的权限范围（scopes / server_ids / 有效期）。
+  // 只更新显式传入的字段（未传=保持原值）；令牌明文不可改（库里只有 HMAC），换密文请新建。
+  // **仅 JWT 管理员**：改 scopes 等价于签发权限——若放开给 admin PAT，就把上一条
+  // 「panel:admin 只能由 JWT 管理员签发」的熔断绕开了（自己改自己的令牌即可重开提权链）。
+  if (method === 'PATCH' && path.startsWith('/api/tokens/')) {
+    if (!isJwtAdmin(user)) return err('token scopes can only be changed by a logged-in admin', 403, 'FORBIDDEN');
+    const id = Number(path.split('/')[3]) || 0;
+    const row = await env.DB.prepare('SELECT id, name, scopes, server_ids, expires_at FROM api_tokens WHERE id = ?').bind(id).first();
+    if (!row) return err('token not found', 404);
+    const body = await request.json().catch(() => ({}));
+    const changed = [];
+
+    let scopes = safeJson(row.scopes);
+    if (!Array.isArray(scopes)) scopes = [];
+    if (body.scopes !== undefined) {
+      // 严格校验（与创建时的"静默过滤"不同）：权限字段里出现未知值必须报错，
+      // 否则 ['server:read','adminn'] 会被静默降级成只读，用户以为提权成功了。
+      if (!Array.isArray(body.scopes) || !body.scopes.length) return err('scopes must be a non-empty array', 400);
+      const bad = body.scopes.filter((s) => !ALLOWED_SCOPES.includes(s));
+      if (bad.length) return err(`invalid scope: ${bad.join(', ')}（allowed: ${ALLOWED_SCOPES.join(', ')}）`, 400);
+      // panel:admin 的提权约束由上方的 isJwtAdmin 守卫覆盖：只有 JWT 管理员能到这里，
+      // 因此可安全地按入参全量替换（降权、升级都在此完成）。
+      scopes = [...new Set(body.scopes)];
+      changed.push('scopes');
+    }
+
+    let serverIDs = safeJson(row.server_ids);
+    if (body.server_ids !== undefined) {
+      if (body.server_ids === null) {
+        serverIDs = null; // null = 全量（与创建时"未提供"同义）
+      } else {
+        if (!Array.isArray(body.server_ids)) return err('server_ids must be an array or null', 400);
+        const nums = body.server_ids.map(Number);
+        const ids = [...new Set(nums.filter((n) => Number.isInteger(n) && n > 0))];
+        if (ids.length !== new Set(nums).size) return err('server_ids must be positive integers', 400);
+        // 空数组 = 空集（禁止访问任何服务器），**不是**全量——与创建时的既有语义保持一致
+        // （见测试「server_ids 语义 — 未提供=全量，空数组=空集」）。若在此把 [] 归一成 null，
+        // 管理员想"收缩到零"反而会放开全部服务器，是权限反向扩大的严重错误。
+        serverIDs = ids;
+      }
+      changed.push('server_ids');
+    }
+
+    let expiresAt = row.expires_at ?? null;
+    if (body.expires_at !== undefined) {
+      if (body.expires_at === null || body.expires_at === '') {
+        expiresAt = null; // 改为永久有效
+      } else {
+        const at = Number(body.expires_at);
+        if (!Number.isFinite(at) || at <= Math.floor(Date.now() / 1000)) return err('expires_at must be a future unix timestamp', 400);
+        expiresAt = Math.floor(at);
+      }
+      changed.push('expires_at');
+    }
+
+    if (!changed.length) return err('nothing to update（可改字段：scopes / server_ids / expires_at）', 400);
+    await env.DB.prepare('UPDATE api_tokens SET scopes = ?, server_ids = ?, expires_at = ? WHERE id = ?')
+      .bind(JSON.stringify(scopes), serverIDs ? JSON.stringify(serverIDs) : null, expiresAt, id).run();
+    // 与创建/撤销同一语义：权限变更必须留痕（谁在何时把哪个令牌改成了什么范围）
+    await auditLog(env, {
+      userId: user.id, username: user.username, ip,
+      action: 'token.update', detail: `#${id} ${row.name}：字段 ${changed.join('/')}；scopes=${scopes.join(',')}`,
+    });
+    // 已建 WS 连接持有 30s 缓存的身份（含旧 scopes）：清缓存让降权立即生效，不等 TTL
+    try {
+      await doPanel(env).fetch('https://do.internal/rpc/clear_auth_cache', { method: 'POST' });
+    } catch { /* 清失败由 authCache 30s TTL 兜底 */ }
+    return json({ ok: true, id, scopes, server_ids: serverIDs, expires_at: expiresAt });
   }
 
   // GET /api/audit-logs —— 审计日志（仅管理员，倒序分页 + 筛选 + CSV 导出，保留 90 天）
@@ -980,7 +1062,7 @@ async function handleApiInner(request, env) {
   }
 
   // ---- 分组排序（kv_json group_order = 组名数组，下标即顺序） ----
-  // 读：所有登录用户（排序影响所有观看者的展示）；写：仅管理员。
+  // 读：所有登录用户（排序影响所有观看者的展示）；写：仅管理员（或带 panel:admin 权限的 PAT）。
   // 未在数组中的组追加在尾部按名称排；「未分组」固定最后（前端 groupList 处理）。
   if (method === 'GET' && path === '/api/group-order') {
     const order = await kvGet(env, 'group_order', []);
@@ -1408,9 +1490,13 @@ async function mcpFindServer(env, args) {
   return server;
 }
 
-// 仅管理员守卫（管理类工具 PAT 一律拒绝）
+// 管理员守卫：JWT 管理员，或带 panel:admin 的 PAT（全权）。
+// 错误信息必须自解释：普通 PAT 无论怎么改 scopes 都不可能放行（admin 不在用户可自选的语义里，
+// 而是需要重新签发带 panel:admin 的令牌），旧文案 'forbidden: admin only' 会让人误判为配置错误。
 function requireAdmin(user) {
-  if (!isAdmin(user)) throw new Error('forbidden: admin only');
+  if (!isAdmin(user)) {
+    throw new Error('forbidden: admin only — 管理类工具需管理员身份（JWT 登录，或由管理员签发的带 panel:admin 权限的 PAT）');
+  }
 }
 
 async function mcpAddServer(user, env, args, ip, url) {
@@ -1531,6 +1617,10 @@ async function mcpCreateToken(user, env, args) {
     if (!scopes.length) throw new Error(`invalid scope, allowed: ${ALLOWED_SCOPES.join(', ')}`);
   } else {
     scopes = [SCOPE_READ];
+  }
+  // 与 REST 同语义：panel:admin 只允许 JWT 管理员签发（断提权链，见 POST /api/tokens 注释）
+  if (scopes.includes(SCOPE_ADMIN) && !isJwtAdmin(user)) {
+    throw new Error('panel:admin 只能由管理员登录（JWT）签发，PAT 不能授予该权限');
   }
   const serverIDs = Array.isArray(args.server_ids) ? args.server_ids.map(Number).filter((n) => n > 0) : null;
   // 与 REST 版同语义：expires_at（unix 秒，须在未来，优先）或 expires_in_days（可小数天）
@@ -1739,15 +1829,18 @@ async function handleMcpInner(request, env) {
         protocolVersion: MCP_VERSION,
         capabilities: { tools: {} },
         serverInfo: { name: 'cf-panel', version: '0.1.0' },
-        instructions: 'cf-panel 面板。工具：list_servers（服务器状态）、get_monitor（监控历史）、exec_command（执行命令，需 exec 权限）、update_agent（触发 Agent 自更新，需 agent:update 权限，单机语义、多台请串行）、create_upload（签发上传签名 URL）、管理类（仅管理员）：add_server/delete_server/update_server/list_tokens/create_token/revoke_token/get_audit_logs/get_usage/get_settings/update_settings。认证：Authorization: Bearer <JWT 或 PAT>',
+        instructions: 'cf-panel 面板。工具：list_servers（服务器状态）、get_monitor（监控历史）、exec_command（执行命令，需 exec 权限）、update_agent（触发 Agent 自更新，需 agent:update 权限，单机语义、多台请串行）、create_upload（签发上传签名 URL）、管理类（需管理员：JWT 登录，或由管理员签发的带 panel:admin 权限的 PAT）：add_server/delete_server/update_server/rotate_agent_key/list_tokens/create_token/revoke_token/get_audit_logs/get_usage/get_settings/update_settings。tools/list 会按当前凭据的实际权限裁剪，不可用的工具不会列出。认证：Authorization: Bearer <JWT 或 PAT>',
       });
     case 'notifications/initialized':
     case 'notifications/cancelled':
       return new Response(null, { status: 202 }); // 通知：接受无 body
     case 'ping':
       return reply(id, {});
-    case 'tools/list':
-      return reply(id, { tools: MCP_TOOLS });
+    case 'tools/list': {
+      // 按实际权限裁剪：非管理员看不到管理类工具（避免"列出来却调不动"的误导）
+      const tools = isAdmin(user) ? MCP_TOOLS : MCP_TOOLS.filter((t) => !MCP_ADMIN_TOOLS.has(t.name));
+      return reply(id, { tools });
+    }
     case 'tools/call': {
       const params = body.params || {};
       const tool = MCP_TOOLS.find((t) => t.name === params.name);

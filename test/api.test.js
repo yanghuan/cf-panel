@@ -712,6 +712,69 @@ test('PAT：创建/使用/删除，scopes + 白名单生效', async () => {
   assert.ok(env.PANEL.calls.some((u) => String(u).includes('/rpc/clear_auth_cache')), 'PAT 删除触发 PanelDO 缓存清除');
 });
 
+// PATCH /api/tokens/:id —— 改已创建令牌的权限范围（本次需求）
+test('PATCH /api/tokens/:id：改已有令牌 scopes/白名单/有效期；仅 JWT 管理员，PAT 一律 403', async () => {
+  const env = makeEnv();
+  const adminToken = await login(env);
+  await addServer(env, adminToken, { name: 't1' });
+
+  const created = await (await call(env, {
+    method: 'POST', path: '/api/tokens', token: adminToken,
+    body: { name: 'ci', scopes: ['server:read'], server_ids: [1], expires_in_days: 7 },
+  })).json();
+  const row = await env.DB.prepare("SELECT id FROM api_tokens WHERE name = 'ci'").first();
+
+  // 只读 → 只读+执行；同时清空白名单（null = 全部服务器）
+  const up = await call(env, { method: 'PATCH', path: `/api/tokens/${row.id}`, token: adminToken, body: { scopes: ['server:read', 'server:exec'], server_ids: null } });
+  assert.equal(up.status, 200);
+  const upBody = await up.json();
+  assert.deepEqual(upBody.scopes, ['server:read', 'server:exec']);
+  assert.equal(upBody.server_ids, null);
+  // 立即生效：鉴权每次按 token_hash 查 api_tokens，不读缓存
+  const me = await (await call(env, { path: '/api/me', token: created.token })).json();
+  assert.deepEqual(me.scopes, ['server:read', 'server:exec'], '新权限立即生效');
+  const dbAfter = await env.DB.prepare("SELECT scopes, server_ids FROM api_tokens WHERE id = ?").bind(row.id).first();
+  assert.deepEqual(JSON.parse(dbAfter.scopes), ['server:read', 'server:exec']);
+  assert.equal(dbAfter.server_ids, null);
+
+  // 有效期改回永久
+  const perm = await (await call(env, { method: 'PATCH', path: `/api/tokens/${row.id}`, token: adminToken, body: { expires_at: null } })).json();
+  assert.equal(perm.expires_at, null, '留空/传 null = 永久有效');
+
+  // 未传的字段保持原值（PATCH 语义）
+  const keep = await (await call(env, { method: 'PATCH', path: `/api/tokens/${row.id}`, token: adminToken, body: { scopes: ['server:read'] } })).json();
+  assert.deepEqual(keep.scopes, ['server:read']);
+
+  // server_ids 三态必须与创建一致：null=全量、[]=空集、有值=白名单。
+  // 若把 [] 归一成 null，"收缩到零"会反向放开全部服务器——权限扩大，必须锁死。
+  const emptySet = await (await call(env, { method: 'PATCH', path: `/api/tokens/${row.id}`, token: adminToken, body: { server_ids: [] } })).json();
+  assert.deepEqual(emptySet.server_ids, [], '空数组 = 空集，不能变全量');
+  assert.deepEqual(await (await call(env, { path: '/api/servers', token: created.token })).json(), [], '空集令牌访问不到任何服务器');
+  const backAll = await (await call(env, { method: 'PATCH', path: `/api/tokens/${row.id}`, token: adminToken, body: { server_ids: null } })).json();
+  assert.equal(backAll.server_ids, null, 'null = 全量');
+  assert.ok((await (await call(env, { path: '/api/servers', token: created.token })).json()).length >= 1, '全量令牌可见服务器');
+
+  // 严格校验：未知 scope 必须报错，不能静默降级（否则用户以为提权/降权成功了）
+  assert.equal((await call(env, { method: 'PATCH', path: `/api/tokens/${row.id}`, token: adminToken, body: { scopes: ['server:read', 'adminn'] } })).status, 400);
+  assert.equal((await call(env, { method: 'PATCH', path: `/api/tokens/${row.id}`, token: adminToken, body: { scopes: [] } })).status, 400);
+  assert.equal((await call(env, { method: 'PATCH', path: `/api/tokens/${row.id}`, token: adminToken, body: { server_ids: ['x'] } })).status, 400);
+  assert.equal((await call(env, { method: 'PATCH', path: `/api/tokens/${row.id}`, token: adminToken, body: { expires_at: 1 } })).status, 400);
+  assert.equal((await call(env, { method: 'PATCH', path: `/api/tokens/${row.id}`, token: adminToken, body: {} })).status, 400, '无字段可改');
+  assert.equal((await call(env, { method: 'PATCH', path: '/api/tokens/99999', token: adminToken, body: { scopes: ['server:read'] } })).status, 404);
+
+  // 提权链：PAT 一律不能改令牌权限——包括带 panel:admin 的全权 PAT
+  // （若能改，等于自己给自己的令牌升级，绕过"panel:admin 只能由 JWT 管理员签发"）
+  const adminPat = (await (await call(env, { method: 'POST', path: '/api/tokens', token: adminToken, body: { name: 'ap', scopes: ['panel:admin'] } })).json()).token;
+  assert.equal((await call(env, { method: 'PATCH', path: `/api/tokens/${row.id}`, token: adminPat, body: { scopes: ['panel:admin'] } })).status, 403, 'admin PAT 也不能改令牌权限');
+  assert.equal((await call(env, { method: 'PATCH', path: `/api/tokens/${row.id}`, token: created.token, body: { scopes: ['panel:admin'] } })).status, 403, '普通 PAT 同样拒绝');
+
+  // 审计留痕，且不得包含令牌明文
+  const logs = await env.DB.prepare("SELECT * FROM audit_logs WHERE action = 'token.update'").all();
+  assert.ok(logs.results.length >= 3, `权限变更必须留痕（实际 ${logs.results.length} 条）`);
+  assert.ok(logs.results.every((l) => !/cfp_/.test(l.detail || '')), 'detail 不得含令牌明文');
+  assert.ok(logs.results.some((l) => /scopes/.test(l.detail || '')), 'detail 记录改动了哪些字段');
+});
+
 // ---------------- 分组排序 ----------------
 test('分组排序：PUT 仅管理员；去空/去重/过滤未分组/孤儿清理；GET 回读；PAT 只读不可写', async () => {
   const env = makeEnv();
@@ -1567,6 +1630,51 @@ test('MCP：tools/list 与 tools/call', async () => {
   const noArg = await (await mcp(env, { token, body: { jsonrpc: '2.0', id: 33, method: 'tools/call', params: { name: 'delete_server', arguments: {} } } })).json();
   assert.equal(noArg.result.isError, true);
   assert.match(noArg.result.content[0].text, /必须提供其一/);
+});
+
+// ---------------- PAT 全权 scope（panel:admin） ----------------
+// 动机：MCP 客户端只能配置长期凭据，而 JWT 仅 24h，否则 get_audit_logs 等 11 个管理工具
+// 在 MCP 中实际不可用（PAT 无论如何配 scopes 都进不去——scopes 白名单里原本没有 admin）。
+test('PAT panel:admin：可读审计日志；tools/list 按权限裁剪；不能自举 admin scope', async () => {
+  const env = makeEnv();
+  const adminToken = await login(env);
+  await addServer(env, adminToken, { name: 'adm-1' });
+
+  // 普通 PAT：tools/list 不列出管理工具（此前无条件返回 11 个调用必 403 的工具，误导 AI 反复重试）
+  const ro = (await (await call(env, { method: 'POST', path: '/api/tokens', token: adminToken, body: { name: 'ro', scopes: ['server:read'] } })).json()).token;
+  const roTools = (await (await mcp(env, { token: ro, body: { jsonrpc: '2.0', id: 1, method: 'tools/list' } })).json()).result.tools.map((t) => t.name);
+  assert.deepEqual(roTools, ['list_servers', 'get_monitor', 'exec_command', 'update_agent', 'create_upload'],
+    '非管理员只看到无需管理权限的工具');
+
+  // 普通 PAT 调管理工具：错误信息须自解释（旧文案 'forbidden: admin only' 会让人误判为 scopes 配错）
+  const denied = await (await mcp(env, { token: ro, body: { jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'get_audit_logs', arguments: {} } } })).json();
+  assert.equal(denied.result.isError, true);
+  assert.match(denied.result.content[0].text, /panel:admin/, '提示如何真正拿到权限');
+
+  // admin PAT（由 JWT 管理员签发）：tools/list 完整，且可读审计日志
+  const adm = (await (await call(env, { method: 'POST', path: '/api/tokens', token: adminToken, body: { name: 'adm', scopes: ['panel:admin'] } })).json()).token;
+  const admTools = (await (await mcp(env, { token: adm, body: { jsonrpc: '2.0', id: 3, method: 'tools/list' } })).json()).result.tools.map((t) => t.name);
+  assert.equal(admTools.length, 16, '管理员看到全部工具');
+  assert.ok(admTools.includes('get_audit_logs'));
+  const al = await (await mcp(env, { token: adm, body: { jsonrpc: '2.0', id: 4, method: 'tools/call', params: { name: 'get_audit_logs', arguments: { limit: 5 } } } })).json();
+  assert.equal(al.result.isError, false, 'panel:admin PAT 可读审计日志（本次诉求）');
+  assert.ok(JSON.parse(al.result.content[0].text).total >= 1);
+
+  // 全权语义：忽略 server_ids 白名单（isAdmin 在 canAccessServer 最前短路，README 已明示）
+  const narrow = (await (await call(env, { method: 'POST', path: '/api/tokens', token: adminToken, body: { name: 'narrow', scopes: ['panel:admin'], server_ids: [99999] } })).json()).token;
+  const list = await call(env, { path: '/api/servers', token: narrow });
+  assert.equal(list.status, 200);
+  assert.ok((await list.json()).length >= 1, 'admin PAT 不受白名单限制');
+
+  // 提权链熔断：PAT（即便已是 admin）不能再签发 panel:admin —— 否则泄露一个令牌可无限铸造永久 admin
+  const esc = await call(env, { method: 'POST', path: '/api/tokens', token: adm, body: { name: 'esc', scopes: ['panel:admin'] } });
+  assert.equal(esc.status, 403, 'REST 拒绝 PAT 自举 admin');
+  const escMcp = await (await mcp(env, { token: adm, body: { jsonrpc: '2.0', id: 5, method: 'tools/call', params: { name: 'create_token', arguments: { name: 'esc2', scopes: ['panel:admin'] } } } })).json();
+  assert.equal(escMcp.result.isError, true, 'MCP 拒绝 PAT 自举 admin');
+  assert.match(escMcp.result.content[0].text, /JWT/);
+  // 但普通 scope 仍可签发（不影响日常轮换）
+  const okTok = await call(env, { method: 'POST', path: '/api/tokens', token: adm, body: { name: 'normal', scopes: ['server:read'] } });
+  assert.equal(okTok.status, 200);
 });
 
 // ---------------- 存活探针 ----------------

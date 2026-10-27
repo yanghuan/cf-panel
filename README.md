@@ -302,7 +302,7 @@ Webhook 出站安全：仅允许 HTTP(S)，拒绝 URL 内嵌凭据、本地域�
 
 二进制经 Worker → TerminalDO → 控制 WS 流式中转，Agent 校验大小 / SHA-256 / 候选 `--version`，保留 `.bak` 后用 `self-replace` 原子替换，由 supervisor 或 `AGENT_SELF_RESTART=1` 拉起。
 
-- PAT **不允许**触发更新（仅 JWT 管理员），操作写审计日志。
+- 更新需 `agent:update` 权限（管理员，或带该 scope 且命中白名单的 PAT），操作写审计日志。
 - Fork 部署请设 `AGENT_RELEASE_REPO=owner/repo`。
 - 不支持该协议的旧 Agent 需先手动升级一次。
 
@@ -318,8 +318,13 @@ Webhook 出站安全：仅允许 HTTP(S)，拒绝 URL 内嵌凭据、本地域�
 
 ### PAT 与 MCP
 
-- **PAT**：设置 → 「访问令牌」创建（scopes + 服务器白名单 + 可选有效期，留空=永久），供 API 调用：`Authorization: Bearer cfp_xxx`。列表显示每个令牌的**最近使用时间**（60 秒节流回写），便于识别僵尸令牌。
-- **MCP**：`/mcp` 端点供 AI 客户端接入，见下方 [MCP 工具](#mcp-工具)。
+- **PAT**：设置 → 「访问令牌」创建（scopes + 服务器白名单 + 可选有效期，留空=永久），供 API 调用：`Authorization: Bearer cfp_xxx`。列表显示每个令牌的**最近使用时间**（60 秒节流回写），便于识别僵尸令牌。已创建的令牌可点「编辑」**原地改权限范围**（scopes / 白名单 / 有效期，改完立即生效，无需重新下发令牌明文）——因为库里只存 HMAC，明文本身不可更换。
+- **PAT 的 `panel:admin`（全权）**：勾选后该令牌等价于管理员，可用全部管理接口（服务器增删改、令牌、设置、审计、用量）与全部 MCP 管理工具。注意两点：
+  1. **会忽略 `server_ids` 白名单与其它 scope**（后端 `isAdmin` 在权限判定最前短路），即"一把 root 钥匙"；
+  2. **只能由 JWT 管理员签发**——PAT 自身无法创建带 `panel:admin` 的令牌（否则一个泄露的 admin PAT 可无限铸造新的永久 admin PAT）。需要轮换时用管理员登录后重建。
+
+  该 scope 的动机：JWT 仅 24 小时有效，而 MCP 客户端只适合配置长期凭据；没有它，`get_audit_logs` / `update_settings` 等 11 个管理工具在 MCP 中实际不可用。
+- **MCP**：`/mcp` 端点供 AI 客户端接入，见下方 [MCP 工具](#mcp-工具)。`tools/list` 按当前凭据的实际权限裁剪，无权调用的工具不会列出。
 
 ### 界面与其他
 
@@ -391,6 +396,7 @@ Webhook 出站安全：仅允许 HTTP(S)，拒绝 URL 内嵌凭据、本地域�
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | GET / POST | `/api/tokens` | PAT 列表（含 `last_used_at`）/ 创建（明文只返回一次） |
+| PATCH | `/api/tokens/:id` | 修改已创建令牌的权限范围（`scopes` / `server_ids` / `expires_at`，只改传入字段，`expires_at:null`=永久）。**仅 JWT 管理员**：PAT 一律 403（否则可自我提权，绕过 `panel:admin` 的签发限制）。令牌明文不可改，换密文请新建 |
 | DELETE | `/api/tokens/:id` | 删除 PAT |
 | GET / PUT | `/api/settings` | 读取 / 更新站点名、公告、IP 归属地开关、告警配置 |
 | POST | `/api/settings/test_webhook` | 测试 Webhook（传当前表单配置，不保存） |
@@ -410,8 +416,8 @@ Webhook 出站安全：仅允许 HTTP(S)，拒绝 URL 内嵌凭据、本地域�
 | `add_server` / `update_server` / `delete_server` | 服务器增删改（仅管理员） |
 | `rotate_agent_key` | 轮换 agent key（仅管理员，历史保留） |
 | `list_tokens` / `create_token` / `revoke_token` | PAT 生命周期（仅管理员，明文只返回一次） |
-| `get_audit_logs` / `get_usage` | 审计日志 / 用量观测（仅管理员） |
-| `get_settings` / `update_settings` | 面板设置（含全局免打扰 `mute_until`） |
+| `get_audit_logs` / `get_usage` | 审计日志 / 用量观测（仅管理员；PAT 需 `panel:admin`） |
+| `get_settings` / `update_settings` | 面板设置（含全局免打扰 `mute_until`，仅管理员；PAT 需 `panel:admin`） |
 
 **客户端配置**（如 Claude Desktop）：
 
@@ -458,7 +464,7 @@ curl -X POST https://<面板域名>/mcp -H "Authorization: Bearer <token>" \
 - **WebSocket 鉴权**：`/ws/terminal/{id}` 仅允许会话创建者或管理员连接（防 stream UUID 劫持）；浏览器 WS 建连后须 10 秒内完成首帧鉴权，超时由 DO alarm 关闭，待鉴权连接硬上限 128 条/实例。
 - **Agent 身份**：`X-Agent-Key` 请求头（**不接受 URL query**，避免边缘日志泄露）；服务端先用 key 的 SHA-256 指纹（`servers.agent_key_id`）反查服务器，再用 HMAC verify 校验 `servers.agent_key_hash`；数据流额外校验 stream 归属。
 - **凭据存储**：面板密码存 CF secret；agent key 与 PAT 只存哈希。WebSocket Hibernation 附件不保存 bearer 明文（PAT 仅存 HMAC，JWT 仅存已验证身份与过期时间）。
-- **权限收敛**：JWT 管理员全量；PAT 按 scopes + `server_ids` 白名单收窄；Agent 更新与全部管理操作拒绝 PAT。
+- **权限收敛**：JWT 管理员全量；PAT 按 scopes + `server_ids` 白名单收窄；管理操作默认拒绝 PAT，唯一例外是显式勾选 `panel:admin` 的全权令牌（等价管理员，忽略白名单；且只能由 JWT 管理员签发，PAT 无法自举同类令牌）。
 - **审计**：登录、服务器变更、会话开启、文件写操作、命令执行、Agent 更新全部留痕（best-effort：D1 短暂失败不影响已创建的会话，避免遗留不可访问的远端会话）。
 - **前端防御**：文件列表按不可信 Agent 输入处理（白名单化类型、数值化大小/时间）；文件会话用代际守卫丢弃关闭后或乱序响应；CSP 仅 `style-src-attr`/`style-src-elem` 放开内联，`script-src` 不允许内联执行。
 - **Agent 侧**：`DISABLE_EXEC=1` 全局禁用命令执行；上传、ZIP 预检与文件操作统一走带超时 / 并发上限 / 熔断的 blocking 边界；系统路径词法 + 真实路径双检（防 symlink 写穿）。

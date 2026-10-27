@@ -440,6 +440,7 @@
         <label class="chk"><input type="checkbox" id="tok-read" checked /> server:read</label>
         <label class="chk"><input type="checkbox" id="tok-exec" /> server:exec</label>
         <label class="chk"><input type="checkbox" id="tok-agent-update" /> agent:update</label>
+        <label class="chk" title="全权管理员：可用全部管理接口（含服务器增删改、令牌、设置、审计）。会忽略 server_ids 白名单与其它 scope；只能由管理员登录后签发" data-i18n-title="token.adminTip"><input type="checkbox" id="tok-admin" /> panel:admin</label>
       </div>
       <div class="settings-row">
         <input id="tok-servers" type="text" placeholder="server_ids（逗号分隔，空=全部服务器）" data-i18n-ph="token.serverIds" />

@@ -209,6 +209,10 @@
     'token.hint': 'server_id 参考：{list}',
     'token.hintEmpty': '暂无服务器',
     'token.pickDate': '当前浏览器不支持弹出日历，请直接输入截止日期（如 2026/9/5 14:00）',
+    'token.adminTip': '全权管理员：可用全部管理接口（含服务器增删改、令牌、设置、审计）。会忽略 server_ids 白名单与其它 scope；只能由管理员登录后签发',
+    'token.adminNoWhitelist': '已勾选 panel:admin：server_ids 白名单不生效（全权访问所有服务器）',
+    'token.idsNone': 'ids=空集（不可访问任何服务器）',
+    'token.badServerIds': 'server_ids 须为正整数，逗号分隔',
   };
 
   // ---------------- 审计日志 ----------------

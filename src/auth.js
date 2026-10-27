@@ -1,5 +1,5 @@
 // cf-panel — 鉴权与权限（JWT/PAT + 服务器列表）
-import { PAT_PREFIX, SCOPE_READ, SCOPE_EXEC, SCOPE_AGENT_UPDATE, ONLINE_GRACE_FAST_S, ONLINE_GRACE_SLOW_S } from './config.js';
+import { PAT_PREFIX, SCOPE_READ, SCOPE_EXEC, SCOPE_AGENT_UPDATE, SCOPE_ADMIN, ONLINE_GRACE_FAST_S, ONLINE_GRACE_SLOW_S } from './config.js';
 import { hashSecret, verifyJwt, safeJson, doPanel, doMetrics } from './utils.js';
 
 // PAT 最后使用时间回写节流（秒）：鉴权是每请求/每 WS 心跳级热路径，逐次 UPDATE 会把
@@ -86,9 +86,18 @@ export async function authUser(request, env) {
   return authUserByToken(token, env);
 }
 
-// 面板管理员（JWT 登录，非 PAT）
+// 面板管理员：JWT 登录（role=1）或带 panel:admin 的 PAT（全权，等价管理员）。
+// 注意这是**全局判定**：命中后 canAccessServer/canExec/canUpdateAgent 会直接短路，
+// 即 admin PAT 忽略 server_ids 白名单与其它 scope——语义上就是"这把钥匙等于管理员"，UI 已明示。
 export function isAdmin(user) {
-  return user && user.role === 1 && !user.pat;
+  if (!user) return false;
+  if (user.pat) return Array.isArray(user.pat.scopes) && user.pat.scopes.includes(SCOPE_ADMIN);
+  return user.role === 1;
+}
+// 仅"真人管理员"（JWT 登录）：用于禁止 PAT 自举更高权限，断开提权链。
+// 典型用途：panel:admin 只能由 JWT 管理员签发——否则一个泄露的 admin PAT 可无限铸造新的永久 admin PAT。
+export function isJwtAdmin(user) {
+  return !!user && !user.pat && user.role === 1;
 }
 export function canAccessServer(user, server) {
   if (!user) return false;

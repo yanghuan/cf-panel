@@ -28,7 +28,16 @@ pub struct FetchResult {
 // 裸 await 在 TCP 半开/TLS 黑洞时会永久挂住——2026-09-09 的生产事故正是这个形态
 //（残留 ESTAB 连接、日志静默 3 天）。下载任务由 spawn 跑，挂住不会拖慢控制通道，但会
 // 残留一个任务 + 半截临时文件，反复发生会累积。
-const DOWNLOAD_TIMEOUT_S: u64 = 180;
+//
+// **必须严宽于服务端的任务窗口**，否则会出现"服务端已判 expired、Agent 仍在下载"：
+// 此时终态回执的条件更新必然落空（status 已不是 running），于是 R2 暂存对象不回收、
+// 审计也不写，用户看到 expired 但文件随后又真的落盘了。
+//
+// 服务端 upload 窗口 = UPLOAD_JOB_AGENT_WINDOW_S(300) + UPLOAD_JOB_GRACE_S(30) = 330s；
+// update 窗口 = UPDATE_JOB_TIMEOUT_S(180) + GRACE(30) = 210s。取 360s 覆盖两者。
+// ⚠️ 改这里时必须同步检查 src/config.js 的窗口常量，测试
+// `download_timeout_exceeds_server_job_windows` 会锁定这个关系。
+const DOWNLOAD_TIMEOUT_S: u64 = 360;
 
 pub async fn download_to_file(
     url: &str,

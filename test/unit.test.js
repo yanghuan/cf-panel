@@ -1046,3 +1046,30 @@ test('exec 命令长度计量与上限（含与 agent 侧 CTRL_MSG_LIMIT 的跨�
   assert.match(readme, new RegExp(`exec_command.*${EXEC_CMD_MAX_BYTES} 字节`),
     'README 工具表的上限应与 EXEC_CMD_MAX_BYTES 一致');
 });
+
+// Agent 侧下载超时必须**严宽于**服务端任务窗口，否则会出现"服务端判 expired、Agent 仍在
+// 下载"：此时终态回执的条件更新必然落空（status 已非 running），于是 R2 暂存对象不回收、
+// 审计也不写，用户看到 expired 但文件随后又真的落盘了。
+// 两侧常量分处 JS/Rust，用源码解析把关系锁死，避免只改一边。
+test('下载超时与服务端任务窗口的时序关系（Agent 必须更宽松）', () => {
+  const root = nodePath.join(nodePath.dirname(fileURLToPath(import.meta.url)), '..');
+  const fetchRs = nodeFs.readFileSync(nodePath.join(root, 'agent/rust/src/fetch.rs'), 'utf8');
+  const m = fetchRs.match(/const DOWNLOAD_TIMEOUT_S: u64 = (\d+);/);
+  assert.ok(m, 'fetch.rs 应有 DOWNLOAD_TIMEOUT_S');
+  const agentTimeout = Number(m[1]);
+
+  const cfg = nodeFs.readFileSync(nodePath.join(root, 'src/config.js'), 'utf8');
+  const num = (name) => Number((cfg.match(new RegExp(`export const ${name} = (\\d+);`)) || [])[1]);
+  const uploadWindow = num('UPLOAD_JOB_AGENT_WINDOW_S') + num('UPLOAD_JOB_GRACE_S');
+  const updateWindow = num('UPDATE_JOB_TIMEOUT_S') + num('UPDATE_JOB_GRACE_S');
+  assert.ok(uploadWindow > 0 && updateWindow > 0, '窗口常量应可解析');
+
+  assert.ok(agentTimeout > uploadWindow,
+    `Agent 下载超时(${agentTimeout}s) 必须 > upload 服务端窗口(${uploadWindow}s)，否则服务端先判 expired`);
+  assert.ok(agentTimeout > updateWindow,
+    `Agent 下载超时(${agentTimeout}s) 必须 > update 服务端窗口(${updateWindow}s)`);
+
+  // download URL 有效期要覆盖整个 Agent 窗口，否则重连重发时旧 URL 已失效（虽会重签，但首签也不该过早过期）
+  const urlTtl = num('JOB_URL_TTL_S');
+  assert.ok(urlTtl >= uploadWindow, `download URL 有效期(${urlTtl}s) 应 >= upload 窗口(${uploadWindow}s)`);
+});

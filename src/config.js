@@ -24,10 +24,16 @@ export const JOB_TERMINAL_STATES = ['succeeded', 'failed', 'timed_out', 'expired
 
 // upload：创建后等客户端上传字节的窗口（10 分钟）。超时即 expired，释放单机串行锁。
 export const UPLOAD_JOB_UPLOAD_WINDOW_S = 600;
-// upload：字节落到 R2 后等 Agent 拉取并落盘的窗口（含重连重试，与旧同步路径的 120s 同量级）
-export const UPLOAD_JOB_AGENT_WINDOW_S = 120;
-export const UPLOAD_JOB_GRACE_S = 30;         // Agent 回执丢失兜底
-// agent update：Agent 下载 + 校验 + self-replace 的总窗口（与旧同步路径的 180s 一致）
+// upload：字节落到 R2 后等 Agent 拉取并落盘的窗口（含重连重试）。
+// 300s 而非旧同步路径的 120s：现在是由 Agent 自己拉取，慢链路下 100MB @0.6MB/s 就需
+// 约 170s，120s 会不够。而且服务端窗口**必须窄于** Agent 侧下载超时
+//（fetch.rs 的 DOWNLOAD_TIMEOUT_S=360），否则会出现"服务端判 expired、Agent 仍在下载"：
+// 终态回执的条件更新落空 → R2 对象不回收、审计不写，用户看到 expired 但文件后来又落盘了。
+export const UPLOAD_JOB_AGENT_WINDOW_S = 300;
+export const UPLOAD_JOB_GRACE_S = 30;         // Agent 回执丢失兜底（合计 330s < 360s）
+// agent update：Agent 下载 + 校验 + self-replace 的总窗口。
+// 180s 是旧同步路径的下载超时；现在 Agent 还要自己拉资产，故保持 180 但确认
+// 180+30=210 < DOWNLOAD_TIMEOUT_S(360)，同样满足"服务端先于 Agent 放弃"。
 export const UPDATE_JOB_TIMEOUT_S = 180;
 export const UPDATE_JOB_GRACE_S = 30;
 // staging 签名 URL 有效期（上传内容 URL / Agent 下载 URL / 资产代理 URL 共用）

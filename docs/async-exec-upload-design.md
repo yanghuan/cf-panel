@@ -643,7 +643,7 @@ deadline_at=now+600
 ```
 
 - 然后调用对应 shard DO `POST /rpc/upload/submit`。该调用只负责下发元数据/通知，不读取文件、不等待 Agent 落盘。
-- DO 真正下发 `upload_fetch` 时，将 `deadline_at` 更新为 `now + 120 + grace`；Agent 离线则保持 `waiting_agent`，deadline 不超过创建时约定的上传任务总上限。
+- DO 真正下发 `upload_fetch` 时，将 `deadline_at` 更新为 `now + UPLOAD_JOB_AGENT_WINDOW_S + UPLOAD_JOB_GRACE_S`（实现为 300 + 30 = 330s，不是旧同步路径的 120s——现在由 Agent 自己拉取，慢链路下 100MB @0.6MB/s 就需约 170s）；Agent 离线则保持 `waiting_agent`，deadline 不超过创建时约定的上传任务总上限。**该窗口必须窄于 Agent 侧下载超时**（见 §8.4）。
 - 返回 HTTP 202：
 
 ```json
@@ -702,14 +702,15 @@ Agent 的网络实现：**不引入 `reqwest`**。仓库已有 `tokio-rustls` + 
 Agent 要求：
 
 - `dispatch()` 收到 `upload_fetch` 后必须 `spawn` 独立下载任务并立即返回，不能阻塞控制读循环；否则下载期间 Agent 的 report/ping/其它指令全部停摆。
-- **必须有总超时**（DNS + TCP + TLS + 读 body 全程，实现取 180s）：裸 `await` 在 TCP 半开或对端不响应时会永久挂住，残留任务 + 半截临时文件不断累积（同类问题曾造成 2026-09-09 的"连接静默 3 天"事故）。超时后删除临时文件。
+- **必须有总超时**（DNS + TCP + TLS + 读 body 全程，实现取 360s）：裸 `await` 在 TCP 半开或对端不响应时会永久挂住，残留任务 + 半截临时文件不断累积（同类问题曾造成 2026-09-09 的"连接静默 3 天"事故）。超时后删除临时文件。
+  - **该超时必须严宽于服务端任务窗口**（upload 330s / update 210s），否则会出现"服务端已判 `expired`、Agent 仍在下载"：此时终态回执的条件更新必然落空（status 已不是 `running`），于是 R2 暂存对象不回收、审计也不写，而文件随后又真的落盘——用户看到的状态与磁盘实际不一致。
+  - 这个关系由 `test/unit.test.js` 的 `下载超时与服务端任务窗口的时序关系` 锁定（两侧常量分处 Rust/JS，只能跨文件解析校验）。改任一侧都要先过那条测试。
 - URL 必须与 `AGENT_WSS_URL` 的 host 一致（`fetch::validate_panel_url`），且 path 必须以 `/mcp/` 开头；仅允许 `https`（本地开发可显式允许 `http`）。这是文档 §10.5 的分层防御——即便 DO 被攻破或 `panel_origin` 被污染，Agent 也不会带着有效 token 去请求任意地址。
 - 不允许把 URL 当成任意代理地址；拒绝其他 host/path。
 - 复用 `write_bytes` 的路径保护（`is_system_path`）、`overwrite=false` 已存在检查、临时文件命名和原子 rename 语义。
 - 临时文件必须登记到连接级清理表（`created`），控制连接退出时统一删除——否则下载中途重启会把 `{path}.cfp-upload-{job_id}` 永久留在业务目录。
 - 流式下载到 `{path}.cfp-upload-{job_id}`，不整体载入内存。
 - 校验 HTTP 状态、`Content-Length`/实际字节数、可选 SHA-256。
-- 总超时沿用 120 秒（或配置化），否则失败并清理临时文件。
 - 下载任务需要独立超时和取消路径；控制通道断开时不能留下长时间挂起的 HTTP 下载任务。
 - 成功后发送单次终态回执：
 

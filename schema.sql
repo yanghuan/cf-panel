@@ -52,7 +52,9 @@ CREATE TABLE IF NOT EXISTS audit_logs (
   action           TEXT    NOT NULL,         -- terminal.open / server.create ...
   target_server_id INTEGER,
   detail           TEXT,
-  created_at       TEXT    NOT NULL DEFAULT (datetime('now'))
+  created_at       TEXT    NOT NULL DEFAULT (datetime('now')),
+  duration_ms      INTEGER,                   -- 异步任务耗时（迁移 0015；同步写入的审计为 NULL）
+  job_id           TEXT                       -- 关联 operation_jobs.id（迁移 0015）
 );
 
 -- 保留期清理 `DELETE FROM audit_logs WHERE created_at < ?` 走索引（迁移 0006；无索引时全表扫）
@@ -61,6 +63,60 @@ CREATE INDEX IF NOT EXISTS idx_audit_logs_created ON audit_logs(created_at);
 -- 筛选查询走索引（迁移 0008；action 精确匹配 / target_server_id + id 倒序分页，此前全表扫）
 CREATE INDEX IF NOT EXISTS idx_audit_logs_action ON audit_logs(action);
 CREATE INDEX IF NOT EXISTS idx_audit_logs_server_id ON audit_logs(target_server_id, id);
+CREATE INDEX IF NOT EXISTS idx_audit_logs_job_id ON audit_logs(job_id); -- 迁移 0015：按任务查审计
+
+-- 异步任务（迁移 0015；阶段 A 只启用 exec，其余列先建好避免二次迁移）
+-- 状态必须落 D1：轮询 GET /api/jobs/:id 由 Worker 直接查库，不激活 DO
+CREATE TABLE IF NOT EXISTS operation_jobs (
+  id                TEXT PRIMARY KEY,
+  kind              TEXT    NOT NULL,          -- exec / upload / agent_update（应用层校验）
+  status            TEXT    NOT NULL,          -- 见 src/jobs.js JOBS_STATES
+  user_id           INTEGER NOT NULL,
+  username          TEXT    NOT NULL,
+  client_ip         TEXT,
+  server_id         INTEGER NOT NULL,
+  command           TEXT,                      -- exec
+  timeout_s         INTEGER,                   -- exec
+  idempotency_key   TEXT,                      -- exec：安全重试
+  exit_code         INTEGER,
+  stdout            TEXT,
+  stderr            TEXT,
+  timed_out         INTEGER,
+  target_path       TEXT,                      -- upload
+  overwrite         INTEGER NOT NULL DEFAULT 0,
+  size_bytes        INTEGER,
+  sha256            TEXT,
+  r2_key            TEXT,
+  build_id          TEXT,                      -- agent_update
+  from_version      TEXT,
+  to_version        TEXT,
+  platform          TEXT,
+  asset_url         TEXT,
+  error             TEXT,
+  created_at        INTEGER NOT NULL,
+  started_at        INTEGER,
+  finished_at       INTEGER,
+  deadline_at       INTEGER NOT NULL,          -- 超过即判 expired（无回执）
+  expires_at        INTEGER NOT NULL,          -- 超过即可删除行（TTL）
+  duration_ms       INTEGER,
+  dispatch_attempts INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_operation_jobs_user_created ON operation_jobs(user_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_operation_jobs_cleanup ON operation_jobs(expires_at);
+CREATE INDEX IF NOT EXISTS idx_operation_jobs_server_status ON operation_jobs(server_id, kind, status);
+-- 单机串行：upload / agent_update 各自最多一个活动任务（部分唯一索引）
+CREATE UNIQUE INDEX IF NOT EXISTS idx_operation_jobs_active_upload
+  ON operation_jobs(server_id)
+  WHERE kind = 'upload'
+    AND status IN ('awaiting_upload', 'staging', 'staged', 'waiting_agent', 'running');
+CREATE UNIQUE INDEX IF NOT EXISTS idx_operation_jobs_active_update
+  ON operation_jobs(server_id)
+  WHERE kind = 'agent_update'
+    AND status IN ('queued', 'waiting_agent', 'running');
+CREATE UNIQUE INDEX IF NOT EXISTS idx_operation_jobs_idempotency
+  ON operation_jobs(user_id, kind, idempotency_key)
+  WHERE idempotency_key IS NOT NULL;
 
 -- 监控时序（分钟级聚合：1 行/分钟/机器；默认归档开启，保留 30 天）
 CREATE TABLE IF NOT EXISTS metrics_min (

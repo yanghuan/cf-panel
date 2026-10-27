@@ -14,6 +14,14 @@ export const SCOPE_AGENT_UPDATE = 'agent:update';
 // 唯一收窄：该 scope 只能由 JWT 管理员签发（见 routes.js 的 create_token），admin PAT 无法再造 admin PAT。
 export const SCOPE_ADMIN = 'panel:admin';
 
+// ---- 异步任务（operation_jobs）----
+// 任务状态落 D1，DO 只负责下发与结果回调；轮询由 Worker 直接查库（不激活 DO）。
+export const JOB_TTL_S = 24 * 3600;           // 任务行保留期：终态后 24h 由清理删除
+export const EXEC_JOB_GRACE_S = 30;           // exec deadline = 命令超时 + 30s 宽限（回执丢失兜底）
+export const JOB_POLL_AFTER_MS = 1000;        // 建议轮询间隔（客户端最小间隔保护也用此值）
+// 终态（SQLite 无法 ALTER CHECK，状态取值由 src/jobs.js 校验，不建 CHECK 约束）
+export const JOB_TERMINAL_STATES = ['succeeded', 'failed', 'timed_out', 'expired'];
+
 // ---- 服务器描述 ----
 // 可选自由文本（用途/负责人/机房等），会随 list_servers 下发给 MCP 客户端。
 // 前端 textarea 的 maxlength 必须与本值一致（由 test/unit.test.js 断言，防两边漂移）。

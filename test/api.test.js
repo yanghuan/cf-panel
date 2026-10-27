@@ -1408,6 +1408,7 @@ test('MCP：tools/list 与 tools/call', async () => {
     'add_server', 'delete_server', 'update_server', 'rotate_agent_key',
     'list_tokens', 'create_token', 'revoke_token',
     'get_audit_logs', 'get_usage', 'get_settings', 'update_settings',
+    'get_operation',
   ]);
 
   // update_settings 的 alerts 字段名必须与 sanitizeAlerts / 前端表单一致。
@@ -1474,12 +1475,21 @@ test('MCP：tools/list 与 tools/call', async () => {
   const noAuthBody = await noAuth.json();
   assert.equal(noAuthBody.error.code, -32001, '未授权返回 JSON-RPC unauthorized');
 
-  // exec_command：DO stub 返回 200（无 agent 语义）→ 结构正确
+  // exec_command：异步语义——只返回 job_id/accepted，不再有 stdout/exit_code
   const ex = await (await mcp(env, { token, body: { jsonrpc: '2.0', id: 6, method: 'tools/call', params: { name: 'exec_command', arguments: { server_name: 'web-1', command: 'echo hi' } } } })).json();
   assert.equal(ex.result.isError, false);
   const exRes = JSON.parse(ex.result.content[0].text);
   assert.equal(exRes.server_name, 'web-1');
-  assert.equal(exRes.exit_code, null);
+  assert.match(exRes.job_id, /^job_[0-9a-f]{32}$/);
+  assert.equal(exRes.poll_tool, 'get_operation');
+  assert.equal('stdout' in exRes, false, '异步化后不得同步返回输出');
+  // get_operation：同一凭据可查到该任务
+  const op = await (await mcp(env, { token, body: { jsonrpc: '2.0', id: 61, method: 'tools/call', params: { name: 'get_operation', arguments: { job_id: exRes.job_id } } } })).json();
+  assert.equal(op.result.isError, false);
+  // DO 在本测试里是桩（不会真的把 queued 置 running），故允许两态；
+  // queued -> running 的真实流转由 test/do.test.js 的 /rpc/exec/submit 用例覆盖
+  assert.match(JSON.parse(op.result.content[0].text).status, /^(queued|running)$/);
+  assert.equal('stdout' in JSON.parse(op.result.content[0].text), false, '未终态不返回输出');
 
   // exec_command：agent 离线（DO 返回 502）→ isError
   const offlineTerminal = {
@@ -1698,11 +1708,11 @@ test('PAT panel:admin：可读审计日志；tools/list 按权限裁剪；不能
   const ro = await mkPat('ro', ['server:read']);
   assert.deepEqual(await toolsOf(ro), ['list_servers', 'get_monitor'], '只读 PAT 只看到读工具');
   const rw = await mkPat('rw', ['server:read', 'server:exec']);
-  assert.deepEqual(await toolsOf(rw), ['list_servers', 'get_monitor', 'exec_command', 'create_upload'],
-    'exec PAT 看不到 update_agent / 管理工具');
+  assert.deepEqual(await toolsOf(rw), ['list_servers', 'get_monitor', 'exec_command', 'create_upload', 'get_operation'],
+    'exec PAT 看不到 update_agent / 管理工具，但能看到任务查询');
   const ua = await mkPat('ua', ['server:read', 'agent:update']);
-  assert.deepEqual(await toolsOf(ua), ['list_servers', 'get_monitor', 'update_agent'],
-    'agent:update PAT 只多出 update_agent');
+  assert.deepEqual(await toolsOf(ua), ['list_servers', 'get_monitor', 'update_agent', 'get_operation'],
+    'agent:update PAT 只多出 update_agent（get_operation 按任一操作 scope 可见）');
 
   // 普通 PAT 调管理工具：错误信息须自解释（旧文案 'forbidden: admin only' 会让人误判为 scopes 配错）
   const denied = await (await mcp(env, { token: ro, body: { jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'get_audit_logs', arguments: {} } } })).json();
@@ -1712,7 +1722,7 @@ test('PAT panel:admin：可读审计日志；tools/list 按权限裁剪；不能
   // admin PAT（由 JWT 管理员签发）：tools/list 完整，且可读审计日志
   const adm = (await (await call(env, { method: 'POST', path: '/api/tokens', token: adminToken, body: { name: 'adm', scopes: ['panel:admin'] } })).json()).token;
   const admTools = (await (await mcp(env, { token: adm, body: { jsonrpc: '2.0', id: 3, method: 'tools/list' } })).json()).result.tools.map((t) => t.name);
-  assert.equal(admTools.length, 16, '管理员看到全部工具');
+  assert.equal(admTools.length, 17, '管理员看到全部工具（含 get_operation）');
   assert.ok(admTools.includes('get_audit_logs'));
   const al = await (await mcp(env, { token: adm, body: { jsonrpc: '2.0', id: 4, method: 'tools/call', params: { name: 'get_audit_logs', arguments: { limit: 5 } } } })).json();
   assert.equal(al.result.isError, false, 'panel:admin PAT 可读审计日志（本次诉求）');
@@ -2006,4 +2016,127 @@ test('MCP：坏 JSON → Parse error；协议版本不一致 → HeaderMismatch'
   });
   const body = await mismatch.json();
   assert.equal(body.error.code, -32020);
+});
+
+// ---------------- 异步 exec 任务（阶段 A） ----------------
+// exec 从「同步等 25s+5s」改为「创建任务 → 短请求下发 → 轮询 D1」。
+// 验收核心：轮询不得访问 DO；DO 不持有等待 Promise；超时由 D1 deadline 判定。
+test('异步 exec：202 + job_id，轮询只查 D1（不激活 DO），过期收敛为 expired', async () => {
+  const env = makeEnv();
+  const token = await login(env);
+  await addServer(env, token, { name: 'web-1' });
+
+  const submitted = await call(env, {
+    method: 'POST', path: '/api/exec-jobs', token,
+    body: { server_id: 1, command: 'echo hi', timeout: 5 },
+  });
+  assert.equal(submitted.status, 202);
+  const sj = await submitted.json();
+  assert.match(sj.job_id, /^job_[0-9a-f]{32}$/);
+  assert.equal(sj.poll_tool, 'get_operation');
+  // DO 在本测试里是桩（不做状态流转），权威状态取自 D1
+  assert.equal(sj.status, 'queued');
+
+  // 走的是新的短 RPC，而不是旧的同步 /rpc/exec
+  assert.equal(env.TERMINAL.calls.at(-1).path, '/rpc/exec/submit');
+
+  const row = await env.DB.prepare('SELECT * FROM operation_jobs WHERE id = ?').bind(sj.job_id).first();
+  assert.equal(row.kind, 'exec');
+  assert.equal(row.command, 'echo hi');
+  assert.equal(row.status, 'queued');
+  assert.equal(row.deadline_at, row.created_at + 5 + 30, 'deadline = 命令超时 + 30s 宽限');
+
+  // 轮询：只读 D1
+  const before = env.TERMINAL.calls.length;
+  const got = await call(env, { path: `/api/jobs/${sj.job_id}`, token });
+  assert.equal(got.status, 200);
+  assert.equal(got.headers.get('cache-control'), 'no-store');
+  const gj = await got.json();
+  assert.equal(gj.status, 'queued');
+  assert.equal('stdout' in gj, false, '未终态不得返回输出');
+  assert.equal(env.TERMINAL.calls.length, before, '轮询不得访问 DO');
+
+  // 过期收敛：deadline 已过且无回执 → expired（幂等，不依赖 cron/DO timer）
+  await env.DB.prepare('UPDATE operation_jobs SET deadline_at = ? WHERE id = ?')
+    .bind(Math.floor(Date.now() / 1000) - 1, sj.job_id).run();
+  const expired = await (await call(env, { path: `/api/jobs/${sj.job_id}`, token })).json();
+  assert.equal(expired.status, 'expired');
+  assert.equal('stdout' in expired, false);
+});
+
+test('异步 exec：权限、长度、幂等、互斥与读取鉴权', async () => {
+  const env = makeEnv();
+  const token = await login(env);
+  await addServer(env, token, { name: 'web-1' });
+
+  // 无 exec scope 的 PAT → 403（建连前就拒绝，不产生任务）
+  const ro = (await (await call(env, { method: 'POST', path: '/api/tokens', token, body: { name: 'ro', scopes: ['server:read'] } })).json()).token;
+  assert.equal((await call(env, { method: 'POST', path: '/api/exec-jobs', token: ro, body: { server_id: 1, command: 'id' } })).status, 403);
+
+  // 命令超长 → 413，且不得下发
+  const callsBefore = env.TERMINAL.calls.length;
+  const tooLong = await call(env, { method: 'POST', path: '/api/exec-jobs', token, body: { server_id: 1, command: 'x'.repeat(EXEC_CMD_MAX_BYTES + 1) } });
+  assert.equal(tooLong.status, 413);
+  assert.equal(env.TERMINAL.calls.length, callsBefore, '超长命令不得触达 DO');
+
+  // 幂等：同 key 第二次直接返回既有任务，不重复下发
+  const first = await (await call(env, { method: 'POST', path: '/api/exec-jobs', token, body: { server_id: 1, command: 'id', idempotency_key: 'k1' } })).json();
+  const afterFirst = env.TERMINAL.calls.length;
+  const second = await (await call(env, { method: 'POST', path: '/api/exec-jobs', token, body: { server_id: 1, command: 'id', idempotency_key: 'k1' } })).json();
+  assert.equal(second.job_id, first.job_id);
+  assert.equal(second.reused, true);
+  assert.equal(env.TERMINAL.calls.length, afterFirst, '幂等命中不得重复下发');
+
+  // 读取鉴权：无 exec 权限的 PAT 读同一个 job → 404（不区分"无权"与"不存在"）
+  assert.equal((await call(env, { path: `/api/jobs/${first.job_id}`, token: ro })).status, 404);
+  // 伪造 / 不存在的 job_id → 404
+  assert.equal((await call(env, { path: '/api/jobs/job_doesnotexist', token })).status, 404);
+
+  // 互斥：存在进行中的 agent_update 时拒绝新的 exec
+  const nowS = Math.floor(Date.now() / 1000);
+  await env.DB.prepare(`INSERT INTO operation_jobs (id, kind, status, user_id, username, server_id, created_at, deadline_at, expires_at)
+    VALUES ('job_upd', 'agent_update', 'running', 1, 'admin', 1, ?, ?, ?)`).bind(nowS, nowS + 180, nowS + 86400).run();
+  const blocked = await call(env, { method: 'POST', path: '/api/exec-jobs', token, body: { server_id: 1, command: 'id' } });
+  assert.equal(blocked.status, 409);
+  assert.match((await blocked.json()).error, /agent update in progress/);
+});
+
+test('异步 exec：Agent 离线 → 失败态回传（不留下永远 queued 的任务）', async () => {
+  const terminal = {
+    idFromName: (n) => n,
+    get: () => ({ fetch: async () => new Response(JSON.stringify({ error: 'agent offline', code: 'AGENT_OFFLINE' }), { status: 503 }) }),
+  };
+  const env = makeEnv({ TERMINAL: terminal });
+  const token = await login(env);
+  await addServer(env, token, { name: 'web-1' });
+  const res = await call(env, { method: 'POST', path: '/api/exec-jobs', token, body: { server_id: 1, command: 'id' } });
+  assert.equal(res.status, 503);
+  const body = await res.json();
+  assert.equal(body.status, 'failed');
+  assert.match(body.error, /agent offline/);
+  assert.match(body.job_id, /^job_/);
+  // 失败必须落库：不能留下永远 queued 的行（DO 未必覆盖所有拒绝路径，Worker 兜底）
+  const row = await env.DB.prepare('SELECT status, error FROM operation_jobs WHERE id = ?').bind(body.job_id).first();
+  assert.equal(row.status, 'failed');
+  assert.match(row.error, /agent offline/);
+  // 客户端仍可凭 job_id 查到失败原因
+  const polled = await (await call(env, { path: `/api/jobs/${body.job_id}`, token })).json();
+  assert.equal(polled.status, 'failed');
+  assert.match(polled.result.error, /agent offline/);
+});
+
+test('异步 exec：DO 不可达时任务落 failed，不悬挂', async () => {
+  const terminal = {
+    idFromName: (n) => n,
+    get: () => ({ fetch: async () => { throw new Error('do unreachable'); } }),
+  };
+  const env = makeEnv({ TERMINAL: terminal });
+  const token = await login(env);
+  await addServer(env, token, { name: 'web-1' });
+  const res = await call(env, { method: 'POST', path: '/api/exec-jobs', token, body: { server_id: 1, command: 'id' } });
+  assert.equal(res.status, 502);
+  const body = await res.json();
+  const row = await env.DB.prepare('SELECT status, error FROM operation_jobs WHERE id = ?').bind(body.job_id).first();
+  assert.equal(row.status, 'failed');
+  assert.match(row.error, /dispatch failed/);
 });

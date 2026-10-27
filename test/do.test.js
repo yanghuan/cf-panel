@@ -2534,3 +2534,126 @@ test('MetricsDO: flush 采用增量 UPSERT，多次 flush 累加而非覆盖', a
   assert.ok(Math.abs(r.total_min - 2) < 1e-6, '两次 flush 的分母应累加为 2 分钟');
   assert.equal(r.bytes_in, 12000, '流量累加而非被第二次 flush 覆盖');
 });
+
+// ---------------- 异步 exec：DO 只下发与落库，不等待 ----------------
+async function seedExecJob(env, id, { status = 'queued', startedAt = null } = {}) {
+  const now = Math.floor(Date.now() / 1000);
+  await env.DB.prepare(`INSERT INTO operation_jobs
+      (id, kind, status, user_id, username, client_ip, server_id, command, timeout_s, created_at, started_at, deadline_at, expires_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+    .bind(id, 'exec', status, 1, 'admin', '1.1.1.1', 1, 'echo hi', 5, now - 5, startedAt, now + 35, now + 86400)
+    .run();
+}
+
+test('TerminalDO /rpc/exec/submit：只下发不等待，queued → running', async () => {
+  const env = makeEnv();
+  await env.DB.prepare('INSERT INTO servers (agent_key_id, name, user_id, agent_key_hash) VALUES (?,?,?,?)')
+    .bind('k1', 's1', 1, 'h1').run();
+  const jobId = `job_${'a'.repeat(32)}`;
+  await seedExecJob(env, jobId);
+
+  const inst = new TerminalDO(mockState(), env);
+  const sent = [];
+  inst.agents.set(1, { send: (m) => sent.push(m), readyState: 1, close() {} });
+  const res = await inst.fetch(new Request('https://do.internal/rpc/exec/submit', {
+    method: 'POST', body: JSON.stringify({ jobId, serverId: 1, command: 'echo hi', timeoutMs: 5000 }),
+  }));
+  assert.equal(res.status, 200);
+  assert.equal((await res.json()).status, 'running');
+
+  const row = await env.DB.prepare('SELECT status, started_at FROM operation_jobs WHERE id = ?').bind(jobId).first();
+  assert.equal(row.status, 'running');
+  assert.ok(row.started_at > 0, '记录执行开始时间（duration 基准）');
+
+  const frame = JSON.parse(sent.find((m) => JSON.parse(m).type === 'exec'));
+  assert.equal(frame.exec_id, jobId, '帧里的 exec_id 就是 job_id，回执据此落库');
+  assert.equal(frame.timeout_s, 5);
+  // 异步化的核心：DO 不持有等待 Promise、不设 timer
+  assert.equal(inst.pendingExec.size, 0, '不得创建 pendingExec');
+});
+
+test('TerminalDO /rpc/exec/submit：Agent 离线 / 更新中 → 任务落 failed', async () => {
+  const env = makeEnv();
+  await env.DB.prepare('INSERT INTO servers (agent_key_id, name, user_id, agent_key_hash) VALUES (?,?,?,?)')
+    .bind('k1', 's1', 1, 'h1').run();
+
+  // 离线
+  const offId = `job_${'b'.repeat(32)}`;
+  await seedExecJob(env, offId);
+  const inst = new TerminalDO(mockState(), env);
+  const off = await inst.fetch(new Request('https://do.internal/rpc/exec/submit', {
+    method: 'POST', body: JSON.stringify({ jobId: offId, serverId: 1, command: 'id', timeoutMs: 5000 }),
+  }));
+  assert.equal(off.status, 503);
+  const offRow = await env.DB.prepare('SELECT status, error FROM operation_jobs WHERE id = ?').bind(offId).first();
+  assert.equal(offRow.status, 'failed');
+  assert.match(offRow.error, /agent offline/);
+
+  // 更新中：内存里已有同步更新标记
+  const updId = `job_${'c'.repeat(32)}`;
+  await seedExecJob(env, updId);
+  inst.agents.set(1, { send() {}, readyState: 1, close() {} });
+  inst.updating.add(1);
+  const upd = await inst.fetch(new Request('https://do.internal/rpc/exec/submit', {
+    method: 'POST', body: JSON.stringify({ jobId: updId, serverId: 1, command: 'id', timeoutMs: 5000 }),
+  }));
+  assert.equal(upd.status, 409);
+  const updRow = await env.DB.prepare('SELECT status FROM operation_jobs WHERE id = ?').bind(updId).first();
+  assert.equal(updRow.status, 'failed');
+});
+
+test('TerminalDO exec_result：终态落 D1 + 审计；DO evict 后仍能完成；重复回执不覆盖', async () => {
+  const env = makeEnv();
+  await env.DB.prepare('INSERT INTO servers (agent_key_id, name, user_id, agent_key_hash) VALUES (?,?,?,?)')
+    .bind('k1', 's1', 1, 'h1').run();
+  const jobId = `job_${'d'.repeat(32)}`;
+  await seedExecJob(env, jobId, { status: 'running', startedAt: Math.floor(Date.now() / 1000) - 3 });
+
+  // 模拟 evict：全新实例，内存 Map 全空，仅有一条 agent 控制连接
+  const inst = new TerminalDO(mockState(), env);
+  const ws = { deserializeAttachment: () => ({ role: 'control', serverId: 1 }), send() {}, readyState: 1, close() {} };
+  inst.agents.set(1, ws);
+  assert.equal(inst.pendingExec.size, 0);
+
+  await inst.webSocketMessage(ws, JSON.stringify({
+    type: 'exec_result', exec_id: jobId, exit_code: 0, stdout: 'hi\n', stderr: '', timed_out: false,
+  }));
+  const row = await env.DB.prepare('SELECT * FROM operation_jobs WHERE id = ?').bind(jobId).first();
+  assert.equal(row.status, 'succeeded');
+  assert.equal(row.exit_code, 0);
+  assert.equal(row.stdout, 'hi\n');
+  assert.ok(row.duration_ms >= 3000, 'duration_ms 由 started_at 计算');
+
+  const audit = await env.DB.prepare("SELECT * FROM audit_logs WHERE action = 'exec.command' AND job_id = ?").bind(jobId).all();
+  assert.equal(audit.results.length, 1, '终态写一条 exec.command 审计');
+  assert.equal(audit.results[0].target_server_id, 1);
+  assert.match(audit.results[0].detail, /^exit=0 echo hi/);
+  assert.equal(audit.results[0].duration_ms, row.duration_ms);
+
+  // 重复回执：不得覆盖终态、不得重复审计
+  await inst.webSocketMessage(ws, JSON.stringify({
+    type: 'exec_result', exec_id: jobId, exit_code: 9, stdout: 'dup', stderr: '', timed_out: false,
+  }));
+  const row2 = await env.DB.prepare('SELECT * FROM operation_jobs WHERE id = ?').bind(jobId).first();
+  assert.equal(row2.exit_code, 0);
+  assert.equal(row2.stdout, 'hi\n');
+  const audit2 = await env.DB.prepare("SELECT COUNT(*) AS c FROM audit_logs WHERE job_id = ?").bind(jobId).first();
+  assert.equal(audit2.c, 1);
+});
+
+test('TerminalDO exec_result：命令超时回执 → timed_out（非 failed/succeeded）', async () => {
+  const env = makeEnv();
+  await env.DB.prepare('INSERT INTO servers (agent_key_id, name, user_id, agent_key_hash) VALUES (?,?,?,?)')
+    .bind('k1', 's1', 1, 'h1').run();
+  const jobId = `job_${'e'.repeat(32)}`;
+  await seedExecJob(env, jobId, { status: 'running', startedAt: Math.floor(Date.now() / 1000) - 25 });
+  const inst = new TerminalDO(mockState(), env);
+  const ws = { deserializeAttachment: () => ({ role: 'control', serverId: 1 }), send() {}, readyState: 1, close() {} };
+  inst.agents.set(1, ws);
+  await inst.webSocketMessage(ws, JSON.stringify({
+    type: 'exec_result', exec_id: jobId, exit_code: null, stdout: '', stderr: '', timed_out: true,
+  }));
+  const row = await env.DB.prepare('SELECT status, timed_out FROM operation_jobs WHERE id = ?').bind(jobId).first();
+  assert.equal(row.status, 'timed_out');
+  assert.equal(row.timed_out, 1);
+});

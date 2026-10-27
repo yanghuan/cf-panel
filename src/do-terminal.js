@@ -3,6 +3,7 @@ import { json, err, doPanel, sha256Hex, verifySecretHash } from './utils.js';
 import { EXEC_CMD_MAX_BYTES, execCommandBytes, execTooLongError } from './config.js';
 import { authIdentityByToken, authUserByIdentity, isAdmin, canExec } from './auth.js';
 import { handleReport } from './report.js';
+import { markJobRunning, failJob, finishExecJob, hasActiveAgentUpdate } from './jobs.js';
 
 // 本模块专用常量（会话/上报间隔/PAT 校验，就近定义便于对照使用代码）
 const SESSION_TTL_MS = 10 * 60 * 1000; // 会话两端都断开超过 10 分钟 → 回收
@@ -207,6 +208,63 @@ export class TerminalDO {
         }
       });
       return json(result);
+    }
+
+    // 内部 RPC：异步 exec 下发（阶段 A）。只负责「把指令发出去 + 落 D1 running」：
+    // 不建 pendingExec、不设 setTimeout、不等结果——结果由 agent 的 exec_result 唤醒 DO 后落库。
+    // 上面的 /rpc/exec 是同步旧路径，过渡期保留用于回滚。
+    if (path === '/rpc/exec/submit' && request.method === 'POST') {
+      const body = await request.json();
+      const jobId = String(body.jobId || '');
+      const serverId = Number(body.serverId) || 0;
+      const command = String(body.command || '');
+      const timeoutMs = Math.min(Math.max(Number(body.timeoutMs) || EXEC_DEFAULT_TIMEOUT_MS, 1000), EXEC_MAX_TIMEOUT_MS);
+      if (!jobId || !serverId || !command) return err('bad request', 400);
+      const cmdBytes = execCommandBytes(command);
+      if (cmdBytes > EXEC_CMD_MAX_BYTES) return err(execTooLongError(cmdBytes), 413);
+
+      // 互斥：内存里的同步更新标记 + D1 里的异步更新任务（双轨期两者都要看）。
+      // exec 之间、exec 与 upload 之间不互斥——保持与旧路径一致的并发语义。
+      if (this.updating.has(serverId) || await hasActiveAgentUpdate(this.env, serverId)) {
+        await failJob(this.env, jobId, 'agent update in progress');
+        return json({ error: 'agent update in progress' }, 409);
+      }
+      const agentWs = this.agents.get(serverId);
+      if (!agentWs) {
+        await failJob(this.env, jobId, 'agent offline');
+        return json({ error: 'agent offline', code: 'AGENT_OFFLINE' }, 503);
+      }
+      // 探活（≤1s，仅对声明 probe_proto 的 agent）：失败即判下行不可达，命令尚未下发，
+      // 调用方重试绝对安全。探活期间状态可能已变，必须重校验（同同步路径的 TOCTOU 处理）。
+      if (this.probeCapable.has(serverId)) {
+        const rttFresh = Date.now() - (this.lastRoundTripAt.get(serverId) || 0) < EXEC_ROUNDTRIP_TTL_MS;
+        if (!rttFresh) {
+          const ok = await this.probeAgent(agentWs, serverId, EXEC_PROBE_TIMEOUT_MS);
+          if (this.agents.get(serverId) !== agentWs) {
+            await failJob(this.env, jobId, 'agent reconnected');
+            return json({ error: 'agent reconnected, please retry', code: 'AGENT_OFFLINE' }, 502);
+          }
+          if (this.updating.has(serverId)) {
+            await failJob(this.env, jobId, 'agent update in progress');
+            return json({ error: 'agent update in progress' }, 409);
+          }
+          if (!ok) {
+            try { agentWs.close(4002, 'exec probe failed'); } catch { /* ignore */ }
+            await failJob(this.env, jobId, 'agent unreachable');
+            return json({ error: 'agent unreachable', code: 'AGENT_OFFLINE' }, 502);
+          }
+        }
+      }
+      // queued -> running 是条件更新：未命中说明任务已被其它路径收敛（过期/取消），不再下发
+      if (!(await markJobRunning(this.env, jobId))) return json({ error: 'job not runnable' }, 409);
+      try {
+        agentWs.send(JSON.stringify({ type: 'exec', exec_id: jobId, command, timeout_s: Math.floor(timeoutMs / 1000) }));
+      } catch {
+        // 发送失败不能留下「running 但命令没发出去」
+        await failJob(this.env, jobId, 'failed to send exec command');
+        return json({ error: 'failed to send exec command' }, 502);
+      }
+      return json({ ok: true, job_id: jobId, status: 'running' });
     }
 
     // 内部 RPC：Agent 自更新（仅 routes 管理员接口调用）。Release 二进制流式切 48KB
@@ -879,7 +937,7 @@ export class TerminalDO {
             return;
           }
           if (j && j.type === 'exec_result') {
-            // MCP 一次性命令结果：resolve 等待中的 /rpc/exec（Promise resolve 幂等，超时/断连兜底）
+            // 旧同步路径（/rpc/exec）：resolve 内存 Promise，过渡期保留
             const r = this.pendingExec.get(j.exec_id);
             if (r) {
               clearTimeout(r.timer);
@@ -895,6 +953,9 @@ export class TerminalDO {
             // 成功回执即最强双向存活证明 → 刷新往返时间，使后续 exec 走快路径（零新增延迟）
             const esid = this.wsServerId(ws);
             if (esid) this.lastRoundTripAt.set(esid, Date.now());
+            // 异步路径：终态落 D1 + 写审计。本条消息可能唤醒的是一台刚 evict 的 DO，
+            // 状态全部来自 D1/job 行，不依赖内存 Map——这正是异步化的核心验收点。
+            if (String(j.exec_id || '').startsWith('job_')) await this.settleExecJob(j.exec_id, j);
             return;
           }
           if (j && j.type === 'upload_result') {
@@ -1053,6 +1114,31 @@ export class TerminalDO {
     } catch { /* 兜底慢采 */ }
     this.agentInterval.set(serverId, want);
     ws.send(JSON.stringify({ type: 'set_report_interval', interval: want }));
+  }
+
+  // exec_result → D1 终态 + 审计（异步路径）。
+  // 条件更新未命中说明是重复回执或任务已判过期：只记日志，不覆盖终态、不重复审计。
+  async settleExecJob(jobId, j) {
+    const job = await finishExecJob(this.env, jobId, {
+      exitCode: typeof j.exit_code === 'number' ? j.exit_code : null,
+      stdout: typeof j.stdout === 'string' ? j.stdout : '',
+      stderr: typeof j.stderr === 'string' ? j.stderr : '',
+      timedOut: !!j.timed_out,
+      error: j.error || null,
+    });
+    if (!job) return;
+    // 审计与旧同步路径同格式（exit=.. + 截断命令），额外带 duration_ms / job_id 便于关联任务
+    const cmd = String(job.command || '');
+    const commandTrunc = cmd.length > 200 ? `${cmd.slice(0, 200)}…` : cmd;
+    try {
+      await this.env.DB.prepare(
+        'INSERT INTO audit_logs (user_id, username, client_ip, action, target_server_id, detail, duration_ms, job_id) VALUES (?,?,?,?,?,?,?,?)'
+      ).bind(
+        job.user_id, job.username, job.client_ip || '', 'exec.command', job.server_id,
+        `exit=${typeof job.exit_code === 'number' ? job.exit_code : '?'} ${commandTrunc}`,
+        job.duration_ms ?? null, jobId,
+      ).run();
+    } catch (e) { console.error('exec audit failed:', e); }
   }
 
   // 会话鉴权重校验的节流判据（10s）：窗口内为纯同步判断，不产生 D1 读

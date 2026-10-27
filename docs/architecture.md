@@ -75,9 +75,18 @@
 #### 3.2.1 MCP（AI 接入端点）
 
 `/mcp` 实现标准 MCP **Streamable HTTP**（兼容协议版本 `2025-11-25`）：单一 POST 端点、无 `Mcp-Session-Id` 会话、每请求独立 `Authorization: Bearer` 鉴权（复用 JWT/PAT），采用**无状态简化实现**（与 2026-07-28 规范正式确立的无状态模型方向一致，但保留旧版 initialize 握手兼容 2025-11-25 客户端）。工具：
-- **只读/操作**：`list_servers`（服务器状态 + 系统信息）、`get_monitor`（监控历史，复用内存热区/D1 归档查询与权限过滤）、`exec_command`（一次性 shell 命令执行，经 TerminalDO 控制通道直达 agent，`canExec` 鉴权：管理员或带 `server:exec` scope 的 PAT，超时 kill 进程组；**命令长度上限 65408 字节**——控制通道单帧 64KiB，超限帧会被 agent 判 `Capacity` 断开整条连接（而非报错，调用方只看到误导性的"超时"），故 Worker 与 DO 两侧前置拒绝，见 `config.js` 的 `EXEC_CMD_MAX_BYTES`）、`create_upload`（签发一次性文件上传**签名 URL**——HMAC 无状态自验证，绑定 server_id/path/overwrite 并 10 分钟过期，AI 将 URL 转给用户/程序用 curl/fetch POST 原始字节上传，服务端流式分片写 agent；大文件/二进制不经过 LLM 上下文）。
-- **管理类（仅管理员，JWT 登录；PAT 一律拒绝）**：`add_server`（注册新服务器 + 生成 agent key）、`update_server` / `delete_server`（改名/分组/排序 / 删除含历史清理）、`list_tokens` / `create_token` / `revoke_token`（PAT 生命周期，明文只返回一次）、`get_audit_logs`（审计日志）、`get_usage`（用量观测）、`get_settings` / `update_settings`（站点名/公告/IP 归属地开关/告警配置）。
+- **只读/操作**：`list_servers`（服务器状态 + 系统信息 + 分组/描述）、`get_monitor`（监控历史，复用内存热区/D1 归档查询与权限过滤）、`exec_command`（一次性 shell 命令执行，经 TerminalDO 控制通道直达 agent，`canExec` 鉴权：管理员或带 `server:exec` scope 的 PAT，超时 kill 进程组；**命令长度上限 65408 字节**——控制通道单帧 64KiB，超限帧会被 agent 判 `Capacity` 断开整条连接（而非报错，调用方只看到误导性的"超时"），故 Worker 与 DO 两侧前置拒绝，见 `config.js` 的 `EXEC_CMD_MAX_BYTES`）、`get_operation`（查询异步任务状态/结果，见下）、`create_upload`（签发一次性文件上传**签名 URL**——HMAC 无状态自验证，绑定 server_id/path/overwrite 并 10 分钟过期，AI 将 URL 转给用户/程序用 curl/fetch POST 原始字节上传，服务端流式分片写 agent；大文件/二进制不经过 LLM 上下文）。
+- **管理类（需管理员：JWT 登录，或由 JWT 管理员签发的带 `panel:admin` 的 PAT）**：`add_server`（注册新服务器 + 生成 agent key）、`update_server` / `delete_server`（改名/分组/描述/排序 / 删除含历史清理）、`list_tokens` / `create_token` / `revoke_token`（PAT 生命周期，明文只返回一次）、`get_audit_logs`（审计日志）、`get_usage`（用量观测）、`get_settings` / `update_settings`（站点名/公告/IP 归属地开关/告警配置）。
+- **按权限裁剪**：`tools/list` 只返回当前凭据**实际可调用**的工具——普通 PAT 看不到管理类，也看不到缺对应 scope 的操作类（如只读 PAT 看不到 `exec_command`/`update_agent`/`create_upload`）。避免"列出来却调不动"导致 AI 客户端反复重试。
 JSON-RPC 2.0：`initialize` / `tools/list` / `tools/call` / `ping`；通知返回 202；校验 `Origin` 防 DNS rebinding。
+
+**异步任务（阶段 A：exec 已落地）**
+
+`exec_command` 不再是同步阻塞调用：它创建 `operation_jobs` 行（D1）并把指令短请求下发给 shard DO，立即返回 `job_id`；执行完成后 agent 的 `exec_result` 唤醒 DO，把终态（`exit_code`/`stdout`/`stderr`/`duration_ms`）写回 D1 并记审计。调用方用 `get_operation`（或 `GET /api/jobs/:id`）轮询，**该路径由 Worker 直接查 D1，不激活 DO**。
+
+动机：原实现让 DO 请求从下发一直挂到回执（exec 最长 25s+5s、upload 120s、agent update 180s）。DO duration 按活跃墙钟 × 128MB 计费，等待 pending I/O 同样计入，且 `setTimeout` 会阻止 Hibernation——这不是调大超时能解决的问题。任务状态落 D1 而非 DO Storage 是刻意的：若存 DO，每次轮询都会激活对象、打断休眠，等于把刚拆掉的耦合装回去。
+
+并发与容错：`agent_update` 独占一台服务器（会重启 Agent），exec 之间、exec 与 upload 之间保持既有并发语义；状态流转全部用条件更新（`WHERE id=? AND status IN (...)`），重复回执与过期后迟到的结果都不会覆盖终态；逾期无回执由 `deadline_at` 收敛为 `expired`（不依赖 cron 或 DO timer）；`idempotency_key` 命中直接返回已有任务。详见 `docs/async-exec-upload-design.md`。upload / agent update 的数据面外移仍待实现（阶段 B/C）。
 
 #### 3.2.2 告警通知与多用户
 
@@ -324,7 +333,7 @@ Rust 版以 `#[cfg(unix)]` / `#[cfg(windows)]` 条件编译实现三平台（平
 **Release 清单**：CI `prepare` job 从触发 commit 时间 + 8 位短 SHA 生成全平台统一 build id（`YYYY.MM.DD-HHMM-xxxxxxxx`），防独立 job 跨分钟版本不一致与同分钟 tag 碰撞；`agent-manifest.json` 包含 schema/Cargo 版本/build id/tag/commit/update protocol，以及四个平台资产的 name/size/SHA-256/固定 GitHub Release URL。
 
 **权限与开关**：
-- API 仅 JWT 管理员可调用，PAT 即使有 `server:exec` 也拒绝；请求、成功、失败均写审计日志。
+- API 需 `agent:update` 权限（`canUpdateAgent`：管理员，或带该 scope 且命中 `server_ids` 白名单的 PAT）。注意与 `server:exec` 分离——远程替换二进制是供应链级操作，不因能执行命令而自动放行。请求、成功、失败均写审计日志。
 - Agent 默认 `ALLOW_SELF_UPDATE=0`；显式设 1 才上报 `self_update_enabled=true` 并显示按钮。
 - 使用 supervisor 时 `AGENT_SELF_RESTART=0`；无 supervisor 时可设 1，由旧进程清理会话后启动新版本，二者不可同时开启。
 - 更新与普通上传、另一个更新互斥；更新开始关闭现有终端/文件会话，并拒绝新会话/exec。
@@ -349,7 +358,8 @@ Rust 版以 `#[cfg(unix)]` / `#[cfg(windows)]` 条件编译实现三平台（平
 
 > **实际实现（2026-08，Rust 版）**：采用下述简化协议，以下"magic 帧/多路复用"为初版设计参考（对齐哪吒），当前未使用。
 > - **鉴权**：agent 数据流（`/ws/agent/terminal|file`）用 `X-Agent-Key` 请求头（key 指纹 + 哈希校验）；浏览器流（`/ws/terminal|file`）用**首帧** `{type:"auth", token}`（token 不进 URL，防日志/历史泄露）。
-> - **控制通道**（agent 常驻 WS）：JSON 文本帧 `open_terminal` / `open_file` / `resize {stream_id,rows,cols}` / `set_report_interval {interval}` / `ping`（心跳）；agent 回执 `terminal_ready` / `file_ready` 停止 DO 的确认重发。自更新使用 Binary 混合帧（`agent_update` JSON 头 + `\n` + ≤48KB 原始字节），最终回 `agent_update_result`。
+> - **控制通道**（agent 常驻 WS）：JSON 文本帧 `open_terminal` / `open_file` / `resize {stream_id,rows,cols}` / `set_report_interval {interval}` / `ping`（心跳）/ `exec {exec_id, command, timeout_s}`（一次性命令）/ `probe {id}`（下行探活，仅对声明 `probe_proto` 的 agent）；agent 回执 `terminal_ready` / `file_ready` / `pong {id}` / `exec_result {exec_id, exit_code, stdout, stderr, timed_out}`。自更新使用 Binary 混合帧（`agent_update` JSON 头 + `\n` + ≤48KB 原始字节），最终回 `agent_update_result`。
+>   - 异步 exec 的 `exec_id` **就是 `operation_jobs.id`**（`job_` 前缀），DO 收到 `exec_result` 后据此把终态写回 D1。同步旧路径的 `exec_id` 为随机串，两者靠前缀区分，过渡期共存。
 > - **终端数据流**：纯字节透传（输入/输出无帧头，单向直转）；resize 走控制通道（非数据流帧）。
 > - **心跳保活**：控制通道 `ping` + DO 侧 30s 限频心跳下行，防健康连接被误判半开。
 
@@ -430,13 +440,14 @@ DO 与 agent 之间的 WebSocket 用二进制帧，结构对齐哪吒实现（�
 | 数据分类 | 存储方案 | 理由 |
 | --- | --- | --- |
 | 面板核心数据（server / 用户 / PAT / 审计） | **D1 (SQLite)** | 关系查询、内置备份与时间点恢复、免费额度足够 |
+| 异步任务状态（`operation_jobs`） | **D1** | 轮询由 Worker 直接查库，**不激活 DO**。若存 DO Storage，每次轮询都会请求 DO、打断 Hibernation，抵消异步化的全部收益；且需按 kind 跨服务器做互斥判断，天然是关系查询 |
 | 终端会话状态（streamId / 双 WS / resize） | **DO Storage（或 DO 内存）** | 瞬态、就近存放、断开即清，不入主库 |
 | 公开配置（站点设置 / 公告） | **D1 `kv_json` 表** | 2026-08-02 由 Workers KV 改为 D1 键值表（key/value，value 存 JSON），少一个依赖 |
 | 监控时序（CPU / 内存 历史） | **内存 DO 热区 + D1 归档（默认开启）** | 内存滚动窗口（`METRICS_KEEP_MIN` 分钟/机，默认 240；`ARCHIVE_TO_D1=0` 时回退 720，秒回）+ alarm 批量归档 D1（默认开启，`ARCHIVE_TO_D1=0` 关闭），保留 30 天、每日清理 |
 
 ### 8.2 D1 初版 Schema（草稿）
 
-> ⚠️ 以下为初版设计草稿，**实际建表以 `schema.sql` / `migrations/` 为准**（版本化管理，部署自动 apply）。与草稿的关键差异：`users` 表已移除（多用户改由环境变量 `PANEL_USERS`/`PANEL_PASSWORD` 配置，登录即管理员）；`servers` 新增 `group`（分组）、`agent_key_hash`（HMAC 密钥哈希）、`wan_ip`（出口 IP）、`probe_json`（服务探活结果）；`audit_logs` 新增 `username`/`client_ip`；`metrics_min` 新增 `mem_total`；另有自定义指标表 `metrics_custom`。
+> ⚠️ 以下为初版设计草稿，**实际建表以 `schema.sql` / `migrations/` 为准**（版本化管理，部署自动 apply）。与草稿的关键差异：`users` 表已移除（多用户改由环境变量 `PANEL_USERS`/`PANEL_PASSWORD` 配置，登录即管理员）；`servers` 新增 `group`（分组）、`agent_key_hash`（HMAC 密钥哈希）、`wan_ip`（出口 IP）、`probe_json`（服务探活结果）；`audit_logs` 新增 `username`/`client_ip`/`duration_ms`/`job_id`；`metrics_min` 新增 `mem_total`；另有自定义指标表 `metrics_custom`、异步任务表 `operation_jobs`（迁移 0015）、按天汇总 `metrics_day`。
 
 ```sql
 -- 服务器（agent 上报身份的归属）
@@ -507,7 +518,8 @@ CREATE TABLE kv_json (
 ### 8.3 设计要点
 
 - 密码与 PAT 一律**只存哈希**（token 本体只在创建时返回一次，对齐哪吒）。
-- PAT 支持 `scopes` + `server_ids` 白名单，实现最小权限（终端需 `server:exec`）。
+- PAT 支持 `scopes`（`server:read` / `server:exec` / `agent:update` / `panel:admin`）+ `server_ids` 白名单，实现最小权限（终端需 `server:exec`）。
+- `panel:admin` 是**全权 scope**：命中后 `isAdmin` 短路，忽略 `server_ids` 与其它 scope，等价管理员。设计动机是 MCP 客户端只能配长期凭据而 JWT 仅 24h，否则管理类工具在 MCP 中不可用。唯一约束：**只能由 JWT 管理员签发**（`isJwtAdmin`），PAT 无法自举同级令牌——否则泄露一个 admin PAT 等于永久 root，可无限铸造新的永久 admin PAT。
 - 监控数据分钟级聚合：30 台机器 ≈ 1,300 行/天，远低于 D1 免费写入配额；机器多了再评估外部时序库（Timescale / ClickHouse）或 KV 滚动窗口。
 
 ---

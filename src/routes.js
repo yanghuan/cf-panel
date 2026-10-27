@@ -1,8 +1,9 @@
 // cf-panel — 路由层：REST API（handleApi）+ MCP（handleMcp）+ WebSocket 路由（handleWs）
 import {
   SCOPE_READ, SCOPE_EXEC, SCOPE_AGENT_UPDATE, SCOPE_ADMIN, PAT_PREFIX, SHARDS, parsePanelUsers, statsTzOffsetSec,
-  EXEC_CMD_MAX_BYTES, execCommandBytes, execTooLongError, SERVER_DESC_MAX,
+  EXEC_CMD_MAX_BYTES, execCommandBytes, execTooLongError, SERVER_DESC_MAX, JOB_POLL_AFTER_MS,
 } from './config.js';
+import { createExecJob, getJob, settleExpired, jobView, hasActiveAgentUpdate, failJob } from './jobs.js';
 
 // 本模块专用常量（PAT scope 白名单 / MCP 协议与工具，就近定义便于对照使用代码）
 const ALLOWED_SCOPES = [SCOPE_READ, SCOPE_EXEC, SCOPE_AGENT_UPDATE, SCOPE_ADMIN]; // PAT 合法 scope 白名单
@@ -29,7 +30,7 @@ const MCP_TOOLS = [
   },
   {
     name: 'exec_command',
-    description: `在指定服务器上通过 agent 执行一次 shell 命令并返回输出（一次性执行、非交互、无 PTY，经控制通道直达；适合只读查询、进程/服务管理、快速运维）。需要 exec 权限（管理员或带 server:exec scope 的 PAT）。提供 server_id 或 server_name 之一；command 必填；timeout 可选（秒，默认 25，最大 25）；输出上限约 44KB（stdout）。命令长度上限 ${EXEC_CMD_MAX_BYTES} 字节（JSON 转义后的字节数：中文 3 字节/字符、换行转义为 \\n 占 2 字节）——更长的脚本请先用 create_upload 上传成文件再执行该文件。`,
+    description: `在指定服务器上通过 agent 执行一次 shell 命令（一次性执行、非交互、无 PTY，经控制通道直达；适合只读查询、进程/服务管理、快速运维）。**异步**：本工具只返回 job_id 与 accepted，命令还在执行，必须用 get_operation 轮询直到终态才能拿到 exit_code/stdout/stderr（建议间隔 poll_after_ms）。需要 exec 权限（管理员或带 server:exec scope 的 PAT）。提供 server_id 或 server_name 之一；command 必填；timeout 可选（秒，默认 25，最大 25）；输出上限约 44KB（stdout）。命令长度上限 ${EXEC_CMD_MAX_BYTES} 字节（JSON 转义后的字节数：中文 3 字节/字符、换行转义为 \\n 占 2 字节）——更长的脚本请先用 create_upload 上传成文件再执行该文件。`,
     inputSchema: {
       type: 'object',
       properties: {
@@ -191,6 +192,17 @@ const MCP_TOOLS = [
         alerts: { type: 'object', description: '告警配置对象。注意是**整体替换**而非合并：请先 get_settings 取当前 alerts，改完整体回传——漏传的字段会丢失（漏传 webhook_url 等于停用告警）。字段名：webhook_url（留空即停用告警，无单独的 enabled 开关）/ webhook_token / method（GET|POST|PUT）/ body_template / content_type / headers / cpu_pct / mem_pct / disk_pct / load（可设 0 关闭该维度）/ cooldown_min / offline_after_s / mute_until（免打扰截止的 unix 秒，到期自动恢复）。阈值类维度还支持逐机覆盖，见 update_server 的 alert_override' },
       },
       required: [],
+    },
+  },
+  {
+    name: 'get_operation',
+    description: `查询异步任务（exec_command / create_upload / update_agent 返回的 job_id）的状态与结果。exec_command 等工具只返回 accepted，**必须轮询本工具**直到 status 为终态（succeeded / failed / timed_out / expired）。建议按返回的 poll_after_ms（默认 ${JOB_POLL_AFTER_MS}ms）间隔轮询。exec 结果在终态的 result 中给出 exit_code/stdout/stderr。`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        job_id: { type: 'string', description: '任务 ID（形如 job_xxx，由 exec_command 等工具返回）' },
+      },
+      required: ['job_id'],
     },
   },
 ];
@@ -360,6 +372,78 @@ function normalizeServerDesc(v) {
   if (!s) return { value: null };
   if (s.length > SERVER_DESC_MAX) return { error: `description too long (max ${SERVER_DESC_MAX} chars)` };
   return { value: s };
+}
+
+// 读取任务并按 kind 重新鉴权（REST 轮询与 MCP get_operation 共用）。
+// 任一条件不满足统一返回 null → 调用方 404：job_id 本身是能力凭证，不能泄露"存在但无权"。
+// 所有者判定按 username 收紧：PAT 共用同一个 user_id，只比 user_id 会让同一个人不同令牌
+// 互相读到对方的命令输出；管理员（含 panel:admin）可读全部。
+async function readJobForUser(env, user, rawId) {
+  const id = String(rawId || '').trim();
+  if (!id) return null;
+  const job = await getJob(env, id);
+  if (!job) return null;
+  const server = await env.DB.prepare('SELECT id, name, user_id FROM servers WHERE id = ?').bind(job.server_id).first();
+  if (!server) return null;
+  const allowed = job.kind === 'agent_update' ? canUpdateAgent(user, server) : canExec(user, server);
+  if (!allowed) return null;
+  if (!isAdmin(user) && !(job.user_id === user.id && job.username === user.username)) return null;
+  // 过期收敛幂等：轮询顺手把「已过 deadline 但无回执」的任务判为 expired，不依赖 cron
+  return { job: await settleExpired(env, job), server };
+}
+
+// 创建 exec 任务并下发给 DO（REST /api/exec-jobs 与 MCP exec_command 共用，避免两处漂移）。
+// 返回 { status, payload }：202 = 已下发（或被幂等命中）；其它状态即失败，payload 仍带 job_id 便于排查。
+async function dispatchExecJob(env, user, { server, command, timeoutS, ip, idempotencyKey = null }) {
+  // 互斥：更新会重启 agent，期间下发命令会与二进制更新帧交错
+  if (await hasActiveAgentUpdate(env, server.id)) {
+    return { status: 409, payload: { error: 'agent update in progress' } };
+  }
+  const { job, reused } = await createExecJob(env, {
+    user, serverId: server.id, command, timeoutS, clientIp: ip, idempotencyKey,
+  });
+  // 幂等命中：不重复下发，直接把已有任务交回调用方
+  if (reused) {
+    return {
+      status: 202,
+      payload: {
+        job_id: job.id, status: job.status, server_id: job.server_id,
+        poll_tool: 'get_operation', poll_after_ms: JOB_POLL_AFTER_MS, reused: true,
+      },
+    };
+  }
+  const failed = (error) => ({ status: 502, payload: { error, job_id: job.id, status: 'failed' } });
+  try {
+    // 短请求：DO 只做「下发 + 落 running」，不等待命令完成
+    const resp = await doForShard(env, shardForServerId(server.id)).fetch('https://do.internal/rpc/exec/submit', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ jobId: job.id, serverId: server.id, command, timeoutMs: timeoutS * 1000 }),
+    });
+    const out = await resp.json().catch(() => ({}));
+    if (!resp.ok) {
+      // DO 的失败分支自己会把任务置 failed；这里兜住它没覆盖到的拒绝（如参数校验），
+      // 避免 D1 里留下永远 queued 的行（客户端会一直看到"排队中"直到 deadline）
+      await failJob(env, job.id, out.error || `dispatch rejected (${resp.status})`);
+      return {
+        status: resp.status,
+        payload: { error: out.error || 'exec dispatch failed', job_id: job.id, status: 'failed' },
+      };
+    }
+  } catch {
+    // DO 不可达：任务标 failed，避免留下永远 queued 的行
+    await failJob(env, job.id, 'dispatch failed');
+    return failed('exec dispatch failed');
+  }
+  // 回读一次，让响应里的 status 与 D1 权威状态一致（DO 已把 queued 置为 running）
+  const fresh = await getJob(env, job.id);
+  return {
+    status: 202,
+    payload: {
+      job_id: job.id, status: fresh ? fresh.status : 'queued', server_id: server.id, server_name: server.name,
+      poll_tool: 'get_operation', poll_after_ms: JOB_POLL_AFTER_MS,
+    },
+  };
 }
 
 // 通用审计写入（best-effort）：审计是旁路留痕，写入失败绝不得改变主流程结果——
@@ -802,6 +886,37 @@ async function handleApiInner(request, env) {
   if (method === 'GET' && path === '/api/usage') {
     if (!isAdmin(user)) return err('forbidden', 403, 'FORBIDDEN');
     return json(await collectUsageView(env));
+  }
+
+  // POST /api/exec-jobs —— 异步命令执行：创建任务 → 短请求下发给 DO → 立即 202。
+  // 客户端不等待执行完成，用 GET /api/jobs/:id 轮询（Worker 只查 D1，不激活 DO）。
+  // 语义变更：exec 不再同步返回 stdout，调用方必须轮询。
+  if (method === 'POST' && path === '/api/exec-jobs') {
+    const body = await request.json().catch(() => ({}));
+    const serverId = Number(body.server_id) || 0;
+    const command = String(body.command || '').trim();
+    if (!command) return err('command required', 400, 'COMMAND_REQUIRED');
+    // 长度最终防线（与 MCP 同一常量）：超限帧会让 agent 判 Capacity 断开控制通道
+    const cmdBytes = execCommandBytes(command);
+    if (cmdBytes > EXEC_CMD_MAX_BYTES) return err(execTooLongError(cmdBytes), 413);
+    const server = await env.DB.prepare('SELECT * FROM servers WHERE id = ?').bind(serverId).first();
+    if (!server) return err('server not found', 404, 'NOT_FOUND');
+    if (!canExec(user, server)) return err('forbidden', 403, 'FORBIDDEN');
+    const timeoutS = Math.min(Math.max(Number(body.timeout) || 25, 1), 25);
+    const { status, payload } = await dispatchExecJob(env, user, {
+      server, command, timeoutS, ip,
+      idempotencyKey: body.idempotency_key ? String(body.idempotency_key).slice(0, 128) : null,
+    });
+    return json(payload, status);
+  }
+
+  // GET /api/jobs/:id —— 任务轮询（exec/upload/agent_update 通用）。只读 D1，不访问 DO。
+  if (method === 'GET' && path.startsWith('/api/jobs/')) {
+    const found = await readJobForUser(env, user, path.slice('/api/jobs/'.length));
+    if (!found) return err('not found', 404, 'NOT_FOUND');
+    const resp = json(jobView(found.job));
+    resp.headers.set('cache-control', 'no-store'); // 输出可能含敏感内容，禁止中间层缓存
+    return resp;
   }
 
   // POST /api/terminal —— 创建终端会话（exec 权限 + 服务器归属）
@@ -1417,31 +1532,23 @@ async function mcpExecCommand(user, env, args, ip) {
   }
   if (!server) throw new Error(`server not found (server_id=${args.server_id || ''}, server_name=${args.server_name || ''})`);
   if (!canExec(user, server)) throw new Error(`no exec permission on server ${server.id} (${server.name})`);
-  const timeout = Math.min(Math.max(Number(args.timeout) || 25, 1), 25);
-  const resp = await doForShard(env, shardForServerId(server.id)).fetch('https://do.internal/rpc/exec', {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ serverId: server.id, command, timeoutMs: timeout * 1000 }),
+  const timeoutS = Math.min(Math.max(Number(args.timeout) || 25, 1), 25);
+  const { status, payload } = await dispatchExecJob(env, user, {
+    server, command, timeoutS, ip,
+    idempotencyKey: args.idempotency_key ? String(args.idempotency_key).slice(0, 128) : null,
   });
-  const result = await resp.json();
-  if (!resp.ok) throw new Error(result.error || `exec failed (${resp.status})`);
-  // exec 是全项目权限最高、最需留痕的写操作（此前是全项目唯一无审计记录的命令执行）。
-  // detail 存截断命令（200 字符）+ exit_code；审计失败不影响命令结果
-  const commandTrunc = command.length > 200 ? command.slice(0, 200) + '…' : command;
-  try {
-    await env.DB.prepare('INSERT INTO audit_logs (user_id, username, client_ip, action, target_server_id, detail) VALUES (?,?,?,?,?,?)')
-      .bind(user.id, user.username, ip, 'exec.command', server.id, `exit=${typeof result.exit_code === 'number' ? result.exit_code : '?'} ${commandTrunc}`)
-      .run();
-  } catch (e) { /* 审计失败不影响命令结果 */ }
-  return {
-    server_id: server.id,
-    server_name: server.name,
-    exit_code: typeof result.exit_code === 'number' ? result.exit_code : null,
-    stdout: result.stdout || '',
-    stderr: result.stderr || '',
-    timed_out: !!result.timed_out,
-    error: result.error || null,
-  };
+  if (status >= 400) throw new Error(payload.error || `exec failed (${status})`);
+  // 异步语义：不再返回 stdout/exit_code，调用方必须轮询 get_operation。
+  // 审计在终态由 DO 写入（此处不写，避免把"已下发"当成"已执行"）。
+  return payload;
+}
+
+// 工具：查询异步任务（exec / upload / agent_update 通用）。
+// 鉴权与 REST 轮询同源（readJobForUser），失败统一按"不存在"处理，避免 job_id 被枚举探测。
+async function mcpGetOperation(user, env, args) {
+  const found = await readJobForUser(env, user, args.job_id);
+  if (!found) throw new Error('job not found（请确认 job_id 属于当前凭据，且未过期）');
+  return jobView(found.job);
 }
 
 // 工具：创建一次性上传签名 URL（大文件上传通道，不经过 LLM 上下文）。
@@ -1529,20 +1636,24 @@ function requireAdmin(user) {
 // 缺 scope 时调用必然失败，就不该出现在 tools/list 里——否则只读 PAT 仍会看到
 // exec_command/update_agent/create_upload 三个调不动且报错不直观的工具。
 const MCP_TOOL_SCOPE = {
-  list_servers: SCOPE_READ,
-  get_monitor: SCOPE_READ,
-  exec_command: SCOPE_EXEC,
-  create_upload: SCOPE_EXEC,
-  update_agent: SCOPE_AGENT_UPDATE,
+  list_servers: [SCOPE_READ],
+  get_monitor: [SCOPE_READ],
+  exec_command: [SCOPE_EXEC],
+  create_upload: [SCOPE_EXEC],
+  update_agent: [SCOPE_AGENT_UPDATE],
+  // 跨 kind 的任务查询：任一操作 scope 即可见（不能只绑 SCOPE_EXEC，否则
+  // 只有 agent:update 的 PAT 拿不到自己的更新任务状态）
+  get_operation: [SCOPE_EXEC, SCOPE_AGENT_UPDATE],
 };
 
-// tools/list 可见性：管理类看 isAdmin，其余看是否持有对应 scope
+// tools/list 可见性：管理类看 isAdmin，其余看是否持有对应 scope（数组=任一命中）
 function mcpToolVisible(user, tool) {
   if (isAdmin(user)) return true;
   if (MCP_ADMIN_TOOLS.has(tool.name)) return false;
   const need = MCP_TOOL_SCOPE[tool.name];
   if (!need) return true;
-  return !!(user.pat && Array.isArray(user.pat.scopes) && user.pat.scopes.includes(need));
+  const scopes = user.pat && Array.isArray(user.pat.scopes) ? user.pat.scopes : [];
+  return need.some((s) => scopes.includes(s));
 }
 
 async function mcpAddServer(user, env, args, ip, url) {
@@ -1886,7 +1997,7 @@ async function handleMcpInner(request, env) {
         protocolVersion: MCP_VERSION,
         capabilities: { tools: {} },
         serverInfo: { name: 'cf-panel', version: '0.1.0' },
-        instructions: 'cf-panel 面板。工具：list_servers（服务器状态）、get_monitor（监控历史）、exec_command（执行命令，需 exec 权限）、update_agent（触发 Agent 自更新，需 agent:update 权限，单机语义、多台请串行）、create_upload（签发上传签名 URL）、管理类（需管理员：JWT 登录，或由管理员签发的带 panel:admin 权限的 PAT）：add_server/delete_server/update_server/rotate_agent_key/list_tokens/create_token/revoke_token/get_audit_logs/get_usage/get_settings/update_settings。tools/list 会按当前凭据的实际权限裁剪，不可用的工具不会列出。认证：Authorization: Bearer <JWT 或 PAT>',
+        instructions: 'cf-panel 面板。工具：list_servers（服务器状态）、get_monitor（监控历史）、exec_command（执行命令，需 exec 权限；**异步**：只返回 job_id，必须用 get_operation 轮询到终态才有输出）、get_operation（查询异步任务状态/结果）、update_agent（触发 Agent 自更新，需 agent:update 权限，单机语义、多台请串行）、create_upload（签发上传签名 URL）、管理类（需管理员：JWT 登录，或由管理员签发的带 panel:admin 权限的 PAT）：add_server/delete_server/update_server/rotate_agent_key/list_tokens/create_token/revoke_token/get_audit_logs/get_usage/get_settings/update_settings。tools/list 会按当前凭据的实际权限裁剪，不可用的工具不会列出。认证：Authorization: Bearer <JWT 或 PAT>',
       });
     case 'notifications/initialized':
     case 'notifications/cancelled':
@@ -1908,6 +2019,7 @@ async function handleMcpInner(request, env) {
         if (params.name === 'list_servers') content = await mcpListServers(user, env);
         else if (params.name === 'get_monitor') content = await mcpGetMonitor(user, env, params.arguments || {});
         else if (params.name === 'exec_command') content = await mcpExecCommand(user, env, params.arguments || {}, clientIp(request));
+        else if (params.name === 'get_operation') content = await mcpGetOperation(user, env, params.arguments || {});
         else if (params.name === 'update_agent') content = await mcpUpdateAgent(user, env, params.arguments || {}, clientIp(request));
         else if (params.name === 'create_upload') content = await mcpCreateUpload(user, env, params.arguments || {}, url, clientIp(request));
         else if (params.name === 'add_server') content = await mcpAddServer(user, env, params.arguments || {}, clientIp(request), url);

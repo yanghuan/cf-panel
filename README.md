@@ -387,6 +387,8 @@ Webhook 出站安全：仅允许 HTTP(S)，拒绝 URL 内嵌凭据、本地域�
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | POST | `/api/terminal` | 创建终端会话（exec 权限 + 归属校验），返回 `session_id` |
+| POST | `/api/exec-jobs` | **异步**执行一次性命令（`server_id` + `command`，`timeout` 1~25s，可选 `idempotency_key`）：创建任务并短请求下发，返回 `202 {job_id, poll_tool, poll_after_ms}`；结果用 `GET /api/jobs/:id` 轮询 |
+| GET | `/api/jobs/:id` | 查询任务状态/结果（exec / upload / agent_update 通用）。只读 D1、**不访问 DO**；终态才返回 `result`；`Cache-Control: no-store` |
 | POST | `/api/file/open` | 创建文件管理会话，返回 `session_id` |
 | GET | `/ws/terminal/{id}` | 浏览器终端 WebSocket（校验创建者 / admin） |
 | GET | `/ws/file/{id}` | 浏览器文件 WebSocket（JSON 行协议：`list`/`read`/`write`/`zip`/`rename`/`delete`/`mkdir`/`touch`/`move`/`copy`/`chmod`/`find`） |
@@ -414,13 +416,18 @@ Webhook 出站安全：仅允许 HTTP(S)，拒绝 URL 内嵌凭据、本地域�
 | --- | --- |
 | `list_servers` | 服务器列表 + 实时状态 + 系统信息 |
 | `get_monitor` | 监控历史（`range`：1h/12h/3d/7d/30d） |
-| `exec_command` | 执行一次性 shell 命令（`timeout` 1~25s，命令长度 ≤65408 字节（JSON 转义后；中文 3 字节/字符），stdout 上限约 44KB）；**写操作**，需 exec 权限，超时 kill 进程组。超长命令请先用 `create_upload` 上传脚本再执行 |
+| `exec_command` | **异步**执行一次性 shell 命令（`timeout` 1~25s，命令长度 ≤65408 字节（JSON 转义后；中文 3 字节/字符），stdout 上限约 44KB）；**写操作**，需 exec 权限，超时 kill 进程组。只返回 `job_id` + `accepted`，**必须用 `get_operation` 轮询**才能拿到 exit_code/stdout/stderr。超长命令请先用 `create_upload` 上传脚本再执行 |
+| `get_operation` | 查询异步任务（`job_id`）状态与结果；`succeeded`/`failed`/`timed_out`/`expired` 为终态。按任务类型校验权限（exec/upload 需 `server:exec`，agent_update 需 `agent:update`；`panel:admin` 全量） |
 | `create_upload` | 签发一次性上传**签名 URL**（HMAC 绑定 server/path/overwrite，10 分钟过期，无需 Bearer）——大文件 / 二进制不经 LLM 上下文 |
 | `add_server` / `update_server` / `delete_server` | 服务器增删改（仅管理员）；支持 `description`（多行运维备注，≤500 字，随 `list_servers` 返回） |
 | `rotate_agent_key` | 轮换 agent key（仅管理员，历史保留） |
 | `list_tokens` / `create_token` / `revoke_token` | PAT 生命周期（仅管理员，明文只返回一次） |
 | `get_audit_logs` / `get_usage` | 审计日志 / 用量观测（仅管理员；PAT 需 `panel:admin`） |
 | `get_settings` / `update_settings` | 面板设置（含全局免打扰 `mute_until`，仅管理员；PAT 需 `panel:admin`） |
+
+> **行为变更（阶段 A）**：`exec_command` 由"同步返回 stdout"改为"异步任务"。调用方拿到 `job_id` 后必须轮询 `get_operation`（建议按返回的 `poll_after_ms`，默认 1s），终态才有 `exit_code`/`stdout`/`stderr`。
+>
+> 动机：原实现让 shard DO 为一次命令保持 25~30 秒活跃（DO duration 按活跃墙钟 × 128MB 计费，等待 I/O 同样计入）。现在 DO 只做「下发 + 结果回执落库」，任务状态存 D1，轮询由 Worker 直接读库、不激活 DO。任务在 DO evict 后仍可完成（结果回调唤醒 DO，状态全部来自 D1）。
 
 **客户端配置**（如 Claude Desktop）：
 

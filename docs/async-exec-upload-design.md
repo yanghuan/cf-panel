@@ -322,7 +322,11 @@ queued/running -> expired（超过 180s + grace 无回执）
 - `failed`：基础设施/协议失败（Agent 离线、下载失败、哈希/版本不符、self-replace 失败等）。
 - `timed_out`：命令/传输/更新实际执行超时。
 - `expired`：超过 deadline 未收到终态，通常意味着 Agent 失联或回执丢失。
-- 所有状态更新使用条件更新，例如 `WHERE id=? AND status='running'`，以 `meta.changes` 判断是否真正命中；重复回执不得覆盖终态。
+- 所有状态更新使用条件更新，例如 `WHERE id=? AND status='running'`，以 `meta.changes` 判断是否真正命中；**真正的终态（`succeeded`/`failed`/`timed_out`）不得被重复回执覆盖**。
+- **例外：`expired` 是"软终态"，允许被迟到的回执纠正**。服务端窗口必然窄于 Agent 兜底超时（这是刻意的：让 Agent 有更长的容错），所以"服务端先判过期、Agent 随后真的完成"这个窗口永远存在，只能缩小不能消除。
+  - 若丢弃这种回执：用户永远看到 `expired`，而文件/命令实际已经生效（状态与磁盘不一致）；且这次操作在审计里完全消失（不写审计）。
+  - 因此 `finishExecJob` / `finishUploadJob` / `finishUpdateJob` 的条件更新都包含 `expired`，并在 `error` 里保留 `late result after expiry (...)`、审计 detail 加 `[late]` 标记。
+  - 关键区别：`expired → succeeded` 是**纠正**（让状态与事实一致），`succeeded → failed` 才是**覆盖**（必须禁止）。
 
 ### 5.3 审计扩展
 
@@ -539,10 +543,11 @@ status = timed_out ? 'timed_out'
                    : (error ? 'failed' : 'succeeded')
 exit_code, stdout, stderr, timed_out, error,
 finished_at, duration_ms
-WHERE id=? AND status='running'
+WHERE id=? AND status IN ('queued','running','expired')
 ```
 
-2. 条件更新未命中时说明重复回执/任务已过期，记录 debug 日志并忽略。
+2. 条件更新未命中时说明是重复回执（真正的终态已写入），记录 debug 日志并忽略。
+   `expired` 是刻意包含的：允许迟到回执把"曾判过期"纠正为真实结果（见 §5.2 的软终态说明），否则命令可能已经执行、调用方却永远看到 expired。
 3. 写 `exec.command` 审计（`duration_ms`、`job_id`）；审计失败不回滚任务结果。
 4. 更新 `lastRoundTripAt`，保留现有探活缓存语义。
 

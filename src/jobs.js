@@ -121,6 +121,8 @@ export async function failJob(env, id, error) {
 
 // 终端回执写入终态。返回更新后的完整行（未命中返回 null：重复回执 / 已过期）。
 // duration_ms 在 SQL 里算，避免「先读后写」的竞态。
+// 同 finishUploadJob：接受 expired 的迟到回执（窗口 30s vs Agent 命令超时 25s，
+// 倒置幅度小但同样存在）。exec 的迟到结果尤其重要——命令可能真的执行了。
 export async function finishExecJob(env, id, { exitCode = null, stdout = '', stderr = '', timedOut = false, error = null }) {
   const now = nowSec();
   const status = timedOut ? 'timed_out' : (error ? 'failed' : 'succeeded');
@@ -128,7 +130,7 @@ export async function finishExecJob(env, id, { exitCode = null, stdout = '', std
     `UPDATE operation_jobs
         SET status = ?, exit_code = ?, stdout = ?, stderr = ?, timed_out = ?, error = ?,
             finished_at = ?, duration_ms = CASE WHEN started_at IS NULL THEN NULL ELSE (? - started_at) * 1000 END
-      WHERE id = ? AND status IN ('queued','running')`
+      WHERE id = ? AND status IN ('queued','running','expired')`
   ).bind(status, exitCode, stdout, stderr, timedOut ? 1 : 0, error, now, now, id).run();
   if (!res.meta.changes) return null;
   return getJob(env, id);
@@ -289,13 +291,22 @@ export async function markUploadRunning(env, id) {
 }
 
 // upload 终态。成功（Agent 已 commit）与失败共用；R2 对象由调用方决定是否删除。
+// 终态回执写入。返回更新后的行；未命中返回 null（重复回执 / 已被其它路径收敛）。
+//
+// **允许 expired → succeeded/failed 的"迟到回执"**（值 `late=1` 记在 error 里）：
+// 服务端窗口只有 330s，而 Agent 兜底超时 360s —— 慢链路下会出现"服务端已判 expired，
+// Agent 随后真的把文件落盘了"。此时若丢弃回执：
+//   · 用户轮询永远看到 expired，可文件实际已经在了（状态与磁盘不一致）；
+//   · 这次上传在审计里完全消失（settleUploadJob 拿到 null 直接 return，走不到审计）。
+// 让回执把状态纠正为真实结果，并保留原判过期的事实，比"终态绝对不可变"更准确。
+// 注意：只接受 expired，不接受 succeeded/failed（真正的终态仍不可覆盖，防重复回执）。
 export async function finishUploadJob(env, id, { ok, error = null }) {
   const now = nowSec();
   const res = await env.DB.prepare(
     `UPDATE operation_jobs
         SET status = ?, error = ?, finished_at = ?,
             duration_ms = CASE WHEN started_at IS NULL THEN NULL ELSE (? - started_at) * 1000 END
-      WHERE id = ? AND status IN ('awaiting_upload','staging','staged','waiting_agent','running')`
+      WHERE id = ? AND status IN ('awaiting_upload','staging','staged','waiting_agent','running','expired')`
   ).bind(ok ? 'succeeded' : 'failed', error, now, now, id).run();
   if (!res.meta.changes) return null;
   return env.DB.prepare('SELECT * FROM operation_jobs WHERE id = ?').bind(id).first();
@@ -341,6 +352,7 @@ export async function markUpdateRunning(env, id) {
   return !!res.meta.changes;
 }
 
+// 同 finishUploadJob：接受 expired 的迟到回执（update 窗口 210s vs 下载超时 360s）。
 export async function finishUpdateJob(env, id, { ok, error = null, timedOut = false }) {
   const now = nowSec();
   const status = timedOut ? 'timed_out' : (ok ? 'succeeded' : 'failed');
@@ -348,7 +360,7 @@ export async function finishUpdateJob(env, id, { ok, error = null, timedOut = fa
     `UPDATE operation_jobs
         SET status = ?, error = ?, finished_at = ?,
             duration_ms = CASE WHEN started_at IS NULL THEN NULL ELSE (? - started_at) * 1000 END
-      WHERE id = ? AND status IN ('queued','running')`
+      WHERE id = ? AND status IN ('queued','running','expired')`
   ).bind(status, error, now, now, id).run();
   if (!res.meta.changes) return null;
   return env.DB.prepare('SELECT * FROM operation_jobs WHERE id = ?').bind(id).first();

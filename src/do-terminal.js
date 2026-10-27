@@ -1317,19 +1317,29 @@ export class TerminalDO {
       ok = false;
       errMsg = `size mismatch: agent wrote ${j.size}, staged ${row.size_bytes}`;
     }
-    const job = await finishUploadJob(this.env, jobId, { ok, error: errMsg });
+    // 迟到回执：任务此前已被判 expired，但 Agent 现在才回报结果。此时仍要落库——
+    // 文件很可能真的落盘了，继续显示 expired 会与磁盘实际不符（用户看到失败，
+    // 实际文件已经在那了）。保留"曾判过期"的事实到 error 里，便于排查。
+    const wasExpired = !!row && row.status === 'expired';
+    const finalErr = wasExpired
+      ? `late result after expiry (expired at ${row.deadline_at}s, deadline passed without result)${errMsg ? `; ${errMsg}` : ''}`
+      : errMsg;
+    const job = await finishUploadJob(this.env, jobId, { ok, error: finalErr });
     if (!job) return;
     if (job.r2_key) {
       try { await this.env.UPLOADS.delete(job.r2_key); } catch { /* 删除失败由 cron 兜底 */ }
     }
     // file.upload 审计改在"Agent 成功 commit 后"写（旧实现在签发 URL 时就写，
     // 把"请求上传"当成了"文件已落地"）。请求阶段另有 file.upload.request。
+    // 迟到回执同样要写审计——否则这次上传在审计里完全消失。
     try {
       await this.env.DB.prepare(
         'INSERT INTO audit_logs (user_id, username, client_ip, action, target_server_id, detail, duration_ms, job_id) VALUES (?,?,?,?,?,?,?,?)'
       ).bind(
-        job.user_id, job.username, job.client_ip || '', ok ? 'file.upload' : 'file.upload.failed',
-        job.server_id, String(job.target_path || '').slice(0, 200),
+        job.user_id, job.username, job.client_ip || '',
+        ok ? 'file.upload' : 'file.upload.failed',
+        job.server_id,
+        `${String(job.target_path || '').slice(0, 180)}${wasExpired ? ' [late]' : ''}`,
         job.duration_ms ?? null, jobId,
       ).run();
     } catch (e) { console.error('upload audit failed:', e); }

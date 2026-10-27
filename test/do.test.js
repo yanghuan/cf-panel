@@ -3008,3 +3008,52 @@ test('agent_update_result：审计 action 用 agent.update.installed（与前端
   assert.deepEqual(audits.results.map((a) => a.action), ['agent.update.installed'],
     '成功必须写 .installed（写裸 agent.update 前端无法翻译）');
 });
+
+// 迟到回执：服务端窗口(330s)窄于 Agent 兜底(360s)，慢链路下必然存在"服务端已判 expired、
+// Agent 随后真的把文件落盘了"的窗口。若丢弃回执，用户会永远看到 expired（而文件已存在），
+// 且这次上传在审计里完全消失。允许 expired → succeeded 的纠正，并保留"曾判过期"的事实。
+test('upload 迟到回执：expired 后收到成功回执 → 纠正为 succeeded 并写审计', async () => {
+  const env = makeEnv();
+  await env.DB.prepare('INSERT INTO servers (agent_key_id, name, user_id, agent_key_hash) VALUES (?,?,?,?)')
+    .bind('k1', 's1', 1, 'h1').run();
+  const now = Math.floor(Date.now() / 1000);
+  await env.DB.prepare(`INSERT INTO operation_jobs (id, kind, status, user_id, username, client_ip, server_id, target_path, size_bytes, r2_key, created_at, started_at, deadline_at, expires_at)
+    VALUES ('job_late','upload','expired',1,'admin','',1,'/opt/a.bin',10,'upload-jobs/job_late',?,?,?,?)`)
+    .bind(now - 400, now - 390, now - 60, now + 86400).run();
+  const inst = new TerminalDO(mockState(), env);
+  const ws = { deserializeAttachment: () => ({ role: 'control', serverId: 1 }), send() {}, readyState: 1, close() {} };
+  inst.agents.set(1, ws);
+
+  await inst.webSocketMessage(ws, JSON.stringify({
+    type: 'upload_result', upload_id: 'job_late', ok: true, commit: true, size: 10,
+  }));
+
+  const row = await env.DB.prepare('SELECT status, error FROM operation_jobs WHERE id = ?').bind('job_late').first();
+  assert.equal(row.status, 'succeeded', '迟到成功必须纠正状态，不能停在 expired');
+  assert.match(row.error, /late result after expiry/, '保留"曾判过期"的事实');
+
+  const audits = await env.DB.prepare("SELECT action, detail FROM audit_logs WHERE job_id = 'job_late'").all();
+  assert.equal(audits.results.length, 1, '迟到回执也必须写审计（否则这次上传完全无记录）');
+  assert.equal(audits.results[0].action, 'file.upload');
+  assert.match(audits.results[0].detail, /\[late\]/, '审计标注迟到');
+});
+
+// 真正的终态仍不可覆盖：重复回执不能把 succeeded 改成 failed
+test('upload 重复回执：已 succeeded 不被后续 failed 覆盖', async () => {
+  const env = makeEnv();
+  await env.DB.prepare('INSERT INTO servers (agent_key_id, name, user_id, agent_key_hash) VALUES (?,?,?,?)')
+    .bind('k1', 's1', 1, 'h1').run();
+  const now = Math.floor(Date.now() / 1000);
+  await env.DB.prepare(`INSERT INTO operation_jobs (id, kind, status, user_id, username, client_ip, server_id, target_path, size_bytes, r2_key, created_at, started_at, deadline_at, expires_at)
+    VALUES ('job_dup','upload','running',1,'admin','',1,'/opt/b.bin',10,'upload-jobs/job_dup',?,?,?,?)`)
+    .bind(now - 5, now - 5, now + 300, now + 86400).run();
+  const inst = new TerminalDO(mockState(), env);
+  const ws = { deserializeAttachment: () => ({ role: 'control', serverId: 1 }), send() {}, readyState: 1, close() {} };
+  inst.agents.set(1, ws);
+  await inst.webSocketMessage(ws, JSON.stringify({ type: 'upload_result', upload_id: 'job_dup', ok: true, commit: true, size: 10 }));
+  await inst.webSocketMessage(ws, JSON.stringify({ type: 'upload_result', upload_id: 'job_dup', ok: false, commit: true, error: 'dup' }));
+  const row = await env.DB.prepare('SELECT status FROM operation_jobs WHERE id = ?').bind('job_dup').first();
+  assert.equal(row.status, 'succeeded', '真实终态不可被重复回执覆盖');
+  const n = await env.DB.prepare("SELECT COUNT(*) AS c FROM audit_logs WHERE job_id = 'job_dup'").first();
+  assert.equal(n.c, 1, '审计不重复');
+});

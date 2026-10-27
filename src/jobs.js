@@ -150,13 +150,16 @@ export async function settleExpired(env, job) {
       WHERE id = ? AND status IN (${placeholders})`
   ).bind(job.kind === 'exec' ? 'no result before deadline' : 'expired before completion', now, now, job.id, ...ACTIVE_STATES).run();
   if (!res.meta.changes) return job;
+  // 回读一次：审计要 duration_ms，而传进来的 job 是 UPDATE **之前**的快照
+  //（那时 finished_at 刚写、duration_ms 仍为 NULL，直接用它会让审计恒为 null）。
+  const fresh = await getJob(env, job.id);
   // 过期即删 staging 对象：不能等 cron 的 24h TTL——一次 Agent 掉线的 100MB 上传
   // 会在额度里白躺一天，几十次就顶满 10GB。此处在判定过期的同一路径上清掉。
-  await deleteStagingObject(env, job);
+  await deleteStagingObject(env, fresh || job);
   // exec 超时同样要留痕：旧同步路径在超时会写一条 exec.command，
   // 异步化后若不补，这条路径就完全无审计（最高权限的写操作反而无痕）。
-  if (job.kind === 'exec') await auditExecFailed(env, job, 'no result before deadline');
-  return getJob(env, job.id);
+  if ((fresh || job).kind === 'exec') await auditExecFailed(env, fresh || job, 'no result before deadline');
+  return fresh || job;
 }
 
 // exec 失败/超时的审计（exec.command.failed）。与 DO 内的 failExecJobWithAudit 同格式，
@@ -165,13 +168,18 @@ export async function auditExecFailed(env, job, reason) {
   if (!job || job.kind !== 'exec') return;
   const cmd = String(job.command || '');
   const commandTrunc = cmd.length > 180 ? `${cmd.slice(0, 180)}…` : cmd;
+  // duration_ms 要现算：settleExpired / settleServerExpired / settleExpiredAll 传进来的是
+  // UPDATE **之前**的行快照（那时 finished_at 刚写、duration_ms 还是 NULL），
+  // 直接取 job.duration_ms 会恒为 null（实测：任务行 380000，审计 null）。
+  const dur = job.duration_ms
+    ?? (job.started_at && job.finished_at ? (job.finished_at - job.started_at) * 1000 : null);
   try {
     await env.DB.prepare(
       'INSERT INTO audit_logs (user_id, username, client_ip, action, target_server_id, detail, duration_ms, job_id) VALUES (?,?,?,?,?,?,?,?)'
     ).bind(
       job.user_id, job.username, job.client_ip || '', 'exec.command.failed', job.server_id,
       `exit=? (${reason}) ${commandTrunc}`,
-      job.duration_ms ?? null, job.id,
+      dur, job.id,
     ).run();
   } catch (e) { console.error('exec failed audit failed:', e); }
 }
@@ -197,17 +205,16 @@ export async function hasActiveAgentUpdate(env, serverId) {
 
 // ---- upload 任务 ----
 
-// 创建 upload 任务（awaiting_upload）。同一服务器已有非终态 upload 时抛 UPLOAD_BUSY。
-// 有效期分两段：先给客户端 10 分钟上传字节；落 R2 后再给 Agent 120s 拉取，
-// 两段窗口互不复用（上传慢不该挤掉 Agent 的时间）。
-// 按 server 收敛该机已过 deadline 的非终态任务（供应在创建前调用）。
+// 按 server 收敛该机已过 deadline 的非终态任务（创建任务前调用）。
+//
 // 不能用 settleExpiredAll：它是全表扫描（LIMIT 200），在创建任务的热路径里调会无谓扫 200 行。
 // 这里只处理"这台机器"，把被过期任务占着的部分唯一索引让出来——否则
 // awaiting_upload / update running 的任务过了 deadline 但没人轮询、cron 未跑到时，
 // createUploadJob 仍会返回 UPLOAD_BUSY，最长挡到 expires_at（24h）。
 export async function settleServerExpired(env, serverId, now = nowSec()) {
   const rows = await env.DB.prepare(
-    `SELECT id, kind, r2_key, user_id, username, client_ip, server_id, command FROM operation_jobs
+    `SELECT id, kind, r2_key, user_id, username, client_ip, server_id, command, started_at, finished_at
+       FROM operation_jobs
       WHERE server_id = ? AND deadline_at < ?
         AND status IN ('queued','awaiting_upload','staging','staged','waiting_agent','running')
       LIMIT 20`
@@ -221,11 +228,16 @@ export async function settleServerExpired(env, serverId, now = nowSec()) {
         WHERE id = ? AND status IN (${placeholders})`
     ).bind(now, now, job.id, ...ACTIVE_STATES).run();
     if (!res.meta.changes) continue;
-    await deleteStagingObject(env, job);
-    if (job.kind === 'exec') await auditExecFailed(env, job, 'no result before deadline');
+    // 回读拿 duration_ms（入参是 UPDATE 前的快照，见 settleExpired 注释）
+    const fresh = (await getJob(env, job.id)) || job;
+    await deleteStagingObject(env, fresh);
+    if (fresh.kind === 'exec') await auditExecFailed(env, fresh, 'no result before deadline');
   }
 }
 
+// 创建 upload 任务（awaiting_upload）。同一服务器已有非终态 upload 时抛 UPLOAD_BUSY。
+// 有效期分两段：先给客户端 10 分钟上传字节；落 R2 后再给 Agent 300s 拉取（+30s grace），
+// 两段窗口互不复用（上传慢不该挤掉 Agent 的时间）。
 export async function createUploadJob(env, { user, serverId, targetPath, overwrite, maxBytes, clientIp }) {
   await purgeExpired(env);
   // 先让出被"已过期但无人轮询"的任务占着的单机串行锁（见 settleServerExpired 注释）
@@ -481,7 +493,7 @@ export function jobView(job, { pollAfterMs = JOB_POLL_AFTER_MS } = {}) {
 // 返回本次收敛的行数，供 cron 观测。
 export async function settleExpiredAll(env, now = nowSec()) {
   const rows = await env.DB.prepare(
-    `SELECT id, kind, r2_key, user_id, username, client_ip, server_id, command
+    `SELECT id, kind, r2_key, user_id, username, client_ip, server_id, command, started_at, finished_at
        FROM operation_jobs
       WHERE status IN ('queued','awaiting_upload','staging','staged','waiting_agent','running')
         AND deadline_at < ?
@@ -500,8 +512,9 @@ export async function settleExpiredAll(env, now = nowSec()) {
     ).bind(now, now, job.id, ...ACTIVE_STATES).run();
     if (!res.meta.changes) continue; // 竞态：已被其它路径收敛
     changed += 1;
-    await deleteStagingObject(env, job);
-    if (job.kind === 'exec') await auditExecFailed(env, job, 'no result before deadline');
+    const fresh = (await getJob(env, job.id)) || job;
+    await deleteStagingObject(env, fresh);
+    if (fresh.kind === 'exec') await auditExecFailed(env, fresh, 'no result before deadline');
   }
   return changed;
 }

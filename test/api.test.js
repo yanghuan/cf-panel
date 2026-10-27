@@ -2448,3 +2448,44 @@ test('upload job：创建前收敛本机过期任务，释放被占的串行锁'
   const row = await env.DB.prepare('SELECT status FROM operation_jobs WHERE id = ?').bind('job_old').first();
   assert.equal(row.status, 'expired', '旧任务应被顺带收敛为 expired');
 });
+
+// P2-4 剩余：DO 返回 409/413 时它自己不写 D1，这两条"下发被拒"路径也必须留痕。
+test('exec 下发被拒：DO 返回非 2xx 时也写 exec.command.failed', async () => {
+  const env = makeEnv();
+  const token = await login(env);
+  await addServer(env, token, { name: 'reject' });
+  // DO 桩返回 413（命令过长/bad request 一类的拒绝），且不改 D1
+  env.TERMINAL.get = () => ({
+    fetch: async () => new Response(JSON.stringify({ error: 'bad request' }), { status: 413 }),
+  });
+  const res = await call(env, {
+    method: 'POST', path: '/api/exec-jobs', token,
+    body: { server_id: 1, command: 'echo hi', timeout: 5 },
+  });
+  assert.equal(res.status, 413);
+  const body = await res.json();
+  const audits = await env.DB.prepare("SELECT action, detail FROM audit_logs WHERE job_id = ?").bind(body.job_id).all();
+  assert.equal(audits.results.length, 1, '下发被拒不能无痕');
+  assert.equal(audits.results[0].action, 'exec.command.failed');
+  assert.match(audits.results[0].detail, /echo hi/, '审计保留被拒绝的命令');
+});
+
+// 审计的 duration_ms 必须与任务行一致。settleExpired/All/ServerExpired 传的是 UPDATE
+// **之前**的行快照（那时 finished_at 刚写、duration_ms 仍是 NULL），不回读就会恒为 null。
+test('exec 过期审计：duration_ms 与任务行一致（不能为 null）', async () => {
+  const env = makeEnv();
+  const token = await login(env);
+  await addServer(env, token, { name: 'dur' });
+  const now = Math.floor(Date.now() / 1000);
+  await env.DB.prepare(`INSERT INTO operation_jobs (id, kind, status, user_id, username, client_ip, server_id, command, timeout_s, created_at, started_at, deadline_at, expires_at)
+    VALUES ('job_dur','exec','running',1,'admin','',1,'sleep 10',5,?,?,?,?)`)
+    .bind(now - 400, now - 390, now - 380, now + 86400).run();
+
+  const polled = await (await call(env, { path: '/api/jobs/job_dur', token })).json();
+  assert.equal(polled.status, 'expired');
+  const row = await env.DB.prepare('SELECT duration_ms FROM operation_jobs WHERE id = ?').bind('job_dur').first();
+  const audit = await env.DB.prepare("SELECT duration_ms, action FROM audit_logs WHERE job_id = 'job_dur'").first();
+  assert.equal(audit.action, 'exec.command.failed');
+  assert.equal(audit.duration_ms, row.duration_ms, '审计 duration_ms 必须与任务行一致');
+  assert.ok(audit.duration_ms > 0, '不能是 null/0');
+});

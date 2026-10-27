@@ -3213,3 +3213,42 @@ test('迟到的 exec 回执：纠正状态并标 [late]', async () => {
   assert.ok(a, '迟到回执也要写审计');
   assert.match(a.detail, /\[late\]/, '审计标注迟到，避免复盘误判为首次成功');
 });
+
+// P1 回归：cleanup 是所有 WS 关闭的统一入口，会话流（role 'user'/'agent'）的附件同样带
+// serverId。若不限定 role 就拿来兜底，用户关闭终端页会误清该机的 updating/probeCapable，
+// 等于"更新期间能新建终端会话"——把互斥又开了一个口子。
+test('cleanup(会话 ws) 不得误清控制连接的互斥与探活状态', async () => {
+  const env = makeEnv();
+  await env.DB.prepare('INSERT INTO servers (agent_key_id, name, user_id, agent_key_hash) VALUES (?,?,?,?)')
+    .bind('k1', 's1', 1, 'h1').run();
+  const inst = new TerminalDO(mockState(), env);
+  const controlWs = {
+    attachment: { role: 'control', serverId: 1, ts: Date.now() },
+    deserializeAttachment() { return this.attachment; },
+    serializeAttachment(a) { this.attachment = a; },
+    send() {}, readyState: 1, close() {},
+  };
+  inst.agents.set(1, controlWs);
+  inst.updating.add(1);
+  inst.probeCapable.add(1);
+  inst.lastRoundTripAt.set(1, Date.now());
+
+  // 用户关闭终端/文件页：会话流的 ws 关闭
+  const sessWs = {
+    attachment: { role: 'user', sid: 'sess-1', serverId: 1 },
+    deserializeAttachment() { return this.attachment; },
+    serializeAttachment(a) { this.attachment = a; },
+    send() {}, readyState: 1, close() {},
+  };
+  inst.sessions.set('sess-1', {
+    streamId: 'sess-1', serverId: 1, type: 'terminal',
+    userWs: sessWs, agentWs: null, creatorUserId: 1, creatorUser: 'admin',
+    createdAt: Date.now(), clientIp: '', auth: null,
+  });
+  inst.cleanup(sessWs);
+
+  assert.equal(inst.updating.has(1), true, '关会话页不得释放更新互斥');
+  assert.equal(inst.probeCapable.has(1), true, '关会话页不得丢掉探活能力');
+  assert.ok(inst.lastRoundTripAt.has(1), '关会话页不得丢掉 RTT 记录');
+  assert.equal(inst.agents.get(1), controlWs, '控制连接不应被误删');
+});

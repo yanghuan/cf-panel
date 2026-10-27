@@ -4,7 +4,7 @@ import {
   EXEC_CMD_MAX_BYTES, execCommandBytes, execTooLongError, SERVER_DESC_MAX, JOB_POLL_AFTER_MS, JOB_URL_TTL_S,
 } from './config.js';
 import {
-  createExecJob, getJob, settleExpired, jobView, hasActiveAgentUpdate, failJob,
+  createExecJob, getJob, settleExpired, jobView, hasActiveAgentUpdate, failJob, auditExecFailed,
   createUploadJob, claimUploadStaging, markUploadStaged, markUploadWaitingAgent,
   createAgentUpdateJob, markUploadRunning, finishUploadJob,
 } from './jobs.js';
@@ -437,8 +437,11 @@ async function dispatchExecJob(env, user, { server, command, timeoutS, ip, idemp
     const out = await resp.json().catch(() => ({}));
     if (!resp.ok) {
       // DO 的失败分支自己会把任务置 failed；这里兜住它没覆盖到的拒绝（如参数校验），
-      // 避免 D1 里留下永远 queued 的行（客户端会一直看到"排队中"直到 deadline）
-      await failJob(env, job.id, out.error || `dispatch rejected (${resp.status})`);
+      // 避免 D1 里留下永远 queued 的行（客户端会一直看到"排队中"直到 deadline）。
+      // 走 audit 版：DO 返回 400/409/413 时它自己不写 D1，这些路径同样需要
+      // exec.command.failed 留痕（条件更新未命中说明 DO 已标过，audit 版会自动跳过）。
+      const changed = await failJob(env, job.id, out.error || `dispatch rejected (${resp.status})`);
+      if (changed) await auditExecFailed(env, await getJob(env, job.id), out.error || `dispatch rejected (${resp.status})`);
       return {
         status: resp.status,
         payload: { error: out.error || 'exec dispatch failed', job_id: job.id, status: 'failed' },
@@ -446,7 +449,8 @@ async function dispatchExecJob(env, user, { server, command, timeoutS, ip, idemp
     }
   } catch {
     // DO 不可达：任务标 failed，避免留下永远 queued 的行
-    await failJob(env, job.id, 'dispatch failed');
+    const changed = await failJob(env, job.id, 'dispatch failed');
+    if (changed) await auditExecFailed(env, await getJob(env, job.id), 'dispatch failed');
     return failed('exec dispatch failed');
   }
   // 回读一次，让响应里的 status 与 D1 权威状态一致（DO 已把 queued 置为 running）

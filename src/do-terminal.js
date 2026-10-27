@@ -1560,8 +1560,15 @@ export class TerminalDO {
     // agents 指向新连接，而 webSocketClose 是异步到达的——届时 agents.get(sid) === ws2 ≠ ws1，
     // 整个分支被跳过，updating 永不释放（该机器在本实例存活期内永久 409）、
     // settleJobsOnDisconnect 也不执行（exec/update 要等 deadline 才收敛）。
-    // 用连接附件里的 serverId 兜底：它不依赖 agents 当前指向谁。
-    const attServerId = this.wsServerId(ws);
+    //
+    // 兜底用连接附件里的 serverId，但**必须先限定 role**：cleanup 是所有 WS 关闭的统一入口，
+    // 而会话流（role 'user'/'agent'）的附件同样带 serverId。不区分角色就会在用户关闭
+    // 终端页时误清该机的 updating/probeCapable——实测后果是"更新期间能新建终端会话"，
+    // 等于把 f81635d 修的互斥又开了一个口子。
+    // typeof att === 'string' 那支要保留：rebuildIndex 兼容旧格式（附件直接存 serverId）。
+    const att = ws.deserializeAttachment?.();
+    const isControlAttachment = typeof att === 'string' || (att && att.role === 'control');
+    const attServerId = isControlAttachment ? this.wsServerId(ws) : 0;
     const matched = [];
     for (const [serverId, w] of this.agents) {
       if (w === ws) matched.push(serverId);

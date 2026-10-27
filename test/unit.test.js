@@ -885,6 +885,37 @@ test('服务器描述：前端 textarea 的 maxlength 必须与后端 SERVER_DES
   assert.equal(Number(m[1]), SERVER_DESC_MAX, '前端上限须与 config.js 的 SERVER_DESC_MAX 一致');
 });
 
+// 前端增量更新两条易回归路径（无 DOM 测试环境，用源码断言锁住关键行为）
+test('服务器描述浮层：增量推送同步可点状态，且不关闭已展开的浮层（静态断言）', () => {
+  const root = nodePath.join(nodePath.dirname(fileURLToPath(import.meta.url)), '..');
+  const app = nodeFs.readFileSync(nodePath.join(root, 'public/app.js'), 'utf8');
+
+  // 1) 他人/MCP 改描述后，增量推送必须同步名字的可点状态与 role/tabindex，
+  //    否则"从无到有"点不动、"从有到无"残留虚线。以前只在 renderServers 里设置。
+  assert.match(app, /hasDesc !== nameEl\.classList\.contains\('has-desc'\)/,
+    'updateServerCards 需同步 name.has-desc（含 data-desc-id / role / tabindex）');
+  assert.match(app, /refreshDescTip\(s\)/,
+    'updateServerCards 需就地刷新已展开的浮层内容');
+
+  // 2) 普通推送不得关闭描述浮层：有观看者时约 5s 一次，关掉会让长描述无法阅读。
+  //    收起只应发生在全量重建（renderServers）与描述被清空（循环内）。
+  //    不能写成「匹配两条相邻语句」：旧实现里关闭语句前恰有一行注释，正则的 \s* 跨不过去，
+  //    断言会恒真。改为切片——取「函数头 → 首次结构判断」这段，它只会包含无条件执行的头部，
+  //    断言其中完全不出现浮层相关标识符。循环内的 hideDescTip 在切片之外，属合法路径。
+  const fnStart = app.indexOf('function updateServerCards()');
+  assert.ok(fnStart > 0, '未找到 updateServerCards');
+  const headEnd = app.indexOf('const domIds = ', fnStart);
+  assert.ok(headEnd > fnStart, '未找到 updateServerCards 的结构判断起点');
+  const pushHead = app.slice(fnStart, headEnd);
+  assert.doesNotMatch(pushHead, /hideDescTip\(|descTip\s*\.|descSource\s*=/,
+    '推送头部不应关闭/触碰描述浮层（收起应放在 renderServers）');
+
+  const renderStart = app.indexOf('function renderServers()');
+  assert.ok(renderStart > 0);
+  assert.match(app.slice(renderStart, renderStart + 400), /hideDescTip\(\)/,
+    'renderServers（全量重建）需先收起浮层，否则锚点脱离文档后留下悬空面板');
+});
+
 test('i18n：index.html 引用的 data-i18n key 必须都在语言包中定义', () => {
   const i18n = loadCfI18n();
   const root = nodePath.join(nodePath.dirname(fileURLToPath(import.meta.url)), '..');

@@ -56,6 +56,11 @@
   let isAdmin = true; // 当前用户是否面板管理员（JWT，或带 panel:admin 的 PAT；控制修改/删除等管理菜单显隐）
   let sessionIsPat = false; // 当前会话是否 PAT：panel:admin 只能由 JWT 管理员签发，PAT 下禁用该勾选
   let serversCache = [];
+  // 服务器描述浮层：元素懒创建（见 ensureDescTip），但变量必须在此声明——
+  // renderServers/updateServerCards 都可能在首次点击前就调用 hideDescTip，
+  // 若用 `const x = document.createElement(...)` 声明在文件后段，会命中 TDZ。
+  let descTip = null;
+  let descSource = null; // 当前浮层锚点（服务器名元素）
   let latestAgent = null; // {build_id,platforms}：管理员登录后一次获取，卡片按 agent capability 显示更新按钮
   const updatingAgents = new Set(); // server id：防重复点击，更新期间按钮置禁用
   let groupOrder = []; // 分组显示顺序（组名数组，下标即顺序；管理员经 ↑↓ 调整，PUT /api/group-order 持久化）
@@ -469,6 +474,8 @@
   }
   function renderServers() {
     const box = $('#servers');
+    // 全量重建会让浮层锚点脱离文档 → 重建前收起（增量推送不动它，见 updateServerCards）
+    hideDescTip();
     pruneSelection(); // 清理已被删除的选中项（批量栏计数随之修正）
     agingServers();
     renderOverview();
@@ -529,11 +536,10 @@
     const box = $('#servers');
     agingServers();
     // 推送数据已更新：关闭可能过期的指标 tooltip 静态快照（数据时点已变）
+    // 描述浮层不在此关闭：推送约每 5s 一次，无条件关闭会让长描述无法阅读/滚动；
+    // 它的收起时机是全量重建（renderServers）与描述被清空（refreshDescTip）。
     metricTip.classList.remove('show');
     tipSource = null;
-    // 描述浮层同理：下方可能触发卡片全量重建，锚点元素会脱离文档
-    descTip.classList.remove('show');
-    descSource = null;
     // 服务器增删或分组结构变化 → 低频全量重建
     const domIds = new Set([...box.querySelectorAll('.card')].map((c) => Number(c.dataset.id)));
     // 用过滤后列表比对：否则搜索期间 dom 数恒小于全量，每次推送都触发全量重建（抖动 + 无谓开销）
@@ -554,6 +560,26 @@
       const card = box.querySelector(`.card[data-id="${s.id}"]`);
       if (!card) continue;
       const metaEl = card.querySelector('.meta');
+      // 名字的描述可点状态：他人（或 MCP）改描述后必须同步，否则虚线与 role/tabindex
+      // 一直停留在旧状态——从无到有会点不动，从有到无则残留一个点了没反应的虚线名。
+      const nameEl = card.querySelector('.name');
+      if (nameEl) {
+        const hasDesc = !!(s.description && s.description.trim());
+        if (hasDesc !== nameEl.classList.contains('has-desc')) {
+          nameEl.classList.toggle('has-desc', hasDesc);
+          if (hasDesc) {
+            nameEl.dataset.descId = String(s.id);
+            nameEl.setAttribute('role', 'button');
+            nameEl.tabIndex = 0;
+          } else {
+            delete nameEl.dataset.descId;
+            nameEl.removeAttribute('role');
+            nameEl.removeAttribute('tabindex');
+            if (descSource === nameEl) hideDescTip();
+          }
+        }
+      }
+      refreshDescTip(s); // 浮层正开着这台机器时，描述变更就地刷新（不关闭）
       // 在线徽章（状态切换才动 DOM）
       const badge = card.querySelector('.badge');
       if (badge) {
@@ -3262,21 +3288,40 @@
   });
 
   // 服务器描述浮层：点击服务器名展开（再次点击 / 点外部 / Esc 关闭）。
-  // 正文用 textContent 写入——描述是用户自由文本，绝不能走 innerHTML。
-  const descTip = document.createElement('div');
-  descTip.className = 'm-tip d-tip';
-  document.body.appendChild(descTip);
-  let descSource = null;
+  // 元素懒创建——renderServers / updateServerCards 在首次点击前就会调用 hideDescTip，
+  // 变量已在文件顶部声明为 null，这里只负责按需建 DOM。
+  function ensureDescTip() {
+    if (!descTip) {
+      descTip = document.createElement('div');
+      descTip.className = 'm-tip d-tip';
+      document.body.appendChild(descTip);
+    }
+    return descTip;
+  }
+  function hideDescTip() {
+    if (descTip) descTip.classList.remove('show');
+    descSource = null;
+  }
+  // 推送到达时：浮层若正开着这台机器且描述变了，就地更新正文。
+  // 不关闭——推送约 5s 一次，关掉会让长描述无法阅读/滚动/选中。
+  function refreshDescTip(s) {
+    if (!descTip || !descSource || !descTip.classList.contains('show')) return;
+    if (Number(descSource.dataset.descId) !== s.id) return;
+    const desc = String(s.description || '').trim();
+    if (!desc) { hideDescTip(); return; } // 描述被清空 → 浮层回落
+    const body = descTip.querySelector('.d-body');
+    if (body && body.textContent !== desc) body.textContent = desc;
+  }
   document.addEventListener('click', (e) => {
     const nameEl = e.target.closest('.name[data-desc-id]');
     if (nameEl) {
-      if (descSource === nameEl && descTip.classList.contains('show')) {
-        descTip.classList.remove('show');
-        descSource = null;
+      if (descSource === nameEl && descTip && descTip.classList.contains('show')) {
+        hideDescTip();
         return;
       }
       const s = serversCache.find((x) => x.id === Number(nameEl.dataset.descId));
       if (!s || !s.description) return;
+      const tip = ensureDescTip();
       descSource = nameEl;
       const nameRow = document.createElement('div');
       nameRow.className = 'd-name';
@@ -3284,14 +3329,13 @@
       const body = document.createElement('div');
       body.className = 'd-body';
       body.textContent = s.description;
-      descTip.replaceChildren(nameRow, body);
-      descTip.classList.add('show');
-      positionTipForMetric(descTip, nameEl);
+      tip.replaceChildren(nameRow, body);
+      tip.classList.add('show');
+      positionTipForMetric(tip, nameEl);
       return;
     }
     if (e.target.closest('.d-tip')) return; // 浮层内可滚动选中文本
-    descTip.classList.remove('show');
-    descSource = null;
+    hideDescTip();
   });
   // 键盘可达：Enter/Space 打开（无键盘支持就不该给 role=button/tabindex），Esc 关闭
   $('#servers').addEventListener('keydown', (e) => {
@@ -3302,10 +3346,7 @@
     }
   });
   document.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape' && descTip.classList.contains('show')) {
-      descTip.classList.remove('show');
-      descSource = null;
-    }
+    if (e.key === 'Escape' && descTip && descTip.classList.contains('show')) hideDescTip();
   });
 
   // 下拉菜单：切换 / 点击外部关闭 / 菜单项路由

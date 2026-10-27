@@ -61,10 +61,14 @@ not_found_handling = "single-page-application"
 # 未设置时登录及所有受保护接口返回 503（包括本地调试）
 
 # ---------- 可观测性（日志/追踪；显式声明并保持开启，防止部署工具自动关闭） ----------
+# 额度取舍：日志量的大头是 invocation_logs（每次请求一条元数据），免费额度被打满主要来自它；
+# 而本项目不带任何 console.log 打点，30 处日志全是 catch 分支的 console.error（信息最强、量最小）。
+# 因此关掉 invocation_logs、把 logs 采样给满：省额度效果优于低采样，同时不丢失错误可见性
+#（低采样会连 console.error 一起抽掉，异步化上线期排查静默失败时基本看不到线索）。
 [observability.logs]
 enabled = true
-invocation_logs = true
-head_sampling_rate = 0.1
+invocation_logs = false
+head_sampling_rate = 1.0
 
 [observability.traces]
 enabled = true

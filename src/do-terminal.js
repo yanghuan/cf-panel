@@ -996,6 +996,21 @@ export class TerminalDO {
             try { ws.close(1008, 'unauthorized'); } catch { /* ignore */ }
             return;
           }
+          // 降权/白名单收窄必须收回**已建**会话：这里与建连时（routes 的 /api/terminal、
+          // /api/file/open 都用 canExec）同源重新授权。只校验"令牌仍存在"是不够的——
+          // 否则撤掉 server:exec 或把 server_ids 收窄后，旧连接仍可持续向 agent 转发
+          // 终端输入与文件写指令（PATCH 只清了 PanelDO 缓存，管不到 TerminalDO）。
+          // 管理员不可能被降权 → 常见路径不加查询。
+          if (!isAdmin(u)) {
+            const server = await this.env.DB
+              .prepare('SELECT id, user_id FROM servers WHERE id = ?')
+              .bind(sess.serverId)
+              .first();
+            if (!server || !canExec(u, server)) {
+              try { ws.close(1008, 'permission revoked'); } catch { /* ignore */ }
+              return;
+            }
+          }
         }
       }
       // 浏览器 → DO

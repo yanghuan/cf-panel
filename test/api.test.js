@@ -1640,11 +1640,18 @@ test('PAT panel:admin：可读审计日志；tools/list 按权限裁剪；不能
   const adminToken = await login(env);
   await addServer(env, adminToken, { name: 'adm-1' });
 
-  // 普通 PAT：tools/list 不列出管理工具（此前无条件返回 11 个调用必 403 的工具，误导 AI 反复重试）
-  const ro = (await (await call(env, { method: 'POST', path: '/api/tokens', token: adminToken, body: { name: 'ro', scopes: ['server:read'] } })).json()).token;
-  const roTools = (await (await mcp(env, { token: ro, body: { jsonrpc: '2.0', id: 1, method: 'tools/list' } })).json()).result.tools.map((t) => t.name);
-  assert.deepEqual(roTools, ['list_servers', 'get_monitor', 'exec_command', 'update_agent', 'create_upload'],
-    '非管理员只看到无需管理权限的工具');
+  // 普通 PAT：tools/list 按**实际 scope** 裁剪。只做"管理员/非管理员"二分是不够的——
+  // 只读 PAT 会看到 exec_command/update_agent/create_upload 三个调用必失败的工具。
+  const mkPat = async (name, scopes) => (await (await call(env, { method: 'POST', path: '/api/tokens', token: adminToken, body: { name, scopes } })).json()).token;
+  const toolsOf = async (t) => (await (await mcp(env, { token: t, body: { jsonrpc: '2.0', id: 1, method: 'tools/list' } })).json()).result.tools.map((x) => x.name);
+  const ro = await mkPat('ro', ['server:read']);
+  assert.deepEqual(await toolsOf(ro), ['list_servers', 'get_monitor'], '只读 PAT 只看到读工具');
+  const rw = await mkPat('rw', ['server:read', 'server:exec']);
+  assert.deepEqual(await toolsOf(rw), ['list_servers', 'get_monitor', 'exec_command', 'create_upload'],
+    'exec PAT 看不到 update_agent / 管理工具');
+  const ua = await mkPat('ua', ['server:read', 'agent:update']);
+  assert.deepEqual(await toolsOf(ua), ['list_servers', 'get_monitor', 'update_agent'],
+    'agent:update PAT 只多出 update_agent');
 
   // 普通 PAT 调管理工具：错误信息须自解释（旧文案 'forbidden: admin only' 会让人误判为 scopes 配错）
   const denied = await (await mcp(env, { token: ro, body: { jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'get_audit_logs', arguments: {} } } })).json();

@@ -1499,6 +1499,28 @@ function requireAdmin(user) {
   }
 }
 
+// 非管理类工具各自需要的 PAT scope，与调用路径的判据一一对应：
+// exec_command/create_upload → canExec（server:exec）、update_agent → canUpdateAgent（agent:update）、
+// list_servers/get_monitor → canAccessServer（server:read）。
+// 缺 scope 时调用必然失败，就不该出现在 tools/list 里——否则只读 PAT 仍会看到
+// exec_command/update_agent/create_upload 三个调不动且报错不直观的工具。
+const MCP_TOOL_SCOPE = {
+  list_servers: SCOPE_READ,
+  get_monitor: SCOPE_READ,
+  exec_command: SCOPE_EXEC,
+  create_upload: SCOPE_EXEC,
+  update_agent: SCOPE_AGENT_UPDATE,
+};
+
+// tools/list 可见性：管理类看 isAdmin，其余看是否持有对应 scope
+function mcpToolVisible(user, tool) {
+  if (isAdmin(user)) return true;
+  if (MCP_ADMIN_TOOLS.has(tool.name)) return false;
+  const need = MCP_TOOL_SCOPE[tool.name];
+  if (!need) return true;
+  return !!(user.pat && Array.isArray(user.pat.scopes) && user.pat.scopes.includes(need));
+}
+
 async function mcpAddServer(user, env, args, ip, url) {
   requireAdmin(user);
   const name = String(args.name || '').trim();
@@ -1837,8 +1859,9 @@ async function handleMcpInner(request, env) {
     case 'ping':
       return reply(id, {});
     case 'tools/list': {
-      // 按实际权限裁剪：非管理员看不到管理类工具（避免"列出来却调不动"的误导）
-      const tools = isAdmin(user) ? MCP_TOOLS : MCP_TOOLS.filter((t) => !MCP_ADMIN_TOOLS.has(t.name));
+      // 按实际权限裁剪：管理类看 isAdmin，其余按各工具所需 scope（见 MCP_TOOL_SCOPE）。
+      // 只做"管理员/非管理员"二分是不够的——只读 PAT 会看到 exec_command 等必失败的工具。
+      const tools = MCP_TOOLS.filter((t) => mcpToolVisible(user, t));
       return reply(id, { tools });
     }
     case 'tools/call': {

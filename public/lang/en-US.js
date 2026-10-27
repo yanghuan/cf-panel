@@ -193,7 +193,8 @@
     'token.pickDateTitle': 'Pick expiry time',
     'token.daysTag': 'days',
     'token.scopes': 'Scopes',
-    'token.serverIds': 'Server ID whitelist (comma-separated, empty = all)',
+    'token.serverIds': 'server_ids: empty = all servers; [] = no server; or 1,2',
+    'token.serverIdsTip': 'Three forms: empty = all servers; [] = deny every server (empty set); comma-separated IDs = only those servers',
     'token.expiry': 'Validity (days e.g. 30, or expiry date e.g. 2026/9/5 14:00; empty = never)',
     'token.create': 'Create token',
     'token.creating': 'Creating...',
@@ -212,8 +213,8 @@
     'token.pickDate': 'This browser cannot open a date picker; type the expiry directly (e.g. 2026/9/5 14:00)',
     'token.adminTip': 'Full admin: grants every management endpoint (server CRUD, tokens, settings, audit). Ignores the server_ids whitelist and other scopes; can only be issued by a logged-in admin',
     'token.adminNoWhitelist': 'panel:admin selected: the server_ids whitelist is ignored (full access to all servers)',
-    'token.idsNone': 'ids=empty set (no server accessible)',
-    'token.badServerIds': 'server_ids must be comma-separated positive integers',
+    'token.idsNone': 'ids=[] (no server accessible)',
+    'token.badServerIds': 'server_ids must be comma-separated positive integers; [] denies every server',
   };
 
   // ---------------- Audit log ----------------

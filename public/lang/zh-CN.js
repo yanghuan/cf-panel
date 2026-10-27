@@ -192,7 +192,8 @@
     'token.pickDateTitle': '选择截止时间',
     'token.daysTag': '天数',
     'token.scopes': '权限',
-    'token.serverIds': '服务器 ID 白名单（逗号分隔，留空=全部）',
+    'token.serverIds': 'server_ids：空=全部服务器；[] =禁止访问任何服务器；或 1,2',
+    'token.serverIdsTip': '三种写法：留空 = 全部服务器；输入 [] = 禁止访问任何服务器（空集）；输入逗号分隔的 ID = 仅这些服务器',
     'token.expiry': '有效期（天数如 30，或截止日期如 2026/9/5 14:00；留空=永久）',
     'token.create': '创建令牌',
     'token.creating': '创建中...',
@@ -211,8 +212,8 @@
     'token.pickDate': '当前浏览器不支持弹出日历，请直接输入截止日期（如 2026/9/5 14:00）',
     'token.adminTip': '全权管理员：可用全部管理接口（含服务器增删改、令牌、设置、审计）。会忽略 server_ids 白名单与其它 scope；只能由管理员登录后签发',
     'token.adminNoWhitelist': '已勾选 panel:admin：server_ids 白名单不生效（全权访问所有服务器）',
-    'token.idsNone': 'ids=空集（不可访问任何服务器）',
-    'token.badServerIds': 'server_ids 须为正整数，逗号分隔',
+    'token.idsNone': 'ids=[]（不可访问任何服务器）',
+    'token.badServerIds': 'server_ids 须为逗号分隔的正整数；[] 表示禁止访问任何服务器',
   };
 
   // ---------------- 审计日志 ----------------

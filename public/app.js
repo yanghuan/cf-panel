@@ -2901,6 +2901,26 @@
     if (!v) return [];
     try { const a = JSON.parse(v); return Array.isArray(a) ? a : []; } catch { return []; }
   }
+  // server_ids 三态的唯一解析口径（创建与编辑共用，避免两处漂移）：
+  //   ""   → null（全量，不限服务器）
+  //   "[]" → []  （空集，禁止访问任何服务器）
+  //   "1,2"→ [1,2]（白名单）
+  // 只认字面 "[]"，不扩展到 JSON 数组语法（否则要处理引号/空格/尾逗号，规则不可控）。
+  function parseServerIds(raw) {
+    const s = String(raw == null ? '' : raw).trim();
+    if (!s) return { value: null };
+    if (s === '[]') return { value: [] };
+    const parts = s.split(',').map((x) => x.trim()).filter(Boolean);
+    const nums = parts.map(Number);
+    if (!parts.length || nums.some((n) => !Number.isInteger(n) || n <= 0)) return { error: true };
+    return { value: [...new Set(nums)] };
+  }
+  // 回显：与 parseServerIds 互逆（空集必须显示成 "[]"，否则会被读成全量而静默放开权限）
+  function serverIdsText(raw) {
+    if (raw === null || raw === undefined) return '';
+    const ids = tokenArr(raw);
+    return ids.length ? ids.join(',') : '[]';
+  }
   let tokenRows = [];
   let editingTokenId = 0; // 0 = 无编辑态
 
@@ -2922,7 +2942,7 @@
               ${TOKEN_SCOPES.map((s) => `<label class="chk"><input type="checkbox" data-edit-scope="${s}" ${scopes.includes(s) ? 'checked' : ''} /> ${s}</label>`).join('')}
             </div>
             <div class="settings-row">
-              <input data-edit-servers data-orig="${escapeHtml(ids.join(','))}" type="text" value="${escapeHtml(ids.join(','))}" placeholder="${escapeHtml(t('token.serverIds'))}" />
+              <input data-edit-servers type="text" value="${escapeHtml(serverIdsText(r.server_ids))}" placeholder="${escapeHtml(t('token.serverIds'))}" title="${escapeHtml(t('token.serverIdsTip'))}" />
               <input data-edit-expires type="text" value="${r.expires_at ? toLocalInput(r.expires_at) : ''}" placeholder="${escapeHtml(t('token.expiryShort'))}" title="${escapeHtml(t('token.expiryTip'))}" />
               <button data-tok-save="${r.id}">${escapeHtml(t('common.save'))}</button>
               <button data-tok-cancel="${r.id}" class="ghost">${escapeHtml(t('common.cancel'))}</button>
@@ -2960,16 +2980,12 @@
     const li = btn.closest('li');
     const scopes = [...li.querySelectorAll('input[data-edit-scope]:checked')].map((el) => el.dataset.editScope);
     if (!scopes.length) return toast(t('token.needScope'));
-    const serversEl = li.querySelector('[data-edit-servers]');
-    const idsText = serversEl.value.trim();
-    const parts = idsText ? idsText.split(',').map((s) => s.trim()).filter(Boolean) : [];
-    const nums = parts.map(Number);
-    if (nums.some((n) => !Number.isInteger(n) || n <= 0)) return toast(t('token.badServerIds'));
+    const parsedIds = parseServerIds(li.querySelector('[data-edit-servers]').value);
+    if (parsedIds.error) return toast(t('token.badServerIds'));
     const expRaw = li.querySelector('[data-edit-expires]').value.trim();
-    const payload = { scopes, expires_at: null };
-    // 只有真的改过才提交 server_ids：空集令牌在编辑框里同样显示为空串，
-    // 若无条件提交「空串→null(全量)」，一次无关的 scopes 调整就会把它静默放开到所有服务器。
-    if (idsText !== (serversEl.dataset.orig || '')) payload.server_ids = nums.length ? nums : null;
+    // 三态直接由输入决定：空=全量(null) / [] =空集 / 1,2=白名单。编辑框回显也按同一约定，
+    // 因此不再需要"字段是否变动"的比较（那套比较无法在 null 与 [] 之间切换）。
+    const payload = { scopes, server_ids: parsedIds.value, expires_at: null };
     if (expRaw) {
       // 与创建弹窗同语义：纯数字=相对天数，否则按日期时间解析
       const asNum = Number(expRaw);
@@ -3005,7 +3021,13 @@
     // panel:admin 全权：后端 isAdmin 短路在白名单之前，server_ids 不再生效——显式忽略并提示，
     // 避免"填了白名单却仍能操作全部服务器"的误解（后端不会报错，静默放行）。
     if (adminScope) toast(t('token.adminNoWhitelist'));
-    const serverIDs = adminScope ? [] : $('#tok-servers').value.split(',').map((s) => Number(s.trim())).filter((n) => n > 0);
+    // 与编辑态共用同一解析：空=全量、[]=空集、1,2=白名单（管理员忽略白名单，恒为全量）
+    let serverIDs = null;
+    if (!adminScope) {
+      const parsedIds = parseServerIds($('#tok-servers').value);
+      if (parsedIds.error) return toast(t('token.badServerIds'));
+      serverIDs = parsedIds.value;
+    }
     const expDays = Number($('#tok-expires').value);
     tokenCreateBusy = true;
     const btn = $('#btn-create-token');
@@ -3016,7 +3038,7 @@
         body: JSON.stringify({
           name: $('#tok-name').value.trim(),
           scopes,
-          server_ids: serverIDs.length ? serverIDs : null,
+          server_ids: serverIDs,
           ...parseTokenExpiry(),
         }),
       });

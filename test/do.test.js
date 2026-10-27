@@ -1079,6 +1079,67 @@ test('TerminalDO: PAT 撤销后浏览器消息关闭连接（重校验）', asyn
   assert.equal(ws.closed, true, 'PAT 撤销后输入即关闭连接');
 });
 
+// 令牌降权后必须收回**已建**会话：此前重校验只确认令牌仍存在（!u），不重跑 canExec，
+// 于是撤掉 server:exec 或收窄 server_ids 后，旧连接仍能把终端输入/文件写指令送给 agent。
+test('TerminalDO: PAT 降权/白名单收窄后已建会话失效（不再转发输入）', async () => {
+  const env = makeEnv();
+  await env.DB.prepare('INSERT INTO servers (agent_key_id, name, user_id, agent_key_hash) VALUES (?,?,?,?)')
+    .bind('k-dg', 's-dg', 1, 'h-dg').run();
+  const insertPat = async (name, scopes, serverIds) => {
+    const token = `cfp_pat-${name}`;
+    const hash = await I.hashSecret(token, env);
+    await env.DB.prepare('INSERT INTO api_tokens (user_id, name, token_hash, scopes, server_ids) VALUES (?,?,?,?,?)')
+      .bind(1, name, hash, JSON.stringify(scopes), JSON.stringify(serverIds)).run();
+    return hash;
+  };
+  // 建一个已挂接的会话（附件里只放 PAT HMAC，与线上一致）
+  const openSession = (hash) => {
+    const inst = new TerminalDO(mockState(), env);
+    const forwarded = [];
+    const sess = {
+      streamId: '0-sid', serverId: 1, creatorUserId: 1, createdAt: Date.now(), type: 'terminal',
+      userWs: null, agentWs: { send: (m) => forwarded.push(m), close() {} }, userBuf: [], agentBuf: [],
+    };
+    inst.sessions.set('0-sid', sess);
+    const ws = {
+      closed: false,
+      attachment: { role: 'user', sid: '0-sid', serverId: 1, creatorUserId: 1, type: 'terminal', createdAt: Date.now(), auth: { kind: 'pat', tokenHash: hash } },
+      deserializeAttachment() { return this.attachment; },
+      serializeAttachment(a) { this.attachment = a; },
+      send() {}, close() { this.closed = true; }, readyState: 1,
+    };
+    sess.userWs = ws;
+    return { inst, sess, ws, forwarded };
+  };
+
+  // A：撤掉 server:exec（只读化的降权）
+  const hA = await insertPat('dg-exec', ['server:read', 'server:exec'], [1]);
+  const a = openSession(hA);
+  await a.inst.webSocketMessage(a.ws, 'echo before');
+  assert.equal(a.forwarded.length, 1, '降权前输入正常转发');
+  await env.DB.prepare('UPDATE api_tokens SET scopes = ? WHERE token_hash = ?').bind(JSON.stringify(['server:read']), hA).run();
+  a.sess.lastAuthCheck = 0; // 越过 10s 重校验节流
+  await a.inst.webSocketMessage(a.ws, 'echo after');
+  assert.equal(a.ws.closed, true, '降权后连接关闭');
+  assert.equal(a.forwarded.length, 1, '降权后输入不得再转发给 agent');
+
+  // B：scopes 仍有 exec，但 server_ids 收窄到不含本机
+  const hB = await insertPat('dg-whitelist', ['server:read', 'server:exec'], [999]);
+  const b = openSession(hB);
+  await b.inst.webSocketMessage(b.ws, 'echo before');
+  assert.equal(b.ws.closed, true, '白名单不含本机 → 建连后的首次校验即关闭');
+  assert.equal(b.forwarded.length, 0, '白名单外不得转发');
+
+  // C：权限未变 → 不受影响（避免把正常会话误杀）
+  const hC = await insertPat('dg-ok', ['server:read', 'server:exec'], [1]);
+  const c = openSession(hC);
+  await c.inst.webSocketMessage(c.ws, 'echo 1');
+  c.sess.lastAuthCheck = 0;
+  await c.inst.webSocketMessage(c.ws, 'echo 2');
+  assert.equal(c.ws.closed, false, '权限未变不得误关');
+  assert.equal(c.forwarded.length, 2, '正常会话持续可转发');
+});
+
 test('PanelDO: /latest 共享缓存 + sync 频率下限（降额）', async () => {
   const env = makeEnv();
   const token = await I.signJwt({ uid: 1, username: 'admin', role: 1, exp: Math.floor(Date.now() / 1000) + 3600 }, env);

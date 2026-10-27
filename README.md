@@ -319,6 +319,8 @@ Webhook 出站安全：仅允许 HTTP(S)，拒绝 URL 内嵌凭据、本地域�
 ### PAT 与 MCP
 
 - **PAT**：设置 → 「访问令牌」创建（scopes + 服务器白名单 + 可选有效期，留空=永久），供 API 调用：`Authorization: Bearer cfp_xxx`。列表显示每个令牌的**最近使用时间**（60 秒节流回写），便于识别僵尸令牌。已创建的令牌可点「编辑」**原地改权限范围**（scopes / 白名单 / 有效期，改完立即生效，无需重新下发令牌明文）——因为库里只存 HMAC，明文本身不可更换。
+  - `server_ids` 输入三态：**留空 = 全部服务器**、**`[]` = 空集（禁止访问任何服务器）**、**`1,2` = 仅这些服务器**。列表把空集显示为 `ids=[]`，与全量（不显示）区分。
+  - **降权对已建连接同样生效**：撤掉 `server:exec` 或收窄白名单后，已打开的终端/文件会话在 ≤10 秒内被服务端关闭（与 PAT 撤销同一条重校验链路），不是"只对新连接生效"。
 - **PAT 的 `panel:admin`（全权）**：勾选后该令牌等价于管理员，可用全部管理接口（服务器增删改、令牌、设置、审计、用量）与全部 MCP 管理工具。注意两点：
   1. **会忽略 `server_ids` 白名单与其它 scope**（后端 `isAdmin` 在权限判定最前短路），即"一把 root 钥匙"；
   2. **只能由 JWT 管理员签发**——PAT 自身无法创建带 `panel:admin` 的令牌（否则一个泄露的 admin PAT 可无限铸造新的永久 admin PAT）。需要轮换时用管理员登录后重建。
@@ -465,6 +467,7 @@ curl -X POST https://<面板域名>/mcp -H "Authorization: Bearer <token>" \
 - **Agent 身份**：`X-Agent-Key` 请求头（**不接受 URL query**，避免边缘日志泄露）；服务端先用 key 的 SHA-256 指纹（`servers.agent_key_id`）反查服务器，再用 HMAC verify 校验 `servers.agent_key_hash`；数据流额外校验 stream 归属。
 - **凭据存储**：面板密码存 CF secret；agent key 与 PAT 只存哈希。WebSocket Hibernation 附件不保存 bearer 明文（PAT 仅存 HMAC，JWT 仅存已验证身份与过期时间）。
 - **权限收敛**：JWT 管理员全量；PAT 按 scopes + `server_ids` 白名单收窄；管理操作默认拒绝 PAT，唯一例外是显式勾选 `panel:admin` 的全权令牌（等价管理员，忽略白名单；且只能由 JWT 管理员签发，PAT 无法自举同类令牌）。
+- **权限变更即时生效**：PAT 的 scopes/白名单在每次鉴权时按 `token_hash` 查库（无长期缓存）；已建的 WS 会话在 10 秒内按同一判据（`canExec` + 白名单）重新授权，失败即断开。故降权、收窄白名单、撤销令牌都能在秒级收回已建立的能力。
 - **审计**：登录、服务器变更、会话开启、文件写操作、命令执行、Agent 更新全部留痕（best-effort：D1 短暂失败不影响已创建的会话，避免遗留不可访问的远端会话）。
 - **前端防御**：文件列表按不可信 Agent 输入处理（白名单化类型、数值化大小/时间）；文件会话用代际守卫丢弃关闭后或乱序响应；CSP 仅 `style-src-attr`/`style-src-elem` 放开内联，`script-src` 不允许内联执行。
 - **Agent 侧**：`DISABLE_EXEC=1` 全局禁用命令执行；上传、ZIP 预检与文件操作统一走带超时 / 并发上限 / 熔断的 blocking 边界；系统路径词法 + 真实路径双检（防 symlink 写穿）。

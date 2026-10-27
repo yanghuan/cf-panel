@@ -7,6 +7,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { MetricsDO, PanelDO, TerminalDO, __internals as I } from '../src/index.js';
 import { EXEC_CMD_MAX_BYTES } from '../src/config.js';
+import { listServersWithState } from '../src/auth.js';
 import { makeEnv, makePanelStub, captureFetch } from './helpers.js';
 
 function mockState(store = {}) {
@@ -1187,6 +1188,22 @@ test('TerminalDO: 降权后 Agent 输出不再投递给浏览器（输出方向�
   // 已标记 revoked：后续 agent 输出直接丢弃，不再重复校验
   await inst.webSocketMessage(agentWs, 'more output');
   assert.deepEqual(received, ['output-1'], 'revoked 后持续丢弃输出');
+});
+
+// 前端 serversCache 由 WS 推送（PanelDO.buildList 的返回值）整体覆盖。两处列表构建
+// （auth.js listServersWithState 与 do-panel.js buildList）必须字段同构：新增字段只改一处，
+// UI 会立刻"丢字段"——description 就踩过：推送到达后名字不再可点，且编辑弹窗回填空值、
+// 保存时把已有描述静默清空。这里用键集合对比把同构关系锁死。
+test('PanelDO.buildList 与 REST 列表字段同构（新增字段不能只改一处）', async () => {
+  const env = makeEnv();
+  await env.DB.prepare('INSERT INTO servers (agent_key_id, name, user_id, agent_key_hash, description) VALUES (?,?,?,?,?)')
+    .bind('k-parity', 'parity', 1, 'h-parity', '备份机 · 每日 2:00').run();
+  const admin = { id: 1, username: 'admin', role: 1, pat: null };
+  const pushed = await new PanelDO(mockState(), env).buildList(admin, {});
+  const rest = await listServersWithState(env, admin);
+  assert.deepEqual(Object.keys(pushed[0]).sort(), Object.keys(rest[0]).sort(), '推送与 REST 列表字段必须一致');
+  assert.equal(pushed[0].description, '备份机 · 每日 2:00', '推送须带描述');
+  assert.equal(rest[0].description, '备份机 · 每日 2:00', 'REST 须带描述');
 });
 
 test('PanelDO: /latest 共享缓存 + sync 频率下限（降额）', async () => {

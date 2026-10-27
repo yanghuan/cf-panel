@@ -404,7 +404,7 @@ button.danger:hover { background: rgba(248, 113, 113, .12); }
 .card-title .name.has-desc:hover { color: var(--accent); border-bottom-color: var(--accent); }
 .card-title .name.has-desc:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 3px; }
 /* 描述浮层：复用 .m-tip 的定位/配色，正文保留换行（描述是多行输入） */
-.d-tip { width: 340px; max-height: 260px; overflow: auto; }
+.d-tip { width: 340px; max-width: calc(100vw - 16px); max-height: 260px; overflow: auto; }
 .d-tip .d-name { font-size: 12px; font-weight: 600; margin-bottom: 6px; }
 .d-tip .d-body { font-size: 12px; line-height: 1.6; color: var(--muted); white-space: pre-wrap; word-break: break-word; }
 .mt-title { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .5px; margin-bottom: 6px; }

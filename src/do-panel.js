@@ -253,6 +253,10 @@ export class PanelDO {
       id: s.id,
       name: s.name,
       group: s.group || '',
+      // description 必须与 REST /api/servers（auth.js listServersWithState）同构：
+      // 前端 serversCache 会被本函数的推送结果整体覆盖，缺字段会让 UI 立刻退化为"无描述"，
+      // 进而在编辑弹窗回填空值、保存时把已有描述静默清空。同构关系由测试锁定。
+      description: s.description || '',
       display_index: s.display_index || 0,
       // 在线判定优先用 MetricsDO 秒级 last_seen_s；D1 last_seen 节流写，仅冷启动兜底
       online: now - (latest[s.id]?.last_seen_s || s.last_seen || 0) < grace,

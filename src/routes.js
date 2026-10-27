@@ -2458,5 +2458,12 @@ async function handleWsInner(request, env) {
   const target = new URL(request.url);
   target.protocol = 'https:';
   target.hostname = 'do.internal';
+  // 公网 origin 随请求头注入：DO 拿到的 URL 已被改写成 do.internal，若让它据此拼下载/资产
+  // URL，下发给 Agent 的会是内网地址（DNS 必然失败）。这里在改写前保留真实 origin。
+  //
+  // WebSocket 转发必须**原样透传 request**（第二个参数不能是普通 init 对象：那样会丢掉
+  // 升级所需的内部状态，DO 侧拿到的是普通请求，返回 500）。所以不重建 request，而是把
+  // origin 编进 URL query —— DO 从 query 读，语义等价且不影响升级。
+  target.searchParams.set('panel_origin', url.origin);
   return stub.fetch(target.toString(), request);
 }

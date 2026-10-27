@@ -472,7 +472,12 @@ export class TerminalDO {
       pair[1].serializeAttachment({ role: 'control', serverId: server.id, ts: Date.now() });
       // Agent 重连 → 重发停在 waiting_agent 的 upload（文档 §9）。不等待，避免拖慢握手：
       // 先把断开期间中断的 running 退回 waiting_agent，再逐条重新签发短期 URL 下发。
-      this.resendWaitingUploads(server.id, pair[1], url.origin).catch(() => { /* 失败不阻塞连接 */ });
+      // 公网 origin 只能来自 Worker 注入的 query：这里的 url 已被 handleWs 改写成
+      // https://do.internal，拿它拼下载 URL 会让 Agent 去连内网地址（DNS 必失败）。
+      const panelOrigin = url.searchParams.get('panel_origin') || '';
+      if (panelOrigin) {
+        this.resendWaitingUploads(server.id, pair[1], panelOrigin).catch(() => { /* 失败不阻塞连接 */ });
+      }
       // T1 能力来源：不在此处探活——建连时能力未知，探活失败无法安全处理（分不清旧 agent 与真断链）。
       // 改为由 agent 在上报里自声明（info.probe_proto，见 report 分支）；声明后 exec 前探活失败
       // 即可安全 close(4002)，旧 agent 不声明 → 永不探活、永不误关。
@@ -1227,14 +1232,36 @@ export class TerminalDO {
   // Agent 重连后重发停在 waiting_agent 的上传（文档 §9）。
   // 短期 download URL 会过期，因此必须**重新签发**，不能复用建任务时的那条。
   // baseUrl 取自本次连接的请求 origin（DO 侧拿不到外部 host，由调用方传入）。
+  // 传给 Agent 的 URL 必须是**公网**地址：Agent 侧会直接按 host 建连。
+  // 内部改写后的 do.internal 不可达（DNS 解析失败），这里做一次显式拦截——
+  // 静默发出错误 URL 的后果是"等到 deadline 超时"，排查成本极高。
+  static isPublicOrigin(base) {
+    try {
+      const h = new URL(base).hostname;
+      return h !== 'do.internal' && h !== 'localhost' && !h.endsWith('.internal');
+    } catch {
+      return false;
+    }
+  }
+
   async resendWaitingUploads(serverId, ws, baseUrl) {
+    if (!TerminalDO.isPublicOrigin(baseUrl)) {
+      console.error(`resendWaitingUploads skipped: non-public origin "${baseUrl}"`);
+      return;
+    }
     // 先收敛：断开期间处于 running 的 upload 不可能再收到回执
     await requeueOrphanUploads(this.env, serverId);
     const waiting = await listWaitingUploads(this.env, serverId);
+    // 能力校验与首次下发同源：积压的旧 Agent 任务不能直接发 upload_fetch（对方不认识）
+    const capable = this.supportsFetch(ws, 'upload');
     for (const job of waiting) {
       if (this.agents.get(serverId) !== ws) return; // 期间连接又被替换：交给新一轮处理
       if (!job.r2_key) {
         await failJob(this.env, job.id, 'staged object missing');
+        continue;
+      }
+      if (!capable) {
+        await failJob(this.env, job.id, 'agent does not support async upload (upgrade required)');
         continue;
       }
       if (!(await markUploadRunning(this.env, job.id))) continue; // 已被其它路径收敛
@@ -1488,7 +1515,28 @@ export class TerminalDO {
             r.resolve({ ok: false, error: 'agent disconnected during update' });
           }
         }
+        // D1 里的在途任务也要收敛，不能只等 deadline（exec ~30s、update ~210s）。
+        // upload 交给重连时的 requeueOrphanUploads（可恢复），exec/update 直接判失败。
+        this.settleJobsOnDisconnect(serverId).catch(() => { /* 失败由 deadline 兜底 */ });
       }
+    }
+  }
+
+  // 断线时的 D1 收敛（见文档 §9.1）。刻意**不含 upload**：它走重连重发，
+  // 在这里判失败就没有恢复机会了。
+  async settleJobsOnDisconnect(serverId) {
+    const now = Math.floor(Date.now() / 1000);
+    const placeholders = ['queued', 'running'].map(() => '?').join(',');
+    try {
+      await this.env.DB.prepare(
+        `UPDATE operation_jobs
+            SET status = 'failed', error = 'agent disconnected', finished_at = ?,
+                duration_ms = CASE WHEN started_at IS NULL THEN NULL ELSE (? - started_at) * 1000 END
+          WHERE server_id = ? AND kind IN ('exec','agent_update')
+            AND status IN (${placeholders})`
+      ).bind(now, now, serverId, 'queued', 'running').run();
+    } catch (e) {
+      console.error('settleJobsOnDisconnect failed:', e);
     }
   }
 }

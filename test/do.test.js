@@ -2880,6 +2880,110 @@ test('upload：Agent 离线停 waiting_agent，重连后自动重发并重新签
   assert.equal(frames[0].upload_id, 'job_w');
   assert.match(frames[0].url, /^https:\/\/panel\.example\/mcp\/upload-jobs\/download\?/, 'URL 重新签发且为绝对地址');
   assert.notEqual(frames[0].url, 'https://p/old', '不得复用建任务时的旧 URL（已过期）');
+  // 回归：DO 收到的 URL 已被 handleWs 改写成 do.internal，若拿它拼 URL 会下发内网地址，
+  // Agent 侧 DNS 必然失败 —— 这条断言防止再次被内部改写绕过。
+  assert.notEqual(new URL(frames[0].url).host, 'do.internal', '下发给 Agent 的 URL 必须是公网地址');
   row = await env.DB.prepare('SELECT status FROM operation_jobs WHERE id = ?').bind('job_w').first();
   assert.equal(row.status, 'running');
+});
+
+// P1 回归：重发路径必须拒绝非公网 origin（do.internal / localhost / *.internal），
+// 宁可不下发也不能把内网地址交给 Agent —— 那种失败只会表现为 deadline 超时，极难排查。
+test('upload 重连重发：非公网 origin 直接放弃（不下发内网 URL）', async () => {
+  const env = makeEnv();
+  await env.DB.prepare('INSERT INTO servers (agent_key_id, name, user_id, agent_key_hash) VALUES (?,?,?,?)')
+    .bind('k1', 's1', 1, 'h1').run();
+  const now = Math.floor(Date.now() / 1000);
+  await env.DB.prepare(`INSERT INTO operation_jobs (id, kind, status, user_id, username, server_id, target_path, overwrite, size_bytes, r2_key, created_at, deadline_at, expires_at)
+    VALUES ('job_np','upload','waiting_agent',1,'admin',1,'/opt/a.bin',0,10,'upload-jobs/job_np',?,?,?)`)
+    .bind(now, now + 600, now + 86400).run();
+  const inst = new TerminalDO(mockState(), env);
+  const sent = [];
+  const ws = {
+    attachment: { role: 'control', serverId: 1, caps: { upload_fetch_proto: 1 } },
+    deserializeAttachment() { return this.attachment; },
+    serializeAttachment(a) { this.attachment = a; },
+    send: (m) => sent.push(JSON.parse(m)), readyState: 1, close() {},
+  };
+  inst.agents.set(1, ws);
+  for (const bad of ['https://do.internal', 'http://localhost:8787', 'https://x.internal']) {
+    await inst.resendWaitingUploads(1, ws, bad);
+  }
+  assert.equal(sent.filter((f) => f.type === 'upload_fetch').length, 0, '非公网 origin 不得下发');
+  const row = await env.DB.prepare('SELECT status FROM operation_jobs WHERE id = ?').bind('job_np').first();
+  assert.equal(row.status, 'waiting_agent', '任务保持可恢复状态，等真正的公网连接');
+});
+
+// 重发循环必须复用能力校验：积压的旧 Agent 任务不能发它不认识的帧
+test('upload 重连重发：Agent 无 upload_fetch_proto → 任务失败而非静默超时', async () => {
+  const env = makeEnv();
+  await env.DB.prepare('INSERT INTO servers (agent_key_id, name, user_id, agent_key_hash) VALUES (?,?,?,?)')
+    .bind('k1', 's1', 1, 'h1').run();
+  const now = Math.floor(Date.now() / 1000);
+  await env.DB.prepare(`INSERT INTO operation_jobs (id, kind, status, user_id, username, server_id, target_path, overwrite, size_bytes, r2_key, created_at, deadline_at, expires_at)
+    VALUES ('job_nc','upload','waiting_agent',1,'admin',1,'/opt/a.bin',0,10,'upload-jobs/job_nc',?,?,?)`)
+    .bind(now, now + 600, now + 86400).run();
+  const inst = new TerminalDO(mockState(), env);
+  const sent = [];
+  const ws = {
+    attachment: { role: 'control', serverId: 1 }, // 无 caps
+    deserializeAttachment() { return this.attachment; },
+    serializeAttachment(a) { this.attachment = a; },
+    send: (m) => sent.push(JSON.parse(m)), readyState: 1, close() {},
+  };
+  inst.agents.set(1, ws);
+  await inst.resendWaitingUploads(1, ws, 'https://panel.example');
+  assert.equal(sent.filter((f) => f.type === 'upload_fetch').length, 0, '不支持异步的 Agent 不得收到 upload_fetch');
+  const row = await env.DB.prepare('SELECT status, error FROM operation_jobs WHERE id = ?').bind('job_nc').first();
+  assert.equal(row.status, 'failed');
+  assert.match(row.error, /does not support async upload/);
+});
+
+// 断线收敛：exec/agent_update 的 running 任务在连接断开时立即 failed，不等 deadline；
+// upload 不在此时判失败（它走重连重发，判死就没有恢复机会）。
+test('断线收敛 D1：exec/update 立即 failed，upload 保持可恢复', async () => {
+  const env = makeEnv();
+  await env.DB.prepare('INSERT INTO servers (agent_key_id, name, user_id, agent_key_hash) VALUES (?,?,?,?)')
+    .bind('k1', 's1', 1, 'h1').run();
+  const now = Math.floor(Date.now() / 1000);
+  const ins = (id, kind) => env.DB.prepare(`INSERT INTO operation_jobs (id, kind, status, user_id, username, server_id, created_at, started_at, deadline_at, expires_at)
+    VALUES (?,?, 'running', 1,'admin',1, ?, ?, ?, ?)`).bind(id, kind, now - 1, now - 1, now + 600, now + 86400).run();
+  await ins('job_x', 'exec');
+  await ins('job_y', 'agent_update');
+  await ins('job_z', 'upload');
+
+  const inst = new TerminalDO(mockState(), env);
+  const ws = { deserializeAttachment: () => ({ role: 'control', serverId: 1 }), send() {}, readyState: 1, close() {} };
+  inst.agents.set(1, ws);
+  inst.cleanup(ws);
+  // cleanup 是同步的，收敛在后台任务里：等一拍
+  await new Promise((r) => setTimeout(r, 30));
+
+  const get = async (id) => (await env.DB.prepare('SELECT status, error FROM operation_jobs WHERE id = ?').bind(id).first());
+  assert.equal((await get('job_x')).status, 'failed', 'exec 断线即失败');
+  assert.match((await get('job_x')).error, /agent disconnected/);
+  assert.equal((await get('job_y')).status, 'failed', 'update 断线即失败（不自动重试）');
+  assert.equal((await get('job_z')).status, 'running', 'upload 不在断线时判死，等重连重发');
+});
+
+// 端到端回归：Worker 转发给 DO 的 query 必须携带公网 origin（handleWs 会把 host
+// 改写成 do.internal，改写前必须把真实 origin 传下去，否则重发 URL 指向内网）。
+test('handleWs 转发：query 携带公网 origin，DO 侧据此签发可用的下载 URL', async () => {
+  const { default: workerEntry, requestBuilder } = await import('../src/index.js').then(async (m) => ({
+    default: m.default, requestBuilder: (await import('./helpers.js')).requestBuilder,
+  }));
+  const call = requestBuilder(workerEntry);
+  const env = makeEnv();
+  const token = (await (await call(env, { method: 'POST', path: '/api/login', body: { password: 'admin123' } })).json()).token;
+  const created = await (await call(env, { method: 'POST', path: '/api/servers', token, body: { name: 'origin' } })).json();
+  let forwarded = null;
+  env.TERMINAL.get = () => ({ fetch: async (u) => { forwarded = String(u); return new Response(null, { status: 200 }); } });
+  await call(env, {
+    method: 'GET', path: '/ws/agent/control', headers: { 'x-agent-key': created.agent_key },
+    base: 'https://panel.example',
+  });
+  assert.ok(forwarded, '应转发到 DO');
+  const u = new URL(forwarded);
+  assert.equal(u.host, 'do.internal', '转发目标仍是内部地址');
+  assert.equal(u.searchParams.get('panel_origin'), 'https://panel.example', '公网 origin 必须随 query 透传');
 });

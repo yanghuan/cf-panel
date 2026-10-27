@@ -182,22 +182,28 @@
     return true;
   }
 
-  // 轮询异步任务到终态。返回 job（含 status/result），超时返回 null。
-  // 阶段 C 起 agent-update 是异步的：接口只回 job_id，真正的下载/校验/替换在 agent 侧，
-  // 不轮询就只能"盲等版本号"，失败时也会先报成功再等满 90 秒。
-  async function waitJob(jobId, timeoutMs = 200000) {
-    const deadline = Date.now() + timeoutMs;
+  // 轮询异步任务到终态。返回 job（含 status/result）；本地等待上限用尽返回 null。
+  // 上限动态取自 job.deadline_at（服务端权威判据）+ 15s 余量：写死 200s 会与
+  // update 的 180+30 撞边——网络慢时先本地超时、误报"未重新上线"，而任务其实还在跑。
+  async function waitJob(jobId) {
+    const started = Date.now();
+    let hardCap = started + 240000; // 服务端已终态却仍拿不到 deadline_at 时的兜底
     let interval = 1000;
-    while (Date.now() < deadline) {
+    for (;;) {
       await new Promise((r) => setTimeout(r, interval));
       let job;
       try {
         job = await api(`/api/jobs/${jobId}`);
-      } catch { interval = Math.min(interval * 2, 5000); continue; }
+      } catch {
+        interval = Math.min(interval * 2, 5000);
+        if (Date.now() > hardCap) return null;
+        continue;
+      }
       if (['succeeded', 'failed', 'timed_out', 'expired'].includes(job.status)) return job;
+      if (job.deadline_at) hardCap = job.deadline_at * 1000 + 15000;
+      if (Date.now() > hardCap) return null;
       interval = Math.min(Number(job.poll_after_ms) || 1000, 5000);
     }
-    return null;
   }
 
   async function updateAgent(id, name) {

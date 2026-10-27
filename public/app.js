@@ -182,6 +182,24 @@
     return true;
   }
 
+  // 轮询异步任务到终态。返回 job（含 status/result），超时返回 null。
+  // 阶段 C 起 agent-update 是异步的：接口只回 job_id，真正的下载/校验/替换在 agent 侧，
+  // 不轮询就只能"盲等版本号"，失败时也会先报成功再等满 90 秒。
+  async function waitJob(jobId, timeoutMs = 200000) {
+    const deadline = Date.now() + timeoutMs;
+    let interval = 1000;
+    while (Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, interval));
+      let job;
+      try {
+        job = await api(`/api/jobs/${jobId}`);
+      } catch { interval = Math.min(interval * 2, 5000); continue; }
+      if (['succeeded', 'failed', 'timed_out', 'expired'].includes(job.status)) return job;
+      interval = Math.min(Number(job.poll_after_ms) || 1000, 5000);
+    }
+    return null;
+  }
+
   async function updateAgent(id, name) {
     if (updatingAgents.has(id) || !latestAgent) return;
     updatingAgents.add(id);
@@ -193,9 +211,21 @@
         toast(t('server.updateLatest'));
         return;
       }
-      toast(t('server.installedWaiting', { build: result.build_id || latestAgent.build_id }), 15000);
-      // 推送通常会在重连首报时自动刷新；额外短轮询覆盖标签页刚恢复/推送重连窗口。
       const target = result.build_id || latestAgent.build_id;
+      // 先等任务到终态：failed/timed_out/expired 立即报错，不要先提示"已安装"
+      if (result.job_id) {
+        const job = await waitJob(result.job_id);
+        if (!job) {
+          toast(t('server.updateNoComeback'), 10000);
+          return;
+        }
+        if (job.status !== 'succeeded') {
+          toast(t('server.updateFailed', { err: (job.result && job.result.error) || job.status }), 10000);
+          return;
+        }
+      }
+      toast(t('server.installedWaiting', { build: target }), 15000);
+      // 任务成功 = 资产已替换并触发重启；再等新的版本号上报（推送/短轮询双保险）
       const deadline = Date.now() + 90000;
       while (Date.now() < deadline) {
         await new Promise((r) => setTimeout(r, 2500));

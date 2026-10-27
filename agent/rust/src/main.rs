@@ -819,6 +819,7 @@ async fn control_conn(
                         &tx,
                         &interval,
                         &note,
+                        shutdown,
                         t.as_str(),
                     ),
                 )
@@ -901,7 +902,26 @@ async fn handle_fetch_upload(
         .unwrap_or("")
         .to_string();
     let size = v.get("size").and_then(|x| x.as_u64()).unwrap_or(0);
+    let overwrite = v
+        .get("overwrite")
+        .and_then(|x| x.as_bool())
+        .unwrap_or(false);
     if upload_id.is_empty() || path.is_empty() || url.is_empty() {
+        return;
+    }
+    // 系统路径保护：与旧同步路径、文件会话保持同一判据（/etc /usr /var /proc 等一律拒绝）。
+    // 少了这一层，拥有 server:exec 的凭据就能把文件写到 /etc/cron.d/ 这类位置。
+    if session::is_system_path(&path) {
+        ctrl_enqueue(
+            &tx,
+            upload_reply(
+                &upload_id,
+                false,
+                Some(session::SYSTEM_PATH_ERR.to_string()),
+                0,
+            ),
+            "upload_result",
+        );
         return;
     }
     // 与旧路径同一上限（Worker 下发的是实际大小；这里留 +1 余量，并且 URL 侧还有 max_bytes）
@@ -924,8 +944,26 @@ async fn handle_fetch_upload(
         };
         // 下载到目标同目录的临时文件：跨文件系统时 rename 会退化，同目录才是原子替换
         let tmp = std::path::PathBuf::from(format!("{path}.cfp-upload-{upload_id}"));
-        match fetch::download_to_file(&url, &tmp, None, None, max_bytes).await {
+        // 传 Some(size) 让下载器校验实际字节：截断的响应（网络中断）必须失败，
+        // 否则短文件会覆盖目标并报成 succeeded。
+        let expect = if size > 0 { Some(size) } else { None };
+        match fetch::download_to_file(&url, &tmp, expect, None, max_bytes).await {
             Ok(res) => {
+                // overwrite=false 且目标已存在 → 拒绝（防误覆盖），与旧同步路径同语义。
+                // exists() 是同步 stat，放在 rename 前一次性判断即可（此处已在 spawn 里）。
+                if !overwrite && std::path::Path::new(&path).exists() {
+                    let _ = std::fs::remove_file(&tmp);
+                    ctrl_enqueue(
+                        &tx,
+                        reply(
+                            false,
+                            Some("target already exists (use overwrite=1)".into()),
+                            0,
+                        ),
+                        "upload_result",
+                    );
+                    return;
+                }
                 let commit = (|| -> std::io::Result<()> {
                     // fsync 后 rename：断电时不会留下半截目标文件
                     if let Ok(f) = std::fs::File::open(&tmp) {
@@ -956,10 +994,23 @@ async fn handle_fetch_upload(
     });
 }
 
+// upload_result 帧构造（成功/失败共用，避免两处字段漂移）
+fn upload_reply(upload_id: &str, ok: bool, err: Option<String>, written: u64) -> Message {
+    let mut j = serde_json::json!({
+        "type": "upload_result", "upload_id": upload_id, "ok": ok,
+        "commit": true, "size": written,
+    });
+    if let Some(e) = err {
+        j["error"] = serde_json::Value::String(e);
+    }
+    Message::Text(j.to_string().into())
+}
+
 // 阶段 C：异步自更新。拉取资产 → 复用 update.rs 的校验/backup/self-replace 全链路。
 async fn handle_fetch_update(
     cfg: Config,
     tx: tokio::sync::mpsc::Sender<OutMsg>,
+    shutdown: Arc<Notify>,
     v: serde_json::Value,
 ) {
     let update_id = v
@@ -1104,17 +1155,30 @@ async fn handle_fetch_update(
         if ready {
             RESTART_AFTER_UPDATE.store(cfg.self_restart_after_update, Ordering::SeqCst);
         }
-        ctrl_enqueue(
-            &tx,
-            Message::Text(response.to_string().into()),
-            "agent_update_result",
-        );
+        // 与同步路径一致：入队用阻塞式 send 拿到"已入队"的确定信号（回执帧极小，
+        // 队列满 256 几乎不可能；最坏阻塞到写任务超时 ≤10s）。
+        let send_result = tx
+            .send(OutMsg::Frame(Message::Text(response.to_string().into())))
+            .await;
         if ready {
             log(if cfg.self_restart_after_update {
                 "agent update installed (pulled); shutting down and starting replacement"
             } else {
                 "agent update installed (pulled); shutting down for supervisor restart"
             });
+            // 排空屏障：写任务处理到屏障时，前面的回执必然已 send + flush 到 socket
+            //（排队序保证）。等屏障回执（≤2s）再通知退出，确保 DO 能拿到"更新成功"
+            // 而不是断线。超时也继续退出——替换成功就必须跑新版本。
+            if send_result.is_ok() {
+                let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+                if tx.send(OutMsg::Barrier(ack_tx)).await.is_ok() {
+                    let _ = tokio::time::timeout(Duration::from_secs(2), ack_rx).await;
+                }
+            }
+            // **关键**：self_replace 只换磁盘文件，当前进程仍跑旧映像。不触发 shutdown
+            // 就永远不会退出，RESTART_AFTER_UPDATE 也无人消费——任务标 succeeded，
+            // 但版本号一直不变，前端最终只会提示"尚未重新上线"。
+            shutdown.notify_waiters();
         }
     });
 }
@@ -1355,6 +1419,10 @@ fn parse_collect_interval(raw: Option<String>, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
+// 参数偏多（8 个）：sessions/file_sessions 是连接级共享注册表，tx/interval/note/shutdown
+// 是连接级控制句柄，cfg 是全局只读配置——它们天然属于"本连接上下文"。收成结构体要
+// 同步改 control_conn/run_control 与所有调用点，收益不抵风险，故显式放行本条 lint。
+#[allow(clippy::too_many_arguments)]
 async fn dispatch(
     cfg: &Config,
     sessions: &Arc<Mutex<std::collections::HashMap<String, Arc<session::TermSession>>>>,
@@ -1362,6 +1430,8 @@ async fn dispatch(
     tx: &tokio::sync::mpsc::Sender<OutMsg>,
     interval: &Arc<AtomicU64>,
     note: &Arc<Notify>,
+    // 异步自更新成功后要触发退出（self_replace 只换磁盘文件，进程仍跑旧映像）
+    shutdown: &Arc<Notify>,
     text: &str,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let v: serde_json::Value = match serde_json::from_str(text) {
@@ -1544,7 +1614,7 @@ async fn dispatch(
                 );
                 return Ok(());
             }
-            handle_fetch_update(cfg.clone(), tx.clone(), v).await;
+            handle_fetch_update(cfg.clone(), tx.clone(), shutdown.clone(), v).await;
         }
         "exec" => {
             // MCP 一次性命令执行：sh -c 跑命令，收集 stdout/stderr/exit_code 经控制通道回执
@@ -2020,6 +2090,27 @@ mod tests {
             60,
             "非法值回退默认"
         );
+    }
+
+    // 异步上传路径曾漏掉旧同步路径的两道保护：系统路径拒绝、overwrite=false 拒绝覆盖。
+    // 少了前者，拥有 server:exec 的凭据可以把文件写到 /etc/cron.d/；
+    // 少了后者，overwrite=false 会静默覆盖同名文件。
+    #[test]
+    fn async_upload_rejects_system_paths_like_sync_path() {
+        for p in [
+            "/etc/cron.d/x",
+            "/usr/local/bin/evil",
+            "/proc/self/environ",
+            "/var/lib/a",
+        ] {
+            assert!(
+                session::is_system_path(p),
+                "异步上传路径必须复用同一系统路径判据，漏判 {p}"
+            );
+        }
+        // 普通用户目录不应被误拦
+        assert!(!session::is_system_path("/home/u/app.tar.gz"));
+        assert!(!session::is_system_path("/opt/app/app.tar.gz"));
     }
 
     #[test]

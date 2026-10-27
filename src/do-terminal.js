@@ -1,11 +1,11 @@
 // cf-panel — Durable Object：WebSocket 中转核心（分片实例 TerminalDO）
-import { json, err, doPanel, sha256Hex, verifySecretHash } from './utils.js';
-import { EXEC_CMD_MAX_BYTES, execCommandBytes, execTooLongError } from './config.js';
+import { json, err, doPanel, sha256Hex, verifySecretHash, signJobToken } from './utils.js';
+import { EXEC_CMD_MAX_BYTES, execCommandBytes, execTooLongError, JOB_URL_TTL_S } from './config.js';
 import { authIdentityByToken, authUserByIdentity, isAdmin, canExec } from './auth.js';
 import { handleReport } from './report.js';
 import {
   markJobRunning, failJob, finishExecJob, hasActiveAgentUpdate,
-  markUploadWaitingAgent, markUploadRunning, finishUploadJob, finishUpdateJob, markUpdateRunning,
+  markUploadWaitingAgent, markUploadRunning, listWaitingUploads, requeueOrphanUploads, finishUploadJob, finishUpdateJob, markUpdateRunning, getJob,
 } from './jobs.js';
 
 // 本模块专用常量（会话/上报间隔/PAT 校验，就近定义便于对照使用代码）
@@ -287,14 +287,20 @@ export class TerminalDO {
       }
       const agentWs = this.agents.get(serverId);
       if (!agentWs) {
-        await failJob(this.env, jobId, 'agent offline');
-        return json({ error: 'agent offline', code: 'AGENT_OFFLINE' }, 503);
+        // 离线不停在失败态（文档 §9）：置 waiting_agent，Agent 重连时自动重发。
+        // 这里不需要生成 download URL——重连重发时会重新签发（短期 URL 会过期）。
+        if (!(await markUploadWaitingAgent(this.env, jobId))) {
+          return json({ error: 'job not runnable' }, 409);
+        }
+        return json({ ok: true, job_id: jobId, status: 'waiting_agent' }, 202);
       }
       // Agent 必须支持异步拉取；旧 Agent 没有 upload_fetch_proto 时只能回落到同步旧路径
       if (!this.supportsFetch(agentWs, 'upload')) {
         await failJob(this.env, jobId, 'agent does not support async upload (upgrade required)');
         return json({ error: 'agent does not support async upload', code: 'AGENT_UPGRADE_REQUIRED' }, 409);
       }
+      // staged -> waiting_agent -> running：markUploadRunning 的前置是 waiting_agent
+      //（两步分开是为了让"已下发但 Agent 未响应"有独立的可观测状态）。
       if (!(await markUploadWaitingAgent(this.env, jobId))) return json({ error: 'job not runnable' }, 409);
       if (!(await markUploadRunning(this.env, jobId))) {
         await failJob(this.env, jobId, 'job not runnable');
@@ -462,8 +468,11 @@ export class TerminalDO {
         try { prevAgent.close(4001, 'superseded by new connection'); } catch { /* ignore */ }
       }
       this.agents.set(server.id, pair[1]);
-      // 附件随连接持久化：休眠唤醒后靠它重建 agents 索引（role 区分控制通道与会话流）
+      // 附件随连接持久化：休眠唤醒后靠它重建 agents index（role 区分控制通道与会话流）
       pair[1].serializeAttachment({ role: 'control', serverId: server.id, ts: Date.now() });
+      // Agent 重连 → 重发停在 waiting_agent 的 upload（文档 §9）。不等待，避免拖慢握手：
+      // 先把断开期间中断的 running 退回 waiting_agent，再逐条重新签发短期 URL 下发。
+      this.resendWaitingUploads(server.id, pair[1], url.origin).catch(() => { /* 失败不阻塞连接 */ });
       // T1 能力来源：不在此处探活——建连时能力未知，探活失败无法安全处理（分不清旧 agent 与真断链）。
       // 改为由 agent 在上报里自声明（info.probe_proto，见 report 分支）；声明后 exec 前探活失败
       // 即可安全 close(4002)，旧 agent 不声明 → 永不探活、永不误关。
@@ -1215,6 +1224,34 @@ export class TerminalDO {
     }
   }
 
+  // Agent 重连后重发停在 waiting_agent 的上传（文档 §9）。
+  // 短期 download URL 会过期，因此必须**重新签发**，不能复用建任务时的那条。
+  // baseUrl 取自本次连接的请求 origin（DO 侧拿不到外部 host，由调用方传入）。
+  async resendWaitingUploads(serverId, ws, baseUrl) {
+    // 先收敛：断开期间处于 running 的 upload 不可能再收到回执
+    await requeueOrphanUploads(this.env, serverId);
+    const waiting = await listWaitingUploads(this.env, serverId);
+    for (const job of waiting) {
+      if (this.agents.get(serverId) !== ws) return; // 期间连接又被替换：交给新一轮处理
+      if (!job.r2_key) {
+        await failJob(this.env, job.id, 'staged object missing');
+        continue;
+      }
+      if (!(await markUploadRunning(this.env, job.id))) continue; // 已被其它路径收敛
+      const size = Number(job.size_bytes) || 0;
+      const token = await signJobToken('download', job.id, serverId, String(size), this.env, JOB_URL_TTL_S);
+      const url = `${baseUrl}/mcp/upload-jobs/download?id=${job.id}&server_id=${serverId}&size=${size}&token=${encodeURIComponent(token)}`;
+      try {
+        ws.send(JSON.stringify({
+          type: 'upload_fetch', job_id: job.id, upload_id: job.id,
+          path: job.target_path, overwrite: !!job.overwrite, size, url,
+        }));
+      } catch {
+        await failJob(this.env, job.id, 'failed to resend upload_fetch');
+      }
+    }
+  }
+
   // 省配额策略：观看者数变化由 PanelDO 事件驱动（/rpc/set_viewers 更新 agentInterval 并广播），
   // 上报时仅读内存（0 个 DO 调用）；仅当内存无记录（实例 evict / 新连接）时查 /viewers 兜底初始化。
   async syncAgentInterval(ws, serverId) {
@@ -1243,8 +1280,17 @@ export class TerminalDO {
   // upload_result → D1 终态 + 审计（异步路径）。
   // 成功即删 R2 staging 对象：任务已落地，暂存件没有保留价值（也避免占满 10GB 额度）。
   async settleUploadJob(jobId, j) {
-    const ok = !!j.ok;
-    const job = await finishUploadJob(this.env, jobId, { ok, error: j.error || null });
+    let ok = !!j.ok;
+    let errMsg = j.error || null;
+    // 回执 size 必须与 staged 时的实际字节一致：下载被截断（网络中断）时 Agent 侧
+    // 若没拦住，会在目标位置留下短文件却报 ok。两道校验（Agent 侧 fetch + 这里）。
+    const row = await getJob(this.env, jobId);
+    if (ok && row && typeof j.size === 'number' && Number(row.size_bytes) > 0
+        && j.size !== Number(row.size_bytes)) {
+      ok = false;
+      errMsg = `size mismatch: agent wrote ${j.size}, staged ${row.size_bytes}`;
+    }
+    const job = await finishUploadJob(this.env, jobId, { ok, error: errMsg });
     if (!job) return;
     if (job.r2_key) {
       try { await this.env.UPLOADS.delete(job.r2_key); } catch { /* 删除失败由 cron 兜底 */ }
@@ -1264,15 +1310,32 @@ export class TerminalDO {
 
   // agent_update_result → D1 终态 + 审计（异步路径）
   async settleUpdateJob(jobId, j) {
-    const ok = !!j.ok;
-    const job = await finishUpdateJob(this.env, jobId, { ok, error: j.error || null });
+    let ok = !!j.ok;
+    let errMsg = j.error || null;
+    // 回执校验（文档 §8.6.3）：乱序或伪造回执可能把错误资产标成成功。
+    // build_id 必须与任务记录的 to_version 一致；声明了 size 时也必须一致。
+    const row = await getJob(this.env, jobId);
+    if (ok && row) {
+      if (j.build_id && row.build_id && String(j.build_id) !== String(row.build_id)) {
+        ok = false;
+        errMsg = `build mismatch: agent reported ${j.build_id}, expected ${row.build_id}`;
+      } else if (typeof j.size === 'number' && row.size_bytes && j.size !== Number(row.size_bytes)) {
+        ok = false;
+        errMsg = `size mismatch: agent reported ${j.size}, expected ${row.size_bytes}`;
+      }
+    }
+    const job = await finishUpdateJob(this.env, jobId, { ok, error: errMsg });
+    // 无论成功失败都要释放内存互斥：updating 只在 send 抛错时清过，
+    // 成功后不清会让这台机器在本 DO 实例存活期内再也无法 exec/upload（反复 409）。
+    if (job) this.updating.delete(job.server_id);
+    else if (row) this.updating.delete(row.server_id);
     if (!job) return;
     try {
       await this.env.DB.prepare(
         'INSERT INTO audit_logs (user_id, username, client_ip, action, target_server_id, detail, duration_ms, job_id) VALUES (?,?,?,?,?,?,?,?)'
       ).bind(
         job.user_id, job.username, job.client_ip || '', ok ? 'agent.update' : 'agent.update.failed',
-        job.server_id, `${job.from_version || '?'} → ${job.build_id || '?'}${ok ? '' : ` (${j.error || 'failed'})`}`,
+        job.server_id, `${job.from_version || '?'} → ${job.build_id || '?'}${ok ? '' : ` (${errMsg || 'failed'})`}`,
         job.duration_ms ?? null, jobId,
       ).run();
     } catch (e) { console.error('agent update audit failed:', e); }
@@ -1387,6 +1450,9 @@ export class TerminalDO {
         // 并立即失败在途探活（否则 /rpc/exec 的探活要等 EXEC_PROBE_TIMEOUT_MS 超时才返回）
         this.lastRoundTripAt.delete(serverId);
         this.probeCapable.delete(serverId);
+        // 控制连接断开 → 释放更新互斥：更新进程已随连接丢失，标记不能留到
+        // DO evict，否则该机器在本实例存活期内一直 409（D1 侧已终态，纯内存泄漏）
+        this.updating.delete(serverId);
         for (const [, r] of [...this.pendingProbe]) {
           if (r.serverId === serverId) r.resolve(false);
         }

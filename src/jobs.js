@@ -250,6 +250,33 @@ export async function markUploadWaitingAgent(env, id) {
   return !!res.meta.changes;
 }
 
+// 重连重发（文档 §9）：Agent 重连后，把该服务器停在 waiting_agent 的 upload 任务捞出来重新下发。
+// 限量 20 条：异常时（大量任务堆积）不能让一次重连触发无界查询与下发。
+export async function listWaitingUploads(env, serverId) {
+  const rows = await env.DB.prepare(
+    `SELECT id, target_path, overwrite, size_bytes, r2_key, deadline_at
+       FROM operation_jobs
+      WHERE server_id = ? AND kind = 'upload' AND status = 'waiting_agent'
+      ORDER BY created_at LIMIT 20`
+  ).bind(serverId).all();
+  return rows.results || [];
+}
+
+// 重连时把 running 的 upload 退回 waiting_agent（连接断了，Agent 那侧不会再有回执），
+// 已过 deadline 的直接判 timed_out。返回被退回的条数。
+export async function requeueOrphanUploads(env, serverId, now = nowSec()) {
+  const back = await env.DB.prepare(
+    `UPDATE operation_jobs SET status = 'waiting_agent'
+      WHERE server_id = ? AND kind = 'upload' AND status = 'running' AND deadline_at > ?`
+  ).bind(serverId, now).run();
+  const dead = await env.DB.prepare(
+    `UPDATE operation_jobs SET status = 'timed_out', error = 'agent disconnected before completion',
+            finished_at = ?, duration_ms = CASE WHEN started_at IS NULL THEN NULL ELSE (? - started_at) * 1000 END
+      WHERE server_id = ? AND kind = 'upload' AND status = 'running' AND deadline_at <= ?`
+  ).bind(now, now, serverId, now).run();
+  return (back.meta.changes || 0) + (dead.meta.changes || 0);
+}
+
 export async function markUploadRunning(env, id) {
   const now = nowSec();
   const res = await env.DB.prepare(

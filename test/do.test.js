@@ -2749,3 +2749,137 @@ test('TerminalDO upload_result：commit 才终态；非 commit 帧不改状态',
   assert.equal(row.status, 'succeeded');
   assert.equal(await env.UPLOADS.head('upload-jobs/job_c'), null, '成功后立刻删 staging 对象');
 });
+
+// 更新互斥释放：updating 只在 send 抛错时清过。成功后不清会让这台机器在本 DO 实例
+// 存活期内再也无法 exec/upload（反复 409），而 D1 侧任务已是终态——纯内存泄漏。
+test('TerminalDO /rpc/agent_update/submit：回执后释放 updating，同机 exec 恢复正常', async () => {
+  const env = makeEnv();
+  await env.DB.prepare('INSERT INTO servers (agent_key_id, name, user_id, agent_key_hash) VALUES (?,?,?,?)')
+    .bind('k1', 's1', 1, 'h1').run();
+  const now = Math.floor(Date.now() / 1000);
+  await env.DB.prepare(`INSERT INTO operation_jobs (id, kind, status, user_id, username, server_id, build_id, from_version, to_version, platform, size_bytes, sha256, asset_url, created_at, deadline_at, expires_at)
+    VALUES ('job_u1','agent_update','queued',1,'admin',1,'2026.10.28-1200','2020.01.01-0000','2026.10.28-1200','linux-x86_64',4,'aa','https://p/x',?,?,?)`)
+    .bind(now, now + 210, now + 86400).run();
+
+  const inst = new TerminalDO(mockState(), env);
+  const sent = [];
+  const ws = {
+    attachment: { role: 'control', serverId: 1, caps: { update_fetch_proto: 1, upload_fetch_proto: 1 } },
+    deserializeAttachment() { return this.attachment; },
+    serializeAttachment(a) { this.attachment = a; },
+    send: (m) => sent.push(m), readyState: 1, close() {},
+  };
+  inst.agents.set(1, ws);
+
+  const res = await inst.fetch(new Request('https://do.internal/rpc/agent_update/submit', {
+    method: 'POST',
+    body: JSON.stringify({ jobId: 'job_u1', serverId: 1, buildId: '2026.10.28-1200', platform: 'linux-x86_64', size: 4, sha256: 'aa', downloadUrl: 'https://p/mcp/agent-update-asset?x=1' }),
+  }));
+  assert.equal(res.status, 200);
+  assert.equal(inst.updating.has(1), true, '下发期间持有互斥');
+
+  // Agent 回执成功 → 互斥必须释放
+  await inst.webSocketMessage(ws, JSON.stringify({
+    type: 'agent_update_result', update_id: 'job_u1', ok: true, build_id: '2026.10.28-1200', size: 4,
+  }));
+  assert.equal(inst.updating.has(1), false, '回执后必须释放 updating（否则同机永久 409）');
+  const row = await env.DB.prepare('SELECT status FROM operation_jobs WHERE id = ?').bind('job_u1').first();
+  assert.equal(row.status, 'succeeded');
+
+  // 后续 exec 不再被"agent update in progress"挡住
+  await env.DB.prepare(`INSERT INTO operation_jobs (id, kind, status, user_id, username, server_id, command, timeout_s, created_at, deadline_at, expires_at)
+    VALUES ('job_e1','exec','queued',1,'admin',1,'echo hi',5,?,?,?)`).bind(now, now + 35, now + 86400).run();
+  const execRes = await inst.fetch(new Request('https://do.internal/rpc/exec/submit', {
+    method: 'POST', body: JSON.stringify({ jobId: 'job_e1', serverId: 1, command: 'echo hi', timeoutMs: 5000 }),
+  }));
+  assert.equal(execRes.status, 200, '更新结束后同机 exec 必须恢复正常');
+});
+
+test('TerminalDO /rpc/agent_update/submit：回执 build 不符不判成功', async () => {
+  const env = makeEnv();
+  await env.DB.prepare('INSERT INTO servers (agent_key_id, name, user_id, agent_key_hash) VALUES (?,?,?,?)')
+    .bind('k1', 's1', 1, 'h1').run();
+  const now = Math.floor(Date.now() / 1000);
+  await env.DB.prepare(`INSERT INTO operation_jobs (id, kind, status, user_id, username, server_id, build_id, from_version, to_version, platform, size_bytes, sha256, asset_url, created_at, deadline_at, expires_at)
+    VALUES ('job_u2','agent_update','queued',1,'admin',1,'2026.10.28-1200','2020.01.01-0000','2026.10.28-1200','linux-x86_64',4,'aa','https://p/x',?,?,?)`)
+    .bind(now, now + 210, now + 86400).run();
+  const inst = new TerminalDO(mockState(), env);
+  const ws = {
+    attachment: { role: 'control', serverId: 1, caps: { update_fetch_proto: 1 } },
+    deserializeAttachment() { return this.attachment; },
+    serializeAttachment(a) { this.attachment = a; },
+    send() {}, readyState: 1, close() {},
+  };
+  inst.agents.set(1, ws);
+  await inst.fetch(new Request('https://do.internal/rpc/agent_update/submit', {
+    method: 'POST',
+    body: JSON.stringify({ jobId: 'job_u2', serverId: 1, buildId: '2026.10.28-1200', platform: 'linux-x86_64', size: 4, sha256: 'aa', downloadUrl: 'https://p/x' }),
+  }));
+  // 回执声明了别的 build → 不能标成功
+  await inst.webSocketMessage(ws, JSON.stringify({
+    type: 'agent_update_result', update_id: 'job_u2', ok: true, build_id: '2026.01.01-0000', size: 4,
+  }));
+  const row = await env.DB.prepare('SELECT status, error FROM operation_jobs WHERE id = ?').bind('job_u2').first();
+  assert.equal(row.status, 'failed');
+  assert.match(row.error, /build mismatch/);
+});
+
+test('TerminalDO /rpc/upload/submit：回执 size 与 staged 不符不判成功', async () => {
+  const env = makeEnv();
+  await env.DB.prepare('INSERT INTO servers (agent_key_id, name, user_id, agent_key_hash) VALUES (?,?,?,?)')
+    .bind('k1', 's1', 1, 'h1').run();
+  const now = Math.floor(Date.now() / 1000);
+  await env.DB.prepare(`INSERT INTO operation_jobs (id, kind, status, user_id, username, server_id, target_path, size_bytes, r2_key, created_at, started_at, deadline_at, expires_at)
+    VALUES ('job_ss','upload','running',1,'admin',1,'/opt/a.bin',100,'upload-jobs/job_ss',?,?,?,?)`)
+    .bind(now - 2, now - 2, now + 120, now + 86400).run();
+  const inst = new TerminalDO(mockState(), env);
+  const ws = { deserializeAttachment: () => ({ role: 'control', serverId: 1 }), send() {}, readyState: 1, close() {} };
+  inst.agents.set(1, ws);
+  // Agent 报"写完 40 字节"，但 staged 是 100 → 下载被截断，不能算成功
+  await inst.webSocketMessage(ws, JSON.stringify({
+    type: 'upload_result', upload_id: 'job_ss', ok: true, commit: true, size: 40,
+  }));
+  const row = await env.DB.prepare('SELECT status, error FROM operation_jobs WHERE id = ?').bind('job_ss').first();
+  assert.equal(row.status, 'failed');
+  assert.match(row.error, /size mismatch/);
+});
+
+// 文档 §9：Agent 离线时任务停在 waiting_agent，重连后自动重发（URL 需重新签发）。
+test('upload：Agent 离线停 waiting_agent，重连后自动重发并重新签发 URL', async () => {
+  const env = makeEnv();
+  await env.DB.prepare('INSERT INTO servers (agent_key_id, name, user_id, agent_key_hash) VALUES (?,?,?,?)')
+    .bind('k1', 's1', 1, 'h1').run();
+  const now = Math.floor(Date.now() / 1000);
+  await env.DB.prepare(`INSERT INTO operation_jobs (id, kind, status, user_id, username, server_id, target_path, overwrite, size_bytes, r2_key, created_at, deadline_at, expires_at)
+    VALUES ('job_w','upload','staged',1,'admin',1,'/opt/a.bin',0,100,'upload-jobs/job_w',?,?,?)`)
+    .bind(now, now + 600, now + 86400).run();
+
+  const inst = new TerminalDO(mockState(), env);
+  // Agent 离线 → 不失败，转 waiting_agent
+  const r1 = await inst.fetch(new Request('https://do.internal/rpc/upload/submit', {
+    method: 'POST',
+    body: JSON.stringify({ jobId: 'job_w', serverId: 1, path: '/opt/a.bin', size: 100, downloadUrl: 'https://p/old' }),
+  }));
+  assert.equal(r1.status, 202);
+  assert.equal((await r1.json()).status, 'waiting_agent');
+  let row = await env.DB.prepare('SELECT status FROM operation_jobs WHERE id = ?').bind('job_w').first();
+  assert.equal(row.status, 'waiting_agent', '离线保留可恢复状态，不判失败');
+
+  // 重连：resendWaitingUploads 重新签发 URL 并下发
+  const sent = [];
+  const ws = {
+    attachment: { role: 'control', serverId: 1, caps: { upload_fetch_proto: 1 } },
+    deserializeAttachment() { return this.attachment; },
+    serializeAttachment(a) { this.attachment = a; },
+    send: (m) => sent.push(JSON.parse(m)), readyState: 1, close() {},
+  };
+  inst.agents.set(1, ws);
+  await inst.resendWaitingUploads(1, ws, 'https://panel.example');
+  const frames = sent.filter((f) => f.type === 'upload_fetch');
+  assert.equal(frames.length, 1, '重连后应重发一次');
+  assert.equal(frames[0].upload_id, 'job_w');
+  assert.match(frames[0].url, /^https:\/\/panel\.example\/mcp\/upload-jobs\/download\?/, 'URL 重新签发且为绝对地址');
+  assert.notEqual(frames[0].url, 'https://p/old', '不得复用建任务时的旧 URL（已过期）');
+  row = await env.DB.prepare('SELECT status FROM operation_jobs WHERE id = ?').bind('job_w').first();
+  assert.equal(row.status, 'running');
+});

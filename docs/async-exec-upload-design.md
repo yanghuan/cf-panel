@@ -13,7 +13,7 @@
 - [x] 阶段 C：agent update 异步 / Worker 资产代理
 - [x] 阶段 D：cron 清理与观测（旧同步路径**保留**，见下方偏差 5）
 
-**阶段 A 的实现偏差（已评审接受）**
+**实现偏差（已评审接受）**
 
 1. `kind` / `status` 均不加 `CHECK`：SQLite 无法 `ALTER CHECK`，状态机演进会被迫重建表；取值由 `src/jobs.js` 校验。
 2. cron 清理未接线（属阶段 D）。为防 D1 无限增长，`createExecJob` 每次顺手删除 `expires_at < now` 的行。
@@ -24,6 +24,23 @@
    待新路径稳定一段时间后再单独提交删除。
 6. Agent 侧不引入 reqwest：新增 `agent/rust/src/fetch.rs` 手写 HTTPS GET（复用现有
    rustls/DNS），同时支持 `Content-Length` 与 `chunked` 两种响应。零新增依赖。
+7. **断连语义按 kind 区分**（见 §9.1）：只有 `upload` 实现"重连后自动重发"，因为重下同一份
+   字节是幂等的；`exec` 重发可能重复执行已生效的命令，`agent_update` 重发可能二次替换二进制，
+   两者都只快速失败。三种语义不同是刻意的，不是遗漏。
+8. **cron 清理已接线**（`src/index.js` 的 `scheduled`），偏差 2 描述的"机会式清理"降级为兜底。
+
+**复核中修复的实现缺陷（记录以免重犯）**
+
+| 问题 | 后果 |
+| --- | --- |
+| `self_replace` 后未 `notify_waiters()` | 进程继续跑旧映像，版本号永不更新，任务却已 `succeeded` |
+| `updating` 只在 send 抛错时清 | 一次更新后该机器在本 DO 实例存活期内永久 409 |
+| 异步上传漏 `is_system_path` / `overwrite` 检查 | 安全净回退：可写 `/etc/cron.d/`，且静默覆盖同名文件 |
+| 上传下载传 `expect_size=None` | 截断响应被判成功，目标位置留下短文件 |
+| `failJob` 只覆盖 `queued/running` | upload 下发失败停在 `staged`，客户端一直显示"等待 Agent" |
+| 过期判定不删 R2 对象 | 废弃的 100MB 暂存件白躺 24 小时，几十次顶满免费额度 |
+| `AGENT_UPGRADE_REQUIRED` 判定在写审计之后 | 被拒绝的请求留下"已请求更新"审计，排查时误判为下发失败 |
+| `streamToR2` 先攒后写 | 100MB 上传驻留 100MB 内存，并发即 OOM（上限 128MB） |
 
 ## 1. 结论先行
 
@@ -705,10 +722,21 @@ Agent 要求：
 
 DO 收到带 `job_id` 的 `upload_result`：
 
-1. 条件更新 D1：`running -> succeeded/failed/timed_out`。
+1. **先校验回执**：`size` 必须等于 staged 时的 `size_bytes`，否则判 `failed`（下载被截断时 Agent 可能仍报 `ok`，文件已在目标位置留下短副本）。校验通过后条件更新 D1：`running -> succeeded/failed/timed_out`。
 2. 成功或失败都删除 `r2_key` 对应的 R2 对象。
-3. 成功时写 `file.upload` 审计，包含 size、path、duration_ms、job_id；失败可写 `file.upload.failed`。
+3. 成功时写 `file.upload` 审计，包含 size、path、duration_ms、job_id；失败写 `file.upload.failed`。
 4. 不依赖 `pendingUpload` Map；即使 DO 此前 evict、任务重新唤醒也能更新。
+
+**R2 对象的删除时机（全部主动删除，不等定时器）**：
+
+| 场景 | 触发点 |
+| --- | --- |
+| 上传失败（超限/读错）、并发抢占、DO 下发失败 | Worker 侧 `finishUploadJob` 后立即删 |
+| Agent 回执成功 / 失败 | `settleUploadJob` 立即删 |
+| **Agent 一直不拉，deadline 过期** | `settleExpired` / `settleExpiredAll` 判过期时立即删 |
+| 行已删但对象残留（Worker 崩溃等） | cron 的 `list` 扫描 + R2 lifecycle 兜底 |
+
+> 过期路径必须主动删：`expires_at` 是 24 小时，若只等 cron 的 TTL，一次 Agent 掉线的 100MB 上传会在额度里白躺一天，几十次就能顶满 10GB 免费额度。注意 `settleExpiredAll` 必须**先 SELECT 再逐条 UPDATE**——纯批量 UPDATE 拿不到受影响行的 `r2_key`。
 
 ### 8.5 Agent 能力协商
 
@@ -950,12 +978,26 @@ DO 收到结果：
 
 ### 9.1 Agent 断连
 
-控制 WS 关闭时：
+**三种 kind 的断连语义刻意不同**，原因写在每一条后面——它们不是同一件事：
 
-- 该 server 的 `running` exec job：标 `failed`，error=`agent_disconnected`。
-- 该 server 的 `running` upload job：若未到 deadline，置 `waiting_agent` 以便重连重试；已过 deadline 标 `timed_out`。
-- 该 server 的 `running` agent_update job：不自动重试更新（更新可能已经替换磁盘文件但回执丢失，自动重试会造成不可控的二次替换）。只有确认没有终态回执时才按 deadline 标 `timed_out`；不要用 close 事件覆盖已经写入的 `succeeded`。
-- 更新成功时 Agent 会主动退出并触发 control WS close，必须保证“结果先落 D1、再关闭/退出”的语义；Agent 发送终态结果后等待 DO `agent_update_ack`（最多 2 秒）再退出。DO 收到结果并写 D1 后回 ack。
+| kind | 断连后 | 是否自动重发 | 原因 |
+| --- | --- | --- | --- |
+| `exec` | 标 `failed`（error=`agent_disconnected`） | ❌ | 命令可能**已执行**、只是回执丢失。自动重发会造成重复执行（`rm`/`systemctl restart` 都不能重放），只能由调用方显式重试 |
+| `upload` | 未过 deadline → `waiting_agent`；已过 → `timed_out` | ✅ | 重下同一份字节是**幂等**的（agent 侧临时文件 + 原子 rename），可安全重发 |
+| `agent_update` | 不自动重试；等 deadline 判 `timed_out`，且**不得覆盖**已写入的 `succeeded` | ❌ | 更新可能已替换磁盘文件但回执丢失，自动重试会造成二次替换 |
+
+实现状态（与上表一一对应）：
+
+- `exec`：`cleanup()` 里对在途 `pendingExec` 直接 resolve `agent disconnected`；新异步路径由 deadline 收敛。
+- `upload`：**已实现重连重发**。控制 WS 建立时调用 `resendWaitingUploads()`：
+  1. 先把该 server 处于 `running` 的 upload 退回 `waiting_agent`（过 deadline 的直接判 `timed_out`）——否则断开期间的那次重连什么都不会做；
+  2. 再捞 `waiting_agent` 的任务（限 20 条）逐条**重新签发** download URL 后下发。**必须重签**：建任务时的短期 URL（10 分钟）早已过期；
+  3. 下发前用条件更新抢 `running`，未命中说明已被其它路径收敛，跳过。
+- `agent_update`：不重试。`cleanup()` 释放 `updating` 内存互斥，D1 侧等 deadline 收敛。
+
+其他约束：
+
+- 更新成功时 Agent 会主动退出并触发 control WS close，必须保证“结果先落 D1、再关闭/退出”的语义：Agent 发送终态结果后先经**排空屏障**（最多 2 秒）确认已 flush 到 socket，再 `notify_waiters()` 让主循环退出、由 supervisor 或 `RESTART_AFTER_UPDATE` 拉起新版本。若只 `self_replace` 而不触发退出，进程会继续跑旧映像、版本号永远不变。
 - 清理 Agent 临时文件由 Agent 自身会话结束逻辑负责，Worker 不删除远端半成品。
 
 ### 9.2 超时与过期
@@ -982,21 +1024,26 @@ crons = ["17 * * * *"]
 
 ### 9.3 与 Agent 更新的互斥
 
-- `agent_update` 也进入 `operation_jobs`，不再只靠内存 `pendingExec` / `pendingUpdate` 判断。
-- update / exec / upload 的提交与下发都要查询 D1：
+**实际实现的互斥矩阵**（比初稿收窄，初稿把 exec 也串行化了，与「连续多个 sleep 5 全部可查回」的验收标准冲突）：
+
+| 组合 | 是否互斥 | 机制 |
+| --- | --- | --- |
+| `agent_update` × 任意 | ✅ 独占 | D1 部分唯一索引 `idx_operation_jobs_active_update` + DO 内存 `updating` |
+| `upload` × `upload`（同机） | ✅ 串行 | 部分唯一索引 `idx_operation_jobs_active_upload` |
+| `exec` × `exec` | ❌ 允许并发 | 保持旧语义（旧同步路径同样允许并发） |
+| `exec` × `upload` | ❌ 允许并发 | 同上 |
+
+判定只用一条查询（`hasActiveAgentUpdate`）：
 
 ```sql
-SELECT 1
-FROM operation_jobs
-WHERE server_id = ?
-  AND (
-    (kind = 'agent_update' AND status IN ('queued','running'))
-    OR (kind IN ('exec','upload') AND status IN ('running','waiting_agent','staged'))
-  )
-LIMIT 1
+SELECT 1 FROM operation_jobs
+ WHERE server_id = ? AND kind = 'agent_update'
+   AND status IN ('queued','waiting_agent','running')
+ LIMIT 1
 ```
 
-- 有活动任务时返回 409；不要让 update 与异步 exec/upload 交错，避免 control WS 帧和 Agent 进程状态竞争。
+- 提交 exec/upload/update 前都查它；命中返回 409 `AGENT_UPDATE_BUSY`。**只判 update**，不判 exec/upload——否则同机第二个 exec 会被拒，与并发验收项矛盾。
+- 跨实例/evict 的正确性由部分唯一索引保证（`INSERT` 撞索引即 `UPDATE_BUSY`）；DO 内存里的 `updating` 只覆盖本实例窗口，且必须在**回执落库后**（`settleUpdateJob`）和**连接断开时**（`cleanup`）释放，否则本实例存活期内该机器永久 409。
 - 在 update 开始前关闭该 server 的终端/文件会话的行为保持现状，避免升级过程中旧 PTY 干扰。
 
 ## 10. 安全要求

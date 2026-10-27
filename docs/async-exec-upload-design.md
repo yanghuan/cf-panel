@@ -1,6 +1,6 @@
 # Exec / Upload / Agent Update 异步化开发文档
 
-> 状态：阶段 A 已实现（exec 异步化）；阶段 B / C / D 待实现  
+> 状态：阶段 A / B / C / D 全部已实现  
 > 基线提交：`832dff7`  
 > 日期：2026-10-28  
 > 目标读者：实现 Agent、Review/验收人员
@@ -9,16 +9,21 @@
 
 - [x] 阶段 A：`operation_jobs`（迁移 0015）+ `src/jobs.js` + `POST /api/exec-jobs` / `GET /api/jobs/:id`
       + DO `/rpc/exec/submit` 与 `exec_result` 落库回调 + MCP `get_operation`
-- [ ] 阶段 B：R2 staging / Agent `upload_fetch`
-- [ ] 阶段 C：agent update 异步 / Worker 资产代理
-- [ ] 阶段 D：删除同步长等待、cron 清理与观测
+- [x] 阶段 B：R2 staging / Agent `upload_fetch`
+- [x] 阶段 C：agent update 异步 / Worker 资产代理
+- [x] 阶段 D：cron 清理与观测（旧同步路径**保留**，见下方偏差 5）
 
 **阶段 A 的实现偏差（已评审接受）**
 
 1. `kind` / `status` 均不加 `CHECK`：SQLite 无法 `ALTER CHECK`，状态机演进会被迫重建表；取值由 `src/jobs.js` 校验。
 2. cron 清理未接线（属阶段 D）。为防 D1 无限增长，`createExecJob` 每次顺手删除 `expires_at < now` 的行。
 3. 过期收敛放在 `GET /api/jobs/:id` 内顺手完成（`deadline_at` 已过 → `expired`），不依赖 cron 与 DO timer。
-4. 互斥只针对 `agent_update`：exec 之间、exec 与 upload 之间保持既有并发语义（见下方 §9.3 待修正项）。
+4. 互斥只针对 `agent_update`：exec 之间、exec 与 upload 之间保持既有并发语义（见下方 §9.3）。
+5. **旧同步路径未删除**（`/rpc/exec`、`/rpc/upload`、`/rpc/agent_update` 与 LEGACY_SYNC_UPDATE）：
+   保留以便线上出问题时用环境变量回退。代价是两条链路长期共存、需一并维护；
+   待新路径稳定一段时间后再单独提交删除。
+6. Agent 侧不引入 reqwest：新增 `agent/rust/src/fetch.rs` 手写 HTTPS GET（复用现有
+   rustls/DNS），同时支持 `Content-Length` 与 `chunked` 两种响应。零新增依赖。
 
 ## 1. 结论先行
 

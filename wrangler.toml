@@ -36,6 +36,20 @@ new_sqlite_classes = ["TerminalDO", "MetricsDO"]
 tag = "v2"
 new_sqlite_classes = ["PanelDO"]
 
+# ---------- R2：upload 暂存（异步化的数据面） ----------
+# 创建：wrangler r2 bucket create cf-panel-upload-staging
+# 未创建时 wrangler deploy 会失败（绑定必须存在）。
+# 用途：客户端字节先写这里，Agent 再从签名 URL 拉取 → 数据面不再经过 DO。
+# 对象 key：upload-jobs/<job_id>；不公开、无公开域名，任务结束即删。
+# 建议另配 24h 生命周期删除规则，作为代码清理失败时的兜底。
+[[r2_buckets]]
+binding = "UPLOADS"
+bucket_name = "cf-panel-upload-staging"
+
+# ---------- 定时任务（阶段 D：任务清理 + R2 孤儿对象回收） ----------
+[triggers]
+crons = ["17 * * * *"]
+
 # ---------- 静态资源（前端，Pages 模式零构建） ----------
 [assets]
 directory = "./public"
@@ -50,9 +64,11 @@ not_found_handling = "single-page-application"
 [observability.logs]
 enabled = true
 invocation_logs = true
+head_sampling_rate = 0.1
 
 [observability.traces]
 enabled = true
+head_sampling_rate = 0.1
 
 # ---------- Smart Placement（智能放置：权衡用户/后端距离；启用后 Dashboard 可看性能对比） ----------
 [placement]

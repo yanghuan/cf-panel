@@ -1,9 +1,13 @@
 // cf-panel — 路由层：REST API（handleApi）+ MCP（handleMcp）+ WebSocket 路由（handleWs）
 import {
   SCOPE_READ, SCOPE_EXEC, SCOPE_AGENT_UPDATE, SCOPE_ADMIN, PAT_PREFIX, SHARDS, parsePanelUsers, statsTzOffsetSec,
-  EXEC_CMD_MAX_BYTES, execCommandBytes, execTooLongError, SERVER_DESC_MAX, JOB_POLL_AFTER_MS,
+  EXEC_CMD_MAX_BYTES, execCommandBytes, execTooLongError, SERVER_DESC_MAX, JOB_POLL_AFTER_MS, JOB_URL_TTL_S,
 } from './config.js';
-import { createExecJob, getJob, settleExpired, jobView, hasActiveAgentUpdate, failJob } from './jobs.js';
+import {
+  createExecJob, getJob, settleExpired, jobView, hasActiveAgentUpdate, failJob,
+  createUploadJob, claimUploadStaging, markUploadStaged, markUploadWaitingAgent,
+  createAgentUpdateJob, markUploadRunning, finishUploadJob,
+} from './jobs.js';
 
 // 本模块专用常量（PAT scope 白名单 / MCP 协议与工具，就近定义便于对照使用代码）
 const ALLOWED_SCOPES = [SCOPE_READ, SCOPE_EXEC, SCOPE_AGENT_UPDATE, SCOPE_ADMIN]; // PAT 合法 scope 白名单
@@ -56,7 +60,7 @@ const MCP_TOOLS = [
   },
   {
     name: 'create_upload',
-    description: '创建一次性的文件上传签名 URL（大文件/二进制上传通道，不经过 LLM 上下文）。返回可直接 curl 使用的 POST URL，签名绑定目标服务器、路径与覆盖标志，10 分钟过期。AI 自身无法直接传大文件——把返回的 upload_url 转给用户/程序执行（或指导客户端用 fetch/curl POST 该 URL，body 为原始文件字节，流式分片；默认上限 100MB，可 UPLOAD_MAX_MB 调高）。需 exec 权限。',
+    description: '创建一次性的文件上传签名 URL（大文件/二进制上传通道，不经过 LLM 上下文）。返回可直接 curl 使用的 POST URL，签名绑定目标服务器、路径与覆盖标志，10 分钟过期。AI 自身无法直接传大文件——把返回的 upload_url 转给用户/程序执行（或指导客户端用 fetch/curl POST 该 URL，body 为原始文件字节；默认上限 100MB，UPLOAD_MAX_MB 可调但受 500MB 硬上限约束，且实际还受 Cloudflare 单请求体上限限制——免费版 100MB，调高也不会生效）。需 exec 权限。**异步**：返回 job_id，必须用 get_operation 轮询终态。',
     inputSchema: {
       type: 'object',
       properties: {
@@ -218,7 +222,7 @@ import {
   json, err, requireJwtSecret, signJwt, randomHex, sha256Hex, hashSecret, safeJson,
   kvGet, kvPut, sanitizeAlerts, sanitizeAlertOverride, parseRangeHours, sendWebhookRaw,
   doMetrics, doForShard, doPanel, shardForServerId, makeStreamId, shardFromStreamId,
-  signUploadToken, verifyUploadToken,
+  signUploadToken, verifyUploadToken, signJobToken, verifyJobToken,
 } from './utils.js';
 import { queryMonitorRows, queryCustomMetrics, queryDayStats, kvClearCache } from './db.js';
 import { authUser, isAdmin, isJwtAdmin, canAccessServer, canExec, canUpdateAgent, listServersWithState, serverListCache } from './auth.js';
@@ -356,6 +360,16 @@ function clientIp(request) {
 // 两者与 host 同源自请求 URL：host 本就取自此处，协议同源派生才不会自相矛盾。
 // 注：上传签名载荷只含 serverId|path|overwrite|exp（utils.js signUploadToken），
 // 不含 host/协议，故基址协议变化不影响已签发 URL 的验签。
+// 上传大小上限（与环境变量同口径，供 upload job 在创建时确定 R2 暂存上限）
+function uploadMaxBytesOf(env) {
+  const UPLOAD_ABS_MAX_MB = 500;
+  const rawMax = Number(env.UPLOAD_MAX_MB);
+  const maxMb = Number.isFinite(rawMax) && rawMax > 0
+    ? Math.min(rawMax, UPLOAD_ABS_MAX_MB)
+    : 100; // UPLOAD_MAX_DEFAULT
+  return maxMb * 1024 * 1024;
+}
+
 function publicOrigin(url) {
   return `${url.protocol === 'http:' ? 'http' : 'https'}://${url.host}`;
 }
@@ -711,7 +725,7 @@ async function handleApiInner(request, env) {
   // Worker 流式中转 Release 资产，不物化整个二进制；Agent 做大小/SHA/版本复核后 self-replace。
   const updateMatch = path.match(/^\/api\/servers\/(\d+)\/agent-update$/);
   if (method === 'POST' && updateMatch) {
-    return agentUpdateCore(env, user, Number(updateMatch[1]) || 0, clientIp(request));
+    return agentUpdateCore(env, user, Number(updateMatch[1]) || 0, clientIp(request), url);
   }
 
   // POST /api/servers —— 注册一台服务器（name + 可选 group/描述/序号；仅管理员）
@@ -908,6 +922,43 @@ async function handleApiInner(request, env) {
       idempotencyKey: body.idempotency_key ? String(body.idempotency_key).slice(0, 128) : null,
     });
     return json(payload, status);
+  }
+
+  // POST /api/upload-jobs —— 创建上传任务（阶段 B）：只创建任务 + 返回签名上传 URL，
+  // 客户端随后把字节 POST 到 /mcp/upload-jobs/:id/content（写 R2），Agent 再从签名 URL 拉取。
+  // 全程不经过 DO：这是 upload 从 120s 同步等待变成秒级返回的关键。
+  if (method === 'POST' && path === '/api/upload-jobs') {
+    const body = await request.json().catch(() => ({}));
+    const serverId = Number(body.server_id) || 0;
+    const targetPath = String(body.path || '').trim();
+    if (!targetPath || !targetPath.startsWith('/')) return err('path is required (absolute)', 400, 'PATH_REQUIRED');
+    const server = await env.DB.prepare('SELECT * FROM servers WHERE id = ?').bind(serverId).first();
+    if (!server) return err('server not found', 404, 'NOT_FOUND');
+    if (!canExec(user, server)) return err('forbidden', 403, 'FORBIDDEN');
+    // 更新会重启 agent，期间的 upload_fetch 会与二进制更新帧交错
+    if (await hasActiveAgentUpdate(env, serverId)) return err('agent update in progress', 409, 'AGENT_UPDATE_BUSY');
+    let job;
+    try {
+      job = await createUploadJob(env, {
+        user, serverId, targetPath,
+        overwrite: !!body.overwrite,
+        maxBytes: uploadMaxBytesOf(env),
+        clientIp: ip,
+      });
+    } catch (e) {
+      if (e.code === 'UPLOAD_BUSY') return err('another upload is in progress for this server', 409, 'UPLOAD_BUSY');
+      throw e;
+    }
+    const token = await signJobToken('content', job.id, serverId, '', env, JOB_URL_TTL_S);
+    const uploadUrl = `${publicOrigin(url)}/mcp/upload-jobs/${job.id}/content?token=${encodeURIComponent(token)}`;
+    // 这里只记"请求上传"；真正的 file.upload 审计在 Agent 成功 commit 后由 DO 写入，
+    // 避免再次把"签发了 URL"当成"文件已落地"（旧实现的语义缺口）。
+    await auditLog(env, {
+      userId: user.id, username: user.username, ip,
+      action: 'file.upload.request', serverId,
+      detail: targetPath,
+    });
+    return json(uploadJobResponse(job, uploadUrl, JOB_POLL_AFTER_MS), 202);
   }
 
   // GET /api/jobs/:id —— 任务轮询（exec/upload/agent_update 通用）。只读 D1，不访问 DO。
@@ -1285,6 +1336,81 @@ async function handleApiInner(request, env) {
   return err('not found', 404, 'NOT_FOUND');
 }
 
+// ---------------- 阶段 B：upload job（数据面走 R2，不经过 DO） ----------------
+
+// 客户端字节 → R2 staging。**真流式**：把 request.body 经一层计数包装直接交给 R2，
+// 全程不在 Worker 内存里落地整个文件。
+//
+// 为什么不能先攒后写（曾这样实现）：100MB 上传会在内存里驻留 100MB，而 Workers
+// 内存上限 128MB —— 单个大文件就贴着上限，两个并发直接 OOM（进程被强制终止，
+// 客户端只看到连接中断）。设计文档 §8.3 也明确要求流式写入。
+//
+// 计数包装的作用：Content-Length 只做前置快筛，**不可信**（可伪造/可为 chunked）。
+// 真实字节超限时让流 error，put() 随之失败，对象不会落地。
+// 返回 { ok, sizeBytes } 或 { error, status }。
+async function streamToR2(env, key, body, contentLength, maxBytes) {
+  if (!body) return { error: 'empty body', status: 400 };
+  const reader = body.getReader();
+  let written = 0;
+  let overflow = false;
+  const counter = new ReadableStream({
+    async pull(controller) {
+      try {
+        const { done, value } = await reader.read();
+        if (done) { controller.close(); return; }
+        if (!value || value.byteLength === 0) return;
+        written += value.byteLength;
+        if (written > maxBytes) {
+          overflow = true;
+          try { await reader.cancel(); } catch { /* ignore */ }
+          controller.error(new Error('too large'));
+          return;
+        }
+        controller.enqueue(value);
+      } catch (e) {
+        controller.error(e);
+      }
+    },
+    cancel(reason) {
+      try { reader.cancel(reason); } catch { /* ignore */ }
+    },
+  });
+  try {
+    await env.UPLOADS.put(key, counter, { httpMetadata: { contentType: 'application/octet-stream' } });
+  } catch {
+    if (overflow) {
+      return { error: `file too large (max ${Math.floor(maxBytes / 1024 / 1024)}MB)`, status: 413 };
+    }
+    return { error: 'staging write failed', status: 502 };
+  }
+  // 事后复核真实大小：Content-Length 可能说谎（声明 1KB 实传 1MB 已由计数拦截，
+  // 反向的"声明很大实传很小"也要发现，否则 Agent 会拿到短文件）。
+  try {
+    const head = await env.UPLOADS.head(key);
+    const real = head ? Number(head.size) || 0 : 0;
+    if (real !== written) {
+      return { error: `size mismatch after write (${real} != ${written})`, status: 502 };
+    }
+  } catch { /* head 失败不阻断：以计数结果为准 */ }
+  return { ok: true, sizeBytes: written };
+}
+
+// 渲染 upload job 的响应（创建 / 内容接收共用同一形状）
+function uploadJobResponse(job, origin, pollAfterMs, { withSize = false } = {}) {
+  return {
+    job_id: job.id,
+    status: job.status,
+    server_id: job.server_id,
+    path: job.target_path,
+    poll_tool: 'get_operation',
+    poll_after_ms: pollAfterMs,
+    expires_at: job.deadline_at,
+    // size_bytes 创建时是"上限"，staged 后才是实际大小——只在后者返回，避免误读
+    ...(withSize ? { size_bytes: job.size_bytes } : {}),
+    ...(origin ? { upload_url: origin } : {}),
+  };
+}
+
 // 上传公共转发：流式转发到 TerminalDO（body 保持原始流，DO 内切分片）；query 参数原样传递。
 // 两条鉴权路径（Bearer JWT/PAT 与签名 URL）共用同一管道。
 function forwardUpload(env, request, serverId) {
@@ -1306,6 +1432,137 @@ async function handleUploadSigned(request, env, u) {
   const v = await verifyUploadToken(u.searchParams.get('token') || '', serverId, targetPath, overwrite, env);
   if (!v.ok) return err(v.error, 403);
   return forwardUpload(env, request, serverId);
+}
+
+// POST /mcp/upload-jobs/:id/content?token=... —— 客户端把字节写入 R2 staging。
+// 只认签名 token（无 Bearer）：URL 可能被转给 curl/程序执行。
+// token 绑定 job_id + server_id；path/overwrite 一律从 D1 的 job 行读，
+// 所以改 query 无法改目标路径（旧签名格式把 path 编进 URL，是本次刻意修掉的点）。
+async function handleJobContentUpload(request, env, u) {
+  const m = u.pathname.match(/^\/mcp\/upload-jobs\/([^/]+)\/content$/);
+  const jobId = m && m[1];
+  if (!jobId) return err('bad path', 400);
+  const job = await getJob(env, jobId);
+  if (!job || job.kind !== 'upload') return err('job not found', 404);
+  const v = await verifyJobToken(u.searchParams.get('token') || '', 'content', job.id, job.server_id, '', env);
+  if (!v.ok) return err(v.error, 403);
+  // 只接受 awaiting_upload：上传成功后旧 URL 立刻失效（防重放覆盖已 staged 的对象）
+  if (job.status !== 'awaiting_upload') {
+    return err(`job is not awaiting upload (status=${job.status})`, 409, 'JOB_NOT_AWAITING_UPLOAD');
+  }
+  const declared = Number(request.headers.get('content-length'));
+  if (!Number.isFinite(declared) || declared <= 0) {
+    // 无 Content-Length 的 chunked 上传拒绝：无法前置判上限，也无从判断是否写完
+    return err('Content-Length required', 411, 'LENGTH_REQUIRED');
+  }
+  const maxBytes = Number(job.size_bytes) || uploadMaxBytesOf(env);
+  if (declared > maxBytes) return err(`file too large (max ${Math.floor(maxBytes / 1024 / 1024)}MB)`, 413, 'TOO_LARGE');
+  // 抢占：并发上传同一 job 时只有一方成功
+  if (!(await claimUploadStaging(env, job.id, job.server_id))) {
+    return err('upload already in progress', 409, 'UPLOAD_CLAIMED');
+  }
+  const res = await streamToR2(env, job.r2_key, request.body, declared, maxBytes);
+  if (res.error) {
+    // 半截对象必须删掉：否则 Agent 会拉到一个被截断的文件
+    try { await env.UPLOADS.delete(job.r2_key); } catch { /* ignore */ }
+    await finishUploadJob(env, job.id, { ok: false, error: res.error });
+    return err(res.error, res.status || 400);
+  }
+  if (!(await markUploadStaged(env, job.id, { sizeBytes: res.sizeBytes }))) {
+    try { await env.UPLOADS.delete(job.r2_key); } catch { /* ignore */ }
+    return err('job state changed during upload', 409);
+  }
+  const staged = await getJob(env, job.id);
+  // 通知 DO 下发 upload_fetch（短请求，不读文件、不等 Agent 落盘）
+  try {
+    const dlToken = await signJobToken('download', job.id, job.server_id, String(res.sizeBytes), env, JOB_URL_TTL_S);
+    const dlUrl = `${publicOrigin(u)}/mcp/upload-jobs/download?id=${job.id}&server_id=${job.server_id}&size=${res.sizeBytes}&token=${encodeURIComponent(dlToken)}`;
+    const resp = await doForShard(env, shardForServerId(job.server_id)).fetch('https://do.internal/rpc/upload/submit', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        jobId: job.id, serverId: job.server_id, path: job.target_path,
+        overwrite: !!job.overwrite, size: res.sizeBytes, downloadUrl: dlUrl,
+      }),
+    });
+    if (!resp.ok) {
+      const out = await resp.json().catch(() => ({}));
+      await finishUploadJob(env, job.id, { ok: false, error: out.error || 'dispatch failed' });
+      try { await env.UPLOADS.delete(job.r2_key); } catch { /* ignore */ }
+      return json({ error: out.error || 'upload dispatch failed', job_id: job.id, status: 'failed' }, resp.status);
+    }
+  } catch {
+    await finishUploadJob(env, job.id, { ok: false, error: 'dispatch failed' });
+    try { await env.UPLOADS.delete(job.r2_key); } catch { /* ignore */ }
+    return json({ error: 'upload dispatch failed', job_id: job.id, status: 'failed' }, 502);
+  }
+  return json(uploadJobResponse(staged, null, JOB_POLL_AFTER_MS, { withSize: true }), 202);
+}
+
+// GET /mcp/upload-jobs/download?id=&server_id=&size=&token= —— Agent 从 R2 拉取 staging 文件。
+// 数据面完全绕开 DO：Worker 直接流式回源 R2。
+async function handleJobDownload(request, env, u) {
+  const jobId = u.searchParams.get('id') || '';
+  const serverId = Number(u.searchParams.get('server_id')) || 0;
+  const size = Number(u.searchParams.get('size')) || 0;
+  if (!jobId || !serverId) return err('id and server_id required', 400);
+  const v = await verifyJobToken(u.searchParams.get('token') || '', 'download', jobId, serverId, String(size), env);
+  if (!v.ok) return err(v.error, 403);
+  const job = await getJob(env, jobId);
+  if (!job || job.kind !== 'upload') return err('job not found', 404);
+  if (job.server_id !== serverId) return err('forbidden', 403);
+  // 只允许 running：staged 阶段还没下发，succeeded 之后对象已删或不该再读
+  if (job.status !== 'running') return err(`job is not running (status=${job.status})`, 409);
+  if (!job.r2_key) return err('no staged object', 404);
+  const obj = await env.UPLOADS.get(job.r2_key);
+  if (!obj) return err('staged object missing', 404);
+  return new Response(obj.body, {
+    status: 200,
+    headers: {
+      'content-type': 'application/octet-stream',
+      // 显式给 Content-Length：agent 侧手写 HTTP 解析按它判长度，chunked 会额外要求解析 chunk 头
+      'content-length': String(obj.size),
+      'cache-control': 'no-store',
+    },
+  });
+}
+
+// GET /mcp/agent-update-asset?id=&server_id=&token=... —— Agent 经 Worker 拉 Release 资产。
+// 代理而非直连 GitHub：asset_url 只来自 Worker 已校验的 manifest，不能让调用方指定 URL（否则是开放代理）。
+async function handleAgentAssetProxy(request, env, u) {
+  const jobId = u.searchParams.get('id') || '';
+  const serverId = Number(u.searchParams.get('server_id')) || 0;
+  if (!jobId || !serverId) return err('id and server_id required', 400);
+  const job = await getJob(env, jobId);
+  if (!job || job.kind !== 'agent_update') return err('job not found', 404);
+  const v = await verifyJobToken(
+    u.searchParams.get('token') || '', 'asset', job.id, job.server_id,
+    `${job.build_id}|${job.platform}|${job.size_bytes}`, env
+  );
+  if (!v.ok) return err(v.error, 403);
+  if (job.status !== 'running') return err(`job is not running (status=${job.status})`, 409);
+  if (!job.asset_url) return err('no asset url', 404);
+  let upstream;
+  try {
+    upstream = await fetch(job.asset_url, {
+      headers: { accept: 'application/octet-stream', 'user-agent': 'cf-panel-agent-updater' },
+      redirect: 'follow',
+    });
+  } catch {
+    return err('asset fetch failed', 502);
+  }
+  if (!upstream.ok || !upstream.body) return err(`asset fetch failed (${upstream.status})`, 502);
+  const len = Number(upstream.headers.get('content-length'));
+  // 与 job 记录比对：manifest 里的大小是权威值，防止代理到异常大的对象
+  if (Number.isFinite(len) && len > 0 && job.size_bytes && len !== Number(job.size_bytes)) {
+    return err(`asset size mismatch (${len} != ${job.size_bytes})`, 502);
+  }
+  const headers = {
+    'content-type': 'application/octet-stream',
+    'cache-control': 'no-store',
+  };
+  if (Number.isFinite(len) && len > 0) headers['content-length'] = String(len);
+  return new Response(upstream.body, { status: 200, headers });
 }
 
 // 服务器增删改后清列表缓存（serverListCache 在 auth.js）
@@ -1387,7 +1644,7 @@ async function mcpListServers(user, env) {
 // 权限：canUpdateAgent（管理员，或带 agent:update scope 且命中 server_ids 白名单的 PAT）。
 // 单机语义：批量由调用方串行逐台（前端批量更新同策略），每台的失败原因与审计独立可见。
 // 审计写失败 fail closed，不执行远端替换。返回 REST 语义 Response（MCP 侧转工具结果/错误）。
-async function agentUpdateCore(env, user, id, ip) {
+async function agentUpdateCore(env, user, id, ip, requestUrl) {
   const server = await env.DB.prepare('SELECT * FROM servers WHERE id = ?').bind(id).first();
   if (!server) return err('server not found', 404, 'NOT_FOUND');
   if (!canUpdateAgent(user, server)) return err('forbidden', 403, 'FORBIDDEN');
@@ -1411,11 +1668,80 @@ async function agentUpdateCore(env, user, id, ip) {
     return err(`current agent ${info.agent_version} is newer than latest release ${manifest.build_id}`, 409);
   }
 
+  // 旧 Agent（无 update_fetch_proto）走不了异步拉取：明确要求升级，而不是静默降级到
+  // 同步长等待（那正是本次要消灭的东西）。LEGACY_SYNC_UPDATE=1 可临时放行旧同步路径。
+  //
+  // 这个纯判定必须放在写审计**之前**：否则被拒绝的请求也会留下一条
+  // agent.update.request（"已请求更新"），而机器版本根本没动，排查时会误判为下发失败。
+  const canFetch = Number(info.update_fetch_proto) >= 1;
+  if (!canFetch && env.LEGACY_SYNC_UPDATE !== '1') {
+    return err(
+      'agent does not support async update (update_fetch_proto missing); upgrade the agent first, or set LEGACY_SYNC_UPDATE=1 to use the legacy synchronous path',
+      409,
+      'AGENT_UPGRADE_REQUIRED'
+    );
+  }
   // 更新是高权限供应链操作：审计写失败则 fail closed，不执行远端替换。
   await env.DB.prepare(
     'INSERT INTO audit_logs (user_id, username, client_ip, action, target_server_id, detail) VALUES (?,?,?,?,?,?)'
   ).bind(user.id, user.username, ip, 'agent.update.request', id,
     `${info.agent_version || 'unknown'} → ${manifest.build_id} (${platform})`).run();
+  if (!canFetch) return agentUpdateLegacySync(env, user, id, ip, { info, manifest, asset, platform });
+
+  // 异步路径：只创建任务 + 下发元数据与短期资产 URL。
+  // Worker 不再下载 Release 再流式转给 DO —— DO 在这条链路上 0 字节参与。
+  let job;
+  try {
+    job = await createAgentUpdateJob(env, {
+      user, serverId: id, buildId: manifest.build_id,
+      fromVersion: info.agent_version || '',
+      platform, sizeBytes: asset.size, sha256: asset.sha256,
+      assetUrl: asset.url, clientIp: ip,
+    });
+  } catch (e) {
+    if (e.code === 'UPDATE_BUSY') return err('an agent update is already in progress for this server', 409, 'UPDATE_BUSY');
+    throw e;
+  }
+  const assetToken = await signJobToken(
+    'asset', job.id, id, `${manifest.build_id}|${platform}|${asset.size}`, env, JOB_URL_TTL_S
+  );
+  // 资产代理 URL 的 origin 必须取自真实请求（协议跟随访问协议，见协议派生测试）
+  const assetProxyUrl = `${publicOrigin(requestUrl || new URL('https://panel.local/'))}/mcp/agent-update-asset?id=${job.id}&server_id=${id}&token=${encodeURIComponent(assetToken)}`;
+  let out = {};
+  try {
+    const resp = await doForShard(env, shardForServerId(id)).fetch('https://do.internal/rpc/agent_update/submit', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        jobId: job.id, serverId: id, buildId: manifest.build_id, platform,
+        size: asset.size, sha256: asset.sha256, downloadUrl: assetProxyUrl,
+      }),
+    });
+    out = await resp.json().catch(() => ({}));
+    if (!resp.ok) {
+      // DO 自己会标 failed；这里兜住它没覆盖的拒绝，避免留下永远 queued 的行
+      await failJob(env, job.id, out.error || `dispatch rejected (${resp.status})`);
+      return json({ error: out.error || 'agent update dispatch failed', job_id: job.id, status: 'failed' }, resp.status);
+    }
+  } catch {
+    await failJob(env, job.id, 'dispatch failed');
+    return json({ error: 'agent update dispatch failed', job_id: job.id, status: 'failed' }, 502);
+  }
+  serverListCacheClear();
+  return json({
+    job_id: job.id,
+    status: 'running',
+    server_id: id,
+    build_id: manifest.build_id,
+    from_version: info.agent_version || '',
+    poll_tool: 'get_operation',
+    poll_after_ms: JOB_POLL_AFTER_MS,
+  }, 202);
+}
+
+// 旧同步路径（仅当显式 LEGACY_SYNC_UPDATE=1 且 Agent 不支持异步拉取时使用）：
+// Worker 下载资产 → DO 流式转发 → 等 Agent 回执。保留仅作升级过渡，不再新增能力。
+async function agentUpdateLegacySync(env, user, id, ip, { info, manifest, asset, platform }) {
   const auditUpdateResult = async (action, detail) => {
     try {
       await env.DB.prepare(
@@ -1423,7 +1749,6 @@ async function agentUpdateCore(env, user, id, ip) {
       ).bind(user.id, user.username, ip, action, id, String(detail).slice(0, 300)).run();
     } catch { /* request 审计已存在，结果审计 best effort */ }
   };
-
   let assetResp;
   try {
     assetResp = await fetch(asset.url, {
@@ -1445,11 +1770,9 @@ async function agentUpdateCore(env, user, id, ip) {
     await auditUpdateResult('agent.update.failed', 'asset size differs from manifest');
     return err('agent asset size differs from manifest', 502);
   }
-
-  const stub = doForShard(env, shardForServerId(id));
   let result;
   try {
-    const resp = await stub.fetch(
+    const resp = await doForShard(env, shardForServerId(id)).fetch(
       `https://do.internal/rpc/agent_update?server_id=${id}`,
       {
         method: 'POST',
@@ -1473,17 +1796,14 @@ async function agentUpdateCore(env, user, id, ip) {
     await auditUpdateResult('agent.update.failed', `relay: ${e.message}`);
     return err(`agent update relay failed: ${e.message}`, 502);
   }
-  await auditUpdateResult(
-    'agent.update.installed',
-    `${info.agent_version || 'unknown'} → ${manifest.build_id}`
-  );
+  await auditUpdateResult('agent.update.installed', `${info.agent_version || 'unknown'} → ${manifest.build_id}`);
   serverListCacheClear();
   return json({ ...result, build_id: manifest.build_id });
 }
 
 // 工具：触发指定服务器的 Agent 自更新（复用 REST 更新核心：manifest 校验/SHA/审计全链路一致）。
 // 鉴权：canUpdateAgent（管理员或 agent:update scope PAT）；server_name 重名拒绝，防更新到错误机器。
-async function mcpUpdateAgent(user, env, args, ip) {
+async function mcpUpdateAgent(user, env, args, ip, url) {
   const serverId = Number(args.server_id) || 0;
   let server = null;
   if (serverId) {
@@ -1499,11 +1819,21 @@ async function mcpUpdateAgent(user, env, args, ip) {
     server = rows.results[0] || null;
   }
   if (!server) throw new Error('server not found: provide server_id or server_name');
-  const resp = await agentUpdateCore(env, user, server.id, ip);
+  const resp = await agentUpdateCore(env, user, server.id, ip, url);
   const body = await resp.json().catch(() => ({ error: `update failed (${resp.status})` }));
   if (!resp.ok) throw new Error(body.error || `agent update failed (${resp.status})`);
   if (body.already_latest) return `服务器「${server.name}」Agent 已是最新版本（${body.build_id}），无需更新。`;
-  return `服务器「${server.name}」Agent 更新指令已送达（→ ${body.build_id}）。新二进制已替换并由 supervisor 或 AGENT_SELF_RESTART 拉起；稍后可用 list_servers 确认上报的新版本号。`;
+  // 异步语义（阶段 C）：此处只是"已下发"，Agent 还要下载/校验/self-replace，必须轮询
+  return {
+    job_id: body.job_id,
+    status: body.status,
+    server_id: server.id,
+    server_name: server.name,
+    build_id: body.build_id,
+    from_version: body.from_version || '',
+    poll_tool: 'get_operation',
+    message: `服务器「${server.name}」Agent 更新已下发（→ ${body.build_id}）。必须用 get_operation 轮询 job_id 直到终态；succeeded 表示新二进制已替换并由 supervisor 或 AGENT_SELF_RESTART 拉起。`,
+  };
 }
 
 // 工具：在 agent 上执行一次性命令（经 TerminalDO 控制通道，等待 exec_result）
@@ -1574,23 +1904,38 @@ async function mcpCreateUpload(user, env, args, url, ip) {
   if (!server) throw new Error('server not found（请先用 list_servers 确认 id 或名称）');
   if (!canExec(user, server)) throw new Error(`no exec permission on server ${server.id} (${server.name})`);
   const overwrite = !!args.overwrite;
-  const { token, exp } = await signUploadToken(server.id, path, overwrite, env);
-  const q = new URLSearchParams({ server_id: String(server.id), path, overwrite: overwrite ? '1' : '0', token });
-  // 上传通道走 /mcp/file_upload（/mcp 前缀为 CF Access 放行区，签名 URL 供 curl 直传不受拦截）
-  const uploadUrl = `${publicOrigin(url)}/mcp/file_upload?${q.toString()}`;
-  // 审计在签发时记录（实际 curl 上传经签名 URL 直传，不再重复记录）
-  await env.DB.prepare('INSERT INTO audit_logs (user_id, username, client_ip, action, target_server_id, detail) VALUES (?,?,?,?,?,?)')
-    .bind(user.id, user.username, ip, 'file.upload', server.id, path)
+  if (await hasActiveAgentUpdate(env, server.id)) {
+    throw new Error('agent update in progress for this server; retry after it finishes');
+  }
+  let job;
+  try {
+    job = await createUploadJob(env, {
+      user, serverId: server.id, targetPath: path, overwrite,
+      maxBytes: uploadMaxBytesOf(env), clientIp: ip,
+    });
+  } catch (e) {
+    if (e.code === 'UPLOAD_BUSY') throw new Error('another upload is in progress for this server; wait for it to finish');
+    throw e;
+  }
+  const token = await signJobToken('content', job.id, server.id, '', env, JOB_URL_TTL_S);
+  // 上传通道走 /mcp/（CF Access 放行区，签名 URL 供 curl 直传不受拦截）
+  const uploadUrl = `${publicOrigin(url)}/mcp/upload-jobs/${job.id}/content?token=${encodeURIComponent(token)}`;
+  // 这里只记"请求上传"；真正的 file.upload 在 Agent 成功 commit 后由 DO 写入
+  await env.DB.prepare('INSERT INTO audit_logs (user_id, username, client_ip, action, target_server_id, detail, job_id) VALUES (?,?,?,?,?,?,?)')
+    .bind(user.id, user.username, ip, 'file.upload.request', server.id, path, job.id)
     .run();
   return {
+    job_id: job.id,
+    status: job.status, // awaiting_upload
     server_id: server.id,
     server_name: server.name,
     path,
     overwrite,
-    expires_at: exp, // unix 秒
-    expires_in_seconds: Math.max(0, exp - Math.floor(Date.now() / 1000)),
+    expires_at: job.deadline_at, // 上传窗口截止（unix 秒）
+    expires_in_seconds: Math.max(0, job.deadline_at - Math.floor(Date.now() / 1000)),
     upload_url: uploadUrl,
-    usage: `curl -X POST '${uploadUrl}' --data-binary @<本地文件>  # body 为原始文件字节，流式分片（默认上限 100MB，可 UPLOAD_MAX_MB 调高）`,
+    poll_tool: 'get_operation',
+    usage: `curl -X POST '${uploadUrl}' --data-binary @<本地文件>  # body 为原始文件字节（默认上限 100MB，可 UPLOAD_MAX_MB 调高）；上传后必须用 get_operation 轮询到终态`,
   };
 }
 
@@ -1931,6 +2276,23 @@ export async function handleMcp(request, env) {
 
 async function handleMcpInner(request, env) {
   const url = new URL(request.url);
+
+  // 阶段 B/C 的任务签名端点必须在「非 POST 一律 405」之前处理：
+  // 它们是 GET（Agent 下载），且不带 Bearer——签名 URL 自验证。
+  // 仍先要求 JWT_SECRET：验签密钥回退依赖它，缺失时不能放开（防配置错误静默放行）。
+  if (url.pathname === '/mcp/upload-jobs/download' || url.pathname === '/mcp/agent-update-asset') {
+    const configError = requireJwtSecret(env);
+    if (configError) return configError;
+    if (request.method !== 'GET') return new Response(null, { status: 405 });
+    if (url.pathname === '/mcp/agent-update-asset') return handleAgentAssetProxy(request, env, url);
+    return handleJobDownload(request, env, url);
+  }
+  if (request.method === 'POST' && /^\/mcp\/upload-jobs\/[^/]+\/content$/.test(url.pathname)) {
+    const configError = requireJwtSecret(env);
+    if (configError) return configError;
+    return handleJobContentUpload(request, env, url);
+  }
+
   if (request.method !== 'POST') return new Response(null, { status: 405 });
   const configError = requireJwtSecret(env);
   if (configError) return configError;
@@ -2020,7 +2382,7 @@ async function handleMcpInner(request, env) {
         else if (params.name === 'get_monitor') content = await mcpGetMonitor(user, env, params.arguments || {});
         else if (params.name === 'exec_command') content = await mcpExecCommand(user, env, params.arguments || {}, clientIp(request));
         else if (params.name === 'get_operation') content = await mcpGetOperation(user, env, params.arguments || {});
-        else if (params.name === 'update_agent') content = await mcpUpdateAgent(user, env, params.arguments || {}, clientIp(request));
+        else if (params.name === 'update_agent') content = await mcpUpdateAgent(user, env, params.arguments || {}, clientIp(request), url);
         else if (params.name === 'create_upload') content = await mcpCreateUpload(user, env, params.arguments || {}, url, clientIp(request));
         else if (params.name === 'add_server') content = await mcpAddServer(user, env, params.arguments || {}, clientIp(request), url);
         else if (params.name === 'delete_server') content = await mcpDeleteServer(user, env, params.arguments || {}, clientIp(request));

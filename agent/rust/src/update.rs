@@ -61,6 +61,60 @@ pub enum UpdateOutcome {
     },
 }
 
+/// 阶段 C：异步更新入口。Agent 已用 fetch 模块把资产下到 `staged`（同目录临时文件），
+/// 这里复用同步路径的校验 + self-replace 全链路（SHA/版本/平台/backup 语义完全一致）。
+/// 与 `handle_frame` 的区别只在"字节怎么来"：帧是 DO 推，这里是自己拉。
+pub struct StagedUpdate {
+    pub update_id: String,
+    pub build_id: String,
+    pub platform: String,
+    pub size: u64,
+    pub sha256: String,
+    pub staging: PathBuf,
+}
+
+/// 在 blocking::file_blocking 内调用（内部做同步 IO）。
+pub fn install_staged(
+    staged: StagedUpdate,
+    expected_platform: &str,
+) -> Result<UpdateOutcome, String> {
+    if !staged.platform.is_empty() && staged.platform != expected_platform {
+        let _ = std::fs::remove_file(&staged.staging);
+        return Err(format!(
+            "update platform mismatch: asset={} agent={expected_platform}",
+            staged.platform
+        ));
+    }
+    let meta =
+        std::fs::metadata(&staged.staging).map_err(|e| format!("stat staged update: {e}"))?;
+    if meta.len() != staged.size {
+        let _ = std::fs::remove_file(&staged.staging);
+        return Err(format!(
+            "staged size mismatch: {} != {}",
+            meta.len(),
+            staged.size
+        ));
+    }
+    let session = UpdateSession {
+        id: staged.update_id,
+        build_id: staged.build_id,
+        expected_size: staged.size,
+        sha256: staged.sha256,
+        platform: staged.platform,
+        staging: staged.staging,
+        written: staged.size,
+    };
+    // cancelled 用一次性 false：本路径不参与 abort（连接断开时下载任务自己清理 staging）
+    let cancelled = std::sync::atomic::AtomicBool::new(false);
+    match install(session, &cancelled) {
+        Ok(outcome) => Ok(outcome),
+        Err((staging, msg)) => {
+            let _ = std::fs::remove_file(staging);
+            Err(msg)
+        }
+    }
+}
+
 pub struct UpdateManager {
     inner: Mutex<Option<UpdateSession>>,
     cancelled: std::sync::atomic::AtomicBool,

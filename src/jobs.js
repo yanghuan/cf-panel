@@ -9,7 +9,11 @@
 //   - 状态流转全部用条件更新（WHERE id=? AND status IN (...)），靠 meta.changes 判断是否命中；
 //     重复回执、过期后迟到的结果都不会覆盖终态。
 //   - agent_update 独占一台服务器；exec 之间、exec 与 upload 之间不互斥（保持既有语义）。
-import { JOB_TTL_S, EXEC_JOB_GRACE_S, JOB_POLL_AFTER_MS, JOB_TERMINAL_STATES } from './config.js';
+import {
+  JOB_TTL_S, EXEC_JOB_GRACE_S, JOB_POLL_AFTER_MS, JOB_TERMINAL_STATES,
+  UPLOAD_JOB_UPLOAD_WINDOW_S, UPLOAD_JOB_AGENT_WINDOW_S, UPLOAD_JOB_GRACE_S,
+  UPDATE_JOB_TIMEOUT_S, UPDATE_JOB_GRACE_S, UPLOAD_R2_PREFIX,
+} from './config.js';
 
 const ACTIVE_STATES = ['queued', 'awaiting_upload', 'staging', 'staged', 'waiting_agent', 'running'];
 
@@ -98,16 +102,20 @@ export async function markJobRunning(env, id) {
   return !!res.meta.changes;
 }
 
-// 下发前失败（Agent 离线、更新中、发送异常）：queued/running -> failed。
-// 允许从 running 回退，是为了覆盖「先置 running 再发送、发送抛错」的窗口。
+// 下发前失败（Agent 离线、更新中、发送异常）：非终态 -> failed。
+// 覆盖**任意非终态**：exec 走 queued/running，upload 会先到 staged，agent_update 走 queued。
+// 只放 queued/running 会让 upload 的下发失败留在 staged，客户端一直看到"等待 Agent"
+// 直到 deadline（实测过，别改窄）。允许从 running 回退，是为了覆盖「先置 running 再发送、
+// 发送抛错」的窗口。
 export async function failJob(env, id, error) {
   const now = nowSec();
+  const placeholders = ACTIVE_STATES.map(() => '?').join(',');
   const res = await env.DB.prepare(
     `UPDATE operation_jobs
         SET status = 'failed', error = ?, finished_at = ?,
             duration_ms = CASE WHEN started_at IS NULL THEN NULL ELSE (? - started_at) * 1000 END
-      WHERE id = ? AND status IN ('queued','running')`
-  ).bind(String(error || 'failed'), now, now, id).run();
+      WHERE id = ? AND status IN (${placeholders})`
+  ).bind(String(error || 'failed'), now, now, id, ...ACTIVE_STATES).run();
   return !!res.meta.changes;
 }
 
@@ -139,7 +147,22 @@ export async function settleExpired(env, job) {
             duration_ms = CASE WHEN started_at IS NULL THEN NULL ELSE (? - started_at) * 1000 END
       WHERE id = ? AND status IN (${placeholders})`
   ).bind(job.kind === 'exec' ? 'no result before deadline' : 'expired before completion', now, now, job.id, ...ACTIVE_STATES).run();
-  return res.meta.changes ? getJob(env, job.id) : job;
+  if (!res.meta.changes) return job;
+  // 过期即删 staging 对象：不能等 cron 的 24h TTL——一次 Agent 掉线的 100MB 上传
+  // 会在额度里白躺一天，几十次就顶满 10GB。此处在判定过期的同一路径上清掉。
+  await deleteStagingObject(env, job);
+  return getJob(env, job.id);
+}
+
+// 删除任务对应的 R2 暂存对象（仅 upload）。失败只记日志：
+// 行仍会过期被删，孤儿对象由 cron 的 list 扫描与 R2 lifecycle 兜底。
+export async function deleteStagingObject(env, job) {
+  if (!job || job.kind !== 'upload' || !job.r2_key) return;
+  try {
+    await env.UPLOADS.delete(job.r2_key);
+  } catch (e) {
+    console.error('staging object delete failed:', e);
+  }
 }
 
 // 互斥：该服务器是否有进行中的 agent update（更新会重启 Agent，禁止与 exec 交错）
@@ -148,6 +171,160 @@ export async function hasActiveAgentUpdate(env, serverId) {
     "SELECT 1 AS x FROM operation_jobs WHERE server_id = ? AND kind = 'agent_update' AND status IN ('queued','waiting_agent','running') LIMIT 1"
   ).bind(serverId).first();
   return !!row;
+}
+
+// ---- upload 任务 ----
+
+// 创建 upload 任务（awaiting_upload）。同一服务器已有非终态 upload 时抛 UPLOAD_BUSY。
+// 有效期分两段：先给客户端 10 分钟上传字节；落 R2 后再给 Agent 120s 拉取，
+// 两段窗口互不复用（上传慢不该挤掉 Agent 的时间）。
+export async function createUploadJob(env, { user, serverId, targetPath, overwrite, maxBytes, clientIp }) {
+  await purgeExpired(env);
+  const now = nowSec();
+  const jobId = newJobId();
+  const job = {
+    id: jobId,
+    kind: 'upload',
+    status: 'awaiting_upload',
+    user_id: user.id,
+    username: user.username,
+    client_ip: clientIp || '',
+    server_id: serverId,
+    target_path: targetPath,
+    overwrite: overwrite ? 1 : 0,
+    size_bytes: maxBytes, // 暂存上限，落盘后覆盖为实际大小
+    created_at: now,
+    deadline_at: now + UPLOAD_JOB_UPLOAD_WINDOW_S,
+    expires_at: now + JOB_TTL_S,
+    r2_key: `${UPLOAD_R2_PREFIX}${jobId}`,
+  };
+  try {
+    await env.DB.prepare(
+      `INSERT INTO operation_jobs
+         (id, kind, status, user_id, username, client_ip, server_id, target_path, overwrite,
+          size_bytes, r2_key, created_at, deadline_at, expires_at)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+    ).bind(
+      job.id, job.kind, job.status, job.user_id, job.username, job.client_ip, job.server_id,
+      job.target_path, job.overwrite, job.size_bytes, job.r2_key, job.created_at, job.deadline_at, job.expires_at
+    ).run();
+  } catch (e) {
+    // 部分唯一索引命中：该服务器已有进行中的 upload。语义上不是错误输入，而是"忙"。
+    if (/UNIQUE constraint failed: operation_jobs\.server_id/.test(String(e && e.message))) {
+      const err = new Error('another upload is in progress for this server');
+      err.code = 'UPLOAD_BUSY';
+      throw err;
+    }
+    throw e;
+  }
+  return env.DB.prepare('SELECT * FROM operation_jobs WHERE id = ?').bind(job.id).first();
+}
+
+// awaiting_upload -> staging（抢占上传权）。返回是否命中：未命中说明已被并发上传或已过期。
+export async function claimUploadStaging(env, id, expectServerId) {
+  const now = nowSec();
+  const res = await env.DB.prepare(
+    `UPDATE operation_jobs SET status = 'staging', started_at = ?
+      WHERE id = ? AND server_id = ? AND status = 'awaiting_upload' AND deadline_at >= ?`
+  ).bind(now, id, expectServerId, now).run();
+  return !!res.meta.changes;
+}
+
+// staging -> staged：字节已完整写入 R2。size 用实测值（不信任 Content-Length）。
+// deadline 重置为 Agent 拉取窗口——上传窗口已消耗完，不能沿用它。
+export async function markUploadStaged(env, id, { sizeBytes }) {
+  const now = nowSec();
+  const res = await env.DB.prepare(
+    `UPDATE operation_jobs
+        SET status = 'staged', size_bytes = ?, deadline_at = ?, started_at = COALESCE(started_at, ?)
+      WHERE id = ? AND status = 'staging'`
+  ).bind(sizeBytes, now + UPLOAD_JOB_AGENT_WINDOW_S + UPLOAD_JOB_GRACE_S, now, id).run();
+  return !!res.meta.changes;
+}
+
+// staged -> waiting_agent -> running：DO 下发 upload_fetch 前后各一次。
+export async function markUploadWaitingAgent(env, id) {
+  const res = await env.DB.prepare(
+    "UPDATE operation_jobs SET status = 'waiting_agent' WHERE id = ? AND status = 'staged'"
+  ).bind(id).run();
+  return !!res.meta.changes;
+}
+
+export async function markUploadRunning(env, id) {
+  const now = nowSec();
+  const res = await env.DB.prepare(
+    `UPDATE operation_jobs
+        SET status = 'running', started_at = COALESCE(started_at, ?), deadline_at = ?,
+            dispatch_attempts = dispatch_attempts + 1
+      WHERE id = ? AND status = 'waiting_agent'`
+  ).bind(now, now + UPLOAD_JOB_AGENT_WINDOW_S + UPLOAD_JOB_GRACE_S, id).run();
+  return !!res.meta.changes;
+}
+
+// upload 终态。成功（Agent 已 commit）与失败共用；R2 对象由调用方决定是否删除。
+export async function finishUploadJob(env, id, { ok, error = null }) {
+  const now = nowSec();
+  const res = await env.DB.prepare(
+    `UPDATE operation_jobs
+        SET status = ?, error = ?, finished_at = ?,
+            duration_ms = CASE WHEN started_at IS NULL THEN NULL ELSE (? - started_at) * 1000 END
+      WHERE id = ? AND status IN ('awaiting_upload','staging','staged','waiting_agent','running')`
+  ).bind(ok ? 'succeeded' : 'failed', error, now, now, id).run();
+  if (!res.meta.changes) return null;
+  return env.DB.prepare('SELECT * FROM operation_jobs WHERE id = ?').bind(id).first();
+}
+
+// ---- agent update 任务 ----
+
+export async function createAgentUpdateJob(env, {
+  user, serverId, buildId, fromVersion, platform, sizeBytes, sha256, assetUrl, clientIp,
+}) {
+  await purgeExpired(env);
+  const now = nowSec();
+  const id = newJobId();
+  try {
+    await env.DB.prepare(
+      `INSERT INTO operation_jobs
+         (id, kind, status, user_id, username, client_ip, server_id, build_id, from_version, to_version,
+          platform, size_bytes, sha256, asset_url, created_at, deadline_at, expires_at)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+    ).bind(
+      id, 'agent_update', 'queued', user.id, user.username, clientIp || '', serverId,
+      buildId, fromVersion, buildId, platform, sizeBytes, sha256, assetUrl,
+      now, now + UPDATE_JOB_TIMEOUT_S + UPDATE_JOB_GRACE_S, now + JOB_TTL_S
+    ).run();
+  } catch (e) {
+    if (/UNIQUE constraint failed: operation_jobs\.server_id/.test(String(e && e.message))) {
+      const err = new Error('an agent update is already in progress for this server');
+      err.code = 'UPDATE_BUSY';
+      throw err;
+    }
+    throw e;
+  }
+  return env.DB.prepare('SELECT * FROM operation_jobs WHERE id = ?').bind(id).first();
+}
+
+export async function markUpdateRunning(env, id) {
+  const now = nowSec();
+  const res = await env.DB.prepare(
+    `UPDATE operation_jobs
+        SET status = 'running', started_at = ?, dispatch_attempts = dispatch_attempts + 1
+      WHERE id = ? AND status = 'queued'`
+  ).bind(now, id).run();
+  return !!res.meta.changes;
+}
+
+export async function finishUpdateJob(env, id, { ok, error = null, timedOut = false }) {
+  const now = nowSec();
+  const status = timedOut ? 'timed_out' : (ok ? 'succeeded' : 'failed');
+  const res = await env.DB.prepare(
+    `UPDATE operation_jobs
+        SET status = ?, error = ?, finished_at = ?,
+            duration_ms = CASE WHEN started_at IS NULL THEN NULL ELSE (? - started_at) * 1000 END
+      WHERE id = ? AND status IN ('queued','running')`
+  ).bind(status, error, now, now, id).run();
+  if (!res.meta.changes) return null;
+  return env.DB.prepare('SELECT * FROM operation_jobs WHERE id = ?').bind(id).first();
 }
 
 // 对外视图：未终态不返回输出（stdout/stderr 可能含敏感内容，且此时还没有值）
@@ -173,13 +350,63 @@ export function jobView(job, { pollAfterMs = JOB_POLL_AFTER_MS } = {}) {
       timed_out: !!job.timed_out,
       error: job.error || null,
     };
+  } else if (job.kind === 'upload') {
+    view.result = {
+      ok: job.status === 'succeeded',
+      error: job.error || null,
+      path: job.target_path || null,
+      size_bytes: job.size_bytes ?? null,
+    };
   } else {
     view.result = {
       ok: job.status === 'succeeded',
       error: job.error || null,
-      size_bytes: job.size_bytes ?? null,
       build_id: job.build_id ?? null,
+      from_version: job.from_version ?? null,
+      size_bytes: job.size_bytes ?? null,
     };
   }
   return view;
+}
+
+// 清理：非终态且过 deadline → expired（exec 的收敛在 settleExpired，这里补 upload/update）。
+// 必须先查后改：纯 UPDATE 拿不到受影响行的 r2_key，upload 的暂存件就只能等 TTL，
+// 而 TTL 是 24h——一次 Agent 掉线的 100MB 上传会白占额度一整天。
+// 返回本次收敛的行数，供 cron 观测。
+export async function settleExpiredAll(env, now = nowSec()) {
+  const rows = await env.DB.prepare(
+    `SELECT id, kind, r2_key FROM operation_jobs
+      WHERE status IN ('queued','awaiting_upload','staging','staged','waiting_agent','running')
+        AND deadline_at < ?
+      LIMIT 200`
+  ).bind(now).all();
+  const list = rows.results || [];
+  if (!list.length) return 0;
+  const placeholders = ACTIVE_STATES.map(() => '?').join(',');
+  let changed = 0;
+  for (const job of list) {
+    const res = await env.DB.prepare(
+      `UPDATE operation_jobs
+          SET status = 'expired', error = COALESCE(error, 'no result before deadline'), finished_at = ?,
+              duration_ms = CASE WHEN started_at IS NULL THEN NULL ELSE (? - started_at) * 1000 END
+        WHERE id = ? AND status IN (${placeholders})`
+    ).bind(now, now, job.id, ...ACTIVE_STATES).run();
+    if (!res.meta.changes) continue; // 竞态：已被其它路径收敛
+    changed += 1;
+    await deleteStagingObject(env, job);
+  }
+  return changed;
+}
+
+// cron：删除已过 TTL 的行，返回被删行数与被删中 r2_key 非空的 key（供 cron 顺带清 R2）。
+export async function purgeExpiredJobs(env, now = nowSec()) {
+  const rows = await env.DB.prepare(
+    'SELECT id, r2_key FROM operation_jobs WHERE expires_at < ? LIMIT 500'
+  ).bind(now).all();
+  const list = rows.results || [];
+  if (!list.length) return { deleted: 0, r2Keys: [] };
+  const placeholders = list.map(() => '?').join(',');
+  await env.DB.prepare(`DELETE FROM operation_jobs WHERE id IN (${placeholders})`)
+    .bind(...list.map((r) => r.id)).run();
+  return { deleted: list.length, r2Keys: list.map((r) => r.r2_key).filter(Boolean) };
 }

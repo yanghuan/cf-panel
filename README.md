@@ -41,18 +41,32 @@ Dashboard → **Workers & Pages → D1 → Create database**，名称 `cf-panel`
 
 > 数据库实例必须在平台手动创建一次（无法脚本化）；**建表与后续迁移全部自动完成**，无需手动执行 SQL。
 
-### 2. 部署 Worker
+### 2. 创建 R2 存储桶
+
+**upload 异步化的暂存区**（阶段 B）：客户端上传的字节先写入 R2，agent 再从签名 URL 拉取——数据面不经过 Durable Object，否则 DO 会在整个传输期间保持活跃计费。
+
+Dashboard → **R2 Object Storage → Create bucket**，名称必须是 **`cf-panel-upload-staging`**（与 `wrangler.toml` 的 `[[r2_buckets]] bucket_name` 一致）。
+
+> - 首次使用 R2 需在控制台**启用一次**（要求绑定支付方式；免费额度 10 GB 存储 + 出网免费，本项目用量远低于此）。
+> - **不要**开启公开访问、不要绑定自定义域名——只通过 Worker 的内部绑定读写。
+> - 桶名不一致时 `wrangler deploy` 会报 `Couldn't find a R2 bucket with name "..."`；此时按此名重建桶，或改 `wrangler.toml` 两边对齐。
+> - 可选：给桶配置「Object lifecycle rules」删除 `upload-jobs/` 前缀下超过 24 小时的对象。代码已有清理（cron + 任务终态即时删除），这条只是第三层兜底。
+
+### 3. 部署 Worker
 
 **方式 A：网页端（推荐，无需本地 CLI）**
 
 1. Workers & Pages → **Create application → Import a repository**，授权 GitHub 并选择本仓库。项目名必须与 `wrangler.toml` 的 `name = "cf-panel"` 完全一致，根目录 `/`，Save and Deploy。
 2. 在该 Worker → **Builds → Build configuration → Deploy command** 填 `npm run deploy`。
    > `npm run deploy` = `wrangler d1 migrations apply cf-panel --remote && wrangler deploy`，此后每次 `git push` 自动「迁移建表 + 部署」。
+   >
+   > ⚠️ **D1 与 R2 必须在网页端先手动创建**（见上面第 1、2 步）——平台无法脚本化创建实例，且 `wrangler.toml` 里的 `[[r2_buckets]]` 绑定若指向不存在的桶，部署会直接失败。
 
 **方式 B：CLI（备选）**
 
 ```bash
 wrangler d1 create cf-panel                                   # 把 database_id 填入 wrangler.toml
+wrangler r2 bucket create cf-panel-upload-staging             # 仅首次：upload 暂存（未创建时 deploy 失败）
 wrangler d1 migrations apply cf-panel --remote                # 建表 / 迁移（幂等）
 wrangler secret put JWT_SECRET                                # 见下一步的密钥说明
 wrangler secret put HASH_SECRET
@@ -60,7 +74,7 @@ wrangler secret put PANEL_USERS                               # 或 PANEL_PASSWO
 wrangler deploy
 ```
 
-### 3. 配置密钥
+### 4. 配置密钥
 
 在 Worker → **Settings → Variables and Secrets** 添加（或 CLI `wrangler secret put <NAME>`）：
 
@@ -77,7 +91,7 @@ wrangler deploy
 - ⚠️ Worker 一旦配置过 Dashboard secret，`wrangler deploy` 会被拒绝，只能走 Builds/CI 部署——即方式 A 是配密钥后的唯一部署路径。
 - 修改 `JWT_SECRET` 会使所有已登录 token 失效（需重新登录）。
 
-### 4. 添加服务器并安装 Agent
+### 5. 添加服务器并安装 Agent
 
 面板点「添加服务器」→ 填名称 → 弹出**一次性** agent 配置（WSS 地址 + KEY），妥善保存（KEY 是 agent 的唯一身份凭证）。
 
@@ -150,7 +164,7 @@ $env:AGENT_SELF_RESTART = "1"   # 无服务包装器时，更新后自启新版�
 
 </details>
 
-### 5. 本地开发
+### 6. 本地开发
 
 ```bash
 npm run dev        # predev 自动生成 .dev.vars 随机密钥，本地 SQLite 自动应用 migrations
@@ -195,6 +209,7 @@ npm run test:e2e   # 端到端（需 wrangler dev + release agent）
 | `STATS_TZ_OFFSET_MINUTES` | `0`（UTC） | 按天账的时区偏移，UTC+8 填 `480` |
 | `AGENT_RELEASE_REPO` | `yanghuan/cf-panel` | Agent 自更新的 Release 仓库（Fork 部署必改） |
 | `AGENT_MANIFEST_URL` | — | 指定清单镜像；资产 URL 仍须匹配 `AGENT_RELEASE_REPO` 的 Release |
+| `UPLOAD_MAX_MB` | `100` | 单次上传大小上限（MB）。钳到 **500 硬上限**；`0`/非数字回退 100（不支持"0=无限"）。注意还受 agent `FILE_LIMIT`（500MB）与 **Cloudflare 单请求体上限**（免费版 100MB）双重约束——平台上限更低时调高无效 |
 
 > `STATS_TZ_OFFSET_MINUTES` 只影响**之后新产生**的天账日期归属；查询与展示统一按**当前**偏移换算，因此中途切换会让历史日期显示整体平移。请在开始记录前确定并避免更改。
 
@@ -287,7 +302,10 @@ Webhook 出站安全：仅允许 HTTP(S)，拒绝 URL 内嵌凭据、本地域�
 卡片点「文件」→ 文件管理器。
 
 - **浏览**：点击进入 / 上级 / 路径跳转；列表显示每项的权限（`rwxr-xr-x (0755)`）。
-- **上传**：支持一次选多个、或直接拖到弹窗；逐个串行并显示进度。**单文件默认上限 100MB**（`UPLOAD_MAX_MB` 可调，受 agent 端 500MB 硬上限约束）。
+- **上传**：支持一次选多个、或直接拖到弹窗；逐个串行并显示进度。**单文件默认上限 100MB**，三层约束共同决定实际可用值：
+  1. `UPLOAD_MAX_MB` 环境变量（默认 100，被钳到 **500MB 硬上限**；`0`/非数字回退 100，不支持"0=无限"）；
+  2. agent 落盘的 `FILE_LIMIT`（500MB 编译期常量，不可调）；
+  3. **Cloudflare 单请求体上限**——免费版 100MB、Pro 100MB、Business 200MB、Enterprise 500MB（以官方公告为准）。所以免费版上调 `UPLOAD_MAX_MB` **不会真正生效**：请求在到达 Worker 之前就被平台拒绝，且报错来自平台层、不易定位。需要更大文件请改用其他传输方式（如 `create_upload` 之外的 rsync/scp），或升级计划。
 - **下载**：目录自动打包 ZIP（文件名 `目录名.zip`）。
 - **搜索**：**过滤**只看当前目录（`*`/`?` 通配符，agent 端先过滤再截断）；**递归搜索**下钻子目录（如 `*.log`，带深度 / 结果数 / 扫描条目三重上限）。递归搜索按**文件名**匹配，不支持内容搜索。
 - **行操作（⋯ 菜单）**：下载 / 重命名（仅改名）/ 移动 / 复制（目录递归拷贝，拒绝复制到自身子目录）/ 权限 / 编辑 / 删除（目录递归）。
@@ -388,6 +406,7 @@ Webhook 出站安全：仅允许 HTTP(S)，拒绝 URL 内嵌凭据、本地域�
 | --- | --- | --- |
 | POST | `/api/terminal` | 创建终端会话（exec 权限 + 归属校验），返回 `session_id` |
 | POST | `/api/exec-jobs` | **异步**执行一次性命令（`server_id` + `command`，`timeout` 1~25s，可选 `idempotency_key`）：创建任务并短请求下发，返回 `202 {job_id, poll_tool, poll_after_ms}`；结果用 `GET /api/jobs/:id` 轮询 |
+| POST | `/api/upload-jobs` | **异步**上传（`server_id` + `path`，可选 `overwrite`）：返回 `202 {job_id, upload_url, ...}`。字节经 `upload_url` 直接写入 R2，Agent 再从签名 URL 拉取——**数据面不经过 DO** |
 | GET | `/api/jobs/:id` | 查询任务状态/结果（exec / upload / agent_update 通用）。只读 D1、**不访问 DO**；终态才返回 `result`；`Cache-Control: no-store` |
 | POST | `/api/file/open` | 创建文件管理会话，返回 `session_id` |
 | GET | `/ws/terminal/{id}` | 浏览器终端 WebSocket（校验创建者 / admin） |
@@ -417,8 +436,9 @@ Webhook 出站安全：仅允许 HTTP(S)，拒绝 URL 内嵌凭据、本地域�
 | `list_servers` | 服务器列表 + 实时状态 + 系统信息 |
 | `get_monitor` | 监控历史（`range`：1h/12h/3d/7d/30d） |
 | `exec_command` | **异步**执行一次性 shell 命令（`timeout` 1~25s，命令长度 ≤65408 字节（JSON 转义后；中文 3 字节/字符），stdout 上限约 44KB）；**写操作**，需 exec 权限，超时 kill 进程组。只返回 `job_id` + `accepted`，**必须用 `get_operation` 轮询**才能拿到 exit_code/stdout/stderr。超长命令请先用 `create_upload` 上传脚本再执行 |
-| `get_operation` | 查询异步任务（`job_id`）状态与结果；`succeeded`/`failed`/`timed_out`/`expired` 为终态。按任务类型校验权限（exec/upload 需 `server:exec`，agent_update 需 `agent:update`；`panel:admin` 全量） |
-| `create_upload` | 签发一次性上传**签名 URL**（HMAC 绑定 server/path/overwrite，10 分钟过期，无需 Bearer）——大文件 / 二进制不经 LLM 上下文 |
+| `get_operation` | 查询异步任务（`job_id`）状态与结果；`succeeded`/`failed`/`timed_out`/`expired` 为终态。按任务类型校验权限（exec/upload 需 `server:exec`，agent_update 需 `agent:update`；`panel:admin` 全量）。**所有异步工具的下一步都是它** |
+| `create_upload` | **异步**上传：创建 upload 任务并签发一次性**签名 URL**（HMAC 绑定 job+server，10 分钟过期，无需 Bearer）——大文件 / 二进制不经 LLM 上下文。字节写入 R2 暂存，Agent 自行拉取，必须用 `get_operation` 轮询终态 |
+| `update_agent` | **异步**触发 Agent 自更新：Agent 自己经 Worker 资产代理下载 Release，DO 只下发元数据（不再转发二进制）。需 `agent:update`；必须用 `get_operation` 轮询终态。单机串行，多台请逐台 |
 | `add_server` / `update_server` / `delete_server` | 服务器增删改（仅管理员）；支持 `description`（多行运维备注，≤500 字，随 `list_servers` 返回） |
 | `rotate_agent_key` | 轮换 agent key（仅管理员，历史保留） |
 | `list_tokens` / `create_token` / `revoke_token` | PAT 生命周期（仅管理员，明文只返回一次） |
@@ -426,6 +446,8 @@ Webhook 出站安全：仅允许 HTTP(S)，拒绝 URL 内嵌凭据、本地域�
 | `get_settings` / `update_settings` | 面板设置（含全局免打扰 `mute_until`，仅管理员；PAT 需 `panel:admin`） |
 
 > **行为变更（阶段 A）**：`exec_command` 由"同步返回 stdout"改为"异步任务"。调用方拿到 `job_id` 后必须轮询 `get_operation`（建议按返回的 `poll_after_ms`，默认 1s），终态才有 `exit_code`/`stdout`/`stderr`。
+>
+> 同一套机制也用于 `create_upload` 与 `update_agent`（阶段 B/C）：上传字节先进 R2、Agent 从签名 URL 拉取；更新资产由 Worker 代理 GitHub，Agent 自己下载。三条链路里 DO 都只下发元数据，不再搬运数据。
 >
 > 动机：原实现让 shard DO 为一次命令保持 25~30 秒活跃（DO duration 按活跃墙钟 × 128MB 计费，等待 I/O 同样计入）。现在 DO 只做「下发 + 结果回执落库」，任务状态存 D1，轮询由 Worker 直接读库、不激活 DO。任务在 DO evict 后仍可完成（结果回调唤醒 DO，状态全部来自 D1）。
 

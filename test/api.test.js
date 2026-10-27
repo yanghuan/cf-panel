@@ -5,7 +5,7 @@
 // ============================================================
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import worker, { __internals as I } from '../src/index.js';
+import worker, { __internals as I, TerminalDO } from '../src/index.js';
 import { EXEC_CMD_MAX_BYTES, SERVER_DESC_MAX } from '../src/config.js';
 import { makeEnv, makePanelStub, makeMetricsStub, requestBuilder } from './helpers.js';
 
@@ -254,18 +254,23 @@ test('对外绝对 URL 协议跟随访问协议（wss_base / upload_url，http�
   const mcpHttps = JSON.parse((await (await mcpAdd('https://panel.local')).json()).result.content[0].text);
   assert.equal(mcpHttps.wss_base, 'wss://panel.local/ws/agent', 'MCP + https → wss://');
 
-  // MCP create_upload：签发给 curl 的上传 URL 同样派生
-  const mcpUpload = (base) => mcp(env, {
+  // MCP create_upload：签发给 curl 的上传 URL 同样派生（阶段 B：/mcp/upload-jobs/:id/content）
+  // 两次调用必须用不同服务器：upload job 单机串行（部分唯一索引），同一台第二次会 409。
+  const mcpUpload = (base, sid) => mcp(env, {
     token, base,
-    body: { jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'create_upload', arguments: { server_id: 1, path: '/opt/app.tar.gz' } } },
+    body: { jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'create_upload', arguments: { server_id: sid, path: '/opt/app.tar.gz' } } },
   });
-  const upHttp = JSON.parse((await (await mcpUpload('http://panel.local')).json()).result.content[0].text);
-  assert.match(upHttp.upload_url, /^http:\/\/panel\.local\/mcp\/file_upload\?/, 'create_upload + http → http://');
-  const upHttps = JSON.parse((await (await mcpUpload('https://panel.local')).json()).result.content[0].text);
-  assert.match(upHttps.upload_url, /^https:\/\/panel\.local\/mcp\/file_upload\?/, 'create_upload + https → https://');
+  const sid1 = (await env.DB.prepare("SELECT id FROM servers WHERE name = 'rest-http'").first()).id;
+  const sid2 = (await env.DB.prepare("SELECT id FROM servers WHERE name = 'rest-https'").first()).id;
+  const upHttp = JSON.parse((await (await mcpUpload('http://panel.local', sid1)).json()).result.content[0].text);
+  assert.match(upHttp.upload_url, /^http:\/\/panel\.local\/mcp\/upload-jobs\/job_[0-9a-f]{32}\/content\?/, 'create_upload + http → http://');
+  const upHttps = JSON.parse((await (await mcpUpload('https://panel.local', sid2)).json()).result.content[0].text);
+  assert.match(upHttps.upload_url, /^https:\/\/panel\.local\/mcp\/upload-jobs\/job_[0-9a-f]{32}\/content\?/, 'create_upload + https → https://');
   // 协议不进签名载荷：http 入口签发的 URL 改写成 https 后仍验签通过（dev/prod 签名语义一致）
-  const rewrote = await worker.fetch(new Request(upHttp.upload_url.replace(/^http:/, 'https:'), { method: 'POST', body: 'x' }), env);
-  assert.equal(rewrote.status, 200, '改写协议不影响签名校验');
+  const rewrote = await worker.fetch(new Request(upHttp.upload_url.replace(/^http:/, 'https:'), {
+    method: 'POST', headers: { 'content-length': '1' }, body: 'x',
+  }), env);
+  assert.notEqual(rewrote.status, 403, '改写协议不影响签名校验');
 });
 
 test('PATCH /api/servers/:id：部分字段更新（不再 500）', async () => {
@@ -1205,6 +1210,8 @@ test('Agent 更新：仅管理员、能力检查、Release 流式中转与审计
     .bind(JSON.stringify({
       agent_version: '2026.08.20-1000', agent_platform: 'linux-x86_64',
       update_protocol: 1, self_update_enabled: true,
+      // 阶段 C：异步更新要求 Agent 声明确切支持 agent_update_fetch 拉取
+      update_fetch_proto: 1,
     }), Math.floor(Date.now() / 1000)).run();
 
   const binary = new Uint8Array([1, 2, 3, 4]);
@@ -1240,17 +1247,26 @@ test('Agent 更新：仅管理员、能力检查、Release 流式中转与审计
     const updated = await call(env, {
       method: 'POST', path: '/api/servers/1/agent-update', token: admin,
     });
-    assert.equal(updated.status, 200);
-    assert.equal((await updated.json()).build_id, manifest.build_id);
-    assert.equal(env.TERMINAL.calls.at(-1).path, '/rpc/agent_update');
-    const headers = env.TERMINAL.calls.at(-1).init.headers;
-    assert.equal(headers['x-agent-platform'], 'linux-x86_64');
-    assert.equal(headers['x-agent-size'], '4');
-    assert.equal(fetched.length, 2, 'manifest 一次 + asset 一次（latest 缓存复用）');
+    // 阶段 C：异步。只创建任务 + 下发元数据与短期资产 URL，不下载资产、不流式转发。
+    assert.equal(updated.status, 202);
+    const upBody = await updated.json();
+    assert.equal(upBody.build_id, manifest.build_id);
+    assert.match(upBody.job_id, /^job_[0-9a-f]{32}$/);
+    assert.equal(upBody.status, 'running');
+    assert.equal(upBody.poll_tool, 'get_operation');
+    assert.equal(env.TERMINAL.calls.at(-1).path, '/rpc/agent_update/submit');
+    const sub = env.TERMINAL.calls.at(-1).init.body;
+    const subJson = JSON.parse(sub);
+    assert.equal(subJson.platform, 'linux-x86_64');
+    assert.equal(subJson.size, 4);
+    assert.match(subJson.downloadUrl, /\/mcp\/agent-update-asset\?/);
+    assert.equal('body' in env.TERMINAL.calls.at(-1).init, true);
+    assert.equal(env.TERMINAL.calls.at(-1).init.body instanceof ReadableStream, false, '不再转发二进制流');
+    // 只取过 manifest，**没有**下载 Release 资产（数据面已移出 Worker→DO 链路）
+    assert.equal(fetched.length, 1, '仅 manifest 一次；资产由 Agent 自行经代理拉取');
     const audits = await env.DB.prepare("SELECT action FROM audit_logs WHERE action LIKE 'agent.update.%' ORDER BY id").all();
-    assert.deepEqual(audits.results.map((x) => x.action), [
-      'agent.update.request', 'agent.update.installed',
-    ]);
+    assert.deepEqual(audits.results.map((x) => x.action), ['agent.update.request'],
+      '终态审计改由 DO 在回执后写入');
 
     // PAT 即使有 exec 权限也不可更新 Agent
     const patRes = await call(env, {
@@ -1268,10 +1284,16 @@ test('Agent 更新：仅管理员、能力检查、Release 流式中转与审计
       body: { name: 'upd', scopes: ['agent:update'] },
     });
     const updToken = (await patUpdRes.json()).token;
+    // 单机串行：上一次更新（管理员触发）的任务仍在 running，第二次必须 409 —— 这正是
+    // 部分唯一索引要防的"二进制更新帧与另一个更新交错"。先把它收敛掉再验证 PAT 能触发。
+    assert.equal((await call(env, {
+      method: 'POST', path: '/api/servers/1/agent-update', token: updToken,
+    })).status, 409, '同一服务器的第二个更新必须被串行锁拒绝');
+    await env.DB.prepare("UPDATE operation_jobs SET status = 'succeeded' WHERE server_id = 1 AND kind = 'agent_update'").run();
     const updByPat = await call(env, {
       method: 'POST', path: '/api/servers/1/agent-update', token: updToken,
     });
-    assert.equal(updByPat.status, 200);
+    assert.equal(updByPat.status, 202);
     assert.equal((await updByPat.json()).build_id, manifest.build_id);
 
     // agent:update PAT 命中 server_ids 白名单限定：限定到其他服务器时对该机拒绝
@@ -1422,22 +1444,50 @@ test('MCP：tools/list 与 tools/call', async () => {
   assert.match(updTool.inputSchema.properties.alerts.description, /整体替换/,
     '须写明 alerts 是整体替换（漏传字段即丢失）');
 
-  // create_upload：签发签名 URL（结构 + 权限 + 绑定字段）
+  // create_upload：阶段 B 改为创建 upload job + 签名上传 URL（数据面走 R2，不经 DO）
   const cu = await (await mcp(env, { token, body: { jsonrpc: '2.0', id: 12, method: 'tools/call', params: { name: 'create_upload', arguments: { server_name: 'web-1', path: '/opt/app.tar.gz' } } } })).json();
   assert.equal(cu.result.isError, false);
   const cuRes = JSON.parse(cu.result.content[0].text);
   assert.equal(cuRes.server_name, 'web-1');
-  assert.match(cuRes.upload_url, /^http:\/\/panel\.local\/mcp\/file_upload\?/); // 测试入口 http → http（见协议派生测试）
+  assert.match(cuRes.job_id, /^job_[0-9a-f]{32}$/);
+  assert.equal(cuRes.status, 'awaiting_upload');
+  assert.match(cuRes.upload_url, /^http:\/\/panel\.local\/mcp\/upload-jobs\/job_[0-9a-f]{32}\/content\?/);
   assert.match(cuRes.upload_url, /token=/);
   assert.equal(cuRes.overwrite, false);
   assert.ok(cuRes.expires_in_seconds > 0 && cuRes.expires_in_seconds <= 600);
-  // 签名 URL 篡改路径 → 403（验签失败；同一签名换了 path 重算对不上）
-  const tampered = cuRes.upload_url.replace(/path=%2Fopt%2Fapp.tar.gz/, 'path=%2Ftmp%2Fevil');
-  const badSigned = await worker.fetch(new Request(tampered, { method: 'POST', body: 'x' }), env);
-  assert.equal(badSigned.status, 403);
-  // 合法签名 URL 可上传（DO stub 透传 → 200，无需 Bearer）
-  const goodSigned = await worker.fetch(new Request(cuRes.upload_url, { method: 'POST', body: 'hello signed' }), env);
-  assert.equal(goodSigned.status, 200);
+  assert.equal(cuRes.poll_tool, 'get_operation');
+
+  // 签名 URL 只绑 job：篡改 token → 403；无 Content-Length → 411
+  const baseUp = cuRes.upload_url;
+  const badToken = await worker.fetch(new Request(baseUp.replace(/token=[^&]+/, 'token=deadbeef.xx'), {
+    method: 'POST', headers: { 'content-length': '1' }, body: 'x',
+  }), env);
+  assert.equal(badToken.status, 403, '篡改 token 必须拒绝');
+  const noLen = await worker.fetch(new Request(baseUp, { method: 'POST', body: 'x' }), env);
+  // fetch 会自动补 content-length；这里只验证"没有 body"时不会写入成功
+  assert.ok([200, 202, 411].includes(noLen.status));
+
+  // 合法签名 URL 上传 → 字节落 R2，job 转 staged，并通知 DO（短请求）
+  const before = env.TERMINAL.calls.length;
+  const goodSigned = await worker.fetch(new Request(baseUp, {
+    method: 'POST', headers: { 'content-length': '12' }, body: 'hello signed',
+  }), env);
+  assert.equal(goodSigned.status, 202);
+  const stagedBody = await goodSigned.json();
+  assert.equal(stagedBody.status, 'staged');
+  assert.equal(stagedBody.size_bytes, 12);
+  // R2 里确有该对象（key = upload-jobs/<job_id>）
+  const stagedObj = await env.UPLOADS.get(`upload-jobs/${cuRes.job_id}`);
+  assert.ok(stagedObj, '字节必须落在 R2 staging');
+  assert.equal(await stagedObj.text(), 'hello signed');
+  // 下发走 /rpc/upload/submit，且只带元数据（不含文件字节）
+  const submitCall = env.TERMINAL.calls.slice(before).find((c) => c.path === '/rpc/upload/submit');
+  assert.ok(submitCall, '上传完成后应下发 upload_fetch');
+  // 同一 URL 再次上传 → 409（只接受 awaiting_upload，防旧 URL 重放覆盖已 staged 对象）
+  const replay = await worker.fetch(new Request(baseUp, {
+    method: 'POST', headers: { 'content-length': '3' }, body: 'abc',
+  }), env);
+  assert.equal(replay.status, 409, '已 staged 的 job 不得再次接收字节');
 
   // Bearer 路径（非签名分支）：/mcp/file_upload 带 token + server_id/path → 审计 + DO /rpc/upload 透传
   const serverRow = await env.DB.prepare("SELECT id FROM servers WHERE name = 'web-1'").first();
@@ -1451,8 +1501,12 @@ test('MCP：tools/list 与 tools/call', async () => {
   );
   assert.equal(bearerUp.status, 200, 'Bearer 上传分支应成功');
   assert.ok(env.TERMINAL.calls.some((c) => c.path === '/rpc/upload'), '转发到 TerminalDO /rpc/upload');
-  const upAudit = await env.DB.prepare("SELECT COUNT(*) AS c FROM audit_logs WHERE action = 'file.upload'").all();
-  assert.equal(upAudit.results[0].c, 2, '签名签发 1 次 + Bearer 直传 1 次审计');
+  // 阶段 B 的语义修正：create_upload 只写 file.upload.request（"请求上传"），
+  // file.upload 只在 Agent 成功 commit 后写——旧实现把"签发了 URL"当成"文件已落地"。
+  const upReq = await env.DB.prepare("SELECT COUNT(*) AS c FROM audit_logs WHERE action = 'file.upload.request'").all();
+  assert.ok(upReq.results[0].c >= 1, '创建任务时记 file.upload.request');
+  const upDone = await env.DB.prepare("SELECT COUNT(*) AS c FROM audit_logs WHERE action = 'file.upload'").all();
+  assert.equal(upDone.results[0].c, 1, '只有 Bearer 直传（旧同步路径）写 file.upload');
   // 非绝对路径拒绝
   const badPath = await worker.fetch(
     new Request(`http://panel.local/mcp/file_upload?server_id=${serverRow.id}&path=rel.txt`, {
@@ -2139,4 +2193,239 @@ test('异步 exec：DO 不可达时任务落 failed，不悬挂', async () => {
   const row = await env.DB.prepare('SELECT status, error FROM operation_jobs WHERE id = ?').bind(body.job_id).first();
   assert.equal(row.status, 'failed');
   assert.match(row.error, /dispatch failed/);
+});
+
+// ---------------- 阶段 B：upload 异步化（数据面走 R2） ----------------
+test('upload job：创建 → 上传字节 → R2 staging → 下发 → 终态清理对象', async () => {
+  const env = makeEnv();
+  const token = await login(env);
+  await addServer(env, token, { name: 'up1' });
+
+  // 创建任务：只创建 + 返回签名 URL，不传字节
+  const created = await call(env, { method: 'POST', path: '/api/upload-jobs', token, body: { server_id: 1, path: '/opt/a.bin' } });
+  assert.equal(created.status, 202);
+  const job = await created.json();
+  assert.equal(job.status, 'awaiting_upload');
+  assert.match(job.upload_url, /\/mcp\/upload-jobs\/job_[0-9a-f]{32}\/content\?/);
+
+  // 单机串行：同服务器第二个 upload → 409 UPLOAD_BUSY
+  const busy = await call(env, { method: 'POST', path: '/api/upload-jobs', token, body: { server_id: 1, path: '/opt/b.bin' } });
+  assert.equal(busy.status, 409);
+  assert.equal((await busy.json()).code, 'UPLOAD_BUSY');
+
+  // 上传字节：落 R2 + job 转 staged
+  const payload = 'x'.repeat(2048);
+  const up = await worker.fetch(new Request(job.upload_url, {
+    method: 'POST', headers: { 'content-length': String(payload.length) }, body: payload,
+  }), env);
+  assert.equal(up.status, 202);
+  const staged = await up.json();
+  assert.equal(staged.status, 'staged');
+  assert.equal(staged.size_bytes, 2048);
+  const obj = await env.UPLOADS.get(`upload-jobs/${job.job_id}`);
+  assert.equal((await obj.text()).length, 2048);
+
+  // 轮询：staged 不是终态，不返回 result
+  const polled = await (await call(env, { path: `/api/jobs/${job.job_id}`, token })).json();
+  assert.equal(polled.status, 'staged');
+  assert.equal('result' in polled, false);
+
+  // DO 回执成功 → succeeded + R2 对象删除 + file.upload 审计
+  const inst = new TerminalDO({ storage: { get: async () => undefined, put: async () => {}, delete: async () => {} }, getWebSockets: () => [] }, env);
+  const ws = { deserializeAttachment: () => ({ role: 'control', serverId: 1 }), send() {}, readyState: 1, close() {} };
+  inst.agents.set(1, ws);
+  await inst.webSocketMessage(ws, JSON.stringify({
+    type: 'upload_result', upload_id: job.job_id, ok: true, commit: true, size: 2048,
+  }));
+  const done = await (await call(env, { path: `/api/jobs/${job.job_id}`, token })).json();
+  assert.equal(done.status, 'succeeded');
+  assert.equal(done.result.size_bytes, 2048);
+  assert.equal(await env.UPLOADS.head(`upload-jobs/${job.job_id}`), null, '成功即删 staging 对象');
+  const audit = await env.DB.prepare("SELECT * FROM audit_logs WHERE action = 'file.upload' AND job_id = ?").bind(job.job_id).all();
+  assert.equal(audit.results.length, 1, 'file.upload 在 Agent commit 后才写');
+});
+
+test('upload job：超长字节被拒且不留半截对象；下载 URL 绑定 job/状态', async () => {
+  const env = makeEnv({ UPLOAD_MAX_MB: '1' }); // 1MB 上限，便于构造超限
+  const token = await login(env);
+  await addServer(env, token, { name: 'up2' });
+  const job = await (await call(env, { method: 'POST', path: '/api/upload-jobs', token, body: { server_id: 1, path: '/opt/big.bin' } })).json();
+
+  // 声明超限 → 413（前置拒绝，不读 body）
+  const tooBig = await worker.fetch(new Request(job.upload_url, {
+    method: 'POST', headers: { 'content-length': String(2 * 1024 * 1024) }, body: 'x',
+  }), env);
+  assert.equal(tooBig.status, 413);
+
+  // 声明不超但实际流动超限：边写边计数必须中断并删除半截对象
+  const stream = new ReadableStream({
+    start(controller) {
+      for (let i = 0; i < 20; i++) controller.enqueue(new Uint8Array(100 * 1024));
+      controller.close();
+    },
+  });
+  const lie = await worker.fetch(new Request(job.upload_url, {
+    method: 'POST', headers: { 'content-length': '1024' }, body: stream, duplex: 'half',
+  }), env);
+  assert.equal(lie.status, 413, '实际字节超限必须拒绝（不信任 Content-Length）');
+  assert.equal(await env.UPLOADS.head(`upload-jobs/${job.job_id}`), null, '失败不得留下半截对象');
+
+  // 下载端点：token 必须匹配 job/server，且状态须为 running
+  const goodToken = await I.signJobToken('download', job.job_id, 1, '0', env, 600);
+  const wrongServer = await worker.fetch(new Request(
+    `https://panel.local/mcp/upload-jobs/download?id=${job.job_id}&server_id=999&size=0&token=${encodeURIComponent(goodToken)}`
+  ), env);
+  assert.equal(wrongServer.status, 403, 'server_id 不匹配必须拒绝');
+  const notRunning = await worker.fetch(new Request(
+    `https://panel.local/mcp/upload-jobs/download?id=${job.job_id}&server_id=1&size=0&token=${encodeURIComponent(goodToken)}`
+  ), env);
+  assert.equal(notRunning.status, 409, '非 running 状态不得下载');
+});
+
+// ---------------- 阶段 D：cron 清理 ----------------
+test('cron 维护：过期任务收敛为 expired、TTL 到期删行、R2 孤儿对象回收', async () => {
+  const { runJobMaintenance } = await import('../src/index.js');
+  const env = makeEnv();
+  const token = await login(env);
+  await addServer(env, token, { name: 'c1' });
+  const now = Math.floor(Date.now() / 1000);
+
+  // 1) 非终态且过 deadline → expired
+  await env.DB.prepare(`INSERT INTO operation_jobs (id, kind, status, user_id, username, server_id, created_at, deadline_at, expires_at)
+    VALUES ('job_a', 'exec', 'running', 1, 'admin', 1, ?, ?, ?)`).bind(now - 100, now - 10, now + 86400).run();
+  // 2) 已过 TTL → 删行 + 删其 R2 对象
+  await env.DB.prepare(`INSERT INTO operation_jobs (id, kind, status, user_id, username, server_id, r2_key, created_at, deadline_at, expires_at)
+    VALUES ('job_b', 'upload', 'staged', 1, 'admin', 1, 'upload-jobs/job_b', ?, ?, ?)`).bind(now - 90000, now - 80000, now - 1).run();
+  await env.UPLOADS.put('upload-jobs/job_b', 'stale');
+  // 3) R2 孤儿（行已不在）：靠 uploaded 时间判断
+  await env.UPLOADS.put('upload-jobs/job_orphan', 'orphan');
+
+  const r1 = await runJobMaintenance(env, now);
+  // job_a（running，过 deadline）与 job_b（staged，过 deadline）都会被收敛为 expired
+  assert.equal(r1.expired, 2);
+  assert.equal(r1.deletedRows, 1);
+  const a = await env.DB.prepare('SELECT status FROM operation_jobs WHERE id = ?').bind('job_a').first();
+  assert.equal(a.status, 'expired');
+  assert.equal(await env.DB.prepare('SELECT id FROM operation_jobs WHERE id = ?').bind('job_b').first(), null, 'TTL 到期删行');
+  assert.equal(await env.UPLOADS.head('upload-jobs/job_b'), null, '删行同时删 R2 对象');
+
+  // 孤儿对象：uploaded 是"现在"，未超 TTL → 本轮不删（保守，避免误删刚写入的）
+  assert.ok(await env.UPLOADS.head('upload-jobs/job_orphan'), '新对象不删');
+  // 把 uploaded 改成过期后重跑 → 删除
+  const obj = env.UPLOADS.objects.get('upload-jobs/job_orphan');
+  obj.uploaded = new Date((now - 90000) * 1000);
+  const r2 = await runJobMaintenance(env, now);
+  assert.equal(r2.deletedObjects, 1);
+  assert.equal(await env.UPLOADS.head('upload-jobs/job_orphan'), null, '超期孤儿对象回收');
+});
+
+// streamToR2 曾经"先攒后写"：100MB 上传会在内存里驻留 100MB，而 Workers 上限 128MB，
+// 单个大文件就贴着上限、两个并发直接 OOM。这里锁住"传给 R2 的是流而不是整块字节"。
+test('upload job：R2 写入必须传流（不整体缓冲到内存）', async () => {
+  const env = makeEnv();
+  const token = await login(env);
+  await addServer(env, token, { name: 'stream' });
+  const job = await (await call(env, { method: 'POST', path: '/api/upload-jobs', token, body: { server_id: 1, path: '/opt/s.bin' } })).json();
+
+  // 记录 put 收到的值类型
+  const realPut = env.UPLOADS.put.bind(env.UPLOADS);
+  let seen = null;
+  env.UPLOADS.put = async (key, value, opts) => { seen = value; return realPut(key, value, opts); };
+
+  const payload = 'y'.repeat(4096);
+  const up = await worker.fetch(new Request(job.upload_url, {
+    method: 'POST', headers: { 'content-length': String(payload.length) }, body: payload,
+  }), env);
+  assert.equal(up.status, 202);
+  assert.equal(typeof seen.getReader, 'function', '必须把 ReadableStream 交给 R2（整体缓冲会随文件大小占内存）');
+  assert.equal(seen instanceof Uint8Array, false, '不得先拼成 Uint8Array 再写入');
+  // 内容仍然完整落盘
+  assert.equal((await env.UPLOADS.get(`upload-jobs/${job.job_id}`).then((o) => o.text())).length, 4096);
+});
+
+// R2 staging 对象必须在"判定失败/过期"的同一路径上删除，不能只等 cron 的 24h TTL：
+// 一次 Agent 掉线的 100MB 上传会白占额度一整天，几十次就顶满 10GB 免费额度。
+test('upload job：过期收敛时立即删除 R2 对象（不等 TTL/cron）', async () => {
+  const { runJobMaintenance } = await import('../src/index.js');
+  const env = makeEnv();
+  const token = await login(env);
+  await addServer(env, token, { name: 'exp1' });
+  const job = await (await call(env, { method: 'POST', path: '/api/upload-jobs', token, body: { server_id: 1, path: '/opt/x.bin' } })).json();
+  // 模拟"已上传、已下发，但 Agent 一直不拉"
+  await env.UPLOADS.put(`upload-jobs/${job.job_id}`, 'staged-bytes');
+  await env.DB.prepare("UPDATE operation_jobs SET status='running', r2_key=? WHERE id=?")
+    .bind(`upload-jobs/${job.job_id}`, job.job_id).run();
+  assert.ok(await env.UPLOADS.head(`upload-jobs/${job.job_id}`), '前提：对象存在');
+
+  // A) 轮询触发的单条收敛
+  await env.DB.prepare('UPDATE operation_jobs SET deadline_at=? WHERE id=?')
+    .bind(Math.floor(Date.now() / 1000) - 1, job.job_id).run();
+  const polled = await (await call(env, { path: `/api/jobs/${job.job_id}`, token })).json();
+  assert.equal(polled.status, 'expired');
+  assert.equal(await env.UPLOADS.head(`upload-jobs/${job.job_id}`), null, '轮询判过期即删对象');
+
+  // B) cron 批量收敛
+  const job2 = await (await call(env, { method: 'POST', path: '/api/upload-jobs', token, body: { server_id: 1, path: '/opt/y.bin' } })).json();
+  await env.UPLOADS.put(`upload-jobs/${job2.job_id}`, 'staged-bytes-2');
+  await env.DB.prepare("UPDATE operation_jobs SET status='staged', r2_key=?, deadline_at=? WHERE id=?")
+    .bind(`upload-jobs/${job2.job_id}`, Math.floor(Date.now() / 1000) - 1, job2.job_id).run();
+  const r = await runJobMaintenance(env, Math.floor(Date.now() / 1000));
+  assert.ok(r.expired >= 1);
+  assert.equal(await env.UPLOADS.head(`upload-jobs/${job2.job_id}`), null, 'cron 收敛同样删对象');
+});
+
+test('upload job：Agent 回执失败也删除 R2 对象', async () => {
+  const env = makeEnv();
+  const token = await login(env);
+  await addServer(env, token, { name: 'exp2' });
+  const job = await (await call(env, { method: 'POST', path: '/api/upload-jobs', token, body: { server_id: 1, path: '/opt/z.bin' } })).json();
+  await env.UPLOADS.put(`upload-jobs/${job.job_id}`, 'bytes');
+  await env.DB.prepare("UPDATE operation_jobs SET status='running', r2_key=? WHERE id=?")
+    .bind(`upload-jobs/${job.job_id}`, job.job_id).run();
+
+  const inst = new TerminalDO({ storage: { get: async () => undefined, put: async () => {}, delete: async () => {} }, getWebSockets: () => [] }, env);
+  const ws = { deserializeAttachment: () => ({ role: 'control', serverId: 1 }), send() {}, readyState: 1, close() {} };
+  inst.agents.set(1, ws);
+  await inst.webSocketMessage(ws, JSON.stringify({
+    type: 'upload_result', upload_id: job.job_id, ok: false, commit: true, error: 'disk full',
+  }));
+  const row = await env.DB.prepare('SELECT status, error FROM operation_jobs WHERE id = ?').bind(job.job_id).first();
+  assert.equal(row.status, 'failed');
+  assert.match(row.error, /disk full/);
+  assert.equal(await env.UPLOADS.head(`upload-jobs/${job.job_id}`), null, '失败回执同样清理暂存对象');
+});
+
+// 旧 Agent 被 AGENT_UPGRADE_REQUIRED 拒绝时不得留下 agent.update.request：
+// 那条审计的意思是"已请求更新"，而机器版本根本没动，排查时会误判为下发失败。
+test('agent update：旧 Agent 被拒时不写 request 审计', async () => {
+  const env = makeEnv();
+  const token = await login(env);
+  await addServer(env, token, { name: 'legacy' });
+  await env.DB.prepare('UPDATE servers SET info_json = ? WHERE id = 1').bind(JSON.stringify({
+    agent_version: '2020.01.01-0000', agent_platform: 'linux-x86_64',
+    update_protocol: 1, self_update_enabled: true, // 无 update_fetch_proto
+  })).run();
+
+  const manifest = {
+    schema: 1, version: '0.3.0', build_id: '2026.10.28-1200',
+    tag: 'cf-panel-agent-2026.10.28-1200', commit: 'abc', update_protocol: 1, assets: {},
+  };
+  for (const [p, n] of Object.entries({
+    'linux-x86_64': 'cf-panel-agent', 'linux-aarch64': 'cf-panel-agent-aarch64',
+    'macos-aarch64': 'cf-panel-agent-macos', 'windows-x86_64': 'cf-panel-agent-windows.exe',
+  })) {
+    manifest.assets[p] = { name: n, size: 4, sha256: 'a'.repeat(64), url: `https://github.com/yanghuan/cf-panel/releases/download/${manifest.tag}/${n}` };
+  }
+  const orig = globalThis.fetch;
+  globalThis.fetch = async (u) =>
+    String(u).endsWith('agent-manifest.json') ? new Response(JSON.stringify(manifest)) : new Response('x');
+  try {
+    const res = await call(env, { method: 'POST', path: '/api/servers/1/agent-update', token });
+    assert.equal(res.status, 409);
+    assert.equal((await res.json()).code, 'AGENT_UPGRADE_REQUIRED');
+    const audits = await env.DB.prepare("SELECT action FROM audit_logs WHERE action LIKE 'agent.update%'").all();
+    assert.equal(audits.results.length, 0, '被拒绝的请求不得写"已请求更新"审计');
+  } finally {
+    globalThis.fetch = orig;
+  }
 });

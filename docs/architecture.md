@@ -80,13 +80,18 @@
 - **按权限裁剪**：`tools/list` 只返回当前凭据**实际可调用**的工具——普通 PAT 看不到管理类，也看不到缺对应 scope 的操作类（如只读 PAT 看不到 `exec_command`/`update_agent`/`create_upload`）。避免"列出来却调不动"导致 AI 客户端反复重试。
 JSON-RPC 2.0：`initialize` / `tools/list` / `tools/call` / `ping`；通知返回 202；校验 `Origin` 防 DNS rebinding。
 
-**异步任务（阶段 A：exec 已落地）**
+**异步任务（阶段 A/B/C/D 均已落地）**
 
 `exec_command` 不再是同步阻塞调用：它创建 `operation_jobs` 行（D1）并把指令短请求下发给 shard DO，立即返回 `job_id`；执行完成后 agent 的 `exec_result` 唤醒 DO，把终态（`exit_code`/`stdout`/`stderr`/`duration_ms`）写回 D1 并记审计。调用方用 `get_operation`（或 `GET /api/jobs/:id`）轮询，**该路径由 Worker 直接查 D1，不激活 DO**。
 
 动机：原实现让 DO 请求从下发一直挂到回执（exec 最长 25s+5s、upload 120s、agent update 180s）。DO duration 按活跃墙钟 × 128MB 计费，等待 pending I/O 同样计入，且 `setTimeout` 会阻止 Hibernation——这不是调大超时能解决的问题。任务状态落 D1 而非 DO Storage 是刻意的：若存 DO，每次轮询都会激活对象、打断休眠，等于把刚拆掉的耦合装回去。
 
-并发与容错：`agent_update` 独占一台服务器（会重启 Agent），exec 之间、exec 与 upload 之间保持既有并发语义；状态流转全部用条件更新（`WHERE id=? AND status IN (...)`），重复回执与过期后迟到的结果都不会覆盖终态；逾期无回执由 `deadline_at` 收敛为 `expired`（不依赖 cron 或 DO timer）；`idempotency_key` 命中直接返回已有任务。详见 `docs/async-exec-upload-design.md`。upload / agent update 的数据面外移仍待实现（阶段 B/C）。
+数据面同样移出 DO：
+- **upload**：字节由客户端写入 R2（`upload-jobs/<job_id>`），Agent 再从 Worker 的签名下载 URL 拉取。DO 只收到元数据并回执落库。
+- **agent update**：Worker 提供 `/mcp/agent-update-asset` 代理 GitHub Release（`asset_url` 只来自已校验的 manifest，防开放代理），Agent 自己下载 + SHA/版本校验 + self-replace。Worker 不再把二进制流式转给 DO。
+- Agent 侧新增 `agent/rust/src/fetch.rs`（手写 HTTPS GET，复用现有 rustls/DNS，同时支持 `Content-Length` 与 `chunked`），零新增依赖；能力通过 `upload_fetch_proto` / `update_fetch_proto` 随上报声明，旧 Agent 会被明确拒绝（`AGENT_UPGRADE_REQUIRED`）而非干等超时。
+
+并发与容错：`agent_update` 独占一台服务器（会重启 Agent），exec 之间、exec 与 upload 之间保持既有并发语义；状态流转全部用条件更新（`WHERE id=? AND status IN (...)`），重复回执与过期后迟到的结果都不会覆盖终态；逾期无回执由 `deadline_at` 收敛为 `expired`（不依赖 cron 或 DO timer）；`idempotency_key` 命中直接返回已有任务。定期清理由 Worker `scheduled` 承担（每小时：收敛过期、删过 TTL 的行、回收 R2 孤儿对象），仍有旧同步路径（`/rpc/exec` 等）保留用于回退。详见 `docs/async-exec-upload-design.md`。
 
 #### 3.2.2 告警通知与多用户
 

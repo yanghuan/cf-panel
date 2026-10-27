@@ -3,7 +3,10 @@ import { json, err, doPanel, sha256Hex, verifySecretHash } from './utils.js';
 import { EXEC_CMD_MAX_BYTES, execCommandBytes, execTooLongError } from './config.js';
 import { authIdentityByToken, authUserByIdentity, isAdmin, canExec } from './auth.js';
 import { handleReport } from './report.js';
-import { markJobRunning, failJob, finishExecJob, hasActiveAgentUpdate } from './jobs.js';
+import {
+  markJobRunning, failJob, finishExecJob, hasActiveAgentUpdate,
+  markUploadWaitingAgent, markUploadRunning, finishUploadJob, finishUpdateJob, markUpdateRunning,
+} from './jobs.js';
 
 // 本模块专用常量（会话/上报间隔/PAT 校验，就近定义便于对照使用代码）
 const SESSION_TTL_MS = 10 * 60 * 1000; // 会话两端都断开超过 10 分钟 → 回收
@@ -263,6 +266,87 @@ export class TerminalDO {
         // 发送失败不能留下「running 但命令没发出去」
         await failJob(this.env, jobId, 'failed to send exec command');
         return json({ error: 'failed to send exec command' }, 502);
+      }
+      return json({ ok: true, job_id: jobId, status: 'running' });
+    }
+
+    // 内部 RPC：异步 upload 下发（阶段 B）。
+    // 只下发元数据与短期下载 URL，不读文件、不等待 Agent 落盘——字节走 R2/Worker，
+    // DO 在这条链路上只承担「告诉 Agent 去哪拉」。
+    if (path === '/rpc/upload/submit' && request.method === 'POST') {
+      const body = await request.json();
+      const jobId = String(body.jobId || '');
+      const serverId = Number(body.serverId) || 0;
+      const targetPath = String(body.path || '');
+      const downloadUrl = String(body.downloadUrl || '');
+      const size = Number(body.size) || 0;
+      if (!jobId || !serverId || !targetPath || !downloadUrl) return err('bad request', 400);
+      if (this.updating.has(serverId) || await hasActiveAgentUpdate(this.env, serverId)) {
+        await failJob(this.env, jobId, 'agent update in progress');
+        return json({ error: 'agent update in progress' }, 409);
+      }
+      const agentWs = this.agents.get(serverId);
+      if (!agentWs) {
+        await failJob(this.env, jobId, 'agent offline');
+        return json({ error: 'agent offline', code: 'AGENT_OFFLINE' }, 503);
+      }
+      // Agent 必须支持异步拉取；旧 Agent 没有 upload_fetch_proto 时只能回落到同步旧路径
+      if (!this.supportsFetch(agentWs, 'upload')) {
+        await failJob(this.env, jobId, 'agent does not support async upload (upgrade required)');
+        return json({ error: 'agent does not support async upload', code: 'AGENT_UPGRADE_REQUIRED' }, 409);
+      }
+      if (!(await markUploadWaitingAgent(this.env, jobId))) return json({ error: 'job not runnable' }, 409);
+      if (!(await markUploadRunning(this.env, jobId))) {
+        await failJob(this.env, jobId, 'job not runnable');
+        return json({ error: 'job not runnable' }, 409);
+      }
+      try {
+        agentWs.send(JSON.stringify({
+          type: 'upload_fetch', job_id: jobId, upload_id: jobId,
+          path: targetPath, overwrite: !!body.overwrite, size, url: downloadUrl,
+        }));
+      } catch {
+        await failJob(this.env, jobId, 'failed to send upload_fetch');
+        return json({ error: 'failed to send upload_fetch' }, 502);
+      }
+      return json({ ok: true, job_id: jobId, status: 'running' });
+    }
+
+    // 内部 RPC：异步 agent update 下发（阶段 C）。只下发元数据 + 短期资产 URL，
+    // Worker 不再在 DO 里下载并流式转发二进制（旧 /rpc/agent_update 保留用于回滚）。
+    if (path === '/rpc/agent_update/submit' && request.method === 'POST') {
+      const body = await request.json();
+      const jobId = String(body.jobId || '');
+      const serverId = Number(body.serverId) || 0;
+      const downloadUrl = String(body.downloadUrl || '');
+      if (!jobId || !serverId || !downloadUrl) return err('bad request', 400);
+      if (this.updating.has(serverId)) {
+        await failJob(this.env, jobId, 'agent update already in progress');
+        return json({ error: 'agent update in progress' }, 409);
+      }
+      const agentWs = this.agents.get(serverId);
+      if (!agentWs) {
+        await failJob(this.env, jobId, 'agent offline');
+        return json({ error: 'agent offline', code: 'AGENT_OFFLINE' }, 503);
+      }
+      if (!this.supportsFetch(agentWs, 'update')) {
+        await failJob(this.env, jobId, 'agent does not support async update (upgrade required)');
+        return json({ error: 'agent does not support async update', code: 'AGENT_UPGRADE_REQUIRED' }, 409);
+      }
+      if (!(await markUpdateRunning(this.env, jobId))) return json({ error: 'job not runnable' }, 409);
+      // 内存互斥只覆盖本次更新窗口；跨实例/evict 的互斥由 D1 的部分唯一索引保证
+      this.updating.add(serverId);
+      try {
+        agentWs.send(JSON.stringify({
+          type: 'agent_update_fetch', job_id: jobId, update_id: jobId,
+          url: downloadUrl, build_id: String(body.buildId || ''),
+          platform: String(body.platform || ''), size: Number(body.size) || 0,
+          sha256: String(body.sha256 || ''),
+        }));
+      } catch {
+        this.updating.delete(serverId);
+        await failJob(this.env, jobId, 'failed to send agent_update_fetch');
+        return json({ error: 'failed to send agent_update_fetch' }, 502);
       }
       return json({ ok: true, job_id: jobId, status: 'running' });
     }
@@ -728,6 +812,8 @@ export class TerminalDO {
         const sid = Number(att.serverId);
         if (sid > 0) {
           if (att.probe) this.probeCapable.add(sid); // 附件标记支持探活 → 唤醒后恢复能力（见 pong 分支）
+          // caps 随连接附件恢复：supportsFetch 读的就是它，漏恢复会让 evict 后的异步任务被判
+          // "不支持异步"而永久失败（agent 明明支持）。
           // 同 serverId 多条控制连接（冻结唤醒后旧半开连接与新连接并存）：保留最新（ts 最大）
           // 者、关闭其余，收敛到「一服务器一活连接」，避免 exec/更新发往死连接。
           const prev = this.agents.get(sid);
@@ -841,6 +927,19 @@ export class TerminalDO {
         delete next.probe;
         ws.serializeAttachment(next);
       }
+    } catch { /* ignore */ }
+  }
+
+  // 记录异步拉取能力到连接附件（evict 后 rebuildIndex 据此恢复）。
+  // 只在值变化时写，避免每帧上报都 serializeAttachment。
+  markFetchCapable(ws, caps) {
+    try {
+      const a = ws.deserializeAttachment?.();
+      if (!a || typeof a !== 'object' || a.role !== 'control') return;
+      const cur = a.caps || {};
+      if (Number(cur.upload_fetch_proto) === caps.upload_fetch_proto
+        && Number(cur.update_fetch_proto) === caps.update_fetch_proto) return;
+      ws.serializeAttachment({ ...a, caps });
     } catch { /* ignore */ }
   }
 
@@ -969,6 +1068,11 @@ export class TerminalDO {
               this.pendingUpload.delete(j.upload_id);
               r.resolve({ ok: !!j.ok, error: j.error || null, size: j.size || 0 });
             }
+            // 异步路径：job_ 前缀的 upload_id。只有 commit 回执才是"文件已落地"，
+            // 非 commit 帧的 ok:true 只表示"该块已写入临时文件"，不能当终态。
+            if (String(j.upload_id || '').startsWith('job_') && (j.commit === true || !j.ok)) {
+              await this.settleUploadJob(j.upload_id, j);
+            }
             return;
           }
           if (j && j.type === 'agent_update_result') {
@@ -984,6 +1088,8 @@ export class TerminalDO {
                 restarting: !!j.restarting,
               });
             }
+            // 异步路径：job_ 前缀。回执到达即终态（成功=self-replace 完成）。
+            if (String(j.update_id || '').startsWith('job_')) await this.settleUpdateJob(j.update_id, j);
             return;
           }
           if (j && j.type === 'report') {
@@ -997,6 +1103,13 @@ export class TerminalDO {
               const declared = Number(j.info.probe_proto) >= 1;
               if (declared && !this.probeCapable.has(serverId)) this.markProbeCapable(ws, serverId);
               else if (!declared && this.probeCapable.has(serverId)) this.clearProbeCapable(ws, serverId);
+              // 异步拉取能力（阶段 B/C）：同样随上报到达，写进附件以便 evict 后恢复。
+              // 旧 Agent 不声明 → supportsFetch 返回 false → 下发前明确拒绝（AGENT_UPGRADE_REQUIRED），
+              // 不会出现"帧发出去但对方不认识，干等 deadline"。
+              this.markFetchCapable(ws, {
+                upload_fetch_proto: Number(j.info.upload_fetch_proto) || 0,
+                update_fetch_proto: Number(j.info.update_fetch_proto) || 0,
+              });
             }
             // E：保活心跳先于上报落库发送（30s 限频）。agent 端 read -t 180 只依赖下行流量，
             // 不能因 handleReport 抛错（D1 配额/写入失败）而连带停发心跳 → 误判半开 → 重连循环。
@@ -1114,6 +1227,55 @@ export class TerminalDO {
     } catch { /* 兜底慢采 */ }
     this.agentInterval.set(serverId, want);
     ws.send(JSON.stringify({ type: 'set_report_interval', interval: want }));
+  }
+
+  // Agent 能力查询：异步拉取能力由 report 的 info 携带（upload_fetch_proto / update_fetch_proto），
+  // 与 probe_proto 同样的"能力随上报免费到达"范式。旧 Agent 不声明 → 明确拒绝而不是静默降级，
+  // 否则会下发它不认识的帧，最终只能在 deadline 上超时。
+  supportsFetch(ws, kind) {
+    const att = ws.deserializeAttachment?.() || {};
+    const cap = att.caps || {};
+    if (kind === 'upload') return Number(cap.upload_fetch_proto) >= 1;
+    if (kind === 'update') return Number(cap.update_fetch_proto) >= 1;
+    return false;
+  }
+
+  // upload_result → D1 终态 + 审计（异步路径）。
+  // 成功即删 R2 staging 对象：任务已落地，暂存件没有保留价值（也避免占满 10GB 额度）。
+  async settleUploadJob(jobId, j) {
+    const ok = !!j.ok;
+    const job = await finishUploadJob(this.env, jobId, { ok, error: j.error || null });
+    if (!job) return;
+    if (job.r2_key) {
+      try { await this.env.UPLOADS.delete(job.r2_key); } catch { /* 删除失败由 cron 兜底 */ }
+    }
+    // file.upload 审计改在"Agent 成功 commit 后"写（旧实现在签发 URL 时就写，
+    // 把"请求上传"当成了"文件已落地"）。请求阶段另有 file.upload.request。
+    try {
+      await this.env.DB.prepare(
+        'INSERT INTO audit_logs (user_id, username, client_ip, action, target_server_id, detail, duration_ms, job_id) VALUES (?,?,?,?,?,?,?,?)'
+      ).bind(
+        job.user_id, job.username, job.client_ip || '', ok ? 'file.upload' : 'file.upload.failed',
+        job.server_id, String(job.target_path || '').slice(0, 200),
+        job.duration_ms ?? null, jobId,
+      ).run();
+    } catch (e) { console.error('upload audit failed:', e); }
+  }
+
+  // agent_update_result → D1 终态 + 审计（异步路径）
+  async settleUpdateJob(jobId, j) {
+    const ok = !!j.ok;
+    const job = await finishUpdateJob(this.env, jobId, { ok, error: j.error || null });
+    if (!job) return;
+    try {
+      await this.env.DB.prepare(
+        'INSERT INTO audit_logs (user_id, username, client_ip, action, target_server_id, detail, duration_ms, job_id) VALUES (?,?,?,?,?,?,?,?)'
+      ).bind(
+        job.user_id, job.username, job.client_ip || '', ok ? 'agent.update' : 'agent.update.failed',
+        job.server_id, `${job.from_version || '?'} → ${job.build_id || '?'}${ok ? '' : ` (${j.error || 'failed'})`}`,
+        job.duration_ms ?? null, jobId,
+      ).run();
+    } catch (e) { console.error('agent update audit failed:', e); }
   }
 
   // exec_result → D1 终态 + 审计（异步路径）。

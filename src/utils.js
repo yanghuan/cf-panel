@@ -206,6 +206,42 @@ export async function signUploadToken(serverId, path, overwrite, env, ttlS = 600
   const sig = b64u(await hmacSha256(new TextEncoder().encode(hashKey), new TextEncoder().encode(payload)));
   return { token: `${exp}.${sig}`, exp };
 }
+// 任务级签名 URL（阶段 B/C）：HMAC(secret, purpose|jobId|serverId|extra|exp)。
+// 与旧 signUploadToken 分开是刻意的——旧格式把 path/overwrite 编进载荷，任务版一律从 D1
+// 的 job 行读取，URL 里只有 job_id，杜绝"改 query 换目标路径"。
+// purpose 区分 content（客户端上传）/download（Agent 拉取）/asset（Agent 拉资产），
+// 同一 token 不能跨用途重放。
+export async function signJobToken(purpose, jobId, serverId, extra, env, ttlS) {
+  const exp = Math.floor(Date.now() / 1000) + ttlS;
+  const payload = `${purpose}|${jobId}|${serverId}|${extra || ''}|${exp}`;
+  const hashKey = env.HASH_SECRET || secret(env);
+  const sig = b64u(await hmacSha256(new TextEncoder().encode(hashKey), new TextEncoder().encode(payload)));
+  return `${exp}.${sig}`;
+}
+
+export async function verifyJobToken(token, purpose, jobId, serverId, extra, env) {
+  try {
+    const dot = String(token || '').indexOf('.');
+    if (dot <= 0) return { ok: false, error: 'bad token' };
+    const exp = Number(token.slice(0, dot));
+    if (!Number.isFinite(exp) || exp < Math.floor(Date.now() / 1000)) return { ok: false, error: 'token expired' };
+    const got = token.slice(dot + 1);
+    if (!/^[A-Za-z0-9_-]+$/.test(got)) return { ok: false, error: 'bad token' };
+    const signature = b64uDecode(got);
+    if (signature.length !== 32) return { ok: false, error: 'bad token' };
+    const payload = `${purpose}|${jobId}|${serverId}|${extra || ''}|${exp}`;
+    const hashKey = env.HASH_SECRET || secret(env);
+    const valid = await verifyHmacSha256(
+      new TextEncoder().encode(hashKey),
+      new TextEncoder().encode(payload),
+      signature
+    );
+    return valid ? { ok: true, exp } : { ok: false, error: 'bad signature' };
+  } catch {
+    return { ok: false, error: 'bad token' };
+  }
+}
+
 export async function verifyUploadToken(token, serverId, path, overwrite, env) {
   try {
     const dot = token.indexOf('.');

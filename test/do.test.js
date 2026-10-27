@@ -2657,3 +2657,95 @@ test('TerminalDO exec_result：命令超时回执 → timed_out（非 failed/suc
   assert.equal(row.status, 'timed_out');
   assert.equal(row.timed_out, 1);
 });
+
+// ---------------- 阶段 B/C：DO 只下发元数据，不推字节 ----------------
+test('TerminalDO /rpc/upload/submit：只下发 upload_fetch 元数据，不推文件字节', async () => {
+  const env = makeEnv();
+  await env.DB.prepare('INSERT INTO servers (agent_key_id, name, user_id, agent_key_hash) VALUES (?,?,?,?)')
+    .bind('k1', 's1', 1, 'h1').run();
+  const now = Math.floor(Date.now() / 1000);
+  await env.DB.prepare(`INSERT INTO operation_jobs (id, kind, status, user_id, username, server_id, target_path, overwrite, size_bytes, r2_key, created_at, deadline_at, expires_at)
+    VALUES ('job_up', 'upload', 'staged', 1, 'admin', 1, '/opt/a.bin', 0, 100, 'upload-jobs/job_up', ?, ?, ?)`)
+    .bind(now, now + 600, now + 86400).run();
+
+  const inst = new TerminalDO(mockState(), env);
+  const sent = [];
+  const ws = {
+    attachment: { role: 'control', serverId: 1, caps: { upload_fetch_proto: 1 } },
+    deserializeAttachment() { return this.attachment; },
+    serializeAttachment(a) { this.attachment = a; },
+    send: (m) => sent.push(m), readyState: 1, close() {},
+  };
+  inst.agents.set(1, ws);
+
+  const res = await inst.fetch(new Request('https://do.internal/rpc/upload/submit', {
+    method: 'POST',
+    body: JSON.stringify({
+      jobId: 'job_up', serverId: 1, path: '/opt/a.bin', overwrite: false,
+      size: 100, downloadUrl: 'https://panel.local/mcp/upload-jobs/download?id=job_up',
+    }),
+  }));
+  assert.equal(res.status, 200);
+  const frame = JSON.parse(sent.at(-1));
+  assert.equal(frame.type, 'upload_fetch');
+  assert.equal(frame.upload_id, 'job_up');
+  assert.equal(frame.path, '/opt/a.bin');
+  assert.match(frame.url, /^https:\/\/panel\.local\//);
+  // 关键：帧里没有文件内容（数据面已移出 DO）
+  assert.equal('data' in frame, false);
+  assert.equal(typeof sent.at(-1), 'string', '只发 JSON 文本帧，不发二进制混合帧');
+  const row = await env.DB.prepare('SELECT status FROM operation_jobs WHERE id = ?').bind('job_up').first();
+  assert.equal(row.status, 'running');
+});
+
+test('TerminalDO /rpc/upload/submit：Agent 无 upload_fetch_proto → 明确要求升级', async () => {
+  const env = makeEnv();
+  await env.DB.prepare('INSERT INTO servers (agent_key_id, name, user_id, agent_key_hash) VALUES (?,?,?,?)')
+    .bind('k1', 's1', 1, 'h1').run();
+  const now = Math.floor(Date.now() / 1000);
+  await env.DB.prepare(`INSERT INTO operation_jobs (id, kind, status, user_id, username, server_id, target_path, size_bytes, r2_key, created_at, deadline_at, expires_at)
+    VALUES ('job_old', 'upload', 'staged', 1, 'admin', 1, '/opt/a.bin', 10, 'upload-jobs/job_old', ?, ?, ?)`)
+    .bind(now, now + 600, now + 86400).run();
+  const inst = new TerminalDO(mockState(), env);
+  // 旧 Agent：附件无 caps
+  inst.agents.set(1, { deserializeAttachment: () => ({ role: 'control', serverId: 1 }), send() {}, readyState: 1, close() {} });
+  const res = await inst.fetch(new Request('https://do.internal/rpc/upload/submit', {
+    method: 'POST',
+    body: JSON.stringify({ jobId: 'job_old', serverId: 1, path: '/opt/a.bin', size: 10, downloadUrl: 'https://p/x' }),
+  }));
+  assert.equal(res.status, 409);
+  assert.equal((await res.json()).code, 'AGENT_UPGRADE_REQUIRED');
+  const row = await env.DB.prepare('SELECT status, error FROM operation_jobs WHERE id = ?').bind('job_old').first();
+  assert.equal(row.status, 'failed');
+  assert.match(row.error, /does not support async upload/);
+});
+
+test('TerminalDO upload_result：commit 才终态；非 commit 帧不改状态', async () => {
+  const env = makeEnv();
+  await env.DB.prepare('INSERT INTO servers (agent_key_id, name, user_id, agent_key_hash) VALUES (?,?,?,?)')
+    .bind('k1', 's1', 1, 'h1').run();
+  const now = Math.floor(Date.now() / 1000);
+  await env.DB.prepare(`INSERT INTO operation_jobs (id, kind, status, user_id, username, client_ip, server_id, target_path, size_bytes, r2_key, created_at, started_at, deadline_at, expires_at)
+    VALUES ('job_c', 'upload', 'running', 1, 'admin', '', 1, '/opt/a.bin', 5, 'upload-jobs/job_c', ?, ?, ?, ?)`)
+    .bind(now - 2, now - 2, now + 120, now + 86400).run();
+  await env.UPLOADS.put('upload-jobs/job_c', 'hello');
+  const inst = new TerminalDO(mockState(), env);
+  const ws = { deserializeAttachment: () => ({ role: 'control', serverId: 1 }), send() {}, readyState: 1, close() {} };
+  inst.agents.set(1, ws);
+
+  // 非 commit 帧（仅表示该块已写入临时文件）→ 不改终态
+  await inst.webSocketMessage(ws, JSON.stringify({
+    type: 'upload_result', upload_id: 'job_c', ok: true, commit: false, size: 5,
+  }));
+  let row = await env.DB.prepare('SELECT status FROM operation_jobs WHERE id = ?').bind('job_c').first();
+  assert.equal(row.status, 'running', '非 commit 回执不得提前判成功');
+  assert.ok(await env.UPLOADS.head('upload-jobs/job_c'), '此时对象仍需保留');
+
+  // commit 帧 → succeeded，对象删除
+  await inst.webSocketMessage(ws, JSON.stringify({
+    type: 'upload_result', upload_id: 'job_c', ok: true, commit: true, size: 5,
+  }));
+  row = await env.DB.prepare('SELECT status FROM operation_jobs WHERE id = ?').bind('job_c').first();
+  assert.equal(row.status, 'succeeded');
+  assert.equal(await env.UPLOADS.head('upload-jobs/job_c'), null, '成功后立刻删 staging 对象');
+});

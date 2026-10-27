@@ -3,6 +3,7 @@
 // 跨平台：Linux 原生 /proc 指标；Windows/macOS 经 sysinfo（见 metrics/ 子模块与 platform.rs）
 mod blocking;
 mod dns;
+mod fetch;
 mod metrics;
 mod platform;
 mod session;
@@ -874,6 +875,250 @@ async fn control_conn(
     result
 }
 
+// 阶段 B：异步上传。字节由本机从 Worker 拉取后原子落盘。
+// 与旧推送路径的区别只在"字节怎么来"：旧的是 DO 切 48KB 帧推过来（DO 全程活跃），
+// 这里是自己发一次 HTTPS GET（DO 完全不参与），落盘仍走"临时文件 + fsync + rename"。
+async fn handle_fetch_upload(
+    cfg: Config,
+    tx: tokio::sync::mpsc::Sender<OutMsg>,
+    v: serde_json::Value,
+) {
+    let _ = &cfg;
+    let upload_id = v
+        .get("upload_id")
+        .or_else(|| v.get("job_id"))
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
+    let path = v
+        .get("path")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
+    let url = v
+        .get("url")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
+    let size = v.get("size").and_then(|x| x.as_u64()).unwrap_or(0);
+    if upload_id.is_empty() || path.is_empty() || url.is_empty() {
+        return;
+    }
+    // 与旧路径同一上限（Worker 下发的是实际大小；这里留 +1 余量，并且 URL 侧还有 max_bytes）
+    let max_bytes = if size > 0 {
+        size.saturating_add(1)
+    } else {
+        500 * 1024 * 1024
+    };
+
+    tokio::spawn(async move {
+        let reply = |ok: bool, err: Option<String>, written: u64| {
+            let mut j = serde_json::json!({
+                "type": "upload_result", "upload_id": upload_id, "ok": ok,
+                "commit": true, "size": written,
+            });
+            if let Some(e) = err {
+                j["error"] = serde_json::Value::String(e);
+            }
+            Message::Text(j.to_string().into())
+        };
+        // 下载到目标同目录的临时文件：跨文件系统时 rename 会退化，同目录才是原子替换
+        let tmp = std::path::PathBuf::from(format!("{path}.cfp-upload-{upload_id}"));
+        match fetch::download_to_file(&url, &tmp, None, None, max_bytes).await {
+            Ok(res) => {
+                let commit = (|| -> std::io::Result<()> {
+                    // fsync 后 rename：断电时不会留下半截目标文件
+                    if let Ok(f) = std::fs::File::open(&tmp) {
+                        let _ = f.sync_all();
+                    }
+                    if let Some(p) = std::path::Path::new(&path).parent() {
+                        std::fs::create_dir_all(p)?;
+                    }
+                    std::fs::rename(&tmp, &path)
+                })();
+                if let Err(e) = commit {
+                    let _ = std::fs::remove_file(&tmp);
+                    ctrl_enqueue(
+                        &tx,
+                        reply(false, Some(format!("commit failed: {e}")), 0),
+                        "upload_result",
+                    );
+                    return;
+                }
+                log(format!("upload {upload_id}: {} bytes -> {path}", res.bytes));
+                ctrl_enqueue(&tx, reply(true, None, res.bytes), "upload_result");
+            }
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp);
+                ctrl_enqueue(&tx, reply(false, Some(e.to_string()), 0), "upload_result");
+            }
+        }
+    });
+}
+
+// 阶段 C：异步自更新。拉取资产 → 复用 update.rs 的校验/backup/self-replace 全链路。
+async fn handle_fetch_update(
+    cfg: Config,
+    tx: tokio::sync::mpsc::Sender<OutMsg>,
+    v: serde_json::Value,
+) {
+    let update_id = v
+        .get("update_id")
+        .or_else(|| v.get("job_id"))
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
+    let url = v
+        .get("url")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
+    let build_id = v
+        .get("build_id")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
+    let platform = v
+        .get("platform")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
+    let size = v.get("size").and_then(|x| x.as_u64()).unwrap_or(0);
+    let sha256 = v
+        .get("sha256")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
+    if update_id.is_empty() || url.is_empty() || size == 0 || sha256.is_empty() {
+        return;
+    }
+    // 与 Worker 侧 UPDATE_MAX 一致：资产只有几 MB，超限说明 URL 或清单异常
+    const UPDATE_MAX_BYTES: u64 = 32 * 1024 * 1024;
+    if size > UPDATE_MAX_BYTES {
+        ctrl_enqueue(
+            &tx,
+            Message::Text(
+                serde_json::json!({
+                    "type": "agent_update_result", "update_id": update_id,
+                    "ok": false, "error": format!("asset too large: {size}"),
+                })
+                .to_string()
+                .into(),
+            ),
+            "agent_update_result",
+        );
+        return;
+    }
+    tokio::spawn(async move {
+        let fail = |err: String| {
+            Message::Text(
+                serde_json::json!({
+                    "type": "agent_update_result", "update_id": update_id,
+                    "ok": false, "error": err,
+                })
+                .to_string()
+                .into(),
+            )
+        };
+        // staging 必须在当前 exe 同目录：Windows self-replace 需同卷，Unix 靠同目录 rename 原子性
+        let exe = match std::env::current_exe() {
+            Ok(p) => p,
+            Err(e) => {
+                ctrl_enqueue(
+                    &tx,
+                    fail(format!("current exe: {e}")),
+                    "agent_update_result",
+                );
+                return;
+            }
+        };
+        let Some(parent) = exe.parent() else {
+            ctrl_enqueue(
+                &tx,
+                fail("current exe has no parent".into()),
+                "agent_update_result",
+            );
+            return;
+        };
+        let name = exe
+            .file_name()
+            .and_then(|x| x.to_str())
+            .unwrap_or("cf-panel-agent");
+        let staging_name = if cfg!(windows) {
+            format!(".{name}.update-{}-{update_id}.exe", std::process::id())
+        } else {
+            format!(".{name}.update-{}-{update_id}", std::process::id())
+        };
+        let staging = parent.join(staging_name);
+        let _ = std::fs::remove_file(&staging);
+
+        if let Err(e) =
+            fetch::download_to_file(&url, &staging, Some(size), Some(&sha256), UPDATE_MAX_BYTES)
+                .await
+        {
+            let _ = std::fs::remove_file(&staging);
+            ctrl_enqueue(&tx, fail(e.to_string()), "agent_update_result");
+            return;
+        }
+        // 校验/替换放到文件线程池（与同步路径一致：这里是同步 IO，不能占 async worker）
+        let staged = update::StagedUpdate {
+            update_id: update_id.clone(),
+            build_id: build_id.clone(),
+            platform: platform.clone(),
+            size,
+            sha256,
+            staging,
+        };
+        let plat = update::platform_key().to_string();
+        let r = crate::blocking::file_blocking(120, move || update::install_staged(staged, &plat))
+            .await;
+        let (response, ready) = match r {
+            Some(Ok(update::UpdateOutcome::Ready {
+                update_id,
+                build_id,
+                size,
+                backup,
+            })) => (
+                serde_json::json!({
+                    "type": "agent_update_result", "update_id": update_id, "ok": true,
+                    "build_id": build_id, "size": size, "backup": backup, "restarting": true,
+                }),
+                true,
+            ),
+            Some(Ok(update::UpdateOutcome::Progress)) => return,
+            Some(Err(e)) => (
+                serde_json::json!({
+                    "type": "agent_update_result", "update_id": update_id, "ok": false, "error": e,
+                }),
+                false,
+            ),
+            None => (
+                serde_json::json!({
+                    "type": "agent_update_result", "update_id": update_id, "ok": false,
+                    "error": "update install timed out",
+                }),
+                false,
+            ),
+        };
+        // 与同步路径同一条铁律：替换成功就必须退出并跑新版本，不能依赖回执送达成功
+        if ready {
+            RESTART_AFTER_UPDATE.store(cfg.self_restart_after_update, Ordering::SeqCst);
+        }
+        ctrl_enqueue(
+            &tx,
+            Message::Text(response.to_string().into()),
+            "agent_update_result",
+        );
+        if ready {
+            log(if cfg.self_restart_after_update {
+                "agent update installed (pulled); shutting down and starting replacement"
+            } else {
+                "agent update installed (pulled); shutting down for supervisor restart"
+            });
+        }
+    });
+}
+
 // Agent 自更新帧：staging/校验/替换全部在线程池执行；commit 成功回执后通知主任务
 // 优雅清理 PTY 并退出，由 systemd/launchd/Windows supervisor 拉起磁盘上的新版本。
 async fn handle_update_frame(
@@ -1256,6 +1501,51 @@ async fn dispatch(
                 term.resize(rows as u16, cols as u16);
             }
         }
+        // 阶段 B：异步上传。DO 只下发元数据与短期签名 URL，字节由本机直接从 Worker 拉，
+        // 全程不经过 DO（这是 upload 从 120s 同步等待变成秒级返回的关键）。
+        // 必须 spawn：下载 100MB 若要几秒，绝不能阻塞控制读循环（否则心跳/ping 全部堆积）。
+        "upload_fetch" => {
+            if cfg.disable_exec {
+                ctrl_enqueue(
+                    tx,
+                    Message::Text(
+                        serde_json::json!({
+                            "type": "upload_result",
+                            "upload_id": v.get("upload_id").or_else(|| v.get("job_id")).and_then(|x| x.as_str()).unwrap_or(""),
+                            "ok": false,
+                            "commit": true,
+                            "error": "upload disabled (DISABLE_EXEC=1)",
+                        })
+                        .to_string()
+                        .into(),
+                    ),
+                    "upload_result",
+                );
+                return Ok(());
+            }
+            handle_fetch_upload(cfg.clone(), tx.clone(), v).await;
+        }
+        // 阶段 C：异步自更新。同样只收元数据 + 签名 URL，二进制由本机拉取。
+        "agent_update_fetch" => {
+            if !cfg.allow_self_update {
+                ctrl_enqueue(
+                    tx,
+                    Message::Text(
+                        serde_json::json!({
+                            "type": "agent_update_result",
+                            "update_id": v.get("update_id").or_else(|| v.get("job_id")).and_then(|x| x.as_str()).unwrap_or(""),
+                            "ok": false,
+                            "error": "self update disabled (ALLOW_SELF_UPDATE=0)",
+                        })
+                        .to_string()
+                        .into(),
+                    ),
+                    "agent_update_result",
+                );
+                return Ok(());
+            }
+            handle_fetch_update(cfg.clone(), tx.clone(), v).await;
+        }
         "exec" => {
             // MCP 一次性命令执行：sh -c 跑命令，收集 stdout/stderr/exit_code 经控制通道回执
             let exec_id = v
@@ -1498,6 +1788,11 @@ pub const VERSION: &str = match option_env!("AGENT_BUILD_TS") {
 // 与 update::UPDATE_PROTOCOL 同范式：能力随系统信息上报（info.probe_proto），
 // 旧 agent 不报该字段 → DO 永不探活、永不误关（向后兼容）。
 pub const PROBE_PROTO: u64 = 1;
+
+// 异步数据面能力版本：DO 据此判断能否下发 upload_fetch / agent_update_fetch
+// （本机自己从 Worker 拉，而不是由 DO 推字节）。同样是"能力随上报免费到达"，
+// 旧 agent 不报 → DO 明确返回 AGENT_UPGRADE_REQUIRED，不会发出对方不认识的帧。
+pub const FETCH_PROTO: u64 = 1;
 
 fn print_version() {
     println!("cf-panel-agent {VERSION}");

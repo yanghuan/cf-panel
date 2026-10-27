@@ -22,6 +22,19 @@ export const JOB_POLL_AFTER_MS = 1000;        // 建议轮询间隔（客户端�
 // 终态（SQLite 无法 ALTER CHECK，状态取值由 src/jobs.js 校验，不建 CHECK 约束）
 export const JOB_TERMINAL_STATES = ['succeeded', 'failed', 'timed_out', 'expired'];
 
+// upload：创建后等客户端上传字节的窗口（10 分钟）。超时即 expired，释放单机串行锁。
+export const UPLOAD_JOB_UPLOAD_WINDOW_S = 600;
+// upload：字节落到 R2 后等 Agent 拉取并落盘的窗口（含重连重试，与旧同步路径的 120s 同量级）
+export const UPLOAD_JOB_AGENT_WINDOW_S = 120;
+export const UPLOAD_JOB_GRACE_S = 30;         // Agent 回执丢失兜底
+// agent update：Agent 下载 + 校验 + self-replace 的总窗口（与旧同步路径的 180s 一致）
+export const UPDATE_JOB_TIMEOUT_S = 180;
+export const UPDATE_JOB_GRACE_S = 30;
+// staging 签名 URL 有效期（上传内容 URL / Agent 下载 URL / 资产代理 URL 共用）
+export const JOB_URL_TTL_S = 600;
+// staging 对象 key 前缀：cron 按前缀扫孤儿对象
+export const UPLOAD_R2_PREFIX = 'upload-jobs/';
+
 // ---- 服务器描述 ----
 // 可选自由文本（用途/负责人/机房等），会随 list_servers 下发给 MCP 客户端。
 // 前端 textarea 的 maxlength 必须与本值一致（由 test/unit.test.js 断言，防两边漂移）。

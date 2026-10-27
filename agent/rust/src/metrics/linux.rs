@@ -578,6 +578,10 @@ pub async fn collect_info() -> serde_json::Value {
         "agent_platform": crate::update::platform_key(),
         "update_protocol": crate::update::UPDATE_PROTOCOL,
         "probe_proto": crate::PROBE_PROTO,
+        // 阶段 B/C：本机可从 Worker 拉取暂存文件 / Release 资产（不再由 DO 推字节）。
+        // 缺这两个字段的旧 agent 会被 DO 明确拒绝（AGENT_UPGRADE_REQUIRED），不会收到不认识的帧。
+        "upload_fetch_proto": crate::FETCH_PROTO,
+        "update_fetch_proto": crate::FETCH_PROTO,
         "self_update_enabled": crate::CONFIG.get().map(|c| c.allow_self_update).unwrap_or(false),
         "self_update_mode": crate::CONFIG.get().map(|c| if !c.allow_self_update { "disabled" } else if c.self_restart_after_update { "self" } else { "supervisor" }).unwrap_or("disabled"),
     });

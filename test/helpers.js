@@ -128,10 +128,97 @@ export function makePanelStub(opts = {}) {
   return stub;
 }
 
+// R2 内存 mock：覆盖生产用到的 API 子集（put/get/head/delete/list）。
+// 不连真实 R2：测试必须可离线运行，且 R2 的最终一致性与计费行为不参与断言。
+// put 支持 string / ArrayBuffer / Uint8Array / ReadableStream / Request.body（流式写入）。
+export function makeR2() {
+  const objects = new Map(); // key -> { data, size, uploaded, customMetadata, httpMetadata }
+  const ops = []; // 调用序列，供"是否写入/是否删除"类断言使用
+
+  async function toBytes(value) {
+    if (value == null) return new Uint8Array(0);
+    if (typeof value === 'string') return new TextEncoder().encode(value);
+    if (value instanceof ArrayBuffer) return new Uint8Array(value);
+    if (ArrayBuffer.isView(value)) return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+    if (typeof value.getReader === 'function') {
+      // ReadableStream（Request.body 或手工构造）→ 累积
+      const reader = value.getReader();
+      const chunks = [];
+      let total = 0;
+      for (;;) {
+        const { done, value: chunk } = await reader.read();
+        if (done) break;
+        const u8 = chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk);
+        chunks.push(u8);
+        total += u8.byteLength;
+      }
+      const out = new Uint8Array(total);
+      let off = 0;
+      for (const c of chunks) { out.set(c, off); off += c.byteLength; }
+      return out;
+    }
+    if (value instanceof Blob) return new Uint8Array(await value.arrayBuffer());
+    throw new TypeError('unsupported R2 put value');
+  }
+
+  return {
+    objects,
+    ops,
+    async put(key, value, opts = {}) {
+      const data = await toBytes(value);
+      objects.set(key, {
+        data,
+        size: data.byteLength,
+        uploaded: new Date(),
+        customMetadata: opts.customMetadata || {},
+        httpMetadata: opts.httpMetadata || {},
+      });
+      ops.push({ op: 'put', key, size: data.byteLength });
+      return { key, size: data.byteLength };
+    },
+    async get(key) {
+      ops.push({ op: 'get', key });
+      const obj = objects.get(key);
+      if (!obj) return null;
+      return {
+        key,
+        size: obj.size,
+        customMetadata: obj.customMetadata,
+        httpMetadata: obj.httpMetadata,
+        body: new Blob([obj.data]).stream(),
+        async arrayBuffer() {
+          return obj.data.buffer.slice(obj.data.byteOffset, obj.data.byteOffset + obj.data.byteLength);
+        },
+        async text() { return new TextDecoder().decode(obj.data); },
+      };
+    },
+    async head(key) {
+      ops.push({ op: 'head', key });
+      const obj = objects.get(key);
+      if (!obj) return null;
+      return { key, size: obj.size, customMetadata: obj.customMetadata, httpMetadata: obj.httpMetadata, uploaded: obj.uploaded };
+    },
+    async delete(key) {
+      ops.push({ op: 'delete', key });
+      return objects.delete(key);
+    },
+    async list(opts = {}) {
+      ops.push({ op: 'list', prefix: opts.prefix });
+      const prefix = opts.prefix || '';
+      const keys = [...objects.keys()].filter((k) => k.startsWith(prefix)).sort();
+      return {
+        objects: keys.map((k) => ({ key: k, size: objects.get(k).size, uploaded: objects.get(k).uploaded })),
+        truncated: false,
+      };
+    },
+  };
+}
+
 // ---- 构造最小 env（测试覆盖时用 overrides 替换） ----
 export function makeEnv(overrides = {}) {
   return {
     DB: makeD1(),
+    UPLOADS: makeR2(),
     TERMINAL: makeTerminalStub(),
     METRICS: makeMetricsStub(),
     PANEL: makePanelStub(),

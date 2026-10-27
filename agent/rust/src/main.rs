@@ -2130,6 +2130,9 @@ mod tests {
     // 异步上传路径曾漏掉旧同步路径的两道保护：系统路径拒绝、overwrite=false 拒绝覆盖。
     // 少了前者，拥有 server:exec 的凭据可以把文件写到 /etc/cron.d/；
     // 少了后者，overwrite=false 会静默覆盖同名文件。
+    // Unix 路径模型：Windows 版归一化只认盘符路径，Unix 风格路径一律 fail closed
+    // 判系统（见 session.rs system_path_check_windows），故本用例只在 Unix 下编译。
+    #[cfg(unix)]
     #[test]
     fn async_upload_rejects_system_paths_like_sync_path() {
         for p in [
@@ -2146,6 +2149,26 @@ mod tests {
         // 普通用户目录不应被误拦
         assert!(!session::is_system_path("/home/u/app.tar.gz"));
         assert!(!session::is_system_path("/opt/app/app.tar.gz"));
+    }
+
+    // Windows 等价用例：与上一个测试同一判据，只换盘符路径（Unix 风格路径在 Windows
+    // 下 fail closed 判系统，不能拿来当“放行”用例，见 session.rs system_path_check_windows）。
+    #[cfg(windows)]
+    #[test]
+    fn async_upload_rejects_system_paths_like_sync_path_windows() {
+        for p in [
+            r"C:\Windows\System32\evil",
+            r"C:\Program Files\evil",
+            r"C:\ProgramData\x",
+        ] {
+            assert!(
+                session::is_system_path(p),
+                "异步上传路径必须复用同一系统路径判据，漏判 {p}"
+            );
+        }
+        // 普通用户目录不应被误拦
+        assert!(!session::is_system_path(r"C:\Users\u\app.tar.gz"));
+        assert!(!session::is_system_path(r"D:\data\app.tar.gz"));
     }
 
     #[test]

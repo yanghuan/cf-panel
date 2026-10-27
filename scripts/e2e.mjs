@@ -389,10 +389,10 @@ async function step7_file() {
 }
 
 // ============================================================
-// 第 8 步：MCP 接口测试（16 个工具全覆盖）
+// 第 8 步：MCP 接口测试（17 个工具全覆盖，含异步化新增的 get_operation）
 // ============================================================
 async function step8_mcp() {
-  section('MCP 接口测试（16 个工具）');
+  section('MCP 接口测试（17 个工具）');
 
   // ---- MCP 辅助函数 ----
   async function mcpCall(id, method, params) {
@@ -418,6 +418,20 @@ async function step8_mcp() {
     try { return JSON.parse(text); } catch { return text; }
   }
 
+  // 异步任务轮询：exec_command / create_upload 现在只返回 job，须用 get_operation 轮询到终态
+  // 终态：succeeded / failed / timed_out / expired（见 src/config.js JOB_TERMINAL_STATES）
+  async function mcpPollJob(jobId, timeoutMs = 90000) {
+    const deadline = Date.now() + timeoutMs;
+    let id = 1000;
+    for (;;) {
+      const r = await mcpTool(id++, 'get_operation', { job_id: jobId });
+      const d = mcpContent(r);
+      if (d && ['succeeded', 'failed', 'timed_out', 'expired'].includes(d.status)) return d;
+      if (Date.now() > deadline) return d;
+      await new Promise((resolve) => setTimeout(resolve, Math.min(d?.poll_after_ms || 1000, 5000)));
+    }
+  }
+
   // ---- 8.0) initialize ----
   const init = await mcpCall(1, 'initialize', { protocolVersion: '2025-11-25', capabilities: {} });
   if (init?.result?.protocolVersion === '2025-11-25') ok('MCP initialize：协议版本 2025-11-25');
@@ -425,9 +439,9 @@ async function step8_mcp() {
 
   // ---- 8.1) tools/list ----
   const list = await mcpCall(2, 'tools/list');
-  const toolCount = list?.result?.tools?.length;
-  if (toolCount === 16) ok(`MCP tools/list：16 个工具全部注册`);
-  else bad(`MCP tools/list：期望 16 个工具，实际 ${toolCount}`);
+  const toolNames = list?.result?.tools?.map((t) => t.name) || [];
+  if (toolNames.length === 17 && toolNames.includes('get_operation')) ok(`MCP tools/list：17 个工具全部注册（含 get_operation）`);
+  else bad(`MCP tools/list：期望 17 个工具（含 get_operation），实际 ${toolNames.length}：${toolNames.join(',')}`);
 
   // ---- 8.2) list_servers ----
   const ls = await mcpTool(3, 'list_servers');
@@ -443,11 +457,12 @@ async function step8_mcp() {
   if (gmData?.points?.length >= 1) ok('MCP get_monitor：监控数据存在（points ≥1 条）');
   else bad(`MCP get_monitor：无监控数据：${JSON.stringify(gmData)}`);
 
-  // ---- 8.4) exec_command ----
+  // ---- 8.4) exec_command（异步：返回 job，轮询 get_operation 到终态再取 stdout） ----
   const exec = await mcpTool(5, 'exec_command', { server_id: serverId, command: 'echo E2E_MCP_EXEC_OK' });
-  const execData = mcpContent(exec);
-  if (execData?.stdout?.includes('E2E_MCP_EXEC_OK')) ok('MCP exec_command：agent 真实执行，输出匹配');
-  else bad(`MCP exec_command 失败：${JSON.stringify(exec)}`);
+  const execJob = mcpContent(exec);
+  const execDone = execJob?.job_id ? await mcpPollJob(execJob.job_id) : null;
+  if (execDone?.result?.stdout?.includes('E2E_MCP_EXEC_OK')) ok('MCP exec_command：agent 真实执行，输出匹配');
+  else bad(`MCP exec_command 失败：${JSON.stringify(execDone || exec)}`);
 
   // ---- 8.5) create_upload + Bearer 上传 + 验证 ----
   const cu = await mcpTool(6, 'create_upload', { server_id: serverId, path: '/tmp/e2e-mcp-upload.txt' });
@@ -465,11 +480,12 @@ async function step8_mcp() {
   });
   const upBody = await upRes.json();
   if (upBody.ok) {
-    // exec_command 验证内容
+    // exec_command 验证内容（异步：轮询到终态再取 stdout）
     const verify = await mcpTool(7, 'exec_command', { server_id: serverId, command: 'cat /tmp/e2e-mcp-upload.txt' });
-    const vData = mcpContent(verify);
-    if (vData?.stdout?.includes('E2E_MCP_UPLOAD_CONTENT')) ok('MCP 上传：Bearer 上传 + exec_command 验证内容一致');
-    else bad(`MCP 上传：内容验证不匹配：${JSON.stringify(vData)}`);
+    const vJob = mcpContent(verify);
+    const vData = vJob?.job_id ? await mcpPollJob(vJob.job_id) : null;
+    if (vData?.result?.stdout?.includes('E2E_MCP_UPLOAD_CONTENT')) ok('MCP 上传：Bearer 上传 + exec_command 验证内容一致');
+    else bad(`MCP 上传：内容验证不匹配：${JSON.stringify(vData || vJob)}`);
   } else bad(`MCP 上传：Bearer POST 失败：${JSON.stringify(upBody)}`);
 
   // 清理

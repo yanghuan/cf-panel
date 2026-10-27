@@ -229,12 +229,12 @@ export class TerminalDO {
       // 互斥：内存里的同步更新标记 + D1 里的异步更新任务（双轨期两者都要看）。
       // exec 之间、exec 与 upload 之间不互斥——保持与旧路径一致的并发语义。
       if (this.updating.has(serverId) || await hasActiveAgentUpdate(this.env, serverId)) {
-        await failJob(this.env, jobId, 'agent update in progress');
+        await this.failExecJobWithAudit(this.env, jobId, 'agent update in progress');
         return json({ error: 'agent update in progress' }, 409);
       }
       const agentWs = this.agents.get(serverId);
       if (!agentWs) {
-        await failJob(this.env, jobId, 'agent offline');
+        await this.failExecJobWithAudit(this.env, jobId, 'agent offline');
         return json({ error: 'agent offline', code: 'AGENT_OFFLINE' }, 503);
       }
       // 探活（≤1s，仅对声明 probe_proto 的 agent）：失败即判下行不可达，命令尚未下发，
@@ -244,16 +244,16 @@ export class TerminalDO {
         if (!rttFresh) {
           const ok = await this.probeAgent(agentWs, serverId, EXEC_PROBE_TIMEOUT_MS);
           if (this.agents.get(serverId) !== agentWs) {
-            await failJob(this.env, jobId, 'agent reconnected');
+            await this.failExecJobWithAudit(this.env, jobId, 'agent reconnected');
             return json({ error: 'agent reconnected, please retry', code: 'AGENT_OFFLINE' }, 502);
           }
           if (this.updating.has(serverId)) {
-            await failJob(this.env, jobId, 'agent update in progress');
+            await this.failExecJobWithAudit(this.env, jobId, 'agent update in progress');
             return json({ error: 'agent update in progress' }, 409);
           }
           if (!ok) {
             try { agentWs.close(4002, 'exec probe failed'); } catch { /* ignore */ }
-            await failJob(this.env, jobId, 'agent unreachable');
+            await this.failExecJobWithAudit(this.env, jobId, 'agent unreachable');
             return json({ error: 'agent unreachable', code: 'AGENT_OFFLINE' }, 502);
           }
         }
@@ -264,7 +264,7 @@ export class TerminalDO {
         agentWs.send(JSON.stringify({ type: 'exec', exec_id: jobId, command, timeout_s: Math.floor(timeoutMs / 1000) }));
       } catch {
         // 发送失败不能留下「running 但命令没发出去」
-        await failJob(this.env, jobId, 'failed to send exec command');
+        await this.failExecJobWithAudit(this.env, jobId, 'failed to send exec command');
         return json({ error: 'failed to send exec command' }, 502);
       }
       return json({ ok: true, job_id: jobId, status: 'running' });
@@ -1244,13 +1244,41 @@ export class TerminalDO {
     }
   }
 
+  // 把该服务器已过 deadline 的 waiting_agent 收敛为 expired 并删暂存件。
+  // 这些任务既不该重发（旧包会延迟覆盖生产文件），也不该永久占着 waiting_agent。
+  async settleExpiredWaitingUploads(serverId) {
+    const now = Math.floor(Date.now() / 1000);
+    const stale = await this.env.DB.prepare(
+      `SELECT id, kind, r2_key FROM operation_jobs
+        WHERE server_id = ? AND kind = 'upload' AND status = 'waiting_agent' AND deadline_at <= ?`
+    ).bind(serverId, now).all();
+    for (const job of stale.results || []) {
+      const res = await this.env.DB.prepare(
+        `UPDATE operation_jobs SET status = 'expired', error = COALESCE(error, 'no result before deadline'),
+                finished_at = ?, duration_ms = CASE WHEN started_at IS NULL THEN NULL ELSE (? - started_at) * 1000 END
+          WHERE id = ? AND status = 'waiting_agent'`
+      ).bind(now, now, job.id).run();
+      if (!res.meta.changes) continue;
+      try {
+        if (job.r2_key) await this.env.UPLOADS.delete(job.r2_key);
+      } catch { /* 删除失败由 cron 兜底 */ }
+    }
+  }
+
   async resendWaitingUploads(serverId, ws, baseUrl) {
     if (!TerminalDO.isPublicOrigin(baseUrl)) {
       console.error(`resendWaitingUploads skipped: non-public origin "${baseUrl}"`);
       return;
     }
+    // 更新期间不下发上传：Agent 正在 self-replace，此时发 upload_fetch 会与升级竞争。
+    // 首次下发路径查了同样的互斥（/rpc/upload/submit），重发路径必须一致。
+    // 任务留在 waiting_agent，更新结束后的下一次重连会再试。
+    if (this.updating.has(serverId) || await hasActiveAgentUpdate(this.env, serverId)) return;
     // 先收敛：断开期间处于 running 的 upload 不可能再收到回执
     await requeueOrphanUploads(this.env, serverId);
+    // 已过 deadline 的 waiting_agent 不再重发（否则旧包会延迟覆盖生产文件），
+    // 但也不能让它永远停在 waiting_agent —— 顺手收敛为 expired 并清暂存件。
+    await this.settleExpiredWaitingUploads(serverId);
     const waiting = await listWaitingUploads(this.env, serverId);
     // 能力校验与首次下发同源：积压的旧 Agent 任务不能直接发 upload_fetch（对方不认识）
     const capable = this.supportsFetch(ws, 'upload');
@@ -1302,6 +1330,32 @@ export class TerminalDO {
     if (kind === 'upload') return Number(cap.upload_fetch_proto) >= 1;
     if (kind === 'update') return Number(cap.update_fetch_proto) >= 1;
     return false;
+  }
+
+  // exec 的失败路径统一收口：标 failed + 写审计。
+  // 旧同步路径在"Agent 离线/下发失败/断连/超时"时都会写一条 exec.command，
+  // 异步化后只在 settleExecJob（收到 exec_result）写，其余路径全部无痕——
+  // 对最高权限的写操作来说这是审计回退。这里补 exec.command.failed，
+  // 保留"谁在何时试图在哪台机器跑什么"的痕迹（文档 §12.2 允许 *.failed 留痕）。
+  async failExecJobWithAudit(env, jobId, reason) {
+    // failJob 返回布尔（是否命中条件更新），不是行对象——这里必须自己回读一次才能拿到
+    // command/user_id 等审计所需字段。
+    const changed = await failJob(env, jobId, reason);
+    if (!changed) return null;
+    const job = await getJob(env, jobId);
+    if (!job) return null;
+    const cmd = String(job.command || '');
+    const commandTrunc = cmd.length > 180 ? `${cmd.slice(0, 180)}…` : cmd;
+    try {
+      await env.DB.prepare(
+        'INSERT INTO audit_logs (user_id, username, client_ip, action, target_server_id, detail, duration_ms, job_id) VALUES (?,?,?,?,?,?,?,?)'
+      ).bind(
+        job.user_id, job.username, job.client_ip || '', 'exec.command.failed', job.server_id,
+        `exit=? (${reason}) ${commandTrunc}`,
+        job.duration_ms ?? null, jobId,
+      ).run();
+    } catch (e) { console.error('exec failed audit failed:', e); }
+    return job;
   }
 
   // upload_result → D1 终态 + 审计（异步路径）。
@@ -1361,7 +1415,13 @@ export class TerminalDO {
         errMsg = `size mismatch: agent reported ${j.size}, expected ${row.size_bytes}`;
       }
     }
-    const job = await finishUpdateJob(this.env, jobId, { ok, error: errMsg });
+    // 迟到回执：任务曾判 expired，Agent 现在才回报。纠正状态但保留"曾判过期"的痕迹，
+    // 否则事后复理会以为是首次成功（与 settleUploadJob 同款处理）。
+    const wasExpired = !!row && row.status === 'expired';
+    const finalErr = wasExpired
+      ? `late result after expiry (expired at ${row.deadline_at}s)${errMsg ? `; ${errMsg}` : ''}`
+      : errMsg;
+    const job = await finishUpdateJob(this.env, jobId, { ok, error: finalErr });
     // 无论成功失败都要释放内存互斥：updating 只在 send 抛错时清过，
     // 成功后不清会让这台机器在本 DO 实例存活期内再也无法 exec/upload（反复 409）。
     if (job) this.updating.delete(job.server_id);
@@ -1374,7 +1434,7 @@ export class TerminalDO {
         // 与同步路径、前端映射表保持同一命名：agent.update.installed / .failed。
         // 少了 .installed 会在审计页显示成裸的 agent.update（前端无对应翻译 key）。
         job.user_id, job.username, job.client_ip || '', ok ? 'agent.update.installed' : 'agent.update.failed',
-        job.server_id, `${job.from_version || '?'} → ${job.build_id || '?'}${ok ? '' : ` (${errMsg || 'failed'})`}`,
+        job.server_id, `${job.from_version || '?'} → ${job.build_id || '?'}${wasExpired ? ' [late]' : ''}${ok ? '' : ` (${finalErr || 'failed'})`}`,
         job.duration_ms ?? null, jobId,
       ).run();
     } catch (e) { console.error('agent update audit failed:', e); }
@@ -1383,23 +1443,37 @@ export class TerminalDO {
   // exec_result → D1 终态 + 审计（异步路径）。
   // 条件更新未命中说明是重复回执或任务已判过期：只记日志，不覆盖终态、不重复审计。
   async settleExecJob(jobId, j) {
+    const row = await getJob(this.env, jobId);
+    // 迟到回执尤其重要：命令可能真的执行了（systemctl restart 之类），报 expired 会
+    // 让调用方误判为"没执行"而重试 → 重复执行。纠正状态，但用 [late] 留下曾判过期的痕迹，
+    // 否则事后复理会以为首次就成功。
+    const wasExpired = !!row && row.status === 'expired';
+    // ⚠️ finishExecJob 用 `error ? 'failed' : 'succeeded'` 判状态，所以"迟到"这个纯标注
+    // **不能**塞进 error —— 否则一次成功的迟到回执会被判成 failed。这里只把真实的
+    // j.error 交给它决定状态，迟到信息写进 stderr（不参与状态判定、但会展示给调用方）。
+    const realErr = j.error || null;
+    const lateNote = wasExpired
+      ? `[late] result arrived after the job was marked expired (deadline ${row.deadline_at}s)\n`
+      : '';
     const job = await finishExecJob(this.env, jobId, {
       exitCode: typeof j.exit_code === 'number' ? j.exit_code : null,
       stdout: typeof j.stdout === 'string' ? j.stdout : '',
-      stderr: typeof j.stderr === 'string' ? j.stderr : '',
+      stderr: `${lateNote}${typeof j.stderr === 'string' ? j.stderr : ''}`,
       timedOut: !!j.timed_out,
-      error: j.error || null,
+      error: realErr,
     });
     if (!job) return;
     // 审计与旧同步路径同格式（exit=.. + 截断命令），额外带 duration_ms / job_id 便于关联任务
     const cmd = String(job.command || '');
-    const commandTrunc = cmd.length > 200 ? `${cmd.slice(0, 200)}…` : cmd;
+    const commandTrunc = cmd.length > 190 ? `${cmd.slice(0, 190)}…` : cmd;
+    const lateTag = wasExpired ? ' [late]' : '';
+    const failTag = job.status === 'failed' || job.status === 'timed_out' ? ` (${job.status})` : '';
     try {
       await this.env.DB.prepare(
         'INSERT INTO audit_logs (user_id, username, client_ip, action, target_server_id, detail, duration_ms, job_id) VALUES (?,?,?,?,?,?,?,?)'
       ).bind(
         job.user_id, job.username, job.client_ip || '', 'exec.command', job.server_id,
-        `exit=${typeof job.exit_code === 'number' ? job.exit_code : '?'} ${commandTrunc}`,
+        `exit=${typeof job.exit_code === 'number' ? job.exit_code : '?'}${lateTag}${failTag} ${commandTrunc}`,
         job.duration_ms ?? null, jobId,
       ).run();
     } catch (e) { console.error('exec audit failed:', e); }
@@ -1482,16 +1556,27 @@ export class TerminalDO {
         this.state.storage.delete('sess:' + sid).catch(() => {}); // 清理持久化会话
       }
     }
+    // serverId 的定位不能只靠 map 值相等：重连时新连接会先把旧连接 close(4001) 再把
+    // agents 指向新连接，而 webSocketClose 是异步到达的——届时 agents.get(sid) === ws2 ≠ ws1，
+    // 整个分支被跳过，updating 永不释放（该机器在本实例存活期内永久 409）、
+    // settleJobsOnDisconnect 也不执行（exec/update 要等 deadline 才收敛）。
+    // 用连接附件里的 serverId 兜底：它不依赖 agents 当前指向谁。
+    const attServerId = this.wsServerId(ws);
+    const matched = [];
     for (const [serverId, w] of this.agents) {
-      if (w === ws) {
-        this.agents.delete(serverId);
+      if (w === ws) matched.push(serverId);
+    }
+    // 被顶替的旧连接：agents 已指向新连接，只能靠附件认出"这个 ws 属于哪台服务器"
+    if (!matched.length && attServerId) matched.push(attServerId);
+    for (const serverId of matched) {
+      const isCurrent = this.agents.get(serverId) === ws;
+      if (isCurrent) this.agents.delete(serverId);
+      // 被顶替的旧连接（isCurrent=false）：只释放 per-server 的互斥/能力记录并收敛 D1，
+      // **不能**清 pendingExec/pendingUpdate 等 Promise——那些属于"当前这条新连接"的
+      // 在途请求，误清会让明明还在跑的请求收到假的"agent disconnected"。
+      if (isCurrent) {
         // 控制连接已断 → 作废该 serverId 的往返/探活能力记录（新连接会重新协商 probe），
         // 并立即失败在途探活（否则 /rpc/exec 的探活要等 EXEC_PROBE_TIMEOUT_MS 超时才返回）
-        this.lastRoundTripAt.delete(serverId);
-        this.probeCapable.delete(serverId);
-        // 控制连接断开 → 释放更新互斥：更新进程已随连接丢失，标记不能留到
-        // DO evict，否则该机器在本实例存活期内一直 409（D1 侧已终态，纯内存泄漏）
-        this.updating.delete(serverId);
         for (const [, r] of [...this.pendingProbe]) {
           if (r.serverId === serverId) r.resolve(false);
         }
@@ -1527,8 +1612,16 @@ export class TerminalDO {
             r.resolve({ ok: false, error: 'agent disconnected during update' });
           }
         }
-        // D1 里的在途任务也要收敛，不能只等 deadline（exec ~30s、update ~210s）。
-        // upload 交给重连时的 requeueOrphanUploads（可恢复），exec/update 直接判失败。
+      }
+      // 以下两项与"是不是当前连接"无关：被顶替的旧连接也要释放，否则永久 409。
+      this.lastRoundTripAt.delete(serverId);
+      this.probeCapable.delete(serverId);
+      // 控制连接断开 → 释放更新互斥：更新进程已随连接丢失，标记不能留到
+      // DO evict，否则该机器在本实例存活期内一直 409（D1 侧已终态，纯内存泄漏）
+      this.updating.delete(serverId);
+      // D1 收敛只对"真正的断开"做：被顶替的旧连接说明 Agent 已重连、任务还在新连接上跑，
+      // 此时判 failed 会误杀正在进行的命令。upload 一律交给重连时的 requeueOrphanUploads。
+      if (isCurrent) {
         this.settleJobsOnDisconnect(serverId).catch(() => { /* 失败由 deadline 兜底 */ });
       }
     }
@@ -1540,13 +1633,19 @@ export class TerminalDO {
     const now = Math.floor(Date.now() / 1000);
     const placeholders = ['queued', 'running'].map(() => '?').join(',');
     try {
-      await this.env.DB.prepare(
-        `UPDATE operation_jobs
-            SET status = 'failed', error = 'agent disconnected', finished_at = ?,
-                duration_ms = CASE WHEN started_at IS NULL THEN NULL ELSE (? - started_at) * 1000 END
-          WHERE server_id = ? AND kind IN ('exec','agent_update')
-            AND status IN (${placeholders})`
-      ).bind(now, now, serverId, 'queued', 'running').run();
+      // 先查后改：exec 的断连失败也要写审计（exec.command.failed），
+      // 纯 UPDATE 拿不到受影响行，会让这条路径依然无痕。
+      const rows = await this.env.DB.prepare(
+        `SELECT id, kind FROM operation_jobs
+          WHERE server_id = ? AND kind IN ('exec','agent_update') AND status IN (${placeholders})`
+      ).bind(serverId, 'queued', 'running').all();
+      for (const row of rows.results || []) {
+        if (row.kind === 'exec') {
+          await this.failExecJobWithAudit(this.env, row.id, 'agent disconnected');
+        } else {
+          await failJob(this.env, row.id, 'agent disconnected');
+        }
+      }
     } catch (e) {
       console.error('settleJobsOnDisconnect failed:', e);
     }

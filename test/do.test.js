@@ -3057,3 +3057,149 @@ test('upload 重复回执：已 succeeded 不被后续 failed 覆盖', async () 
   const n = await env.DB.prepare("SELECT COUNT(*) AS c FROM audit_logs WHERE job_id = 'job_dup'").first();
   assert.equal(n.c, 1, '审计不重复');
 });
+
+// P1-1：被顶替的旧连接（重连时先 close 旧的、再把 agents 指向新的）其 cleanup 到达时
+// agents.get(sid) 已是新连接，老的 map 值比较分支会被整体跳过 —— updating 永不释放，
+// 该机器在本 DO 实例存活期内永久 409，且断连收敛也不执行。
+test('superseded 旧连接：cleanup 仍释放 updating（不依赖 map 命中）', async () => {
+  const env = makeEnv();
+  await env.DB.prepare('INSERT INTO servers (agent_key_id, name, user_id, agent_key_hash) VALUES (?,?,?,?)')
+    .bind('k1', 's1', 1, 'h1').run();
+  const inst = new TerminalDO(mockState(), env);
+  const mk = () => ({
+    attachment: { role: 'control', serverId: 1, ts: Date.now() },
+    deserializeAttachment() { return this.attachment; },
+    serializeAttachment(a) { this.attachment = a; },
+    send() {}, readyState: 1, close() {},
+  });
+  const ws1 = mk();
+  const ws2 = mk();
+  inst.agents.set(1, ws1);
+  inst.updating.add(1);
+
+  // 重连：新连接顶替
+  inst.agents.set(1, ws2);
+  // 旧连接的 close 事件这才到达（异步）
+  inst.cleanup(ws1);
+
+  assert.equal(inst.updating.has(1), false, '被顶替的旧连接也必须释放 updating');
+  assert.equal(inst.agents.get(1), ws2, '不能误删当前连接的索引');
+});
+
+// P1-2：requeueOrphanUploads 判 timed_out 时必须删 R2 暂存件
+test('requeueOrphanUploads：过 deadline 的 running upload → timed_out 且删 R2', async () => {
+  const env = makeEnv();
+  await env.DB.prepare('INSERT INTO servers (agent_key_id, name, user_id, agent_key_hash) VALUES (?,?,?,?)')
+    .bind('k1', 's1', 1, 'h1').run();
+  const now = Math.floor(Date.now() / 1000);
+  await env.DB.prepare(`INSERT INTO operation_jobs (id, kind, status, user_id, username, server_id, target_path, size_bytes, r2_key, created_at, started_at, deadline_at, expires_at)
+    VALUES ('job_o','upload','running',1,'admin',1,'/opt/a.bin',10,'upload-jobs/job_o',?,?,?,?)`)
+    .bind(now - 400, now - 390, now - 60, now + 86400).run();
+  await env.UPLOADS.put('upload-jobs/job_o', 'bytes');
+  assert.ok(await env.UPLOADS.head('upload-jobs/job_o'), '前提：对象存在');
+
+  const { requeueOrphanUploads } = await import('../src/jobs.js');
+  const n = await requeueOrphanUploads(env, 1, now);
+  assert.equal(n, 1);
+  const row = await env.DB.prepare('SELECT status FROM operation_jobs WHERE id = ?').bind('job_o').first();
+  assert.equal(row.status, 'timed_out');
+  assert.equal(await env.UPLOADS.head('upload-jobs/job_o'), null, '判 timed_out 时必须删暂存件（不能等 24h cron）');
+});
+
+// P2-3：已过 deadline 的 waiting_agent 不得重发（否则旧包延迟覆盖生产文件）
+test('重连重发：过期 waiting_agent 不重发，并收敛为 expired + 删 R2', async () => {
+  const env = makeEnv();
+  await env.DB.prepare('INSERT INTO servers (agent_key_id, name, user_id, agent_key_hash) VALUES (?,?,?,?)')
+    .bind('k1', 's1', 1, 'h1').run();
+  const now = Math.floor(Date.now() / 1000);
+  await env.DB.prepare(`INSERT INTO operation_jobs (id, kind, status, user_id, username, server_id, target_path, overwrite, size_bytes, r2_key, created_at, deadline_at, expires_at)
+    VALUES ('job_stale','upload','waiting_agent',1,'admin',1,'/opt/app.tar.gz',0,10,'upload-jobs/job_stale',?,?,?)`)
+    .bind(now - 3000, now - 3000, now + 86400).run();
+  await env.UPLOADS.put('upload-jobs/job_stale', 'old-bytes');
+
+  const inst = new TerminalDO(mockState(), env);
+  const sent = [];
+  const ws = {
+    attachment: { role: 'control', serverId: 1, caps: { upload_fetch_proto: 1 } },
+    deserializeAttachment() { return this.attachment; },
+    serializeAttachment(a) { this.attachment = a; },
+    send: (m) => sent.push(JSON.parse(m)), readyState: 1, close() {},
+  };
+  inst.agents.set(1, ws);
+  await inst.resendWaitingUploads(1, ws, 'https://panel.example');
+
+  assert.equal(sent.filter((f) => f.type === 'upload_fetch').length, 0, '过期任务绝不能再下发（会覆盖生产文件）');
+  const row = await env.DB.prepare('SELECT status FROM operation_jobs WHERE id = ?').bind('job_stale').first();
+  assert.equal(row.status, 'expired', '过期任务要有终态，不能永远挂在 waiting_agent');
+  assert.equal(await env.UPLOADS.head('upload-jobs/job_stale'), null, '收敛时同样清暂存件');
+});
+
+// listWaitingUploads 自身必须过滤 deadline：只靠 settleExpiredWaitingUploads 收敛会让
+// "过滤缺失"这个 bug 被掩盖（两者都在重连路径上，前者先执行）。这里直接测函数本身。
+test('listWaitingUploads：只返回未过 deadline 的任务', async () => {
+  const env = makeEnv();
+  await env.DB.prepare('INSERT INTO servers (agent_key_id, name, user_id, agent_key_hash) VALUES (?,?,?,?)')
+    .bind('k1', 's1', 1, 'h1').run();
+  const now = Math.floor(Date.now() / 1000);
+  // 两台服务器各一个任务：同一 server 只允许一个非终态 upload（部分唯一索引），
+  // 所以用不同 server_id 分别验证"未过期保留 / 已过期排除"。
+  await env.DB.prepare('INSERT INTO servers (agent_key_id, name, user_id, agent_key_hash) VALUES (?,?,?,?)')
+    .bind('k2', 's2', 1, 'h2').run();
+  const ins = (id, serverId, deadline) => env.DB.prepare(`INSERT INTO operation_jobs (id, kind, status, user_id, username, server_id, target_path, overwrite, size_bytes, r2_key, created_at, deadline_at, expires_at)
+    VALUES (?, 'upload', 'waiting_agent', 1,'admin',?,'/opt/x',0,10,?,?,?,?)`)
+    .bind(id, serverId, `upload-jobs/${id}`, now - 100, deadline, now + 86400).run();
+  await ins('job_live', 1, now + 300);
+  await ins('job_dead', 2, now - 60);
+
+  const { listWaitingUploads } = await import('../src/jobs.js');
+  assert.deepEqual((await listWaitingUploads(env, 1, now)).map((r) => r.id), ['job_live']);
+  assert.deepEqual((await listWaitingUploads(env, 2, now)).map((r) => r.id), [],
+    '过期任务不得进入重发列表');
+});
+
+// P2-4：exec 失败路径必须留审计（旧同步路径这几种场景都会写 exec.command）
+test('exec 失败留审计：Agent 离线提交 → exec.command.failed', async () => {
+  const env = makeEnv();
+  await env.DB.prepare('INSERT INTO servers (agent_key_id, name, user_id, agent_key_hash) VALUES (?,?,?,?)')
+    .bind('k1', 's1', 1, 'h1').run();
+  const now = Math.floor(Date.now() / 1000);
+  await env.DB.prepare(`INSERT INTO operation_jobs (id, kind, status, user_id, username, client_ip, server_id, command, timeout_s, created_at, deadline_at, expires_at)
+    VALUES ('job_ef','exec','queued',1,'admin','',1,'rm -rf /tmp/x',5,?,?,?)`).bind(now, now + 35, now + 86400).run();
+  const inst = new TerminalDO(mockState(), env); // 不注册 agent → 离线
+
+  const res = await inst.fetch(new Request('https://do.internal/rpc/exec/submit', {
+    method: 'POST', body: JSON.stringify({ jobId: 'job_ef', serverId: 1, command: 'rm -rf /tmp/x', timeoutMs: 5000 }),
+  }));
+  assert.equal(res.status, 503);
+  const row = await env.DB.prepare('SELECT status FROM operation_jobs WHERE id = ?').bind('job_ef').first();
+  assert.equal(row.status, 'failed');
+  const audits = await env.DB.prepare("SELECT action, detail FROM audit_logs WHERE job_id = 'job_ef'").all();
+  assert.equal(audits.results.length, 1, '最高权限的写操作失败时不能无痕');
+  assert.equal(audits.results[0].action, 'exec.command.failed');
+  assert.match(audits.results[0].detail, /rm -rf \/tmp\/x/, '审计必须保留被拒绝的命令内容');
+});
+
+// P2-5：exec/update 的迟到回执也要留 [late] 痕迹（与 upload 对齐）
+test('迟到的 exec 回执：纠正状态并标 [late]', async () => {
+  const env = makeEnv();
+  await env.DB.prepare('INSERT INTO servers (agent_key_id, name, user_id, agent_key_hash) VALUES (?,?,?,?)')
+    .bind('k1', 's1', 1, 'h1').run();
+  const now = Math.floor(Date.now() / 1000);
+  await env.DB.prepare(`INSERT INTO operation_jobs (id, kind, status, user_id, username, client_ip, server_id, command, timeout_s, exit_code, created_at, started_at, deadline_at, expires_at)
+    VALUES ('job_le','exec','expired',1,'admin','',1,'systemctl restart app',5,NULL,?,?,?,?)`)
+    .bind(now - 100, now - 99, now - 60, now + 86400).run();
+  const inst = new TerminalDO(mockState(), env);
+  const ws = { deserializeAttachment: () => ({ role: 'control', serverId: 1 }), send() {}, readyState: 1, close() {} };
+  inst.agents.set(1, ws);
+
+  await inst.webSocketMessage(ws, JSON.stringify({
+    type: 'exec_result', exec_id: 'job_le', stdout: 'ok', stderr: '', exit_code: 0, timed_out: false,
+  }));
+  const row = await env.DB.prepare('SELECT status, stderr FROM operation_jobs WHERE id = ?').bind('job_le').first();
+  assert.equal(row.status, 'succeeded', '命令真的执行了，状态必须纠正');
+  // 迟到标注写在 stderr：finishExecJob 用 error 判状态，塞进 error 会把成功误判成 failed
+  assert.match(row.stderr, /\[late\]/, '保留曾判过期的事实');
+  const a = await env.DB.prepare("SELECT detail FROM audit_logs WHERE job_id = 'job_le'").first();
+  assert.ok(a, '迟到回执也要写审计');
+  assert.match(a.detail, /\[late\]/, '审计标注迟到，避免复盘误判为首次成功');
+});

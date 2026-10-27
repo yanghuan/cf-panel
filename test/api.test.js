@@ -2429,3 +2429,22 @@ test('agent update：旧 Agent 被拒时不写 request 审计', async () => {
     globalThis.fetch = orig;
   }
 });
+
+// 已过 deadline 但没人轮询的上传任务会一直占着单机串行锁（部分唯一索引），
+// 让同机后续上传全部 409 UPLOAD_BUSY，最长挡到 expires_at（24h）。
+// 创建前按 server 顺手收敛即可让出，不需要全表扫描的 settleExpiredAll。
+test('upload job：创建前收敛本机过期任务，释放被占的串行锁', async () => {
+  const env = makeEnv();
+  const token = await login(env);
+  await addServer(env, token, { name: 'stale-lock' });
+  const now = Math.floor(Date.now() / 1000);
+  // 一个早已过 deadline 的 awaiting_upload 任务（没人轮询，cron 也没跑到）
+  await env.DB.prepare(`INSERT INTO operation_jobs (id, kind, status, user_id, username, server_id, target_path, overwrite, size_bytes, created_at, deadline_at, expires_at)
+    VALUES ('job_old','upload','awaiting_upload',1,'admin',1,'/opt/old',0,10,?,?,?)`)
+    .bind(now - 4000, now - 3000, now + 86400).run();
+
+  const res = await call(env, { method: 'POST', path: '/api/upload-jobs', token, body: { server_id: 1, path: '/opt/new' } });
+  assert.equal(res.status, 202, '过期任务不应阻塞新上传');
+  const row = await env.DB.prepare('SELECT status FROM operation_jobs WHERE id = ?').bind('job_old').first();
+  assert.equal(row.status, 'expired', '旧任务应被顺带收敛为 expired');
+});

@@ -763,7 +763,7 @@ DO 在下发 upload_fetch 前检查能力：
 
 - 支持 `upload_fetch_proto >= 1`：走新异步路径。
 - 不支持：返回明确 `AGENT_UPGRADE_REQUIRED`，不要把新任务静默降级成同步 `/rpc/upload`。
-- 过渡期如需兼容旧 Agent，只能通过显式环境变量 `LEGACY_SYNC_UPLOAD=1` 开启旧路径；默认关闭，并在 README 标记 deprecated。
+- 旧 Agent 兼容：**没有 `LEGACY_SYNC_UPLOAD` 开关**（早期草案设想过，未实现）。旧 Agent 调用异步上传接口会得到 `AGENT_UPGRADE_REQUIRED`；如需继续用旧方式，走保留的 `/mcp/file_upload` + Bearer 同步路径（一个版本周期后删除）。
 - 旧 `/mcp/file_upload` + `/rpc/upload` 保留一个版本周期，确认 Agent 全量升级后再删除。
 
 ### 8.6 Agent update 异步接口
@@ -1012,7 +1012,7 @@ DO 收到结果：
 
 实现状态（与上表一一对应）：
 
-- `exec`：`cleanup()` 里对在途 `pendingExec` 直接 resolve `agent disconnected`；新异步路径由 deadline 收敛。
+- `exec`：断连立即收敛（不是等 deadline）——`cleanup()` 对在途 `pendingExec` 直接 resolve `agent disconnected`，并把该 server 处于 `queued`/`running` 的 exec 任务标 `failed` 并写 `exec.command.failed` 审计（见 `settleJobsOnDisconnect`）。被判 `expired` 的情况只在 deadline 超时且没有断连事件时出现。
 - `upload`：**已实现重连重发**。控制 WS 建立时调用 `resendWaitingUploads()`：
   1. 先把该 server 处于 `running` 的 upload 退回 `waiting_agent`（过 deadline 的直接判 `timed_out`）——否则断开期间的那次重连什么都不会做；
   2. 再捞 `waiting_agent` 的任务（限 20 条）逐条**重新签发** download URL 后下发。**必须重签**：建任务时的短期 URL（10 分钟）早已过期；
@@ -1028,7 +1028,7 @@ DO 收到结果：
 
 - 不在 DO 中为任务设置 `setTimeout`。
 - Worker `GET /api/jobs/:id` 发现：
-  - `now > deadline_at` 且状态非终态：条件更新为 `timed_out`。
+  - `now > deadline_at` 且状态非终态：条件更新为 `expired`（与 §5.2 一致；exec 同时写 `exec.command.failed` 审计）。
 - 新增 Worker scheduled（建议每小时）：
   - 非终态且超 deadline → `timed_out/expired`。
   - `expires_at < now` 的任务删除 D1 行。
@@ -1099,7 +1099,7 @@ SELECT 1 FROM operation_jobs
    - README、initialize instructions、工具描述同步更新。
 5. **观察期**：确认新任务成功率、R2 清理、Agent 下载/更新失败率。
 6. **移除旧同步路径**：删除 `/rpc/exec` 的 Promise 等待、`pendingExec`、`pendingUpload`、`pendingUpdate`，以及旧 `/mcp/file_upload`。若需回滚，用环境变量恢复旧路径，而不是默认保留。
-7. **旧 Agent 过渡**：在旧 Agent 未升级完前，`LEGACY_SYNC_UPDATE=1` 保留更新自举路径；`LEGACY_SYNC_UPLOAD` 同理。它们都会产生长 DO duration，必须监控使用次数并计划关闭。
+7. **旧 Agent 过渡**：仅 `LEGACY_SYNC_UPDATE=1` 保留更新自举的同步路径（它会产生长 DO duration，必须监控使用次数并计划关闭）。上传侧没有对应的 legacy 开关：旧 Agent 走保留的 `/mcp/file_upload` Bearer 路径，异步 `/api/upload-jobs` 对旧 Agent 明确返回 `AGENT_UPGRADE_REQUIRED`。
 
 注意：执行 `exec_command` / `update_agent` 语义从“同步返回最终结果”变为“异步 job”是 API 行为变更，必须在 README、MCP instructions、客户端示例中明确，不能只改实现。
 

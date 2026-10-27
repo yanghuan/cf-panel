@@ -462,11 +462,12 @@ async function dispatchExecJob(env, user, { server, command, timeoutS, ip, idemp
 
 // 通用审计写入（best-effort）：审计是旁路留痕，写入失败绝不得改变主流程结果——
 // 否则一次 D1 抖动会让登录/鉴权跟着失败，可用性被旁路系统绑架。
-async function auditLog(env, { userId = 0, username = '', ip = '', action, serverId = null, detail = null }) {
+async function auditLog(env, { userId = 0, username = '', ip = '', action, serverId = null, detail = null, jobId = null }) {
   try {
+    // job_id 可空：带上它才能在审计页从一次操作反查到具体任务（异步任务才有）。
     await env.DB.prepare(
-      'INSERT INTO audit_logs (user_id, username, client_ip, action, target_server_id, detail) VALUES (?,?,?,?,?,?)'
-    ).bind(userId, username, ip, action, serverId, detail).run();
+      'INSERT INTO audit_logs (user_id, username, client_ip, action, target_server_id, detail, job_id) VALUES (?,?,?,?,?,?,?)'
+    ).bind(userId, username, ip, action, serverId, detail, jobId).run();
     return true;
   } catch (e) {
     console.error(`audit failed (${action}):`, e);
@@ -956,7 +957,7 @@ async function handleApiInner(request, env) {
     await auditLog(env, {
       userId: user.id, username: user.username, ip,
       action: 'file.upload.request', serverId,
-      detail: targetPath,
+      detail: targetPath, jobId: job.id,
     });
     return json(uploadJobResponse(job, uploadUrl, JOB_POLL_AFTER_MS), 202);
   }
@@ -1540,6 +1541,9 @@ async function handleAgentAssetProxy(request, env, u) {
     `${job.build_id}|${job.platform}|${job.size_bytes}`, env
   );
   if (!v.ok) return err(v.error, 403);
+  // 与 handleJobDownload 对齐：token 已绑定 job.server_id，这里再显式比对一次，
+  // 两个端点的行为保持一致（也防将来 token 格式变化时静默失去这一层）。
+  if (Number(job.server_id) !== serverId) return err('forbidden', 403);
   if (job.status !== 'running') return err(`job is not running (status=${job.status})`, 409);
   if (!job.asset_url) return err('no asset url', 404);
   let upstream;
@@ -1547,6 +1551,9 @@ async function handleAgentAssetProxy(request, env, u) {
     upstream = await fetch(job.asset_url, {
       headers: { accept: 'application/octet-stream', 'user-agent': 'cf-panel-agent-updater' },
       redirect: 'follow',
+      // 与旧同步路径（agentUpdateLegacySync）一致：同一版本资产被 N 台机器更新时复用
+      // 边缘缓存，避免 N 次回源 GitHub（也降低触发限流的概率）。文档 §8.6.2 要求沿用。
+      cf: { cacheTtl: 86400, cacheEverything: true },
     });
   } catch {
     return err('asset fetch failed', 502);
@@ -1823,6 +1830,11 @@ async function mcpUpdateAgent(user, env, args, ip, url) {
   const body = await resp.json().catch(() => ({ error: `update failed (${resp.status})` }));
   if (!resp.ok) throw new Error(body.error || `agent update failed (${resp.status})`);
   if (body.already_latest) return `服务器「${server.name}」Agent 已是最新版本（${body.build_id}），无需更新。`;
+  // legacy 同步分支（LEGACY_SYNC_UPDATE=1 + 旧 Agent）没有 job_id：它是同步完成的，
+  // 不能包装成"请轮询 job_id"，否则客户端会去轮询一个不存在的任务。
+  if (!body.job_id) {
+    return `服务器「${server.name}」Agent 已更新（→ ${body.build_id}，旧同步路径）。新二进制已替换，稍后可用 list_servers 确认上报的新版本号。`;
+  }
   // 异步语义（阶段 C）：此处只是"已下发"，Agent 还要下载/校验/self-replace，必须轮询
   return {
     job_id: body.job_id,

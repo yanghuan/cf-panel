@@ -153,7 +153,27 @@ export async function settleExpired(env, job) {
   // 过期即删 staging 对象：不能等 cron 的 24h TTL——一次 Agent 掉线的 100MB 上传
   // 会在额度里白躺一天，几十次就顶满 10GB。此处在判定过期的同一路径上清掉。
   await deleteStagingObject(env, job);
+  // exec 超时同样要留痕：旧同步路径在超时会写一条 exec.command，
+  // 异步化后若不补，这条路径就完全无审计（最高权限的写操作反而无痕）。
+  if (job.kind === 'exec') await auditExecFailed(env, job, 'no result before deadline');
   return getJob(env, job.id);
+}
+
+// exec 失败/超时的审计（exec.command.failed）。与 DO 内的 failExecJobWithAudit 同格式，
+// 供 Worker 侧的过期收敛路径复用（那里没有 DO 实例方法可用）。
+export async function auditExecFailed(env, job, reason) {
+  if (!job || job.kind !== 'exec') return;
+  const cmd = String(job.command || '');
+  const commandTrunc = cmd.length > 180 ? `${cmd.slice(0, 180)}…` : cmd;
+  try {
+    await env.DB.prepare(
+      'INSERT INTO audit_logs (user_id, username, client_ip, action, target_server_id, detail, duration_ms, job_id) VALUES (?,?,?,?,?,?,?,?)'
+    ).bind(
+      job.user_id, job.username, job.client_ip || '', 'exec.command.failed', job.server_id,
+      `exit=? (${reason}) ${commandTrunc}`,
+      job.duration_ms ?? null, job.id,
+    ).run();
+  } catch (e) { console.error('exec failed audit failed:', e); }
 }
 
 // 删除任务对应的 R2 暂存对象（仅 upload）。失败只记日志：
@@ -180,8 +200,36 @@ export async function hasActiveAgentUpdate(env, serverId) {
 // 创建 upload 任务（awaiting_upload）。同一服务器已有非终态 upload 时抛 UPLOAD_BUSY。
 // 有效期分两段：先给客户端 10 分钟上传字节；落 R2 后再给 Agent 120s 拉取，
 // 两段窗口互不复用（上传慢不该挤掉 Agent 的时间）。
+// 按 server 收敛该机已过 deadline 的非终态任务（供应在创建前调用）。
+// 不能用 settleExpiredAll：它是全表扫描（LIMIT 200），在创建任务的热路径里调会无谓扫 200 行。
+// 这里只处理"这台机器"，把被过期任务占着的部分唯一索引让出来——否则
+// awaiting_upload / update running 的任务过了 deadline 但没人轮询、cron 未跑到时，
+// createUploadJob 仍会返回 UPLOAD_BUSY，最长挡到 expires_at（24h）。
+export async function settleServerExpired(env, serverId, now = nowSec()) {
+  const rows = await env.DB.prepare(
+    `SELECT id, kind, r2_key, user_id, username, client_ip, server_id, command FROM operation_jobs
+      WHERE server_id = ? AND deadline_at < ?
+        AND status IN ('queued','awaiting_upload','staging','staged','waiting_agent','running')
+      LIMIT 20`
+  ).bind(serverId, now).all();
+  for (const job of rows.results || []) {
+    const placeholders = ACTIVE_STATES.map(() => '?').join(',');
+    const res = await env.DB.prepare(
+      `UPDATE operation_jobs
+          SET status = 'expired', error = COALESCE(error, 'no result before deadline'), finished_at = ?,
+              duration_ms = CASE WHEN started_at IS NULL THEN NULL ELSE (? - started_at) * 1000 END
+        WHERE id = ? AND status IN (${placeholders})`
+    ).bind(now, now, job.id, ...ACTIVE_STATES).run();
+    if (!res.meta.changes) continue;
+    await deleteStagingObject(env, job);
+    if (job.kind === 'exec') await auditExecFailed(env, job, 'no result before deadline');
+  }
+}
+
 export async function createUploadJob(env, { user, serverId, targetPath, overwrite, maxBytes, clientIp }) {
   await purgeExpired(env);
+  // 先让出被"已过期但无人轮询"的任务占着的单机串行锁（见 settleServerExpired 注释）
+  await settleServerExpired(env, serverId);
   const now = nowSec();
   const jobId = newJobId();
   const job = {
@@ -254,13 +302,19 @@ export async function markUploadWaitingAgent(env, id) {
 
 // 重连重发（文档 §9）：Agent 重连后，把该服务器停在 waiting_agent 的 upload 任务捞出来重新下发。
 // 限量 20 条：异常时（大量任务堆积）不能让一次重连触发无界查询与下发。
-export async function listWaitingUploads(env, serverId) {
+// 只捞"还没过期"的 waiting_agent。
+//
+// 不过滤 deadline 的后果远不止"多发一次"：markUploadRunning 会把 deadline_at 重置成
+// now+330，于是一份几小时前的旧暂存包会被投递到目标机、覆盖 /opt/app/app.tar.gz ——
+// 这是"延迟生效的写"，比超时难排查得多，而且用户早已认为该任务过期。
+export async function listWaitingUploads(env, serverId, now = nowSec()) {
   const rows = await env.DB.prepare(
     `SELECT id, target_path, overwrite, size_bytes, r2_key, deadline_at
        FROM operation_jobs
       WHERE server_id = ? AND kind = 'upload' AND status = 'waiting_agent'
+        AND deadline_at > ?
       ORDER BY created_at LIMIT 20`
-  ).bind(serverId).all();
+  ).bind(serverId, now).all();
   return rows.results || [];
 }
 
@@ -271,12 +325,24 @@ export async function requeueOrphanUploads(env, serverId, now = nowSec()) {
     `UPDATE operation_jobs SET status = 'waiting_agent'
       WHERE server_id = ? AND kind = 'upload' AND status = 'running' AND deadline_at > ?`
   ).bind(serverId, now).run();
-  const dead = await env.DB.prepare(
-    `UPDATE operation_jobs SET status = 'timed_out', error = 'agent disconnected before completion',
-            finished_at = ?, duration_ms = CASE WHEN started_at IS NULL THEN NULL ELSE (? - started_at) * 1000 END
+  // 已过 deadline 的：先查出 r2_key 再逐条判死。纯 UPDATE 拿不到受影响行，
+  // 会让暂存对象白躺到 expires_at（24h）——正是 settleExpiredAll 注释里点出的坑。
+  const stale = await env.DB.prepare(
+    `SELECT id, kind, r2_key FROM operation_jobs
       WHERE server_id = ? AND kind = 'upload' AND status = 'running' AND deadline_at <= ?`
-  ).bind(now, now, serverId, now).run();
-  return (back.meta.changes || 0) + (dead.meta.changes || 0);
+  ).bind(serverId, now).all();
+  let dead = 0;
+  for (const job of stale.results || []) {
+    const res = await env.DB.prepare(
+      `UPDATE operation_jobs SET status = 'timed_out', error = 'agent disconnected before completion',
+              finished_at = ?, duration_ms = CASE WHEN started_at IS NULL THEN NULL ELSE (? - started_at) * 1000 END
+        WHERE id = ? AND status = 'running'`
+    ).bind(now, now, job.id).run();
+    if (!res.meta.changes) continue;
+    dead += 1;
+    await deleteStagingObject(env, job);
+  }
+  return (back.meta.changes || 0) + dead;
 }
 
 export async function markUploadRunning(env, id) {
@@ -318,6 +384,7 @@ export async function createAgentUpdateJob(env, {
   user, serverId, buildId, fromVersion, platform, sizeBytes, sha256, assetUrl, clientIp,
 }) {
   await purgeExpired(env);
+  await settleServerExpired(env, serverId);
   const now = nowSec();
   const id = newJobId();
   try {
@@ -414,7 +481,8 @@ export function jobView(job, { pollAfterMs = JOB_POLL_AFTER_MS } = {}) {
 // 返回本次收敛的行数，供 cron 观测。
 export async function settleExpiredAll(env, now = nowSec()) {
   const rows = await env.DB.prepare(
-    `SELECT id, kind, r2_key FROM operation_jobs
+    `SELECT id, kind, r2_key, user_id, username, client_ip, server_id, command
+       FROM operation_jobs
       WHERE status IN ('queued','awaiting_upload','staging','staged','waiting_agent','running')
         AND deadline_at < ?
       LIMIT 200`
@@ -433,6 +501,7 @@ export async function settleExpiredAll(env, now = nowSec()) {
     if (!res.meta.changes) continue; // 竞态：已被其它路径收敛
     changed += 1;
     await deleteStagingObject(env, job);
+    if (job.kind === 'exec') await auditExecFailed(env, job, 'no result before deadline');
   }
   return changed;
 }

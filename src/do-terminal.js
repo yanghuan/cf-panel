@@ -971,48 +971,8 @@ export class TerminalDO {
     }
 
     if (ws === sess.userWs) {
-      // PAT 撤销/JWT 过期校验（10s 节流）。新附件只保存 PAT HMAC 或 JWT claims；
-      // 旧版本 patToken 附件在首次活动时校验并原地迁移，避免在线升级强制中断会话。
-      let uatt = ws.deserializeAttachment?.();
-      let identity = uatt && uatt.auth;
-      if (!identity && uatt && uatt.patToken) {
-        const migrated = await authIdentityByToken(uatt.patToken, this.env);
-        if (!migrated) {
-          try { ws.close(1008, 'unauthorized'); } catch { /* ignore */ }
-          return;
-        }
-        const { patToken: _discard, ...safe } = uatt;
-        safe.auth = migrated.identity;
-        ws.serializeAttachment(safe);
-        uatt = safe;
-        identity = safe.auth;
-      }
-      if (identity) {
-        const nowP = Date.now();
-        if (!sess.lastAuthCheck || nowP - sess.lastAuthCheck >= PAT_CHECK_INTERVAL_MS) {
-          sess.lastAuthCheck = nowP;
-          const u = await authUserByIdentity(identity, this.env);
-          if (!u) {
-            try { ws.close(1008, 'unauthorized'); } catch { /* ignore */ }
-            return;
-          }
-          // 降权/白名单收窄必须收回**已建**会话：这里与建连时（routes 的 /api/terminal、
-          // /api/file/open 都用 canExec）同源重新授权。只校验"令牌仍存在"是不够的——
-          // 否则撤掉 server:exec 或把 server_ids 收窄后，旧连接仍可持续向 agent 转发
-          // 终端输入与文件写指令（PATCH 只清了 PanelDO 缓存，管不到 TerminalDO）。
-          // 管理员不可能被降权 → 常见路径不加查询。
-          if (!isAdmin(u)) {
-            const server = await this.env.DB
-              .prepare('SELECT id, user_id FROM servers WHERE id = ?')
-              .bind(sess.serverId)
-              .first();
-            if (!server || !canExec(u, server)) {
-              try { ws.close(1008, 'permission revoked'); } catch { /* ignore */ }
-              return;
-            }
-          }
-        }
-      }
+      if (sess.revoked) return; // 已判定失效：丢弃后续流量，等 cleanup 收尾
+      if (this.authRecheckDue(sess) && (await this.revalidateOrRevoke(sess, ws))) return;
       // 浏览器 → DO
       // 文件写操作审计（zip/rename/delete + write 首块）：记入 audit_logs，失败不影响透传。
       // 文件会话与终端共用本通道，仅文件指令携带 path 字段，据此区分。
@@ -1067,8 +1027,12 @@ export class TerminalDO {
         sess.agentBuf.push(message);
       }
     } else if (ws === sess.agentWs) {
+      if (sess.revoked) return; // 已判定失效：不再向浏览器投递
       // agent → DO → 浏览器（纯字节透传）
+      // 输出方向同样重校验：降权/撤销后若用户不再发消息，只看输入方向就会让旧连接持续
+      // 收到终端回显、文件读取结果等敏感内容（10s 节流，窗口内无额外查询）。
       if (sess.userWs) {
+        if (this.authRecheckDue(sess) && (await this.revalidateOrRevoke(sess, sess.userWs))) return;
         sess.userWs.send(message);
       } else if (sess.userBuf && sess.userBuf.length < 128) {
         // 浏览器尚未鉴权挂接：缓冲首屏输出（如 bash 初始提示符），避免被丢弃
@@ -1089,6 +1053,51 @@ export class TerminalDO {
     } catch { /* 兜底慢采 */ }
     this.agentInterval.set(serverId, want);
     ws.send(JSON.stringify({ type: 'set_report_interval', interval: want }));
+  }
+
+  // 会话鉴权重校验的节流判据（10s）：窗口内为纯同步判断，不产生 D1 读
+  authRecheckDue(sess) {
+    return !sess.lastAuthCheck || Date.now() - sess.lastAuthCheck >= PAT_CHECK_INTERVAL_MS;
+  }
+
+  // 按「当前」身份重新授权已建会话。返回 true = 已失效（调用方须停止本轮转发）。
+  // **双向**共用：只看浏览器→agent 方向是不够的——用户停手不发消息时，降权/撤销后的旧连接
+  // 仍会持续收到 agent 输出（终端回显、文件读取结果），连接也不会被关闭。
+  // 判据与建连同源（routes 的 /api/terminal、/api/file/open 都用 canExec）；管理员不查库。
+  async revalidateOrRevoke(sess, ws) {
+    if (sess.revoked) return true;
+    let att = ws.deserializeAttachment?.();
+    let identity = att && att.auth;
+    // 旧版本 patToken 附件：首次活动时校验并原地迁移，避免在线升级强制中断会话
+    if (!identity && att && att.patToken) {
+      const migrated = await authIdentityByToken(att.patToken, this.env);
+      if (!migrated) return this.revokeSession(sess, ws, 'unauthorized');
+      const { patToken: _discard, ...safe } = att;
+      safe.auth = migrated.identity;
+      ws.serializeAttachment(safe);
+      identity = safe.auth;
+    }
+    if (!identity) return false; // 无身份信息（升级前的旧会话）：沿用既有行为
+    sess.lastAuthCheck = Date.now();
+    const u = await authUserByIdentity(identity, this.env);
+    if (!u) return this.revokeSession(sess, ws, 'unauthorized');
+    // 降权/白名单收窄必须收回已建会话：撤掉 server:exec 或收窄 server_ids 后，
+    // 旧连接不得再转发输入、也不得再接收输出（PATCH 只清了 PanelDO 缓存，管不到本 DO）。
+    if (!isAdmin(u)) {
+      const server = await this.env.DB
+        .prepare('SELECT id, user_id FROM servers WHERE id = ?')
+        .bind(sess.serverId)
+        .first();
+      if (!server || !canExec(u, server)) return this.revokeSession(sess, ws, 'permission revoked');
+    }
+    return false;
+  }
+
+  // 标记会话失效并关闭浏览器端连接：revoked 让后续双向流量立即短路（等 cleanup 收尾）
+  revokeSession(sess, ws, reason) {
+    sess.revoked = true;
+    try { ws.close(1008, reason); } catch { /* ignore */ }
+    return true;
   }
 
   async webSocketClose(ws) {

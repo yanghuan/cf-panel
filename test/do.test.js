@@ -1140,6 +1140,55 @@ test('TerminalDO: PAT 降权/白名单收窄后已建会话失效（不再转发
   assert.equal(c.forwarded.length, 2, '正常会话持续可转发');
 });
 
+// 输出方向同样要重校验：只拦浏览器→agent 时，用户停手不发消息，降权后的旧连接
+// 仍会持续收到终端回显 / 文件读取结果，且连接不会关闭。
+test('TerminalDO: 降权后 Agent 输出不再投递给浏览器（输出方向同校）', async () => {
+  const env = makeEnv();
+  await env.DB.prepare('INSERT INTO servers (agent_key_id, name, user_id, agent_key_hash) VALUES (?,?,?,?)')
+    .bind('k-out', 's-out', 1, 'h-out').run();
+  const token = 'cfp_pat-out';
+  const hash = await I.hashSecret(token, env);
+  await env.DB.prepare('INSERT INTO api_tokens (user_id, name, token_hash, scopes, server_ids) VALUES (?,?,?,?,?)')
+    .bind(1, 'out', hash, JSON.stringify(['server:read', 'server:exec']), JSON.stringify([1])).run();
+
+  const inst = new TerminalDO(mockState(), env);
+  const sess = {
+    streamId: '0-sid', serverId: 1, creatorUserId: 1, createdAt: Date.now(), type: 'terminal',
+    userWs: null, agentWs: null, userBuf: [], agentBuf: [],
+  };
+  inst.sessions.set('0-sid', sess);
+  const received = [];
+  const userWs = {
+    closed: false,
+    attachment: { role: 'user', sid: '0-sid', serverId: 1, creatorUserId: 1, type: 'terminal', createdAt: Date.now(), auth: { kind: 'pat', tokenHash: hash } },
+    deserializeAttachment() { return this.attachment; },
+    serializeAttachment(a) { this.attachment = a; },
+    send: (m) => received.push(m), close() { this.closed = true; }, readyState: 1,
+  };
+  const agentWs = {
+    attachment: { role: 'agent', sid: '0-sid', serverId: 1, type: 'terminal', createdAt: Date.now() },
+    deserializeAttachment() { return this.attachment; },
+    send() {}, close() {}, readyState: 1,
+  };
+  sess.userWs = userWs;
+  sess.agentWs = agentWs;
+
+  // 降权前：输出正常投递
+  await inst.webSocketMessage(agentWs, 'output-1');
+  assert.deepEqual(received, ['output-1'], '降权前输出正常送达浏览器');
+
+  // 降为只读
+  await env.DB.prepare('UPDATE api_tokens SET scopes = ? WHERE token_hash = ?').bind(JSON.stringify(['server:read']), hash).run();
+  sess.lastAuthCheck = 0; // 越过 10s 节流
+  await inst.webSocketMessage(agentWs, 'sensitive output');
+  assert.equal(userWs.closed, true, '输出方向触发重校验并关闭连接');
+  assert.deepEqual(received, ['output-1'], '降权后的输出不得投递给浏览器');
+
+  // 已标记 revoked：后续 agent 输出直接丢弃，不再重复校验
+  await inst.webSocketMessage(agentWs, 'more output');
+  assert.deepEqual(received, ['output-1'], 'revoked 后持续丢弃输出');
+});
+
 test('PanelDO: /latest 共享缓存 + sync 频率下限（降额）', async () => {
   const env = makeEnv();
   const token = await I.signJwt({ uid: 1, username: 'admin', role: 1, exp: Math.floor(Date.now() / 1000) + 3600 }, env);

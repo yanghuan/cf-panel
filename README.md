@@ -467,7 +467,7 @@ curl -X POST https://<面板域名>/mcp -H "Authorization: Bearer <token>" \
 - **Agent 身份**：`X-Agent-Key` 请求头（**不接受 URL query**，避免边缘日志泄露）；服务端先用 key 的 SHA-256 指纹（`servers.agent_key_id`）反查服务器，再用 HMAC verify 校验 `servers.agent_key_hash`；数据流额外校验 stream 归属。
 - **凭据存储**：面板密码存 CF secret；agent key 与 PAT 只存哈希。WebSocket Hibernation 附件不保存 bearer 明文（PAT 仅存 HMAC，JWT 仅存已验证身份与过期时间）。
 - **权限收敛**：JWT 管理员全量；PAT 按 scopes + `server_ids` 白名单收窄；管理操作默认拒绝 PAT，唯一例外是显式勾选 `panel:admin` 的全权令牌（等价管理员，忽略白名单；且只能由 JWT 管理员签发，PAT 无法自举同类令牌）。
-- **权限变更即时生效**：PAT 的 scopes/白名单在每次鉴权时按 `token_hash` 查库（无长期缓存）；已建的 WS 会话在 10 秒内按同一判据（`canExec` + 白名单）重新授权，失败即断开。故降权、收窄白名单、撤销令牌都能在秒级收回已建立的能力。
+- **权限变更即时生效**：PAT 的 scopes/白名单在每次鉴权时按 `token_hash` 查库（无长期缓存）；已建的 WS 会话在 10 秒内按同一判据（`canExec` + 白名单）重新授权，失败即断开。**输入与输出方向都会校验**——即使不再发消息，降权后也不会继续收到终端回显、文件读取结果等 agent 输出。故降权、收窄白名单、撤销令牌都能在秒级收回已建立的能力。
 - **审计**：登录、服务器变更、会话开启、文件写操作、命令执行、Agent 更新全部留痕（best-effort：D1 短暂失败不影响已创建的会话，避免遗留不可访问的远端会话）。
 - **前端防御**：文件列表按不可信 Agent 输入处理（白名单化类型、数值化大小/时间）；文件会话用代际守卫丢弃关闭后或乱序响应；CSP 仅 `style-src-attr`/`style-src-elem` 放开内联，`script-src` 不允许内联执行。
 - **Agent 侧**：`DISABLE_EXEC=1` 全局禁用命令执行；上传、ZIP 预检与文件操作统一走带超时 / 并发上限 / 熔断的 blocking 边界；系统路径词法 + 真实路径双检（防 symlink 写穿）。

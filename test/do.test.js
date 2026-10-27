@@ -2436,10 +2436,20 @@ test('TerminalDO: cleanup 按归属清理 pendingOpen，跨服务器/会话隔�
 // 存在理由：metrics_min 只留 30 天、7 天后降采样，且离线期间根本没有行——
 // 月度流量与可用率无法事后反推，只能实时累加。以下锁定四条核心不变式。
 
+// 日界安全的基准时刻：取当天 12:00（UTC）。addDaySpan 会按天拆分区间，
+// 若直接用 Date.now() 当基准，一旦当前时刻距当天结束不足用例跨度的时长
+// （如 UTC 21:00 之后跑 3 小时跨度的用例），区间会跨日拆成两行，
+// 断言（单行 total_min）必然失败——此前 UTC 21:00 之后 CI 每天变红。
+// 取正午可留出 12 小时余量，覆盖本文件所有用例的跨度。
+function daySafeBase() {
+  const now = Math.floor(Date.now() / 1000);
+  return Math.floor(now / 86400) * 86400 + 12 * 3600;
+}
+
 test('MetricsDO: 按天统计累加在线时长与流量（速率 × 时长）', async () => {
   const env = makeEnv({ ARCHIVE_TO_D1: '0' });
   const { inst } = mkMetrics(env, mockState());
-  const base = Math.floor(Date.now() / 1000);
+  const base = daySafeBase();
   inst.accumulateDay(7, base, 100, 200, 3600);        // 首帧：建立游标，无区间
   inst.accumulateDay(7, base + 60, 100, 200, 3600);   // 间隔 60s → 记 60s 在线
   await inst.flushDayPending();
@@ -2475,7 +2485,7 @@ test('MetricsDO: 跨天区间按天拆分，不整体记入某一天', async () 
 test('MetricsDO: 长时间离线只补可用率分母——可用率不得虚高', async () => {
   const env = makeEnv({ ARCHIVE_TO_D1: '0' });
   const { inst } = mkMetrics(env, mockState());
-  const base = Math.floor(Date.now() / 1000);
+  const base = daySafeBase();
   inst.accumulateDay(9, base, 0, 0, 100);
   // 间隔 3 小时（远超 DAY_ONLINE_GAP_S=300s）：仅尾部 300s 视为在线
   inst.accumulateDay(9, base + 3 * 3600, 0, 0, 100);
@@ -2491,7 +2501,7 @@ test('MetricsDO: 长时间离线只补可用率分母——可用率不得虚高
 test('MetricsDO: 离线机器由 alarm 补记分母（不再上报也不虚高）', async () => {
   const env = makeEnv({ ARCHIVE_TO_D1: '0' });
   const { inst } = mkMetrics(env, mockState());
-  const base = Math.floor(Date.now() / 1000);
+  const base = daySafeBase();
   inst.accumulateDay(11, base, 0, 0, 100);
   inst.lastSeenSec.set(11, base);
   await inst.flushDayPending(); // 先落一次在线段

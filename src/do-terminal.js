@@ -1361,7 +1361,9 @@ export class TerminalDO {
       await this.env.DB.prepare(
         'INSERT INTO audit_logs (user_id, username, client_ip, action, target_server_id, detail, duration_ms, job_id) VALUES (?,?,?,?,?,?,?,?)'
       ).bind(
-        job.user_id, job.username, job.client_ip || '', ok ? 'agent.update' : 'agent.update.failed',
+        // 与同步路径、前端映射表保持同一命名：agent.update.installed / .failed。
+        // 少了 .installed 会在审计页显示成裸的 agent.update（前端无对应翻译 key）。
+        job.user_id, job.username, job.client_ip || '', ok ? 'agent.update.installed' : 'agent.update.failed',
         job.server_id, `${job.from_version || '?'} → ${job.build_id || '?'}${ok ? '' : ` (${errMsg || 'failed'})`}`,
         job.duration_ms ?? null, jobId,
       ).run();

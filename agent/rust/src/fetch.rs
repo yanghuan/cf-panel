@@ -24,7 +24,55 @@ pub struct FetchResult {
 
 /// 从 `url` 下载到 `dest`，边下边算 SHA-256 并校验 `expect_size` / `expect_sha256`。
 /// 全程流式：不把整个文件读进内存（Release 资产最大 32MB，暂存文件上限 100MB）。
+// 单次下载的**总**超时（DNS + TCP + TLS + 读完整 body）。与 CONNECT_TIMEOUT_S 同源思路：
+// 裸 await 在 TCP 半开/TLS 黑洞时会永久挂住——2026-09-09 的生产事故正是这个形态
+//（残留 ESTAB 连接、日志静默 3 天）。下载任务由 spawn 跑，挂住不会拖慢控制通道，但会
+// 残留一个任务 + 半截临时文件，反复发生会累积。
+const DOWNLOAD_TIMEOUT_S: u64 = 180;
+
 pub async fn download_to_file(
+    url: &str,
+    dest: &Path,
+    expect_size: Option<u64>,
+    expect_sha256: Option<&str>,
+    max_bytes: u64,
+) -> Result<FetchResult, Box<dyn Error + Send + Sync>> {
+    download_within(
+        std::time::Duration::from_secs(DOWNLOAD_TIMEOUT_S),
+        url,
+        dest,
+        expect_size,
+        expect_sha256,
+        max_bytes,
+    )
+    .await
+}
+
+// 超时可注入版本：生产统一 DOWNLOAD_TIMEOUT_S，测试用短超时验证"挂住必然返回错误"。
+async fn download_within(
+    limit: std::time::Duration,
+    url: &str,
+    dest: &Path,
+    expect_size: Option<u64>,
+    expect_sha256: Option<&str>,
+    max_bytes: u64,
+) -> Result<FetchResult, Box<dyn Error + Send + Sync>> {
+    match tokio::time::timeout(
+        limit,
+        download_to_file_inner(url, dest, expect_size, expect_sha256, max_bytes),
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(_) => {
+            // 超时：清掉可能已写出的半截文件，不把脏文件留在目标目录
+            let _ = std::fs::remove_file(dest);
+            Err(format!("download timed out after {}s", limit.as_secs()).into())
+        }
+    }
+}
+
+async fn download_to_file_inner(
     url: &str,
     dest: &Path,
     expect_size: Option<u64>,
@@ -253,6 +301,44 @@ fn parse_url(url: &str) -> Result<ParsedUrl, Box<dyn Error + Send + Sync>> {
     })
 }
 
+/// 校验下载 URL 与面板同源（文档 §10.5：防 SSRF 的分层防御）。
+///
+/// 当前 url 只来自 Worker/DO，风险可控；但若 DO 被攻破、`panel_origin` 被污染，
+/// 或不慎支持多面板，Agent 会带着有效 token 去请求任意地址。要求：
+///   - host 必须等于 `AGENT_WSS_URL` 的 host（面板自身域名）
+///   - path 必须以 `/mcp/` 开头（只允许我们自己的两个下载端点）
+pub fn validate_panel_url(url: &str, panel_wss: &str) -> Result<(), String> {
+    let target = parse_url(url).map_err(|e| format!("invalid download url: {e}"))?;
+    // AGENT_WSS_URL 形如 wss://panel.example/ws/agent：取 authority 里的 host 作为唯一合法目标
+    let panel_host = panel_wss_host(panel_wss);
+    if panel_host.is_empty() {
+        return Err("AGENT_WSS_URL missing host, cannot validate download url".into());
+    }
+    if !target.host.eq_ignore_ascii_case(&panel_host) {
+        return Err(format!(
+            "download url host mismatch: {} != {panel_host}",
+            target.host
+        ));
+    }
+    if !target.path_and_query.starts_with("/mcp/") {
+        return Err(format!(
+            "download url path must start with /mcp/, got {}",
+            target.path_and_query
+        ));
+    }
+    Ok(())
+}
+
+// 从 ws(s)://host[:port]/path 里取 host（含 IPv6 字面量处理）
+fn panel_wss_host(wss: &str) -> String {
+    let rest = wss.split("://").nth(1).unwrap_or("");
+    let authority = rest.split('/').next().unwrap_or("");
+    if let Some(stripped) = authority.strip_prefix('[') {
+        return stripped.split(']').next().unwrap_or("").to_string();
+    }
+    authority.split(':').next().unwrap_or("").to_string()
+}
+
 async fn resolve_addr(u: &ParsedUrl) -> Result<std::net::SocketAddr, Box<dyn Error + Send + Sync>> {
     crate::dns::resolve(&u.host, u.port)
         .await
@@ -303,6 +389,70 @@ mod tests {
         assert_eq!(u.path_and_query, "/");
 
         assert!(parse_url("ftp://x/y").is_err());
+    }
+
+    // 文档 §10.5：下载 URL 必须与面板同源，防 SSRF。
+    // 2026-09-09 生产事故形态：TCP 半开 / 对端不响应时裸 await 会永久挂住。
+    // 这里起一个"只 accept、永不响应"的 TCP 监听，验证超时必然返回错误且清理临时文件。
+    #[tokio::test]
+    async fn download_times_out_on_silent_peer() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // 接受连接但从不写任何字节
+        let _hold = tokio::spawn(async move {
+            let mut keep = Vec::new();
+            while let Ok((sock, _)) = listener.accept().await {
+                keep.push(sock);
+            }
+        });
+        let dest = std::env::temp_dir().join(format!("cfp-timeout-test-{}", std::process::id()));
+        let _ = std::fs::remove_file(&dest);
+        let url = format!("http://127.0.0.1:{}/mcp/x", addr.port());
+        let r = download_within(
+            std::time::Duration::from_millis(300),
+            &url,
+            &dest,
+            None,
+            None,
+            1 << 20,
+        )
+        .await;
+        assert!(r.is_err(), "对端不响应时必须超时返回错误");
+        assert!(
+            r.err().unwrap().to_string().contains("timed out"),
+            "错误信息应说明是超时"
+        );
+        assert!(!dest.exists(), "超时必须清掉半截临时文件");
+    }
+
+    #[test]
+    fn validate_panel_url_rejects_foreign_host() {
+        let panel = "wss://panel.example/ws/agent";
+        assert!(
+            validate_panel_url("https://panel.example/mcp/upload-jobs/download?id=1", panel)
+                .is_ok()
+        );
+        // 端口不同的面板地址也应通过（AGENT_WSS_URL 可能带端口）
+        assert!(
+            validate_panel_url(
+                "https://panel.example/mcp/x",
+                "wss://panel.example:8787/ws/agent"
+            )
+            .is_ok()
+        );
+
+        // 异源必须拒绝
+        for bad in [
+            "https://evil.example/mcp/x",
+            "https://do.internal/mcp/x",
+            "http://127.0.0.1:8080/mcp/x",
+        ] {
+            assert!(validate_panel_url(bad, panel).is_err(), "必须拒绝 {bad}");
+        }
+        // 同源但路径不在 /mcp/ 下：拒绝（只允许我们自己的下载端点）
+        assert!(validate_panel_url("https://panel.example/admin/secret", panel).is_err());
+        // 非法 scheme
+        assert!(validate_panel_url("ftp://panel.example/mcp/x", panel).is_err());
     }
 
     #[test]

@@ -2987,3 +2987,24 @@ test('handleWs 转发：query 携带公网 origin，DO 侧据此签发可用的�
   assert.equal(u.host, 'do.internal', '转发目标仍是内部地址');
   assert.equal(u.searchParams.get('panel_origin'), 'https://panel.example', '公网 origin 必须随 query 透传');
 });
+
+// 审计 action 必须与同步路径、前端翻译表一致：写裸 'agent.update' 会让审计页
+// 显示原始英文（前端只映射 agent.update.request / .installed / .failed）。
+test('agent_update_result：审计 action 用 agent.update.installed（与前端映射一致）', async () => {
+  const env = makeEnv();
+  await env.DB.prepare('INSERT INTO servers (agent_key_id, name, user_id, agent_key_hash) VALUES (?,?,?,?)')
+    .bind('k1', 's1', 1, 'h1').run();
+  const now = Math.floor(Date.now() / 1000);
+  await env.DB.prepare(`INSERT INTO operation_jobs (id, kind, status, user_id, username, client_ip, server_id, build_id, from_version, to_version, platform, size_bytes, sha256, asset_url, created_at, started_at, deadline_at, expires_at)
+    VALUES ('job_au','agent_update','running',1,'admin','',1,'2026.10.28-1200','2020.01.01-0000','2026.10.28-1200','linux-x86_64',4,'aa','https://p/x',?,?,?,?)`)
+    .bind(now - 3, now - 3, now + 210, now + 86400).run();
+  const inst = new TerminalDO(mockState(), env);
+  const ws = { deserializeAttachment: () => ({ role: 'control', serverId: 1 }), send() {}, readyState: 1, close() {} };
+  inst.agents.set(1, ws);
+  await inst.webSocketMessage(ws, JSON.stringify({
+    type: 'agent_update_result', update_id: 'job_au', ok: true, build_id: '2026.10.28-1200', size: 4,
+  }));
+  const audits = await env.DB.prepare("SELECT action FROM audit_logs WHERE job_id = 'job_au'").all();
+  assert.deepEqual(audits.results.map((a) => a.action), ['agent.update.installed'],
+    '成功必须写 .installed（写裸 agent.update 前端无法翻译）');
+});

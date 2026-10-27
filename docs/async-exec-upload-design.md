@@ -205,12 +205,10 @@ POST /api/servers/:id/agent-update / MCP update_agent
 ```sql
 CREATE TABLE IF NOT EXISTS operation_jobs (
   id              TEXT PRIMARY KEY,
-  kind            TEXT NOT NULL CHECK (kind IN ('exec', 'upload', 'agent_update')),
-  status          TEXT NOT NULL CHECK (status IN (
-                    'queued', 'awaiting_upload', 'staging', 'staged',
-                    'waiting_agent', 'running', 'succeeded', 'failed',
-                    'timed_out', 'expired'
-                  )),
+  -- kind / status 刻意**不加 CHECK**（见顶部"实现偏差 1"）：SQLite 无法 ALTER CHECK，
+  -- 状态机演进会被迫重建表。取值由 src/jobs.js 校验。
+  kind            TEXT NOT NULL,
+  status          TEXT NOT NULL,
   user_id         INTEGER NOT NULL,
   username        TEXT NOT NULL,
   client_ip       TEXT,
@@ -352,7 +350,7 @@ CREATE INDEX IF NOT EXISTS idx_audit_logs_job_id ON audit_logs(job_id);
 | POST | `/api/servers/:id/agent-update` | Bearer + `canUpdateAgent` | 创建异步 Agent 更新 |
 | POST | `/api/upload-jobs` | Bearer + `canExec` | 创建 upload 任务，返回签名上传 URL |
 | POST | `/mcp/upload-jobs/:id/content` | 签名 token | 客户端上传文件字节到 Worker→R2 |
-| GET | `/mcp/upload-jobs/:id/download` | 签名 token | Agent 从 R2 拉取 staged 文件 |
+| GET | `/mcp/upload-jobs/download?id=&server_id=&size=&token=` | 签名 token | Agent 从 R2 拉取 staged 文件（**query 形式**，与 content 的路径参数不同） |
 | GET | `/mcp/agent-update-asset` | 签名 token | Agent 从 Worker 资产代理拉取 Release |
 | POST | `/mcp/file_upload` | 旧 Bearer/签名 token | 旧同步上传，过渡期兼容 |
 | POST | `/mcp` | Bearer + JSON-RPC | MCP `exec_command` / `create_upload` / `update_agent` / `get_operation` 等 |
@@ -663,7 +661,9 @@ deadline_at=now+600
 
 Worker 提供：
 
-`GET /mcp/upload-jobs/:id/download?token=...`
+`GET /mcp/upload-jobs/download?id=<job_id>&server_id=<id>&size=<bytes>&token=...`
+
+> 注意：`content` 用**路径参数**（`/mcp/upload-jobs/:id/content`），`download` 用 **query**（`/mcp/upload-jobs/download?id=`）。两者形式不同是既有实现，集成时请按实际 URL 拼，不要互相套用。`size` 参与签名（`signJobToken` 的 extra），防篡改。
 
 - 以 `/mcp` 前缀提供，沿用现有 Cloudflare Access 放行策略；不要新增公开 R2 域名。
 - token 绑定 job_id / server_id / size / 过期时间；有效期建议 10 分钟。
@@ -673,7 +673,7 @@ Worker 提供：
 
 路由实现注意：
 
-- 当前 `handleMcpInner` 在解析 body 前就拒绝所有非 POST 请求；新增 `GET /mcp/upload-jobs/:id/download` 必须先于该检查，并在 `authUser` 前用签名 token 验证。
+- 当前 `handleMcpInner` 在解析 body 前就拒绝所有非 POST 请求；`GET /mcp/upload-jobs/download` 必须先于该检查，并在 `authUser` 前用签名 token 验证。
 - `POST /mcp/upload-jobs/:id/content` 同理，必须在普通 Bearer/JSON-RPC 分支前处理；只验证签名 token 和 job 状态，不解析 JSON body。
 - 两条分支仍要先执行 `requireJwtSecret`，并复用现有 Origin 校验策略；Agent 的 GET 无 Origin，不能让 Origin 逻辑误拒绝。
 - `src/index.js` 继续按 `/mcp` 前缀路由到 `handleMcp`，不需要新开顶层前缀；若将下载端点放到其他路径，必须同步 CF Access 放行配置。
@@ -684,23 +684,30 @@ DO 向 Agent 下发：
 {
   "type": "upload_fetch",
   "job_id": "job_...",
-  "url": "https://panel.example/mcp/upload-jobs/job_.../download?token=...",
+  "url": "https://panel.example/mcp/upload-jobs/download?id=job_...&server_id=17&size=12345678&token=...",
   "path": "/opt/app/app.tar.gz",
   "overwrite": false,
-  "size": 12345678,
-  "sha256": "..."
+  "size": 12345678
 }
 ```
 
-Agent 的网络依赖：仓库当前没有通用 HTTP 客户端。新增 `reqwest` 时必须显式选用与现有 rustls `ring` 一致的 TLS 配置，避免再次引入 `aws-lc-rs` 或运行时 CryptoProvider 冲突；如果依赖无法满足四个发布目标，使用现有 `tokio-rustls` 实现最小 HTTPS GET，不要引入会破坏静态构建的默认特性。
+> 帧里**没有 `sha256`**：§8.3 已把摘要列为可选，实际完整性由 `size`（Agent 侧传
+> `expect_size`，下载器据此校验实际字节）加事后 `head()` 复核兜住。不要按早期草案去实现 sha 校验。
+
+Agent 的网络实现：**不引入 `reqwest`**。仓库已有 `tokio-rustls` + 自建 DNS（`dns.rs`）+
+手写 HTTP 的能力（`lenient_ws_handshake`），故新增 `fetch.rs` 实现最小 HTTPS GET：
+零新增依赖，也不会重演 `aws-lc-rs` / CryptoProvider 冲突（2026-08-25 事故）。
+必须同时支持 `Content-Length` 与 `chunked` 两种响应——只处理一种会偶发解析错位。
 
 Agent 要求：
 
 - `dispatch()` 收到 `upload_fetch` 后必须 `spawn` 独立下载任务并立即返回，不能阻塞控制读循环；否则下载期间 Agent 的 report/ping/其它指令全部停摆。
-- URL 必须与 `AGENT_WSS_URL` 的 host 一致，仅允许 `https`（本地开发可显式允许 `http`）。
+- **必须有总超时**（DNS + TCP + TLS + 读 body 全程，实现取 180s）：裸 `await` 在 TCP 半开或对端不响应时会永久挂住，残留任务 + 半截临时文件不断累积（同类问题曾造成 2026-09-09 的"连接静默 3 天"事故）。超时后删除临时文件。
+- URL 必须与 `AGENT_WSS_URL` 的 host 一致（`fetch::validate_panel_url`），且 path 必须以 `/mcp/` 开头；仅允许 `https`（本地开发可显式允许 `http`）。这是文档 §10.5 的分层防御——即便 DO 被攻破或 `panel_origin` 被污染，Agent 也不会带着有效 token 去请求任意地址。
 - 不允许把 URL 当成任意代理地址；拒绝其他 host/path。
-- 复用 `write_bytes` 的路径保护、`overwrite=false` 已存在检查、临时文件命名和原子 rename 语义。
-- 流式下载到 `{path}.upload.{job_id}`，不整体载入内存。
+- 复用 `write_bytes` 的路径保护（`is_system_path`）、`overwrite=false` 已存在检查、临时文件命名和原子 rename 语义。
+- 临时文件必须登记到连接级清理表（`created`），控制连接退出时统一删除——否则下载中途重启会把 `{path}.cfp-upload-{job_id}` 永久留在业务目录。
+- 流式下载到 `{path}.cfp-upload-{job_id}`，不整体载入内存。
 - 校验 HTTP 状态、`Content-Length`/实际字节数、可选 SHA-256。
 - 总超时沿用 120 秒（或配置化），否则失败并清理临时文件。
 - 下载任务需要独立超时和取消路径；控制通道断开时不能留下长时间挂起的 HTTP 下载任务。
@@ -877,13 +884,24 @@ Agent：
 ```
 
 - 先入队并 flush 终态回执，再通知进程退出；保持现有“回执发送失败也必须升级退出”的约束。
-- 必选新增 `agent_update_ack`：DO 写 D1 后回该帧，Agent 最多等待 2 秒；超时也必须退出并运行新版本，不能因 ack 丢失阻止升级。
+
+**实现采用「排空屏障」而非 `agent_update_ack`（与本文档早期草案不同，此处以实现为准）**：
+
+Agent 侧先 `tx.send(OutMsg::Frame(回执))`（阻塞式，拿到"已入队"的确定信号），再发一个
+`OutMsg::Barrier`，等写任务回 ack（≤2 秒）——屏障按排队序处理，因此屏障回执即代表
+前面的回执**已经 flush 到 socket**。之后无条件 `shutdown.notify_waiters()` 退出。
+
+为什么不用 DO 回的 ack：
+
+- Barrier 是**本地**证据，比等远端 ack 更强（ack 只证明 DO 收到，不证明已到达）；
+- 若等 DO 的 ack，DO 不可达时升级会卡死——而"替换成功就必须跑新版本"是硬约束，不能被网络状况否决。
+
+所以本文档不再要求 `agent_update_ack`。
 
 DO 收到结果：
 
 - 校验 `build_id`、`size`、`restarting` 与 job/manifest 一致；不一致按 `agent.update.failed` 处理，不能把错误资产标成功。
 - 条件更新 D1 `running -> succeeded/failed/timed_out`。
-- 成功写 D1 后回 `agent_update_ack`；ack 只表示结果已落库，不改变 Agent 必须退出的语义。
 - 写 `agent.update.installed` 或 `agent.update.failed` 审计，带 `job_id`、`duration_ms`。
 - 不需要 `pendingUpdate` Map；DO evict 后由 D1 恢复。
 - 成功更新后清理该服务器旧会话的行为保持现状，避免旧 Agent 进程残留。

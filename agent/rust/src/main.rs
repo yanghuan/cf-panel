@@ -820,6 +820,7 @@ async fn control_conn(
                         &interval,
                         &note,
                         shutdown,
+                        &created,
                         t.as_str(),
                     ),
                 )
@@ -882,9 +883,9 @@ async fn control_conn(
 async fn handle_fetch_upload(
     cfg: Config,
     tx: tokio::sync::mpsc::Sender<OutMsg>,
+    created: Arc<std::sync::Mutex<Vec<String>>>,
     v: serde_json::Value,
 ) {
-    let _ = &cfg;
     let upload_id = v
         .get("upload_id")
         .or_else(|| v.get("job_id"))
@@ -907,6 +908,16 @@ async fn handle_fetch_upload(
         .and_then(|x| x.as_bool())
         .unwrap_or(false);
     if upload_id.is_empty() || path.is_empty() || url.is_empty() {
+        return;
+    }
+    // 下载 URL 必须与面板同源（文档 §10.5）：即便 DO 已被攻破/panel_origin 被污染，
+    // 也不能带着有效 token 去请求任意地址。
+    if let Err(e) = fetch::validate_panel_url(&url, &cfg.wss) {
+        ctrl_enqueue(
+            &tx,
+            upload_reply(&upload_id, false, Some(e), 0),
+            "upload_result",
+        );
         return;
     }
     // 系统路径保护：与旧同步路径、文件会话保持同一判据（/etc /usr /var /proc 等一律拒绝）。
@@ -944,6 +955,11 @@ async fn handle_fetch_upload(
         };
         // 下载到目标同目录的临时文件：跨文件系统时 rename 会退化，同目录才是原子替换
         let tmp = std::path::PathBuf::from(format!("{path}.cfp-upload-{upload_id}"));
+        // 登记到连接级清理表：若下载中途进程重启/控制连接断开，连接退出时会删除，
+        // 不在 /opt 这类业务目录留下半截文件（旧同步路径同样登记）。
+        if let Ok(mut tmps) = created.lock() {
+            tmps.push(tmp.to_string_lossy().to_string());
+        }
         // 传 Some(size) 让下载器校验实际字节：截断的响应（网络中断）必须失败，
         // 否则短文件会覆盖目标并报成 succeeded。
         let expect = if size > 0 { Some(size) } else { None };
@@ -1041,6 +1057,23 @@ async fn handle_fetch_update(
         .unwrap_or("")
         .to_string();
     if update_id.is_empty() || url.is_empty() || size == 0 || sha256.is_empty() {
+        return;
+    }
+    // 资产 URL 必须与面板同源（文档 §10.5）：更新会 self-replace 二进制，
+    // 从任意地址拉取等于把执行权交给对方。
+    if let Err(e) = fetch::validate_panel_url(&url, &cfg.wss) {
+        ctrl_enqueue(
+            &tx,
+            Message::Text(
+                serde_json::json!({
+                    "type": "agent_update_result", "update_id": update_id,
+                    "ok": false, "error": e,
+                })
+                .to_string()
+                .into(),
+            ),
+            "agent_update_result",
+        );
         return;
     }
     // 与 Worker 侧 UPDATE_MAX 一致：资产只有几 MB，超限说明 URL 或清单异常
@@ -1432,6 +1465,8 @@ async fn dispatch(
     note: &Arc<Notify>,
     // 异步自更新成功后要触发退出（self_replace 只换磁盘文件，进程仍跑旧映像）
     shutdown: &Arc<Notify>,
+    // 在途临时文件登记表：连接退出时统一清理，避免半截下载残留在业务目录
+    created: &Arc<std::sync::Mutex<Vec<String>>>,
     text: &str,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let v: serde_json::Value = match serde_json::from_str(text) {
@@ -1593,7 +1628,7 @@ async fn dispatch(
                 );
                 return Ok(());
             }
-            handle_fetch_upload(cfg.clone(), tx.clone(), v).await;
+            handle_fetch_upload(cfg.clone(), tx.clone(), created.clone(), v).await;
         }
         // 阶段 C：异步自更新。同样只收元数据 + 签名 URL，二进制由本机拉取。
         "agent_update_fetch" => {

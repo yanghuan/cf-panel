@@ -1382,11 +1382,12 @@ async function streamToR2(env, key, body, contentLength, maxBytes) {
   });
   try {
     await env.UPLOADS.put(key, counter, { httpMetadata: { contentType: 'application/octet-stream' } });
-  } catch {
+  } catch (e) {
+    console.error('streamToR2 put failed', key, e);
     if (overflow) {
       return { error: `file too large (max ${Math.floor(maxBytes / 1024 / 1024)}MB)`, status: 413 };
     }
-    return { error: 'staging write failed', status: 502 };
+    return { error: `staging write failed: ${e && e.message ? e.message : String(e)}`, status: 502 };
   }
   // 事后复核真实大小：Content-Length 可能说谎（声明 1KB 实传 1MB 已由计数拦截，
   // 反向的"声明很大实传很小"也要发现，否则 Agent 会拿到短文件）。

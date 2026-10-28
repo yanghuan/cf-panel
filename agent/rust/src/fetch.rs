@@ -242,14 +242,38 @@ async fn download_to_file_inner(
             raw.drain(..consumed + size + 2); // 末尾 CRLF
         }
     } else {
-        write_chunk(&pending, &mut file, &mut hasher, &mut written)?;
+        // 非 chunked：Content-Length 已知时只读到该长度就停，不要读到 EOF。
+        // 旧代码读到 EOF 才停：对端以 TLS 关闭且不发 close_notify 时（Cloudflare
+        // Worker 回 R2  body 后直接关连接即如此），rustls 读会报
+        // "peer closed connection without sending TLS close_notify"，明明 body
+        // 已收全却判失败。163 上传失败即此形态；本地经 MITM 代理时对端会发
+        // close_notify，读回 Ok(0) 才没暴露。
+        let mut to_write: &[u8] = &pending;
+        if let Some(cl) = content_length {
+            if (to_write.len() as u64) > cl {
+                to_write = &to_write[..cl as usize];
+            }
+        }
+        write_chunk(to_write, &mut file, &mut hasher, &mut written)?;
         pending.clear();
         loop {
+            if let Some(cl) = content_length {
+                if written >= cl {
+                    break;
+                }
+            }
             let n = stream.read(&mut tmp).await?;
             if n == 0 {
                 break;
             }
-            write_chunk(&tmp[..n], &mut file, &mut hasher, &mut written)?;
+            let mut chunk: &[u8] = &tmp[..n];
+            if let Some(cl) = content_length {
+                let rem = cl - written;
+                if (chunk.len() as u64) > rem {
+                    chunk = &chunk[..rem as usize];
+                }
+            }
+            write_chunk(chunk, &mut file, &mut hasher, &mut written)?;
         }
     }
 
@@ -504,6 +528,51 @@ mod tests {
         )
         .await;
         assert!(r.is_ok(), "经代理下载应成功：{:?}", r.err());
+        assert_eq!(r.unwrap().bytes, 5);
+        assert_eq!(std::fs::read(&dest).unwrap(), b"hello");
+        let _ = std::fs::remove_file(&dest);
+        server.abort();
+    }
+
+    // Content-Length 已知时，body 收全就应立即返回，不要等对端关连接。
+    // 旧代码读到 EOF 才停：对端不发 TLS close_notify 就判失败（163 上传实测）。
+    // 这里服务器发完 body 后故意保持连接不关：旧代码会等到超时，新代码应立刻成功。
+    #[tokio::test]
+    async fn download_stops_at_content_length_without_eof() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 8192];
+            let mut got = Vec::new();
+            loop {
+                let n = sock.read(&mut buf).await.unwrap();
+                got.extend_from_slice(&buf[..n]);
+                if got.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello")
+                .await
+                .unwrap();
+            // 发完 body 后保持连接不关，模拟对端不发 close_notify / 不关连接
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        });
+        let dest =
+            std::env::temp_dir().join(format!("cfp-content-length-test-{}", std::process::id()));
+        let _ = std::fs::remove_file(&dest);
+        let r = download_within(
+            std::time::Duration::from_secs(10),
+            &format!("http://127.0.0.1:{}/mcp/x", addr.port()),
+            &dest,
+            Some(5),
+            None,
+            1 << 20,
+            None,
+        )
+        .await;
+        assert!(r.is_ok(), "Content-Length 收全就应成功：{:?}", r.err());
         assert_eq!(r.unwrap().bytes, 5);
         assert_eq!(std::fs::read(&dest).unwrap(), b"hello");
         let _ = std::fs::remove_file(&dest);

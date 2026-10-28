@@ -303,7 +303,7 @@ mod tests {
                 .unwrap();
             // 隧道建立后：回一个字节，证明流可继续用
             let mut one = [0u8; 1];
-            sock.read(&mut one).await.unwrap();
+            sock.read_exact(&mut one).await.unwrap();
             sock.write_all(b"Y").await.unwrap();
         });
         let proxy =

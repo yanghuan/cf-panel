@@ -59,6 +59,8 @@ not_found_handling = "single-page-application"
 [vars]
 # JWT_SECRET 必须用 secret 设置：wrangler secret put JWT_SECRET
 # 未设置时登录及所有受保护接口返回 503（包括本地调试）
+# 临时：LEGACY_SYNC_UPDATE=1 放行旧同步更新路径（仅用于 2026-10-17 旧 Agent 的 update_agent，升完即删）
+LEGACY_SYNC_UPDATE = "1"
 
 # ---------- 可观测性（日志/追踪；显式声明并保持开启，防止部署工具自动关闭） ----------
 # 额度取舍：日志量的大头是 invocation_logs（每次请求一条元数据），免费额度被打满主要来自它；

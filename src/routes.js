@@ -1343,54 +1343,60 @@ async function handleApiInner(request, env) {
 
 // ---------------- 阶段 B：upload job（数据面走 R2，不经过 DO） ----------------
 
-// 客户端字节 → R2 staging。**真流式**：把 request.body 经一层计数包装直接交给 R2，
+// 客户端字节 → R2 staging。**真流式**：把 request.body 经 FixedLengthStream 直接交给 R2，
 // 全程不在 Worker 内存里落地整个文件。
 //
 // 为什么不能先攒后写（曾这样实现）：100MB 上传会在内存里驻留 100MB，而 Workers
 // 内存上限 128MB —— 单个大文件就贴着上限，两个并发直接 OOM（进程被强制终止，
 // 客户端只看到连接中断）。设计文档 §8.3 也明确要求流式写入。
 //
-// 计数包装的作用：Content-Length 只做前置快筛，**不可信**（可伪造/可为 chunked）。
-// 真实字节超限时让流 error，put() 随之失败，对象不会落地。
+// FixedLengthStream 的作用：R2 put 要求流有已知长度，普通自定义 ReadableStream 无长度会被拒
+// （"Provided readable stream must have a known length"）。FixedLengthStream 以声明的 Content-Length
+// 为长度（handler 已保证 declared > 0 且 <= maxBytes）：实际比声明短时 close 会让 readable error
+// （防短文件落地）；实际比声明长时 write 抛错（映射回 413）；写满声明长度才算成功。
 // 返回 { ok, sizeBytes } 或 { error, status }。
 async function streamToR2(env, key, body, contentLength, maxBytes) {
   if (!body) return { error: 'empty body', status: 400 };
+  const { readable, writable } = new FixedLengthStream(contentLength);
+  const writer = writable.getWriter();
   const reader = body.getReader();
   let written = 0;
   let overflow = false;
-  const counter = new ReadableStream({
-    async pull(controller) {
-      try {
+  const pump = (async () => {
+    try {
+      for (;;) {
         const { done, value } = await reader.read();
-        if (done) { controller.close(); return; }
-        if (!value || value.byteLength === 0) return;
+        if (done) break;
+        if (!value || value.byteLength === 0) continue;
         written += value.byteLength;
         if (written > maxBytes) {
           overflow = true;
           try { await reader.cancel(); } catch { /* ignore */ }
-          controller.error(new Error('too large'));
+          try { await writer.abort(new Error('too large')); } catch { /* ignore */ }
           return;
         }
-        controller.enqueue(value);
-      } catch (e) {
-        controller.error(e);
+        await writer.write(value);
       }
-    },
-    cancel(reason) {
-      try { reader.cancel(reason); } catch { /* ignore */ }
-    },
-  });
+      await writer.close();
+    } catch (e) {
+      if (written > contentLength) overflow = true;
+      try { await writer.abort(e); } catch { /* ignore */ }
+    }
+  })();
   try {
-    await env.UPLOADS.put(key, counter, { httpMetadata: { contentType: 'application/octet-stream' } });
+    await env.UPLOADS.put(key, readable, { httpMetadata: { contentType: 'application/octet-stream' } });
   } catch (e) {
+    try { await writer.abort(e); } catch { /* ignore */ }
+    await pump.catch(() => {});
     console.error('streamToR2 put failed', key, e);
     if (overflow) {
       return { error: `file too large (max ${Math.floor(maxBytes / 1024 / 1024)}MB)`, status: 413 };
     }
     return { error: `staging write failed: ${e && e.message ? e.message : String(e)}`, status: 502 };
   }
-  // 事后复核真实大小：Content-Length 可能说谎（声明 1KB 实传 1MB 已由计数拦截，
-  // 反向的"声明很大实传很小"也要发现，否则 Agent 会拿到短文件）。
+  await pump.catch(() => {});
+  // 事后复核真实大小：写满声明长度才算成功（短了 close 已让 readable error、长了 write 已抛错，
+  // 这里只是再对一次数，防万一）。
   try {
     const head = await env.UPLOADS.head(key);
     const real = head ? Number(head.size) || 0 : 0;

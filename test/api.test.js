@@ -9,6 +9,32 @@ import worker, { __internals as I, TerminalDO } from '../src/index.js';
 import { EXEC_CMD_MAX_BYTES, SERVER_DESC_MAX } from '../src/config.js';
 import { makeEnv, makePanelStub, makeMetricsStub, requestBuilder } from './helpers.js';
 
+// node 没有 FixedLengthStream（Workers 才有）：用 TransformStream 搭一个等价物，
+// 让上传测试走真实的 FixedLengthStream 分支（超长写抛错、提前 close 报错、写满才成功）。
+// streamToR2 只在调用时引用它，所以这里赋值时测试尚未跑到上传路径，时机足够。
+if (typeof globalThis.FixedLengthStream === 'undefined') {
+  globalThis.FixedLengthStream = class FixedLengthStream {
+    constructor(length) {
+      let written = 0;
+      const ts = new TransformStream({
+        transform(chunk, controller) {
+          written += chunk.byteLength;
+          if (written > length) {
+            controller.error(new Error('too large'));
+            return;
+          }
+          controller.enqueue(chunk);
+        },
+        flush(controller) {
+          if (written !== length) controller.error(new Error('short stream'));
+        },
+      });
+      this.readable = ts.readable;
+      this.writable = ts.writable;
+    }
+  };
+}
+
 const call = requestBuilder(worker);
 
 async function login(env, password = 'admin123') {

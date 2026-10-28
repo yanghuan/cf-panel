@@ -46,6 +46,10 @@ pub async fn download_to_file(
     expect_sha256: Option<&str>,
     max_bytes: u64,
 ) -> Result<FetchResult, Box<dyn Error + Send + Sync>> {
+    // 代理配置在生产入口解析一次：设了但解析不了 = 直接报错，不回落直连
+    // （见 proxy.rs；测试走 download_within 注入，不碰环境变量）。
+    let proxy =
+        crate::proxy::proxy_from_env().map_err(|e| -> Box<dyn Error + Send + Sync> { e.into() })?;
     download_within(
         std::time::Duration::from_secs(DOWNLOAD_TIMEOUT_S),
         url,
@@ -53,6 +57,7 @@ pub async fn download_to_file(
         expect_size,
         expect_sha256,
         max_bytes,
+        proxy.as_ref(),
     )
     .await
 }
@@ -65,10 +70,11 @@ async fn download_within(
     expect_size: Option<u64>,
     expect_sha256: Option<&str>,
     max_bytes: u64,
+    proxy: Option<&crate::proxy::ProxyConfig>,
 ) -> Result<FetchResult, Box<dyn Error + Send + Sync>> {
     match tokio::time::timeout(
         limit,
-        download_to_file_inner(url, dest, expect_size, expect_sha256, max_bytes),
+        download_to_file_inner(url, dest, expect_size, expect_sha256, max_bytes, proxy),
     )
     .await
     {
@@ -87,11 +93,19 @@ async fn download_to_file_inner(
     expect_size: Option<u64>,
     expect_sha256: Option<&str>,
     max_bytes: u64,
+    proxy: Option<&crate::proxy::ProxyConfig>,
 ) -> Result<FetchResult, Box<dyn Error + Send + Sync>> {
     let parsed = parse_url(url)?;
-    let addr = resolve_addr(&parsed).await?;
-    let tcp = tokio::net::TcpStream::connect(addr).await?;
-    tcp.set_nodelay(true).ok();
+    // 代理时不解析目标域名、不直连：CONNECT 让代理去解析目标，之后 TLS 的
+    // SNI/证书校验仍按目标域名（与直连路径一致），代理只看到隧道，不终止 TLS。
+    let tcp = match proxy {
+        Some(p) => crate::proxy::connect_via_proxy(p, &parsed.host, parsed.port).await?,
+        None => {
+            let addr = resolve_addr(&parsed).await?;
+            tokio::net::TcpStream::connect(addr).await?
+        }
+    };
+    let _ = tcp.set_nodelay(true);
 
     // 与 WS 路径一致：https 才做 TLS；http 仅用于本地开发（回环）
     let mut stream: Box<dyn AsyncReadWrite> = if parsed.tls {
@@ -424,6 +438,7 @@ mod tests {
             None,
             None,
             1 << 20,
+            None,
         )
         .await;
         assert!(r.is_err(), "对端不响应时必须超时返回错误");
@@ -432,6 +447,67 @@ mod tests {
             "错误信息应说明是超时"
         );
         assert!(!dest.exists(), "超时必须清掉半截临时文件");
+    }
+
+    // 经代理下载：假代理收到 CONNECT 后回 200，之后直接当 HTTP 服务器回 body。
+    // 目标域名是编造的——代理路径下 agent 本就不应解析目标域名，CONNECT 让代理去解析，
+    // 这里假代理不转发也照样能回，恰好证明了这一点。
+    #[tokio::test]
+    async fn download_via_proxy() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 8192];
+            let mut got = Vec::new();
+            // 1) 读 CONNECT
+            loop {
+                let n = sock.read(&mut buf).await.unwrap();
+                got.extend_from_slice(&buf[..n]);
+                if got.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let req = String::from_utf8_lossy(&got).to_string();
+            assert!(req.starts_with("CONNECT target.example:80 "), "实际: {req}");
+            sock.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                .await
+                .unwrap();
+            // 2) 读 GET，回固定 body
+            let mut got2 = Vec::new();
+            loop {
+                let n = sock.read(&mut buf).await.unwrap();
+                got2.extend_from_slice(&buf[..n]);
+                if got2.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let get = String::from_utf8_lossy(&got2).to_string();
+            assert!(get.starts_with("GET /mcp/x HTTP/1.1"), "实际: {get}");
+            sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello")
+                .await
+                .unwrap();
+        });
+        let proxy =
+            crate::proxy::parse_proxy_url(&format!("http://127.0.0.1:{}", addr.port())).unwrap();
+        let dest = std::env::temp_dir().join(format!("cfp-proxy-test-{}", std::process::id()));
+        let _ = std::fs::remove_file(&dest);
+        let r = download_within(
+            std::time::Duration::from_secs(10),
+            "http://target.example/mcp/x",
+            &dest,
+            None,
+            None,
+            1 << 20,
+            Some(&proxy),
+        )
+        .await;
+        assert!(r.is_ok(), "经代理下载应成功：{:?}", r.err());
+        assert_eq!(r.unwrap().bytes, 5);
+        assert_eq!(std::fs::read(&dest).unwrap(), b"hello");
+        let _ = std::fs::remove_file(&dest);
+        server.abort();
     }
 
     #[test]

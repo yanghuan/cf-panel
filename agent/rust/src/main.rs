@@ -6,6 +6,7 @@ mod dns;
 mod fetch;
 mod metrics;
 mod platform;
+mod proxy;
 mod session;
 mod update;
 
@@ -88,6 +89,17 @@ async fn connect_ws_inner(
     req: tokio_tungstenite::tungstenite::handshake::client::Request,
     cfg: Option<tokio_tungstenite::tungstenite::protocol::WebSocketConfig>,
 ) -> Result<WsStream, Box<dyn Error + Send + Sync>> {
+    // 代理优先于一切解析/回落路径：显式配了代理，失败就直接报错，
+    // 不回落到直连（直连本就是被堵才配代理的路；回落还会把代理故障伪装成直连超时）。
+    // 代理路径也不走下面那条 tokio_tungstenite::connect_async_with_config（它无代理支持）。
+    match proxy::proxy_from_env() {
+        Err(e) => return Err(e.into()),
+        Ok(Some(p)) => {
+            let pinned = std::env::var("AGENT_WSS_IP").unwrap_or_default();
+            return connect_via_own_resolver_with(req, cfg, &pinned, Some(&p)).await;
+        }
+        Ok(None) => {}
+    }
     let mode = dns_mode();
     if mode != DnsMode::System {
         // req 只在回退分支还要用；握手请求很小，克隆成本可忽略
@@ -121,16 +133,22 @@ pub(crate) async fn connect_via_own_resolver(
     cfg: Option<tokio_tungstenite::tungstenite::protocol::WebSocketConfig>,
 ) -> Result<WsStream, Box<dyn Error + Send + Sync>> {
     let pinned = std::env::var("AGENT_WSS_IP").unwrap_or_default();
-    connect_via_own_resolver_with(req, cfg, &pinned).await
+    let proxy =
+        proxy::proxy_from_env().map_err(|e| -> Box<dyn Error + Send + Sync> { e.into() })?;
+    connect_via_own_resolver_with(req, cfg, &pinned, proxy.as_ref()).await
 }
 
 /// `pinned_ip` 非空时跳过 DNS 直连该 IP（`AGENT_WSS_IP` 的落地实现）。
 /// 环境变量读取刻意放在外层：测试并行执行，改环境变量会互相污染
 ///（已实测：非法取值会让并发跑的其它用例一起失败），注入形参后测试无需碰环境。
+/// `proxy` 非空时优先于 pinned_ip：pinned_ip 指向的是本地 relay，
+//  经代理 CONNECT 到本地回环没有意义；代理路径下直接 CONNECT 到目标域名，
+//  之后 TLS 的 SNI/证书校验仍按 URL 里的域名，与直连路径一致。
 async fn connect_via_own_resolver_with(
     req: tokio_tungstenite::tungstenite::handshake::client::Request,
     cfg: Option<tokio_tungstenite::tungstenite::protocol::WebSocketConfig>,
     pinned_ip: &str,
+    proxy: Option<&proxy::ProxyConfig>,
 ) -> Result<WsStream, Box<dyn Error + Send + Sync>> {
     let uri = req.uri().clone();
     let host = uri
@@ -142,19 +160,27 @@ async fn connect_via_own_resolver_with(
     let port = uri
         .port_u16()
         .unwrap_or(if scheme == "wss" { 443 } else { 80 });
-    let addr = if pinned_ip.trim().is_empty() {
-        dns::resolve(&host, port)
-            .await
-            .ok_or("dns resolve failed")?
-    } else {
-        // parse_ip 容忍方括号与空白（"[::1]" / "::1" / " 127.0.0.1 " 都收）
-        let ip = dns::parse_ip(pinned_ip).ok_or("AGENT_WSS_IP must be a literal IP")?;
-        std::net::SocketAddr::new(ip, port)
+    let tcp = match proxy {
+        Some(p) => {
+            log(format!("via proxy {} -> {host}:{port}", p.display()));
+            proxy::connect_via_proxy(p, &host, port).await?
+        }
+        None => {
+            let addr = if pinned_ip.trim().is_empty() {
+                dns::resolve(&host, port)
+                    .await
+                    .ok_or("dns resolve failed")?
+            } else {
+                // parse_ip 容忍方括号与空白（"[::1]" / "::1" / " 127.0.0.1 " 都收）
+                let ip = dns::parse_ip(pinned_ip).ok_or("AGENT_WSS_IP must be a literal IP")?;
+                std::net::SocketAddr::new(ip, port)
+            };
+            // 解析结果先落日志再连：连不上时也要能看出"域名解析成了什么"
+            //（排查解析类问题全指望这一行；放在 connect 之后的话，连不上就什么都不剩）
+            log(format!("resolve {host}:{port} -> {addr}"));
+            tokio::net::TcpStream::connect(addr).await?
+        }
     };
-    // 解析结果先落日志再连：连不上时也要能看出"域名解析成了什么"
-    //（排查解析类问题全指望这一行；放在 connect 之后的话，连不上就什么都不剩）
-    log(format!("resolve {host}:{port} -> {addr}"));
-    let tcp = tokio::net::TcpStream::connect(addr).await?;
     if scheme == "wss" {
         // AGENT_TLS_ROOTS=webpki|native（默认 webpki，各平台统一）：运行时选择 TLS 根证书来源。
         // native 走系统证书池（含 SSL_CERT_FILE），webpki 用硬编码 Mozilla 根。
@@ -1938,6 +1964,9 @@ fn print_help() {
     println!(
         "  AGENT_LENIENT_WS  默认 0   设为 1 时用宽松握手（ws:// 与 wss:// 均适用）（只校验 101 + Sec-WebSocket-Accept，兼容 MITM 代理剥头）"
     );
+    println!(
+        "  AGENT_PROXY_URL   默认 空   设为 http://[user:pass@]host:port 时，WS 与下载都经该代理 CONNECT 到目标（直连被堵的机器用；未设回落 PROXY_URL；代理失败不回落直连；设了代理时 AGENT_WSS_IP 的本地 relay 覆盖被忽略）"
+    );
 }
 
 #[tokio::main]
@@ -2335,9 +2364,45 @@ mod tests {
             .into_client_request()
             .unwrap();
         // 传 "": 不做 IP 覆盖，走着真实解析路径（IP 字面量会短路，不产生 DNS 流量）
-        let ws = connect_via_own_resolver_with(req, None, "")
+        let ws = connect_via_own_resolver_with(req, None, "", None)
             .await
             .expect("自建路径应完成 TCP + WS 握手");
+        drop(ws);
+        server.abort();
+    }
+
+    // 经代理的 WS：假代理收到 CONNECT 回 200 后直接当 WS 服务器握手。
+    // 代理路径下 agent 不应解析目标域名（目标是编造的 target.invalid），
+    // 也不应理会 pinned_ip（这里故意传一个非法 IP，代理优先于它）。
+    #[tokio::test]
+    async fn connect_via_proxy_ws_handshakes() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            let mut got = Vec::new();
+            loop {
+                let n = sock.read(&mut buf).await.unwrap();
+                got.extend_from_slice(&buf[..n]);
+                if got.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let req = String::from_utf8_lossy(&got).to_string();
+            assert!(req.starts_with("CONNECT target.invalid:80 "), "实际: {req}");
+            sock.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                .await
+                .unwrap();
+            let _ = tokio_tungstenite::accept_async(sock).await;
+            tokio::time::sleep(Duration::from_secs(3)).await;
+        });
+        let proxy = proxy::parse_proxy_url(&format!("http://127.0.0.1:{}", addr.port())).unwrap();
+        let req = "ws://target.invalid/control".into_client_request().unwrap();
+        let ws = connect_via_own_resolver_with(req, None, "not-an-ip.example", Some(&proxy))
+            .await
+            .expect("经代理应完成 CONNECT + WS 握手");
         drop(ws);
         server.abort();
     }
@@ -2365,7 +2430,7 @@ mod tests {
             Some("[::1]"),
             "Uri::host() 对 IPv6 字面量带方括号——strip_brackets 的存在理由"
         );
-        match connect_via_own_resolver_with(req, None, "").await {
+        match connect_via_own_resolver_with(req, None, "", None).await {
             Ok(ws) => drop(ws),
             Err(e) => panic!("IPv6 字面量应能直连：{e}"),
         }
@@ -2378,7 +2443,7 @@ mod tests {
     async fn agent_wss_ip_pin_semantics() {
         // 1) 非法值必须报错，而不是静默回退 DNS——静默回退会让"设了没生效"极难排查
         let req = "ws://127.0.0.1:9/control".into_client_request().unwrap();
-        let e = connect_via_own_resolver_with(req, None, "not-an-ip.example")
+        let e = connect_via_own_resolver_with(req, None, "not-an-ip.example", None)
             .await
             .unwrap_err();
         assert!(
@@ -2392,7 +2457,7 @@ mod tests {
         let req = format!("ws://panel.invalid:{}/control", addr.port())
             .into_client_request()
             .unwrap();
-        match connect_via_own_resolver_with(req, None, "127.0.0.1").await {
+        match connect_via_own_resolver_with(req, None, "127.0.0.1", None).await {
             Ok(ws) => drop(ws),
             Err(e) => panic!("有 IP 覆盖时不应依赖 DNS：{e}"),
         }

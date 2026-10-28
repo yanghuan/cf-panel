@@ -222,7 +222,7 @@ import {
   json, err, requireJwtSecret, signJwt, randomHex, sha256Hex, hashSecret, safeJson,
   kvGet, kvPut, sanitizeAlerts, sanitizeAlertOverride, parseRangeHours, sendWebhookRaw,
   doMetrics, doForShard, doPanel, shardForServerId, makeStreamId, shardFromStreamId,
-  signUploadToken, verifyUploadToken, signJobToken, verifyJobToken,
+  signJobToken, verifyJobToken,
 } from './utils.js';
 import { queryMonitorRows, queryCustomMetrics, queryDayStats, kvClearCache } from './db.js';
 import { authUser, isAdmin, isJwtAdmin, canAccessServer, canExec, canUpdateAgent, listServersWithState, serverListCache } from './auth.js';
@@ -358,8 +358,8 @@ function clientIp(request) {
 // 生产（Workers 仅 https）恒为 https/wss；wrangler dev / 本地 http 下是 http/ws——
 // 硬编码安全协议会让照抄的 curl / agent 在明文端口上做 TLS 握手而连不上。
 // 两者与 host 同源自请求 URL：host 本就取自此处，协议同源派生才不会自相矛盾。
-// 注：上传签名载荷只含 serverId|path|overwrite|exp（utils.js signUploadToken），
-// 不含 host/协议，故基址协议变化不影响已签发 URL 的验签。
+// 注：上传签名载荷不含 host/协议（任务版 token 只绑 job_id，path 从 D1 读），
+// 故基址协议变化不影响已签发 URL 的验签。
 // 上传大小上限（与环境变量同口径，供 upload job 在创建时确定 R2 暂存上限）
 function uploadMaxBytesOf(env) {
   const UPLOAD_ABS_MAX_MB = 500;
@@ -1423,29 +1423,6 @@ function uploadJobResponse(job, origin, pollAfterMs, { withSize = false } = {}) 
   };
 }
 
-// 上传公共转发：流式转发到 TerminalDO（body 保持原始流，DO 内切分片）；query 参数原样传递。
-// 两条鉴权路径（Bearer JWT/PAT 与签名 URL）共用同一管道。
-function forwardUpload(env, request, serverId) {
-  const target = new URL(request.url);
-  target.protocol = 'https:';
-  target.hostname = 'do.internal';
-  target.pathname = '/rpc/upload'; // DO 内部 RPC 路径（/api/file_upload 仅面板入口）
-  return doForShard(env, shardForServerId(serverId)).fetch(target.toString(), request);
-}
-
-// 签名 URL 直传（MCP create_upload 签发）：HMAC 验签无状态自验证，无需 Bearer。
-// 审计已在 create_upload 时记录（file.upload），此处不重复。
-async function handleUploadSigned(request, env, u) {
-  const serverId = Number(u.searchParams.get('server_id')) || 0;
-  const targetPath = u.searchParams.get('path') || '';
-  const overwrite = u.searchParams.get('overwrite') === '1';
-  if (!serverId) return err('server_id is required', 400);
-  if (!targetPath || !targetPath.startsWith('/')) return err('path is required (absolute)', 400);
-  const v = await verifyUploadToken(u.searchParams.get('token') || '', serverId, targetPath, overwrite, env);
-  if (!v.ok) return err(v.error, 403);
-  return forwardUpload(env, request, serverId);
-}
-
 // POST /mcp/upload-jobs/:id/content?token=... —— 客户端把字节写入 R2 staging。
 // 只认签名 token（无 Bearer）：URL 可能被转给 curl/程序执行。
 // token 绑定 job_id + server_id；path/overwrite 一律从 D1 的 job 行读，
@@ -2265,36 +2242,9 @@ async function handleMcpInner(request, env) {
   // 响应 CORS 回显同源 origin（见 mcpResult；无 Origin 的 curl/MCP 客户端自动 '*'）
   const reply = (id, result, error) => mcpResult(id, result, error, origin);
 
-  // POST /mcp/file_upload —— 上传通道（签名 URL 直传 / Bearer 鉴权），非 JSON-RPC
-  // 签名 URL 直传（MCP create_upload 签发，无状态 HMAC 验签，无需 Bearer）：
-  // 签名绑定 server_id/path/overwrite/exp；验证失败 403。审计在 create_upload 时已记录，此处不重复。
-  // JWT_SECRET 仍是必需安全边界（验签密钥回退依赖它）：缺失时签名上传同样 503，防止绕过配置错误。
-  if (request.method === 'POST' && url.pathname === '/mcp/file_upload' && url.searchParams.get('token')) {
-    const configError = requireJwtSecret(env);
-    if (configError) return configError;
-    return handleUploadSigned(request, env, url);
-  }
-
   // 每请求独立鉴权（与现有 API 一致：Bearer JWT 或 PAT）
   const user = await authUser(request, env);
   if (!user) return reply(null, null, { code: -32001, message: 'unauthorized' });
-
-  // POST /mcp/file_upload?server_id=&path=&overwrite= —— Bearer 流式上传文件到 agent（body = 原始字节）
-  // 小文件（配置/脚本）与大文件（备份/包）统一入口：Worker 流式读 body → 自动分片 →
-  // 控制通道 Binary 混合帧 → agent 原子写。需 exec 权限（管理员或带 server:exec 的 PAT）。
-  if (request.method === 'POST' && url.pathname === '/mcp/file_upload') {
-    const serverId = Number(url.searchParams.get('server_id')) || 0;
-    const targetPath = url.searchParams.get('path') || '';
-    if (!serverId) return json({ error: 'server_id is required' }, 400);
-    if (!targetPath || !targetPath.startsWith('/')) return json({ error: 'path is required (absolute)' }, 400);
-    const server = await env.DB.prepare('SELECT * FROM servers WHERE id = ?').bind(serverId).first();
-    if (!server) return json({ error: 'server not found' }, 404);
-    if (!canExec(user, server)) return json({ error: 'forbidden' }, 403);
-    await env.DB.prepare('INSERT INTO audit_logs (user_id, username, client_ip, action, target_server_id, detail) VALUES (?,?,?,?,?,?)')
-      .bind(user.id, user.username, clientIp(request), 'file.upload', server.id, targetPath)
-      .run();
-    return forwardUpload(env, request, serverId);
-  }
 
   let body;
   try { body = await request.json(); } catch {

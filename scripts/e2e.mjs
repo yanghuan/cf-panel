@@ -464,7 +464,7 @@ async function step8_mcp() {
   if (execDone?.result?.stdout?.includes('E2E_MCP_EXEC_OK')) ok('MCP exec_command：agent 真实执行，输出匹配');
   else bad(`MCP exec_command 失败：${JSON.stringify(execDone || exec)}`);
 
-  // ---- 8.5) create_upload + Bearer 上传 + 验证 ----
+  // ---- 8.5) create_upload + 签名 URL 上传 + 验证 ----
   const cu = await mcpTool(6, 'create_upload', { server_id: serverId, path: '/tmp/e2e-mcp-upload.txt' });
   const cuData = mcpContent(cu);
   const cuUrl = cuData?.upload_url || '';
@@ -472,21 +472,23 @@ async function step8_mcp() {
   if (cuUrl && cuExp > 0 && cuExp <= 600) ok(`MCP create_upload：签名 URL 结构正确（expires_in_seconds=${cuExp}）`);
   else bad(`MCP create_upload：响应结构异常：${JSON.stringify(cuData)}`);
 
-  // Bearer 上传
-  const upRes = await fetch(`${BASE}/mcp/file_upload?server_id=${serverId}&path=/tmp/e2e-mcp-upload.txt`, {
+  // 签名 URL 上传（异步：POST 到 upload_url 暂存 R2，轮询 job 到终态）
+  const upRes = await fetch(cuUrl, {
     method: 'POST',
-    headers: { 'authorization': `Bearer ${token}` },
     body: 'E2E_MCP_UPLOAD_CONTENT',
   });
-  const upBody = await upRes.json();
-  if (upBody.ok) {
-    // exec_command 验证内容（异步：轮询到终态再取 stdout）
-    const verify = await mcpTool(7, 'exec_command', { server_id: serverId, command: 'cat /tmp/e2e-mcp-upload.txt' });
-    const vJob = mcpContent(verify);
-    const vData = vJob?.job_id ? await mcpPollJob(vJob.job_id) : null;
-    if (vData?.result?.stdout?.includes('E2E_MCP_UPLOAD_CONTENT')) ok('MCP 上传：Bearer 上传 + exec_command 验证内容一致');
-    else bad(`MCP 上传：内容验证不匹配：${JSON.stringify(vData || vJob)}`);
-  } else bad(`MCP 上传：Bearer POST 失败：${JSON.stringify(upBody)}`);
+  const upBody = await upRes.json().catch(() => ({}));
+  if (upRes.status === 202 && upBody.job_id) {
+    const upDone = await mcpPollJob(upBody.job_id);
+    if (upDone?.status === 'succeeded') {
+      // exec_command 验证内容（异步：轮询到终态再取 stdout）
+      const verify = await mcpTool(7, 'exec_command', { server_id: serverId, command: 'cat /tmp/e2e-mcp-upload.txt' });
+      const vJob = mcpContent(verify);
+      const vData = vJob?.job_id ? await mcpPollJob(vJob.job_id) : null;
+      if (vData?.result?.stdout?.includes('E2E_MCP_UPLOAD_CONTENT')) ok('MCP 上传：签名 URL 上传 + exec_command 验证内容一致');
+      else bad(`MCP 上传：内容验证不匹配：${JSON.stringify(vData || vJob)}`);
+    } else bad(`MCP 上传：任务未成功：${JSON.stringify(upDone)}`);
+  } else bad(`MCP 上传：签名 URL POST 失败：${upRes.status} ${JSON.stringify(upBody)}`);
 
   // 清理
   await mcpTool(8, 'exec_command', { server_id: serverId, command: 'rm -f /tmp/e2e-mcp-upload.txt' });

@@ -36,11 +36,7 @@ export class TerminalDO {
     this.agents = new Map(); // serverId -> 控制 WS
     this.agentInterval = new Map(); // serverId -> 当前下发的上报间隔（秒），避免重复下发
     this.pendingOpen = new Map(); // streamId -> {tries, timer, type} open_terminal/open_file 确认重发
-    this.pendingExec = new Map(); // execId -> {resolve, timer, serverId} MCP 一次性命令等待
-    this.pendingUpload = new Map(); // uploadId -> {resolve, timer, serverId} /api/file_upload 等待 upload_result
-    this.pendingUpdate = new Map(); // updateId -> {resolve,timer,serverId} Agent 更新等待最终校验/替换回执
     this.pendingProbe = new Map(); // probeId -> {resolve, timer, serverId} exec 前往返探活等待 pong
-    this.uploading = new Set(); // serverId -> 普通文件上传进行中（控制通道单 WS，防并发帧交错）
     this.updating = new Set(); // serverId -> Agent 更新进行中（与上传/更新互斥，防 Binary 帧交错）
     this.lastPingAt = new Map(); // serverId -> 上次心跳时间（控制通道保活，防健康连接被 read -t 180 误判半开）
     this.lastRoundTripAt = new Map(); // serverId -> 上次确认双向可达时间（exec_result/pong），exec 前探活据此跳过
@@ -154,68 +150,8 @@ export class TerminalDO {
       return err('bad op');
     }
 
-    // 内部 RPC：MCP 一次性命令执行（不建终端会话，控制通道直达，等 agent 返回 exec_result）
-    // 调用方（routes.mcpExecCommand）已完成 canExec 鉴权；此处只负责下发与等待。
-    if (path === '/rpc/exec' && request.method === 'POST') {
-      const body = await request.json();
-      const serverId = Number(body.serverId) || 0;
-      const command = String(body.command || '').trim();
-      if (!command) return err('empty command');
-      // 长度最终防线（与 Worker 侧同一常量）：超限帧会让 agent 判 Capacity 断开控制通道，
-      // 命令不执行而调用方只见误导性超时。Worker 已前置拒绝，此处兜住将来新增的调用方
-      const cmdBytes = execCommandBytes(command);
-      if (cmdBytes > EXEC_CMD_MAX_BYTES) return err(execTooLongError(cmdBytes), 413);
-      if (this.updating.has(serverId)) return json({ error: 'agent update in progress' }, 409);
-      const timeoutMs = Math.min(Math.max(Number(body.timeoutMs) || EXEC_DEFAULT_TIMEOUT_MS, 1000), EXEC_MAX_TIMEOUT_MS);
-      const agentWs = this.agents.get(serverId);
-      if (!agentWs) return json({ error: 'agent offline', code: 'AGENT_OFFLINE' }, 502);
-      // T1：report 只证明「上行通」，exec 依赖「下行通」，两者不等价（非对称半开时索引正确也发不出去）。
-      // 往返缓存过期时先做一次探活：失败即判下行不可达 → 快速失败（不再空等 25s），且命令未下发，
-      // 调用方重试绝对安全（避免「已执行但回执丢失 → 重试重复执行」）。频繁 exec 命中缓存则零新增延迟。
-      // 仅对已证明支持 probe 的 agent 启用（probeCapable）：旧 agent 不回 pong，保持直接下发，避免升级期 exec 全废。
-      if (this.probeCapable.has(serverId)) {
-        const rttFresh = Date.now() - (this.lastRoundTripAt.get(serverId) || 0) < EXEC_ROUNDTRIP_TTL_MS;
-        if (!rttFresh) {
-          const ok = await this.probeAgent(agentWs, serverId, EXEC_PROBE_TIMEOUT_MS);
-          // 探活期间（≤1s）状态可能已变，必须重校验，否则会把命令发往失效连接或与更新帧交错：
-          // ① 连接被重连替换 → 让调用方重试（此时旧 agentWs 已 close，send 会失败/进虚空）
-          if (this.agents.get(serverId) !== agentWs) {
-            return json({ error: 'agent reconnected, please retry', code: 'AGENT_OFFLINE' }, 502);
-          }
-          // ② 期间开始了 Agent 更新 → 让路（否则命令帧与二进制更新帧交错，且兜底超时 close 会误杀更新链路）
-          if (this.updating.has(serverId)) return json({ error: 'agent update in progress' }, 409);
-          if (!ok) {
-            try { agentWs.close(4002, 'exec probe failed'); } catch { /* ignore */ } // 4002 → agent 正常退避重连
-            return json({ error: 'agent unreachable', code: 'AGENT_OFFLINE' }, 502);
-          }
-        }
-      }
-      const execId = `e-${crypto.randomUUID()}`;
-      const result = await new Promise((resolve) => {
-        // 兜底定时器晚于 agent 实际超时（EXEC_TIMEOUT_GRACE_MS）：正常路径 agent 先回执
-        // exec_result（超时=无输出，agent 侧已 kill 进程组），此处仅防 agent 失联/回执丢失导致的悬挂。
-        const timer = setTimeout(() => {
-          this.pendingExec.delete(execId);
-          // 兜底超时只在 agent 未按自身超时回执时触发（健康 agent 必先回 exec_result）→ 判链路故障，
-          // 主动关闭触发重连自愈；否则降级路径（旧 agent / 唤醒后未协商 probe）每次 exec 都会空等。
-          try { agentWs.close(4002, 'exec timeout'); } catch { /* ignore */ }
-          resolve({ error: `command timed out after ${Math.floor(timeoutMs / 1000)}s` });
-        }, timeoutMs + EXEC_TIMEOUT_GRACE_MS);
-        this.pendingExec.set(execId, { resolve, timer, serverId });
-        try {
-          agentWs.send(JSON.stringify({ type: 'exec', exec_id: execId, command, timeout_s: Math.floor(timeoutMs / 1000) }));
-        } catch {
-          clearTimeout(timer);
-          this.pendingExec.delete(execId);
-          resolve({ error: 'failed to send exec command' });
-        }
-      });
-      return json(result);
-    }
-
     // 内部 RPC：异步 exec 下发（阶段 A）。只负责「把指令发出去 + 落 D1 running」：
-    // 不建 pendingExec、不设 setTimeout、不等结果——结果由 agent 的 exec_result 唤醒 DO 后落库。
-    // 上面的 /rpc/exec 是同步旧路径，过渡期保留用于回滚。
+    // 不设内存等待、不设 setTimeout、不等结果——结果由 agent 的 exec_result 唤醒 DO 后落库。
     if (path === '/rpc/exec/submit' && request.method === 'POST') {
       const body = await request.json();
       const jobId = String(body.jobId || '');
@@ -294,7 +230,7 @@ export class TerminalDO {
         }
         return json({ ok: true, job_id: jobId, status: 'waiting_agent' }, 202);
       }
-      // Agent 必须支持异步拉取；旧 Agent 没有 upload_fetch_proto 时只能回落到同步旧路径
+      // Agent 必须支持异步拉取；旧 Agent 没有 upload_fetch_proto 时直接失败 AGENT_UPGRADE_REQUIRED（同步旧路径已删除，不再回落）
       if (!this.supportsFetch(agentWs, 'upload')) {
         await failJob(this.env, jobId, 'agent does not support async upload (upgrade required)');
         return json({ error: 'agent does not support async upload', code: 'AGENT_UPGRADE_REQUIRED' }, 409);
@@ -319,7 +255,7 @@ export class TerminalDO {
     }
 
     // 内部 RPC：异步 agent update 下发（阶段 C）。只下发元数据 + 短期资产 URL，
-    // Worker 不再在 DO 里下载并流式转发二进制（旧 /rpc/agent_update 保留用于回滚）。
+    // Worker 不再在 DO 里下载并流式转发二进制。
     if (path === '/rpc/agent_update/submit' && request.method === 'POST') {
       const body = await request.json();
       const jobId = String(body.jobId || '');
@@ -355,63 +291,6 @@ export class TerminalDO {
         return json({ error: 'failed to send agent_update_fetch' }, 502);
       }
       return json({ ok: true, job_id: jobId, status: 'running' });
-    }
-
-    // 内部 RPC：Agent 自更新（仅 routes 管理员接口调用）。Release 二进制流式切 48KB
-    // 专用 agent_update 帧；Agent 同目录 staging + SHA/版本校验 + self-replace 后回执并退出。
-    if (path === '/rpc/agent_update' && request.method === 'POST') {
-      const serverId = Number(url.searchParams.get('server_id')) || 0;
-      const buildId = String(request.headers.get('x-agent-build-id') || '');
-      const platform = String(request.headers.get('x-agent-platform') || '');
-      const sha256 = String(request.headers.get('x-agent-sha256') || '').toLowerCase();
-      const size = Number(request.headers.get('x-agent-size'));
-      if (!serverId || !/^[A-Za-z0-9._-]{1,64}$/.test(buildId)
-          || !/^[A-Za-z0-9_-]{3,32}$/.test(platform)
-          || !/^[0-9a-f]{64}$/.test(sha256)
-          || !Number.isSafeInteger(size) || size <= 0 || size > AGENT_UPDATE_MAX_BYTES) {
-        return err('invalid agent update metadata');
-      }
-      const agentWs = this.agents.get(serverId);
-      if (!agentWs) return json({ error: 'agent offline', code: 'AGENT_OFFLINE' }, 502);
-      if (this.updating.has(serverId) || this.uploading.has(serverId)) {
-        return json({ error: 'agent update/upload already in progress' }, 409);
-      }
-      if ([...this.pendingExec.values()].some((r) => r.serverId === serverId)) {
-        return json({ error: 'command execution in progress' }, 409);
-      }
-      this.updating.add(serverId);
-      // 更新会退出 Agent；先关闭活跃终端/文件流，确保 PTY/临时文件按正常链路清理。
-      this.dropAgentSessions(serverId);
-      try {
-        return await this.doAgentUpdate(agentWs, request, {
-          serverId, buildId, platform, sha256, size,
-        });
-      } finally {
-        this.updating.delete(serverId);
-      }
-    }
-
-    // 内部 RPC：/api/file_upload 流式上传（调用方 routes 已鉴权 canExec）
-    // Worker 流式读请求 body → 自动切成 ≤48KB 分片 → 控制通道 Binary 混合帧发给 agent →
-    // agent 写临时文件（offset 校验）→ 最后一帧 commit 原子替换 → 回执 upload_result。
-    // 客户端零分片逻辑：curl --data-binary @file 一行即可，大文件天然流式（不占内存）。
-    if (path === '/rpc/upload' && request.method === 'POST') {
-      const serverId = Number(url.searchParams.get('server_id')) || 0;
-      const targetPath = url.searchParams.get('path') || '';
-      const overwrite = url.searchParams.get('overwrite') === '1';
-      if (!serverId) return err('server_id is required');
-      if (!targetPath || !targetPath.startsWith('/')) return err('path is required (absolute)');
-      const agentWs = this.agents.get(serverId);
-      if (!agentWs) return json({ error: 'agent offline', code: 'AGENT_OFFLINE' }, 502);
-      if (this.uploading.has(serverId) || this.updating.has(serverId)) {
-        return json({ error: 'upload/update already in progress for this server' }, 409);
-      }
-      this.uploading.add(serverId);
-      try {
-        return await this.doUpload(agentWs, targetPath, overwrite, request);
-      } finally {
-        this.uploading.delete(serverId);
-      }
     }
 
     // GET /ws/terminal/:id | /ws/file/:id —— 浏览器会话（防 UUID 劫持）
@@ -534,166 +413,6 @@ export class TerminalDO {
 
   // /api/file_upload 核心：流式读 body → 自动切 ≤48KB 分片 → 控制通道 Binary 混合帧 → 等 upload_result。
   // 客户端零分片逻辑（curl --data-binary @file 一行）；分片顺序由 offset 严格保证（agent 端校验）。
-  async doAgentUpdate(agentWs, request, meta) {
-    const updateId = `au-${crypto.randomUUID()}`;
-    let failed = false;
-    let resolveResult;
-    const resultPromise = new Promise((resolve) => { resolveResult = resolve; });
-    const timer = setTimeout(() => {
-      failed = true;
-      this.pendingUpdate.delete(updateId);
-      try { agentWs.close(1011, 'agent update timeout'); } catch { /* ignore */ }
-      resolveResult({ ok: false, error: 'agent update timed out' });
-    }, AGENT_UPDATE_TIMEOUT_MS);
-    this.pendingUpdate.set(updateId, { resolve: resolveResult, timer, serverId: meta.serverId });
-    try {
-      const encoder = new TextEncoder();
-      const sendFrame = (offset, piece, commit) => {
-        if (failed) return;
-        const head = encoder.encode(JSON.stringify({
-          type: 'agent_update', update_id: updateId, build_id: meta.buildId,
-          platform: meta.platform, size: meta.size, sha256: meta.sha256, offset, commit,
-        }) + '\n');
-        const frame = new Uint8Array(head.length + piece.length);
-        frame.set(head, 0);
-        frame.set(piece, head.length);
-        try {
-          agentWs.send(frame.buffer);
-        } catch {
-          failed = true;
-          resolveResult({ ok: false, error: 'agent disconnected during update' });
-        }
-      };
-      const reader = request.body ? request.body.getReader() : null;
-      let offset = 0;
-      try {
-        while (reader && !failed) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          if (!value || !value.length) continue;
-          if (offset + value.length > meta.size) {
-            failed = true;
-            resolveResult({ ok: false, error: 'agent update body exceeds manifest size' });
-            break;
-          }
-          // 不拼整包：直接把上游 chunk 切成 ≤48KB WS 帧，内存峰值与 fetch chunk 等量。
-          for (let pos = 0; pos < value.length && !failed; pos += UPLOAD_CHUNK_BYTES) {
-            const piece = value.subarray(pos, Math.min(value.length, pos + UPLOAD_CHUNK_BYTES));
-            sendFrame(offset, piece, false);
-            offset += piece.length;
-          }
-        }
-      } catch (e) {
-        failed = true;
-        resolveResult({ ok: false, error: `agent update stream failed: ${e.message}` });
-      }
-      if (failed && reader) {
-        try { await reader.cancel(); } catch { /* ignore */ }
-      }
-      if (!failed && offset !== meta.size) {
-        failed = true;
-        resolveResult({
-          ok: false,
-          error: `agent update size mismatch: expected ${meta.size}, got ${offset}`,
-        });
-      }
-      if (!failed) sendFrame(offset, new Uint8Array(0), true);
-      const result = await resultPromise;
-      if (!result.ok) {
-        // 中途失败时关闭控制通道，让 Agent control_conn 退出并清理 staging；随后自动重连。
-        if (failed) { try { agentWs.close(1011, 'update relay failed'); } catch { /* ignore */ } }
-        const message = result.error || 'agent update failed';
-        const status = /timed out/.test(message) ? 504 : /disconnected|stream failed/.test(message) ? 502 : 400;
-        return json({ error: message }, status);
-      }
-      if (result.build_id !== meta.buildId || result.size !== meta.size || !result.restarting) {
-        return json({ error: 'agent update result does not match manifest' }, 502);
-      }
-      return json({ ...result, update_id: updateId, transferred: offset });
-    } finally {
-      clearTimeout(timer);
-      this.pendingUpdate.delete(updateId);
-    }
-  }
-
-  async doUpload(agentWs, targetPath, overwrite, request) {
-    const uploadId = `u-${crypto.randomUUID()}`;
-    let resolveResult;
-    const resultPromise = new Promise((resolve) => { resolveResult = resolve; });
-    const timer = setTimeout(() => {
-      this.pendingUpload.delete(uploadId);
-      resolveResult({ ok: false, error: 'upload timed out' });
-    }, UPLOAD_TIMEOUT_MS);
-    // serverId 用于 cleanup：agent 断连时立即失败该上传，而非空等 UPLOAD_TIMEOUT_MS(120s) 兜底
-    this.pendingUpload.set(uploadId, { resolve: resolveResult, timer, serverId: this.wsServerId(agentWs) });
-    // 大小上限：优先环境变量 UPLOAD_MAX_MB（磁盘耗尽防护）。
-    // 显式解析：0/非数字回退默认 100MB（不支持 0=无限）；上限钳到 agent 端 FILE_LIMIT
-    //（500MB 绝对硬上限，README/routes.js 工具描述同口径——UPLOAD_MAX_DEFAULT 是默认值
-    // 不是上限，钳 100 会静默砍掉文档承诺的"调高到 500"能力）
-    const UPLOAD_ABS_MAX_MB = 500;
-    const rawMax = Number(this.env.UPLOAD_MAX_MB);
-    const maxMb = Number.isFinite(rawMax) && rawMax > 0
-      ? Math.min(rawMax, UPLOAD_ABS_MAX_MB)
-      : UPLOAD_MAX_DEFAULT / (1024 * 1024);
-    const maxBytes = maxMb * 1024 * 1024;
-    try {
-      const encoder = new TextEncoder();
-      let failed = false; // agent 断连/超限后置位：停止发帧并提前退出读循环
-      // 发一帧：JSON 头 + '\n' + 原始字节（Binary 混合帧，与文件会话同构）
-      const sendFrame = (offset, piece, commit) => {
-        if (failed) return;
-        const head = encoder.encode(JSON.stringify({
-          type: 'upload', upload_id: uploadId, path: targetPath, offset, commit, overwrite,
-        }) + '\n');
-        const frame = new Uint8Array(head.length + piece.length);
-        frame.set(head, 0);
-        frame.set(piece, head.length);
-        try {
-          agentWs.send(frame.buffer);
-        } catch {
-          failed = true;
-          resolveResult({ ok: false, error: 'agent disconnected during upload' });
-        }
-      };
-      // 流式读 body：跨块拼接后切帧，不整体缓冲（大文件内存友好）
-      const reader = request.body ? request.body.getReader() : null;
-      let offset = 0;
-      let buf = new Uint8Array(0);
-      while (reader && !failed) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        if (value && value.length) {
-          if (offset + value.length > maxBytes) {
-            failed = true;
-            resolveResult({ ok: false, error: `upload exceeds ${Math.round(maxBytes / (1024 * 1024))}MB limit` });
-            break;
-          }
-          const combined = new Uint8Array(buf.length + value.length);
-          combined.set(buf, 0);
-          combined.set(value, buf.length);
-          buf = combined;
-        }
-        while (!failed && buf.length >= UPLOAD_CHUNK_BYTES) {
-          sendFrame(offset, buf.slice(0, UPLOAD_CHUNK_BYTES), false);
-          offset += UPLOAD_CHUNK_BYTES;
-          buf = buf.slice(UPLOAD_CHUNK_BYTES);
-        }
-      }
-      if (!failed && buf.length > 0) {
-        sendFrame(offset, buf, false);
-        offset += buf.length;
-      }
-      // commit 帧（空数据）：agent 端 fsync + rename 原子替换（失败路径不发，避免残留 commit）
-      if (!failed) sendFrame(offset, new Uint8Array(0), true);
-      const result = await resultPromise;
-      if (!result.ok) return json({ error: result.error || 'upload failed' }, result.error && /too large|exceeds/.test(result.error) ? 413 : 400);
-      return json({ ok: true, path: targetPath, size: offset, upload_id: uploadId });
-    } finally {
-      clearTimeout(timer);
-      this.pendingUpload.delete(uploadId);
-    }
-  }
-
   // 控制通道（重）连接时调用：关闭该服务器旧的终端/文件会话流。
   // agent 侧 websocat 收到 close → 退出 → 触发清理链（kill pty/bash/脚本），防半开残留。
   dropAgentSessions(serverId) {
@@ -1050,19 +769,6 @@ export class TerminalDO {
             return;
           }
           if (j && j.type === 'exec_result') {
-            // 旧同步路径（/rpc/exec）：resolve 内存 Promise，过渡期保留
-            const r = this.pendingExec.get(j.exec_id);
-            if (r) {
-              clearTimeout(r.timer);
-              this.pendingExec.delete(j.exec_id);
-              r.resolve({
-                exit_code: j.exit_code,
-                stdout: j.stdout || '',
-                stderr: j.stderr || '',
-                timed_out: !!j.timed_out,
-                error: j.error || null,
-              });
-            }
             // 成功回执即最强双向存活证明 → 刷新往返时间，使后续 exec 走快路径（零新增延迟）
             const esid = this.wsServerId(ws);
             if (esid) this.lastRoundTripAt.set(esid, Date.now());
@@ -1072,16 +778,6 @@ export class TerminalDO {
             return;
           }
           if (j && j.type === 'upload_result') {
-            // /api/file_upload 结果。agent 对每个分片帧都回执（非 commit 帧 ok:true 表示
-            // "该块已写入临时文件"）——只有 commit 帧的回执才代表"文件已 fsync+rename 完成"。
-            // 首帧即 resolve 会在大文件上传中提前返回成功（目标文件尚不存在/后续块写失败
-            // 客户端无从得知）。失败帧（ok:false）保持立即 resolve 的快速失败语义。
-            const r = this.pendingUpload.get(j.upload_id);
-            if (r && (j.commit === true || !j.ok)) {
-              clearTimeout(r.timer);
-              this.pendingUpload.delete(j.upload_id);
-              r.resolve({ ok: !!j.ok, error: j.error || null, size: j.size || 0 });
-            }
             // 异步路径：job_ 前缀的 upload_id。只有 commit 回执才是"文件已落地"，
             // 非 commit 帧的 ok:true 只表示"该块已写入临时文件"，不能当终态。
             if (String(j.upload_id || '').startsWith('job_') && (j.commit === true || !j.ok)) {
@@ -1090,18 +786,6 @@ export class TerminalDO {
             return;
           }
           if (j && j.type === 'agent_update_result') {
-            const r = this.pendingUpdate.get(j.update_id);
-            if (r) {
-              clearTimeout(r.timer);
-              this.pendingUpdate.delete(j.update_id);
-              r.resolve({
-                ok: !!j.ok,
-                error: j.error || null,
-                build_id: j.build_id || null,
-                size: Number(j.size) || 0,
-                restarting: !!j.restarting,
-              });
-            }
             // 异步路径：job_ 前缀。回执到达即终态（成功=self-replace 完成）。
             if (String(j.update_id || '').startsWith('job_')) await this.settleUpdateJob(j.update_id, j);
             return;
@@ -1578,9 +1262,9 @@ export class TerminalDO {
     for (const serverId of matched) {
       const isCurrent = this.agents.get(serverId) === ws;
       if (isCurrent) this.agents.delete(serverId);
-      // 被顶替的旧连接（isCurrent=false）：只释放 per-server 的互斥/能力记录并收敛 D1，
-      // **不能**清 pendingExec/pendingUpdate 等 Promise——那些属于"当前这条新连接"的
-      // 在途请求，误清会让明明还在跑的请求收到假的"agent disconnected"。
+      // 被顶替的旧连接（isCurrent=false）：只释放 per-server 的互斥/能力记录并收敛 D1。
+      // 在途异步任务的状态全在 D1（不在内存 Promise 里），顶替连接不影响它们，
+      // 不会让明明还在跑的请求收到假的"agent disconnected"。
       if (isCurrent) {
         // 控制连接已断 → 作废该 serverId 的往返/探活能力记录（新连接会重新协商 probe），
         // 并立即失败在途探活（否则 /rpc/exec 的探活要等 EXEC_PROBE_TIMEOUT_MS 超时才返回）
@@ -1592,31 +1276,6 @@ export class TerminalDO {
           if (r.serverId === serverId) {
             if (r.timer) clearTimeout(r.timer);
             this.pendingOpen.delete(sid);
-          }
-        }
-        // 未完成的 MCP exec 一并失败返回（Promise resolve 幂等，超时定时器已清）
-        for (const [execId, r] of [...this.pendingExec]) {
-          if (r.serverId === serverId) {
-            if (r.timer) clearTimeout(r.timer);
-            this.pendingExec.delete(execId);
-            r.resolve({ error: 'agent disconnected' });
-          }
-        }
-        // 未完成的上传一并失败返回（此前缺 serverId 只能等 120s 兜底）
-        for (const [uploadId, r] of [...this.pendingUpload]) {
-          if (r.serverId === serverId) {
-            if (r.timer) clearTimeout(r.timer);
-            this.pendingUpload.delete(uploadId);
-            r.resolve({ ok: false, error: 'agent disconnected during upload' });
-          }
-        }
-        // 更新成功会先回 agent_update_result 再主动退出；若结果未到就断线则明确失败，
-        // 不让 Worker 请求悬挂到 180s 定时器。
-        for (const [updateId, r] of [...this.pendingUpdate]) {
-          if (r.serverId === serverId) {
-            if (r.timer) clearTimeout(r.timer);
-            this.pendingUpdate.delete(updateId);
-            r.resolve({ ok: false, error: 'agent disconnected during update' });
           }
         }
       }

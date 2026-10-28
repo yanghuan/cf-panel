@@ -1487,128 +1487,6 @@ test('TerminalDO: file_ready 确认后停止 open_file 重发', async (t) => {
   }
 });
 
-test('TerminalDO: /rpc/upload 仅 commit 帧回执才 resolve（多分片上传不被首帧提前判定成功）', async (t) => {
-  t.mock.timers.enable({ apis: ['setTimeout'] });
-  try {
-    const env = makeEnv();
-    const sent = [];
-    const agentWs = { send: (m) => sent.push(m), readyState: 1 };
-    const inst = new TerminalDO(mockState(), env);
-    inst.agents.set(1, agentWs);
-
-    // 100KB body（> 48KB 分片阈值 → 2 个数据帧 + 1 个 commit 帧）。
-    // upload_id 由 DO 随机生成，从实际发出的帧头提取（与生产 agent 收帧回执的时序同构）
-    const resultPromise = inst.fetch(new Request('https://do.internal/rpc/upload?server_id=1&path=/tmp/up.bin', {
-      method: 'POST',
-      body: new Uint8Array(96 * 1024).fill(0x61),
-    }));
-    for (let i = 0; i < 100 && sent.length < 3; i++) {
-      await new Promise((r) => setImmediate(r)); // 等读循环把全部帧发出（mock timers 不拦 setImmediate）
-    }
-    assert.equal(sent.length, 3, '两个数据帧 + 一个 commit 帧');
-    const headOf = (f) => {
-      const u = new Uint8Array(f.buffer ?? f);
-      const nl = u.indexOf(10);
-      return JSON.parse(new TextDecoder().decode(u.subarray(0, nl)));
-    };
-    const heads = sent.map(headOf);
-    const uploadId = heads[0].upload_id;
-    assert.equal(heads.filter((h) => h.commit === false).length, 2, '两个数据帧');
-    assert.equal(heads.filter((h) => h.commit === true).length, 1, '一个 commit 帧');
-
-    // agent 对非 commit 分片帧回执（生产语义：ok:true 仅表示该块写入临时文件）
-    await inst.webSocketMessage(agentWs, JSON.stringify({
-      type: 'upload_result', upload_id: uploadId, ok: true, size: 49152, commit: false,
-    }));
-    // 不得 resolve：清空微任务后仍应 pending
-    let resolvedEarly = false;
-    resultPromise.then(() => { resolvedEarly = true; });
-    await new Promise((r) => setImmediate(r));
-    assert.equal(resolvedEarly, false, '非 commit 帧回执不得提前 resolve（旧实现在此返回假成功）');
-
-    // commit 帧回执 → resolve 成功，size 为最终偏移
-    await inst.webSocketMessage(agentWs, JSON.stringify({
-      type: 'upload_result', upload_id: uploadId, ok: true, size: 98304, commit: true,
-    }));
-    const res = await resultPromise;
-    assert.equal(res.status, 200);
-    const j = await res.json();
-    assert.equal(j.ok, true);
-    assert.equal(j.size, 98304);
-
-    // 失败帧（ok:false）保持立即 resolve 的快速失败语义（未到 commit 即失败）
-    const failPromise = inst.fetch(new Request('https://do.internal/rpc/upload?server_id=1&path=/tmp/up2.bin', {
-      method: 'POST',
-      body: new Uint8Array(10),
-    }));
-    for (let i = 0; i < 100 && sent.length < 4; i++) {
-      await new Promise((r) => setImmediate(r));
-    }
-    const failId = headOf(sent[3]).upload_id;
-    await inst.webSocketMessage(agentWs, JSON.stringify({
-      type: 'upload_result', upload_id: failId, ok: false, error: 'write failed', commit: false,
-    }));
-    const failRes = await failPromise;
-    assert.equal(failRes.status, 400);
-    const fj = await failRes.json();
-    assert.equal(fj.error, 'write failed');
-  } finally {
-    t.mock.timers.reset();
-  }
-});
-
-test('TerminalDO: Agent 更新流式分片并等待最终替换回执', async (t) => {
-  t.mock.timers.enable({ apis: ['setTimeout'] });
-  try {
-    const inst = new TerminalDO(mockState(), makeEnv());
-    const sent = [];
-    const agentWs = { send: (m) => sent.push(m), close() {}, readyState: 1 };
-    inst.agents.set(1, agentWs);
-    const bytes = new Uint8Array(96 * 1024).fill(0x5a);
-    const promise = inst.fetch(new Request('https://do.internal/rpc/agent_update?server_id=1', {
-      method: 'POST',
-      headers: {
-        'x-agent-build-id': '2026.08.25-1200',
-        'x-agent-platform': 'linux-x86_64',
-        'x-agent-size': String(bytes.length),
-        'x-agent-sha256': 'a'.repeat(64),
-      },
-      body: bytes,
-    }));
-    for (let i = 0; i < 100 && sent.length < 3; i++) await new Promise((r) => setImmediate(r));
-    assert.equal(sent.length, 3, '96KB → 两个数据帧 + commit');
-    const heads = sent.map((frame) => {
-      const u = new Uint8Array(frame);
-      const nl = u.indexOf(10);
-      return JSON.parse(new TextDecoder().decode(u.subarray(0, nl)));
-    });
-    assert.ok(heads.every((h) => h.type === 'agent_update'));
-    assert.ok(heads.every((h) => h.build_id === '2026.08.25-1200'));
-    assert.deepEqual(heads.map((h) => h.offset), [0, 49152, 98304]);
-    assert.deepEqual(heads.map((h) => h.commit), [false, false, true]);
-    const updateId = heads[0].update_id;
-    let resolved = false;
-    promise.then(() => { resolved = true; });
-    await new Promise((r) => setImmediate(r));
-    assert.equal(resolved, false, '发送完成后仍须等待 Agent SHA/替换结果');
-
-    await inst.webSocketMessage(agentWs, JSON.stringify({
-      type: 'agent_update_result', update_id: updateId, ok: true,
-      build_id: '2026.08.25-1200', size: bytes.length, restarting: true,
-    }));
-    const res = await promise;
-    assert.equal(res.status, 200);
-    const result = await res.json();
-    assert.equal(result.ok, true);
-    assert.equal(result.transferred, bytes.length);
-    assert.equal(result.restarting, true);
-    assert.equal(inst.pendingUpdate.size, 0);
-    assert.equal(inst.updating.size, 0);
-  } finally {
-    t.mock.timers.reset();
-  }
-});
-
 test('TerminalDO: 文件写操作指令写审计（delete/zip/rename Text 帧 + write 首块 Binary 混合帧）', async () => {
   const env = makeEnv();
   const inst = new TerminalDO(mockState(), env);
@@ -1693,106 +1571,6 @@ test('TerminalDO: 休眠唤醒后文件审计保留 username 与 client_ip', asy
   assert.equal(row.username, 'alice');
   assert.equal(row.client_ip, '203.0.113.7');
   assert.equal(agentWs.sent.length, 1, '休眠恢复后消息仍转发给 agent');
-});
-
-test('TerminalDO: /rpc/exec 下发 exec 指令，收到 exec_result 后返回结果', async () => {
-  const env = makeEnv();
-  const sent = [];
-  const agentWs = { send: (m) => sent.push(m), readyState: 1 };
-  const inst = new TerminalDO(mockState(), env);
-  inst.agents.set(1, agentWs);
-
-  const pending = inst.fetch(new Request('https://do.internal/rpc/exec', {
-    method: 'POST',
-    body: JSON.stringify({ serverId: 1, command: 'echo hi', timeoutMs: 5000 }),
-  }));
-  // fetch 内部先 await request.json()，send 发生在下一微任务；等一拍再断言
-  await new Promise((r) => setTimeout(r, 0));
-  assert.equal(sent.length, 1, 'exec 指令已下发');
-  const cmd = JSON.parse(sent[0]);
-  assert.equal(cmd.type, 'exec');
-  assert.equal(cmd.command, 'echo hi');
-  assert.equal(cmd.timeout_s, 5);
-  assert.ok(cmd.exec_id.startsWith('e-'));
-
-  // agent 回 exec_result → resolve
-  await inst.webSocketMessage(agentWs, JSON.stringify({
-    type: 'exec_result', exec_id: cmd.exec_id,
-    stdout: 'hi\n', stderr: '', exit_code: 0, timed_out: false,
-  }));
-  const res = await pending;
-  assert.equal(res.status, 200);
-  const body = await res.json();
-  assert.deepEqual(body, { exit_code: 0, stdout: 'hi\n', stderr: '', timed_out: false, error: null });
-  assert.equal(inst.pendingExec.size, 0, '完成后清理 pending');
-});
-
-test('TerminalDO: /rpc/exec agent 回执 error（DISABLE_EXEC）透传', async () => {
-  const env = makeEnv();
-  const sent = [];
-  const agentWs = { send: (m) => sent.push(m), readyState: 1 };
-  const inst = new TerminalDO(mockState(), env);
-  inst.agents.set(1, agentWs);
-  const pending = inst.fetch(new Request('https://do.internal/rpc/exec', {
-    method: 'POST',
-    body: JSON.stringify({ serverId: 1, command: 'echo hi', timeoutMs: 5000 }),
-  }));
-  await new Promise((r) => setTimeout(r, 0));
-  const cmd = JSON.parse(sent[0]);
-  // agent 回执带 error（exec disabled）
-  await inst.webSocketMessage(agentWs, JSON.stringify({
-    type: 'exec_result', exec_id: cmd.exec_id,
-    stdout: '', stderr: '', exit_code: null, timed_out: false, error: 'exec disabled (DISABLE_EXEC=1)',
-  }));
-  const res = await pending;
-  const body = await res.json();
-  assert.equal(body.error, 'exec disabled (DISABLE_EXEC=1)');
-  assert.equal(body.exit_code, null);
-});
-
-test('TerminalDO: /rpc/exec agent 离线 → 502', async () => {
-  const env = makeEnv();
-  const inst = new TerminalDO(mockState(), env);
-  const res = await inst.fetch(new Request('https://do.internal/rpc/exec', {
-    method: 'POST',
-    body: JSON.stringify({ serverId: 1, command: 'echo hi' }),
-  }));
-  assert.equal(res.status, 502);
-  assert.equal((await res.json()).error, 'agent offline');
-});
-
-test('TerminalDO: /rpc/exec 超时未收到结果 → 返回超时错误并清理 pending', async () => {
-  const env = makeEnv();
-  const agentWs = { send: () => {}, readyState: 1 };
-  const inst = new TerminalDO(mockState(), env);
-  inst.agents.set(1, agentWs);
-  const pending = inst.fetch(new Request('https://do.internal/rpc/exec', {
-    method: 'POST',
-    body: JSON.stringify({ serverId: 1, command: 'sleep 99', timeoutMs: 1000 }),
-  }));
-  const res = await pending; // 真实 1s 超时 → resolve
-  assert.equal(res.status, 200);
-  const body = await res.json();
-  assert.match(body.error, /timed out after 1s/);
-  assert.equal(inst.pendingExec.size, 0, '超时后清理 pending');
-});
-
-test('TerminalDO: /rpc/exec 命令超长 → 413，且不向 agent 下发超限帧', async () => {
-  const env = makeEnv();
-  const sent = [];
-  const inst = new TerminalDO(mockState(), env);
-  inst.agents.set(1, { send: (m) => sent.push(m), readyState: 1 });
-  const res = await inst.fetch(new Request('https://do.internal/rpc/exec', {
-    method: 'POST',
-    body: JSON.stringify({ serverId: 1, command: 'x'.repeat(EXEC_CMD_MAX_BYTES + 1), timeoutMs: 5000 }),
-  }));
-  assert.equal(res.status, 413);
-  const body = await res.json();
-  assert.match(body.error, /command too long/);
-  // 关键：不能下发。超限帧会被 agent 判 Capacity 并断开整条控制通道（连带清掉活跃终端会话），
-  // 而调用方只看得到误导性的"超时"——宁可在发送前拒绝
-  assert.equal(sent.length, 0, '超限帧不得下发');
-  assert.equal(inst.pendingExec.size, 0, '拒绝时不应留下 pending');
 });
 
 test('TerminalDO: 僵尸会话超 TTL 由 alarm 清理，未到期安排下次 alarm', async () => {
@@ -2147,45 +1925,45 @@ test('TerminalDO: rebuildIndex 唤醒后只重建一次（不复活已摘除的�
   assert.equal(inst.agents.has(1), false, '已摘除的连接不会被再次重建复活');
 });
 
-test('TerminalDO: 控制通道断开时未完成上传立即失败（不再等 120s 兜底）', () => {
-  const env = makeEnv();
-  const agentWs = { deserializeAttachment: () => ({ role: 'control', serverId: 1 }), send() {}, readyState: 1 };
-  const inst = new TerminalDO(mockState(), env);
-  inst.agents.set(1, agentWs);
-  let resolved = null;
-  const timer = setTimeout(() => {}, 100000);
-  inst.pendingUpload.set('u-1', { resolve: (r) => { resolved = r; }, timer, serverId: 1 });
-  inst.cleanup(agentWs);
-  assert.deepEqual(resolved, { ok: false, error: 'agent disconnected during upload' });
-  assert.equal(inst.pendingUpload.size, 0, 'pending 已清理');
-});
-
 test('TerminalDO: exec 探活——已协商 probe 时先探活，pong 后正常下发', async () => {
   const env = makeEnv();
+  await env.DB.prepare('INSERT INTO servers (agent_key_id, name, user_id, agent_key_hash) VALUES (?,?,?,?)')
+    .bind('k1', 's1', 1, 'h1').run();
+  const jobId = `job_${'f'.repeat(32)}`;
+  await seedExecJob(env, jobId);
   const sent = [];
   const agentWs = { send: (m) => sent.push(m), readyState: 1 };
   const inst = new TerminalDO(mockState(), env);
   inst.agents.set(1, agentWs);
   inst.probeCapable.add(1); // agent 已证明支持 probe
-  const pending = inst.fetch(new Request('https://do.internal/rpc/exec', {
+  const pending = inst.fetch(new Request('https://do.internal/rpc/exec/submit', {
     method: 'POST',
-    body: JSON.stringify({ serverId: 1, command: 'echo hi', timeoutMs: 5000 }),
+    body: JSON.stringify({ jobId, serverId: 1, command: 'echo hi', timeoutMs: 5000 }),
   }));
   await new Promise((r) => setTimeout(r, 0));
   const probe = JSON.parse(sent[0]);
   assert.equal(probe.type, 'probe', '先发探活而非 exec');
   await inst.webSocketMessage(agentWs, JSON.stringify({ type: 'pong', id: probe.id }));
-  await new Promise((r) => setTimeout(r, 0));
+  const res = await pending;
+  assert.equal(res.status, 200);
+  assert.equal((await res.json()).status, 'running');
   const cmd = JSON.parse(sent[1]);
   assert.equal(cmd.type, 'exec', 'pong 后下发 exec');
+  assert.equal(cmd.exec_id, jobId, '帧里的 exec_id 就是 job_id');
   await inst.webSocketMessage(agentWs, JSON.stringify({
-    type: 'exec_result', exec_id: cmd.exec_id, stdout: 'hi\n', stderr: '', exit_code: 0, timed_out: false,
+    type: 'exec_result', exec_id: jobId, stdout: 'hi', stderr: '', exit_code: 0, timed_out: false,
   }));
-  assert.equal((await pending).status, 200);
+  const row = await env.DB.prepare('SELECT status, stdout FROM operation_jobs WHERE id = ?').bind(jobId).first();
+  assert.equal(row.status, 'succeeded');
+  assert.equal(row.stdout, 'hi');
 });
 
 test('TerminalDO: exec 探活失败（下行不可达）→ 立即 502 并关闭连接', async () => {
   const env = makeEnv();
+  await env.DB.prepare('INSERT INTO servers (agent_key_id, name, user_id, agent_key_hash) VALUES (?,?,?,?)')
+    .bind('k1', 's1', 1, 'h1').run();
+  const jobId = `job_${'c'.repeat(32)}`;
+  await seedExecJob(env, jobId);
   const sent = [];
   const agentWs = {
     send: (m) => sent.push(m), readyState: 1, closed: false, code: 0,
@@ -2194,9 +1972,9 @@ test('TerminalDO: exec 探活失败（下行不可达）→ 立即 502 并关闭
   const inst = new TerminalDO(mockState(), env);
   inst.agents.set(1, agentWs);
   inst.probeCapable.add(1);
-  const res = await inst.fetch(new Request('https://do.internal/rpc/exec', {
+  const res = await inst.fetch(new Request('https://do.internal/rpc/exec/submit', {
     method: 'POST',
-    body: JSON.stringify({ serverId: 1, command: 'echo hi', timeoutMs: 5000 }),
+    body: JSON.stringify({ jobId, serverId: 1, command: 'echo hi', timeoutMs: 5000 }),
   }));
   assert.equal(res.status, 502);
   assert.equal((await res.json()).error, 'agent unreachable');
@@ -2204,24 +1982,34 @@ test('TerminalDO: exec 探活失败（下行不可达）→ 立即 502 并关闭
   assert.equal(JSON.parse(sent[0]).type, 'probe');
   assert.equal(agentWs.closed, true, '下行不可达 → 关闭连接触发重连');
   assert.equal(agentWs.code, 4002);
+  const row = await env.DB.prepare('SELECT status FROM operation_jobs WHERE id = ?').bind(jobId).first();
+  assert.equal(row.status, 'failed', '探活失败 → 任务落 failed');
 });
 
 test('TerminalDO: 未协商 probe 的 agent（旧版）exec 直接下发，不做探活', async () => {
   const env = makeEnv();
+  await env.DB.prepare('INSERT INTO servers (agent_key_id, name, user_id, agent_key_hash) VALUES (?,?,?,?)')
+    .bind('k1', 's1', 1, 'h1').run();
+  const jobId = `job_${'9'.repeat(32)}`;
+  await seedExecJob(env, jobId);
   const sent = [];
   const agentWs = { send: (m) => sent.push(m), readyState: 1 };
   const inst = new TerminalDO(mockState(), env);
   inst.agents.set(1, agentWs); // 未 add probeCapable → 旧 agent
-  const pending = inst.fetch(new Request('https://do.internal/rpc/exec', {
+  const pending = inst.fetch(new Request('https://do.internal/rpc/exec/submit', {
     method: 'POST',
-    body: JSON.stringify({ serverId: 1, command: 'echo hi', timeoutMs: 5000 }),
+    body: JSON.stringify({ jobId, serverId: 1, command: 'echo hi', timeoutMs: 5000 }),
   }));
-  await new Promise((r) => setTimeout(r, 0));
+  const res = await pending;
+  assert.equal(res.status, 200);
+  assert.equal((await res.json()).status, 'running');
   assert.equal(JSON.parse(sent[0]).type, 'exec', '未协商 → 直接下发，保持向后兼容');
+  assert.equal(JSON.parse(sent[0]).exec_id, jobId, '帧里的 exec_id 就是 job_id');
   await inst.webSocketMessage(agentWs, JSON.stringify({
-    type: 'exec_result', exec_id: JSON.parse(sent[0]).exec_id, stdout: '', stderr: '', exit_code: 0, timed_out: false,
+    type: 'exec_result', exec_id: jobId, stdout: '', stderr: '', exit_code: 0, timed_out: false,
   }));
-  assert.equal((await pending).status, 200);
+  const row = await env.DB.prepare('SELECT status FROM operation_jobs WHERE id = ?').bind(jobId).first();
+  assert.equal(row.status, 'succeeded');
 });
 
 test('TerminalDO: 上报处理抛错（D1 故障）仍发送保活心跳（E）', async () => {
@@ -2289,6 +2077,10 @@ test('TerminalDO: 旧 agent 上报无 probe_proto → 不登记能力（exec 永
 
 test('TerminalDO: 探活成功（pong）刷新往返时间 → 紧邻 exec 不再重复探活', async () => {
   const env = makeEnv();
+  await env.DB.prepare('INSERT INTO servers (agent_key_id, name, user_id, agent_key_hash) VALUES (?,?,?,?)')
+    .bind('k1', 's1', 1, 'h1').run();
+  const jobId = `job_${'8'.repeat(32)}`;
+  await seedExecJob(env, jobId);
   const sent = [];
   const agentWs = { send: (m) => sent.push(m), readyState: 1 };
   const inst = new TerminalDO(mockState(), env);
@@ -2302,15 +2094,19 @@ test('TerminalDO: 探活成功（pong）刷新往返时间 → 紧邻 exec 不�
   assert.ok(inst.lastRoundTripAt.has(1), 'pong 刷新往返时间');
 
   // 紧邻的 exec：往返缓存新鲜 → 直接下发，不重复探活
-  const pending = inst.fetch(new Request('https://do.internal/rpc/exec', {
-    method: 'POST', body: JSON.stringify({ serverId: 1, command: 'echo hi', timeoutMs: 5000 }),
+  const pending = inst.fetch(new Request('https://do.internal/rpc/exec/submit', {
+    method: 'POST', body: JSON.stringify({ jobId, serverId: 1, command: 'echo hi', timeoutMs: 5000 }),
   }));
-  await new Promise((r) => setTimeout(r, 0));
+  const res = await pending;
+  assert.equal(res.status, 200);
+  assert.equal((await res.json()).status, 'running');
   assert.equal(JSON.parse(sent[1]).type, 'exec', 'pong 已刷新往返 → exec 直接下发（不再探活）');
+  assert.equal(JSON.parse(sent[1]).exec_id, jobId, '帧里的 exec_id 就是 job_id');
   await inst.webSocketMessage(agentWs, JSON.stringify({
-    type: 'exec_result', exec_id: JSON.parse(sent[1]).exec_id, stdout: '', stderr: '', exit_code: 0, timed_out: false,
+    type: 'exec_result', exec_id: jobId, stdout: '', stderr: '', exit_code: 0, timed_out: false,
   }));
-  assert.equal((await pending).status, 200);
+  const row = await env.DB.prepare('SELECT status FROM operation_jobs WHERE id = ?').bind(jobId).first();
+  assert.equal(row.status, 'succeeded');
 });
 
 test('TerminalDO: agent 降级不再声明 probe_proto → 清除能力与附件标记', async () => {
@@ -2336,14 +2132,18 @@ test('TerminalDO: agent 降级不再声明 probe_proto → 清除能力与附件
 
 test('TerminalDO: 探活期间连接被重连替换 → 拒绝下发（不让命令进虚空）', async () => {
   const env = makeEnv();
+  await env.DB.prepare('INSERT INTO servers (agent_key_id, name, user_id, agent_key_hash) VALUES (?,?,?,?)')
+    .bind('k1', 's1', 1, 'h1').run();
+  const jobId = `job_${'7'.repeat(32)}`;
+  await seedExecJob(env, jobId);
   const sent = [];
   const oldWs = { send: (m) => sent.push(m), readyState: 1 };
   const newWs = { send: () => {}, readyState: 1 };
   const inst = new TerminalDO(mockState(), env);
   inst.agents.set(1, oldWs);
   inst.probeCapable.add(1);
-  const pending = inst.fetch(new Request('https://do.internal/rpc/exec', {
-    method: 'POST', body: JSON.stringify({ serverId: 1, command: 'echo hi', timeoutMs: 5000 }),
+  const pending = inst.fetch(new Request('https://do.internal/rpc/exec/submit', {
+    method: 'POST', body: JSON.stringify({ jobId, serverId: 1, command: 'echo hi', timeoutMs: 5000 }),
   }));
   await new Promise((r) => setTimeout(r, 0));
   assert.equal(JSON.parse(sent[0]).type, 'probe');
@@ -2353,26 +2153,34 @@ test('TerminalDO: 探活期间连接被重连替换 → 拒绝下发（不让命
   assert.equal(res.status, 502);
   assert.equal((await res.json()).error, 'agent reconnected, please retry');
   assert.equal(sent.length, 1, '未把命令发往已失效的旧连接');
+  const row = await env.DB.prepare('SELECT status FROM operation_jobs WHERE id = ?').bind(jobId).first();
+  assert.equal(row.status, 'failed', '重连拒绝 → 任务落 failed');
 });
 
 test('TerminalDO: 探活期间开始 Agent 更新 → exec 让路（409）', async () => {
   const env = makeEnv();
+  await env.DB.prepare('INSERT INTO servers (agent_key_id, name, user_id, agent_key_hash) VALUES (?,?,?,?)')
+    .bind('k1', 's1', 1, 'h1').run();
+  const jobId = `job_${'6'.repeat(32)}`;
+  await seedExecJob(env, jobId);
   const sent = [];
   const agentWs = { send: (m) => sent.push(m), readyState: 1 };
   const inst = new TerminalDO(mockState(), env);
   inst.agents.set(1, agentWs);
   inst.probeCapable.add(1);
-  const pending = inst.fetch(new Request('https://do.internal/rpc/exec', {
-    method: 'POST', body: JSON.stringify({ serverId: 1, command: 'echo hi', timeoutMs: 5000 }),
+  const pending = inst.fetch(new Request('https://do.internal/rpc/exec/submit', {
+    method: 'POST', body: JSON.stringify({ jobId, serverId: 1, command: 'echo hi', timeoutMs: 5000 }),
   }));
   await new Promise((r) => setTimeout(r, 0));
   assert.equal(JSON.parse(sent[0]).type, 'probe');
-  inst.updating.add(1); // 探活期间开始更新（探活时 pendingExec 尚无记录，更新检查会放行）
+  inst.updating.add(1); // 探活期间开始更新（探活后复查捕获，exec 让路）
   await inst.webSocketMessage(agentWs, JSON.stringify({ type: 'pong', id: JSON.parse(sent[0]).id }));
   const res = await pending;
   assert.equal(res.status, 409);
   assert.equal((await res.json()).error, 'agent update in progress');
   assert.equal(sent.length, 1, '未与二进制更新帧交错');
+  const row = await env.DB.prepare('SELECT status FROM operation_jobs WHERE id = ?').bind(jobId).first();
+  assert.equal(row.status, 'failed', '更新让路 → 任务落 failed');
 });
 
 test('MetricsDO: 归档超过 100 行分批 batch 落 D1', async () => {
@@ -2579,7 +2387,6 @@ test('TerminalDO /rpc/exec/submit：只下发不等待，queued → running', as
   assert.equal(frame.exec_id, jobId, '帧里的 exec_id 就是 job_id，回执据此落库');
   assert.equal(frame.timeout_s, 5);
   // 异步化的核心：DO 不持有等待 Promise、不设 timer
-  assert.equal(inst.pendingExec.size, 0, '不得创建 pendingExec');
 });
 
 test('TerminalDO /rpc/exec/submit：Agent 离线 / 更新中 → 任务落 failed', async () => {
@@ -2623,7 +2430,6 @@ test('TerminalDO exec_result：终态落 D1 + 审计；DO evict 后仍能完成�
   const inst = new TerminalDO(mockState(), env);
   const ws = { deserializeAttachment: () => ({ role: 'control', serverId: 1 }), send() {}, readyState: 1, close() {} };
   inst.agents.set(1, ws);
-  assert.equal(inst.pendingExec.size, 0);
 
   await inst.webSocketMessage(ws, JSON.stringify({
     type: 'exec_result', exec_id: jobId, exit_code: 0, stdout: 'hi\n', stderr: '', timed_out: false,

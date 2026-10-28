@@ -1,6 +1,6 @@
 # Exec / Upload / Agent Update 异步化开发文档
 
-> 状态：阶段 A / B / C / D 全部已实现  
+> 状态：阶段 A / B / C / D 全部已实现；旧同步路径已于 2026-10-28 删除（阶段 E）  
 > 基线提交：`832dff7`  
 > 日期：2026-10-28  
 > 目标读者：实现 Agent、Review/验收人员
@@ -12,6 +12,7 @@
 - [x] 阶段 B：R2 staging / Agent `upload_fetch`
 - [x] 阶段 C：agent update 异步 / Worker 资产代理
 - [x] 阶段 D：cron 清理与观测（旧同步路径**保留**，见下方偏差 5）
+- [x] 阶段 E：旧同步路径删除（2026-10-28，fleet 全量新版后：`/rpc/exec`、`/rpc/upload`、`/rpc/agent_update`、`/mcp/file_upload`、`pendingExec`/`pendingUpload`/`pendingUpdate`、`doUpload`/`doAgentUpdate`、`signUploadToken`/`verifyUploadToken`；探活测试已迁移到 `/rpc/exec/submit`）
 
 **实现偏差（已评审接受）**
 
@@ -22,6 +23,7 @@
 5. **旧同步路径未删除**（`/rpc/exec`、`/rpc/upload`、`/rpc/agent_update` 与 LEGACY_SYNC_UPDATE）：
    保留以便线上出问题时用环境变量回退。代价是两条链路长期共存、需一并维护；
    待新路径稳定一段时间后再单独提交删除。
+   → 2026-10-28 已删除（fleet 全量升级到 2026.10.27 后，Worker 侧 LEGACY 门先删、DO 侧同步中继后删，分两批提交部署）。
 6. Agent 侧不引入 reqwest：新增 `agent/rust/src/fetch.rs` 手写 HTTPS GET（复用现有
    rustls/DNS），同时支持 `Content-Length` 与 `chunked` 两种响应。零新增依赖。
 7. **断连语义按 kind 区分**（见 §9.1）：只有 `upload` 实现"重连后自动重发"，因为重下同一份
@@ -1098,7 +1100,7 @@ SELECT 1 FROM operation_jobs
    - 增加 `get_operation`，更新前端 agent update 状态处理；
    - README、initialize instructions、工具描述同步更新。
 5. **观察期**：确认新任务成功率、R2 清理、Agent 下载/更新失败率。
-6. **移除旧同步路径**：删除 `/rpc/exec` 的 Promise 等待、`pendingExec`、`pendingUpload`、`pendingUpdate`，以及旧 `/mcp/file_upload`。若需回滚，用环境变量恢复旧路径，而不是默认保留。
+6. **移除旧同步路径**（2026-10-28 已完成）：删除 `/rpc/exec` 的 Promise 等待、`pendingExec`、`pendingUpload`、`pendingUpdate`，以及旧 `/mcp/file_upload`。回滚需恢复代码（不再有环境变量开关）。
 7. **旧 Agent 过渡**：仅 `LEGACY_SYNC_UPDATE=1` 保留更新自举的同步路径（它会产生长 DO duration，必须监控使用次数并计划关闭）。上传侧没有对应的 legacy 开关：旧 Agent 走保留的 `/mcp/file_upload` Bearer 路径，异步 `/api/upload-jobs` 对旧 Agent 明确返回 `AGENT_UPGRADE_REQUIRED`。
 
 注意：执行 `exec_command` / `update_agent` 语义从“同步返回最终结果”变为“异步 job”是 API 行为变更，必须在 README、MCP instructions、客户端示例中明确，不能只改实现。
@@ -1220,7 +1222,7 @@ cargo clippy --manifest-path agent/rust/Cargo.toml -- -D warnings
 - 新增 `agent_update` job、Worker 资产代理、DO `/rpc/agent_update/submit`。
 - Agent 增加 `agent_update_fetch`、`update_fetch_proto`、下载/SHA/self-replace 流程。
 - 更新 REST/MCP 语义和 `public/app.js` 的单台/批量更新状态处理。
-- 旧 Agent 仅通过 `LEGACY_SYNC_UPDATE=1` 走过渡路径；完成全量升级后删除。
+- 旧 Agent 仅通过 `LEGACY_SYNC_UPDATE=1` 走过渡路径；完成全量升级后删除（2026-10-28 已删除）。
 - 更新 README、审计、工具描述和验收用例。
 
 ### 阶段 D：清理与收口

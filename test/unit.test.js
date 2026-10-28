@@ -117,13 +117,6 @@ test('WebSocket 安全身份：PAT 只保留 HMAC，JWT 只保留已验证 claim
   assert.equal(JSON.stringify(jwtAuth.identity).includes(jwt), false);
 });
 
-test('上传签名使用 HMAC verify 并拒绝篡改', async () => {
-  const signed = await I.signUploadToken(7, '/tmp/a.txt', false, env);
-  assert.deepEqual(await I.verifyUploadToken(signed.token, 7, '/tmp/a.txt', false, env), { ok: true });
-  assert.equal((await I.verifyUploadToken(signed.token, 8, '/tmp/a.txt', false, env)).ok, false);
-  assert.equal((await I.verifyUploadToken(`${signed.token}x`, 7, '/tmp/a.txt', false, env)).ok, false);
-});
-
 test('hashSecret：未配置 HASH_SECRET 时回退 JWT_SECRET（平滑迁移）', async () => {
   // 只有 JWT_SECRET，无 HASH_SECRET → 用 JWT_SECRET 作为哈希密钥
   const noHash = await I.hashSecret('key1', env);

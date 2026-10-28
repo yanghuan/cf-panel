@@ -1515,46 +1515,6 @@ test('MCP：tools/list 与 tools/call', async () => {
   }), env);
   assert.equal(replay.status, 409, '已 staged 的 job 不得再次接收字节');
 
-  // Bearer 路径（非签名分支）：/mcp/file_upload 带 token + server_id/path → 审计 + DO /rpc/upload 透传
-  const serverRow = await env.DB.prepare("SELECT id FROM servers WHERE name = 'web-1'").first();
-  const bearerUp = await worker.fetch(
-    new Request(`http://panel.local/mcp/file_upload?server_id=${serverRow.id}&path=/tmp/t.txt`, {
-      method: 'POST',
-      headers: { authorization: `Bearer ${token}` },
-      body: 'raw bytes',
-    }),
-    env
-  );
-  assert.equal(bearerUp.status, 200, 'Bearer 上传分支应成功');
-  assert.ok(env.TERMINAL.calls.some((c) => c.path === '/rpc/upload'), '转发到 TerminalDO /rpc/upload');
-  // 阶段 B 的语义修正：create_upload 只写 file.upload.request（"请求上传"），
-  // file.upload 只在 Agent 成功 commit 后写——旧实现把"签发了 URL"当成"文件已落地"。
-  const upReq = await env.DB.prepare("SELECT COUNT(*) AS c FROM audit_logs WHERE action = 'file.upload.request'").all();
-  assert.ok(upReq.results[0].c >= 1, '创建任务时记 file.upload.request');
-  const upDone = await env.DB.prepare("SELECT COUNT(*) AS c FROM audit_logs WHERE action = 'file.upload'").all();
-  assert.equal(upDone.results[0].c, 1, '只有 Bearer 直传（旧同步路径）写 file.upload');
-  // 非绝对路径拒绝
-  const badPath = await worker.fetch(
-    new Request(`http://panel.local/mcp/file_upload?server_id=${serverRow.id}&path=rel.txt`, {
-      method: 'POST',
-      headers: { authorization: `Bearer ${token}` },
-      body: 'x',
-    }),
-    env
-  );
-  assert.equal(badPath.status, 400);
-  // 无鉴权访问 Bearer 上传 → 400（JSON-RPC error 语义，code=-32001）
-  const noAuth = await worker.fetch(
-    new Request(`http://panel.local/mcp/file_upload?server_id=${serverRow.id}&path=/tmp/t.txt`, {
-      method: 'POST',
-      body: 'x',
-    }),
-    env
-  );
-  assert.equal(noAuth.status, 400, 'JSON-RPC error 返回 400');
-  const noAuthBody = await noAuth.json();
-  assert.equal(noAuthBody.error.code, -32001, '未授权返回 JSON-RPC unauthorized');
-
   // exec_command：异步语义——只返回 job_id/accepted，不再有 stdout/exit_code
   const ex = await (await mcp(env, { token, body: { jsonrpc: '2.0', id: 6, method: 'tools/call', params: { name: 'exec_command', arguments: { server_name: 'web-1', command: 'echo hi' } } } })).json();
   assert.equal(ex.result.isError, false);

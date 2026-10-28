@@ -91,7 +91,7 @@ JSON-RPC 2.0：`initialize` / `tools/list` / `tools/call` / `ping`；通知返�
 - **agent update**：Worker 提供 `/mcp/agent-update-asset` 代理 GitHub Release（`asset_url` 只来自已校验的 manifest，防开放代理），Agent 自己下载 + SHA/版本校验 + self-replace。Worker 不再把二进制流式转给 DO。
 - Agent 侧新增 `agent/rust/src/fetch.rs`（手写 HTTPS GET，复用现有 rustls/DNS，同时支持 `Content-Length` 与 `chunked`），零新增依赖；能力通过 `upload_fetch_proto` / `update_fetch_proto` 随上报声明，旧 Agent 会被明确拒绝（`AGENT_UPGRADE_REQUIRED`）而非干等超时。
 
-并发与容错：`agent_update` 独占一台服务器（会重启 Agent），exec 之间、exec 与 upload 之间保持既有并发语义；状态流转全部用条件更新（`WHERE id=? AND status IN (...)`），重复回执与过期后迟到的结果都不会覆盖终态；逾期无回执由 `deadline_at` 收敛为 `expired`（不依赖 cron 或 DO timer）；`idempotency_key` 命中直接返回已有任务。定期清理由 Worker `scheduled` 承担（每小时：收敛过期、删过 TTL 的行、回收 R2 孤儿对象），仍有旧同步路径（`/rpc/exec` 等）保留用于回退。详见 `docs/async-exec-upload-design.md`。
+并发与容错：`agent_update` 独占一台服务器（会重启 Agent），exec 之间、exec 与 upload 之间保持既有并发语义；状态流转全部用条件更新（`WHERE id=? AND status IN (...)`），重复回执与过期后迟到的结果都不会覆盖终态；逾期无回执由 `deadline_at` 收敛为 `expired`（不依赖 cron 或 DO timer）；`idempotency_key` 命中直接返回已有任务。定期清理由 Worker `scheduled` 承担（每小时：收敛过期、删过 TTL 的行、回收 R2 孤儿对象）。旧同步路径（`/rpc/exec`、`/rpc/upload`、`/rpc/agent_update`、`/mcp/file_upload`）已于 2026-10-28 删除（fleet 全量新版后，见 `docs/async-exec-upload-design.md` 的删除记录）。
 
 #### 3.2.2 告警通知与多用户
 

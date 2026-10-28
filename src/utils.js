@@ -196,19 +196,9 @@ export async function verifySecretHash(value, expectedHex, env) {
   }
 }
 
-// 上传签名 URL（无状态自验证）：HMAC(secret, serverId|path|overwrite|exp)。
-// 验证所需信息全部编码在 URL（server_id/path/overwrite/exp），secret 只在环境变量——
-// 不落任何存储；篡改任一字段签名对不上，过期即失效。密钥复用 HASH_SECRET（回退 JWT_SECRET）。
-export async function signUploadToken(serverId, path, overwrite, env, ttlS = 600) {
-  const exp = Math.floor(Date.now() / 1000) + ttlS;
-  const payload = `${serverId}|${path}|${overwrite ? 1 : 0}|${exp}`;
-  const hashKey = env.HASH_SECRET || secret(env);
-  const sig = b64u(await hmacSha256(new TextEncoder().encode(hashKey), new TextEncoder().encode(payload)));
-  return { token: `${exp}.${sig}`, exp };
-}
+
 // 任务级签名 URL（阶段 B/C）：HMAC(secret, purpose|jobId|serverId|extra|exp)。
-// 与旧 signUploadToken 分开是刻意的——旧格式把 path/overwrite 编进载荷，任务版一律从 D1
-// 的 job 行读取，URL 里只有 job_id，杜绝"改 query 换目标路径"。
+// 任务版一律从 D1 的 job 行读取，URL 里只有 job_id，杜绝"改 query 换目标路径"。
 // purpose 区分 content（客户端上传）/download（Agent 拉取）/asset（Agent 拉资产），
 // 同一 token 不能跨用途重放。
 export async function signJobToken(purpose, jobId, serverId, extra, env, ttlS) {
@@ -242,28 +232,7 @@ export async function verifyJobToken(token, purpose, jobId, serverId, extra, env
   }
 }
 
-export async function verifyUploadToken(token, serverId, path, overwrite, env) {
-  try {
-    const dot = token.indexOf('.');
-    if (dot <= 0) return { ok: false, error: 'bad token' };
-    const exp = Number(token.slice(0, dot));
-    if (!Number.isFinite(exp) || exp < Math.floor(Date.now() / 1000)) return { ok: false, error: 'token expired' };
-    const got = token.slice(dot + 1);
-    if (!/^[A-Za-z0-9_-]+$/.test(got)) return { ok: false, error: 'bad token' };
-    const signature = b64uDecode(got);
-    if (signature.length !== 32) return { ok: false, error: 'bad token' };
-    const payload = `${serverId}|${path}|${overwrite ? 1 : 0}|${exp}`;
-    const hashKey = env.HASH_SECRET || secret(env);
-    const valid = await verifyHmacSha256(
-      new TextEncoder().encode(hashKey),
-      new TextEncoder().encode(payload),
-      signature
-    );
-    return valid ? { ok: true } : { ok: false, error: 'bad token' };
-  } catch {
-    return { ok: false, error: 'bad token' };
-  }
-}
+
 
 // D1 键值表（替代 Workers KV）：value 直接存 JSON 字符串
 export async function kvGet(env, key, fallback) {

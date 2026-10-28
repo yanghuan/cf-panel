@@ -1562,8 +1562,8 @@ async function handleAgentAssetProxy(request, env, u) {
     upstream = await fetch(job.asset_url, {
       headers: { accept: 'application/octet-stream', 'user-agent': 'cf-panel-agent-updater' },
       redirect: 'follow',
-      // 与旧同步路径（agentUpdateLegacySync）一致：同一版本资产被 N 台机器更新时复用
-      // 边缘缓存，避免 N 次回源 GitHub（也降低触发限流的概率）。文档 §8.6.2 要求沿用。
+      // 同一版本资产被 N 台机器更新时复用边缘缓存，
+      // 避免 N 次回源 GitHub（也降低触发限流的概率）。文档 §8.6.2 要求沿用。
       cf: { cacheTtl: 86400, cacheEverything: true },
     });
   } catch {
@@ -1686,15 +1686,15 @@ async function agentUpdateCore(env, user, id, ip, requestUrl) {
     return err(`current agent ${info.agent_version} is newer than latest release ${manifest.build_id}`, 409);
   }
 
-  // 旧 Agent（无 update_fetch_proto）走不了异步拉取：明确要求升级，而不是静默降级到
-  // 同步长等待（那正是本次要消灭的东西）。LEGACY_SYNC_UPDATE=1 可临时放行旧同步路径。
+  // 旧 Agent（无 update_fetch_proto）走不了异步拉取：同步兼容路径已删除，
+  // 旧 Agent 只能手动升级（本机替换二进制 + 重启），不再经面板更新。
   //
   // 这个纯判定必须放在写审计**之前**：否则被拒绝的请求也会留下一条
   // agent.update.request（"已请求更新"），而机器版本根本没动，排查时会误判为下发失败。
   const canFetch = Number(info.update_fetch_proto) >= 1;
-  if (!canFetch && env.LEGACY_SYNC_UPDATE !== '1') {
+  if (!canFetch) {
     return err(
-      'agent does not support async update (update_fetch_proto missing); upgrade the agent first, or set LEGACY_SYNC_UPDATE=1 to use the legacy synchronous path',
+      'agent does not support async update (update_fetch_proto missing); upgrade the agent manually',
       409,
       'AGENT_UPGRADE_REQUIRED'
     );
@@ -1704,7 +1704,6 @@ async function agentUpdateCore(env, user, id, ip, requestUrl) {
     'INSERT INTO audit_logs (user_id, username, client_ip, action, target_server_id, detail) VALUES (?,?,?,?,?,?)'
   ).bind(user.id, user.username, ip, 'agent.update.request', id,
     `${info.agent_version || 'unknown'} → ${manifest.build_id} (${platform})`).run();
-  if (!canFetch) return agentUpdateLegacySync(env, user, id, ip, { info, manifest, asset, platform });
 
   // 异步路径：只创建任务 + 下发元数据与短期资产 URL。
   // Worker 不再下载 Release 再流式转给 DO —— DO 在这条链路上 0 字节参与。
@@ -1757,67 +1756,6 @@ async function agentUpdateCore(env, user, id, ip, requestUrl) {
   }, 202);
 }
 
-// 旧同步路径（仅当显式 LEGACY_SYNC_UPDATE=1 且 Agent 不支持异步拉取时使用）：
-// Worker 下载资产 → DO 流式转发 → 等 Agent 回执。保留仅作升级过渡，不再新增能力。
-async function agentUpdateLegacySync(env, user, id, ip, { info, manifest, asset, platform }) {
-  const auditUpdateResult = async (action, detail) => {
-    try {
-      await env.DB.prepare(
-        'INSERT INTO audit_logs (user_id, username, client_ip, action, target_server_id, detail) VALUES (?,?,?,?,?,?)'
-      ).bind(user.id, user.username, ip, action, id, String(detail).slice(0, 300)).run();
-    } catch { /* request 审计已存在，结果审计 best effort */ }
-  };
-  let assetResp;
-  try {
-    assetResp = await fetch(asset.url, {
-      headers: { accept: 'application/octet-stream', 'user-agent': 'cf-panel-agent-updater' },
-      redirect: 'follow',
-      cf: { cacheTtl: 86400, cacheEverything: true }, // 同版本多机更新复用边缘缓存
-    });
-  } catch (e) {
-    await auditUpdateResult('agent.update.failed', `asset download: ${e.message}`);
-    return err(`agent asset download failed: ${e.message}`, 502);
-  }
-  if (!assetResp.ok || !assetResp.body) {
-    await auditUpdateResult('agent.update.failed', `asset download HTTP ${assetResp.status}`);
-    return err(`agent asset download failed (${assetResp.status})`, 502);
-  }
-  const contentLength = Number(assetResp.headers.get('content-length'));
-  if (Number.isFinite(contentLength) && contentLength > 0 && contentLength !== asset.size) {
-    try { await assetResp.body.cancel(); } catch { /* ignore */ }
-    await auditUpdateResult('agent.update.failed', 'asset size differs from manifest');
-    return err('agent asset size differs from manifest', 502);
-  }
-  let result;
-  try {
-    const resp = await doForShard(env, shardForServerId(id)).fetch(
-      `https://do.internal/rpc/agent_update?server_id=${id}`,
-      {
-        method: 'POST',
-        headers: {
-          'content-type': 'application/octet-stream',
-          'x-agent-build-id': manifest.build_id,
-          'x-agent-platform': platform,
-          'x-agent-size': String(asset.size),
-          'x-agent-sha256': asset.sha256,
-        },
-        body: assetResp.body,
-        duplex: 'half', // ReadableStream request body（Node 测试/标准 Fetch 要求；Workers 忽略或支持）
-      }
-    );
-    result = await resp.json().catch(() => ({ error: `update failed (${resp.status})` }));
-    if (!resp.ok) {
-      await auditUpdateResult('agent.update.failed', result.error || `HTTP ${resp.status}`);
-      return json({ error: result.error || 'agent update failed' }, resp.status);
-    }
-  } catch (e) {
-    await auditUpdateResult('agent.update.failed', `relay: ${e.message}`);
-    return err(`agent update relay failed: ${e.message}`, 502);
-  }
-  await auditUpdateResult('agent.update.installed', `${info.agent_version || 'unknown'} → ${manifest.build_id}`);
-  serverListCacheClear();
-  return json({ ...result, build_id: manifest.build_id });
-}
 
 // 工具：触发指定服务器的 Agent 自更新（复用 REST 更新核心：manifest 校验/SHA/审计全链路一致）。
 // 鉴权：canUpdateAgent（管理员或 agent:update scope PAT）；server_name 重名拒绝，防更新到错误机器。
@@ -1841,11 +1779,6 @@ async function mcpUpdateAgent(user, env, args, ip, url) {
   const body = await resp.json().catch(() => ({ error: `update failed (${resp.status})` }));
   if (!resp.ok) throw new Error(body.error || `agent update failed (${resp.status})`);
   if (body.already_latest) return `服务器「${server.name}」Agent 已是最新版本（${body.build_id}），无需更新。`;
-  // legacy 同步分支（LEGACY_SYNC_UPDATE=1 + 旧 Agent）没有 job_id：它是同步完成的，
-  // 不能包装成"请轮询 job_id"，否则客户端会去轮询一个不存在的任务。
-  if (!body.job_id) {
-    return `服务器「${server.name}」Agent 已更新（→ ${body.build_id}，旧同步路径）。新二进制已替换，稍后可用 list_servers 确认上报的新版本号。`;
-  }
   // 异步语义（阶段 C）：此处只是"已下发"，Agent 还要下载/校验/self-replace，必须轮询
   return {
     job_id: body.job_id,

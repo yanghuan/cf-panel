@@ -147,14 +147,20 @@ async function touchLastSeen(env, serverId, ts, force) {
   return true;
 }
 
-export async function handleReport(env, payload) {
+// timing（可选，埋点用）：调用方传入空对象，本函数只往里写各阶段耗时（ms）与缓存命中标记，
+// 不参与任何业务判断；不传时零开销。用于定位「单条上报耗时从 0.5s 涨到数秒」发生在哪一段。
+export async function handleReport(env, payload, timing) {
   payload = sanitizeReportPayload(payload);
   const ts = Math.floor(Date.now() / 1000);
   const minTs = Math.floor(ts / 60);
+  const tRow = Date.now();
+  const rowHit = !!serverRowCache.get(payload.serverId); // 行缓存命中则省一次 D1 读
   // 服务器行读缓存同时承担存在性复核（缓存未命中才查 D1；删除窗口孤儿写无害，
   // 见 getServerRow 注释；热区由 MetricsDO /drop + alarm 清理兜底）。
   const server = await getServerRow(env, payload.serverId);
-  if (!server) return;
+  if (!server) { if (timing) timing.gone = 1; return; }
+  const tD1 = Date.now();
+  if (timing) { timing.row = tD1 - tRow; timing.rowHit = rowHit ? 1 : 0; }
   // 探活状态：变更才写 probe_json（告警去重状态在 MetricsDO 顺风车处理），写后更新行缓存。
   // 对比剥离 ms——探活耗时 ms 每次探测必然毫秒级抖动，全量 JSON 对比会每帧触发
   // UPDATE（快采 6,240 行写/天/机，「变更才写」对 probes 完全失效）；改用稳定投影
@@ -227,16 +233,19 @@ export async function handleReport(env, payload) {
     // 免得告警路径每帧多一次 D1 查询（行缓存已承担读取成本）
     alertOverride: server.alert_override ?? null,
   });
+  if (timing) timing.d1 = Date.now() - tD1; // 行读之后的 D1 写耗时（探活/自定义指标/last_seen）
   const flushNow = Date.now();
   if (flushNow - reportFlushAt >= REPORT_FWD_THROTTLE_S * 1000) {
     reportFlushAt = flushNow;
     const frames = [...reportBatch.values()];
     reportBatch.clear();
     const mdo = doMetrics(env);
+    const tFwd = Date.now();
     await mdo.fetch('https://do.internal/report', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ frames }),
     });
+    if (timing) { timing.fwd = Date.now() - tFwd; timing.flushed = 1; }
   }
 }

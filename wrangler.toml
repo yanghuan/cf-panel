@@ -7,6 +7,20 @@ compatibility_date = "2026-08-02"
 # 关闭 workers.dev 预置 URL（已有自定义域名，wrangler deploy 默认开启会导致重复暴露）
 workers_dev = false
 
+# ---------- 兼容性开关 ----------
+# durable_object_io_tasks_do_not_prevent_eviction（Cloudflare 2026-10-01 changelog）：
+# 关闭「挂起的 I/O 阻止 Durable Object 被空闲驱逐」的新行为。
+# 新行为下，下列操作会让实例持续驻留（每次最多 15 分钟，可被后续操作续期）且 duration 照常计费：
+#   挂起的 fetch()/RPC 到其他 DO、waitUntil() 的 Promise、setTimeout()/setInterval() 定时器。
+# 本项目 DO 内没有「客户端断开后仍须继续执行」的长任务——exec/upload/agent update 已全部异步化
+# （任务状态落 D1，调用方轮询 get_operation），DO 只负责下发。而 broadcastViewers/setPush/
+# resendWaitingUploads 这类 fire-and-forget 的 fetch，以及 pendingExec/pendingUpload/pendingUpdate
+# 的 setTimeout（30s/120s/180s）都会成为 pending I/O，把实例按住不让驱逐。
+# 若线上本就处于旧行为（compatibility_date < 2026-10-01 时该行为默认关闭），本 flag 为空操作，无害；
+# 若 10-26 之后 duration 的异常增长确由该行为引起（请求数不变、单条驻留从 0.5s 涨到 5s），
+# 加上它即可回落。验证后如确认无关，可移除并改为埋点定位（见 do-terminal.js 的 logSlow）。
+compatibility_flags = ["durable_object_io_tasks_do_not_prevent_eviction"]
+
 # ---------- D1 数据库（面板核心数据 + 键值表 kv_json） ----------
 # 创建：wrangler d1 create cf-panel → 把返回的 database_id 填到这里
 # （CF Pages 部署的 npm run deploy 会执行 D1 迁移，必须为真实 id，否则 7400 报错）

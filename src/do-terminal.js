@@ -27,6 +27,11 @@ const UPLOAD_TIMEOUT_MS = 120 * 1000; // 上传总超时（流式转发 + agent 
 const UPLOAD_MAX_DEFAULT = 100 * 1024 * 1024; // 单次上传大小上限默认 100MB（磁盘耗尽防护；agent 端 FILE_LIMIT 500MB 兜底）
 const AGENT_UPDATE_MAX_BYTES = 32 * 1024 * 1024; // 更新包硬上限（远高于当前 2~4MB，防异常 manifest）
 const AGENT_UPDATE_TIMEOUT_MS = 180 * 1000; // GitHub→Worker→DO→Agent + 校验/替换总超时
+// 慢路径埋点（定位「DO 唤醒后单条消息为什么贵」）：正常单条处理后端各段都是毫秒级，
+// 超过阈值才输出一行 JSON；每实例每小时限量，避免埋点自己吃掉可观测性额度。
+const SLOW_REPORT_MS = 1000; // 单条上报（消息到达 → D1 + 转发 MetricsDO 完成）阈值
+const SLOW_CONN_MS = 1000; // agent 控制通道握手（D1 反查 → 101）阈值
+const SLOW_LOG_BUDGET_PER_HOUR = 20; // 每实例每小时上限（4 分片 × 20 = 最多 80 条/小时）
 
 export class TerminalDO {
   constructor(state, env) {
@@ -42,6 +47,22 @@ export class TerminalDO {
     this.lastRoundTripAt = new Map(); // serverId -> 上次确认双向可达时间（exec_result/pong），exec 前探活据此跳过
     this.probeCapable = new Set(); // serverId -> agent 已回 pong（支持 exec 前探活）；未支持则 exec 直接下发（向后兼容旧 agent）
     this.rebuilt = false; // 本实例是否已按附件重建过索引（唤醒后只重建一次，见 rebuildIndex）
+    this.slowLogAt = 0; // 埋点日志的小时窗口起点（ms）
+    this.slowLogCount = 0; // 本窗口已输出条数（每实例独立）
+  }
+
+  // 慢路径埋点：只在超过阈值时输出一行 JSON，且每实例每小时限量。
+  // 把「单条消息为什么贵」拆成可核对的数字（冷启动重建 / D1 行读 / D1 写 / DO 间 fetch / 建连），
+  // 避免继续靠推断定位。正常一天只有几十条，不挤占观测额度（wrangler.toml 只保留 console 日志）。
+  logSlow(kind, data) {
+    const now = Date.now();
+    if (now - this.slowLogAt >= 3600_000) {
+      this.slowLogAt = now;
+      this.slowLogCount = 0;
+    }
+    if (this.slowLogCount >= SLOW_LOG_BUDGET_PER_HOUR) return;
+    this.slowLogCount += 1;
+    try { console.error(`[slow-${kind}] ${JSON.stringify(data)}`); } catch { /* ignore */ }
   }
 
   async fetch(request) {
@@ -322,6 +343,7 @@ export class TerminalDO {
 
     // GET /ws/agent/control —— agent 常驻控制通道（只接受请求头，避免凭证进入 URL 日志/历史）
     if (path === '/ws/agent/control') {
+      const tConn = Date.now(); // 埋点：握手总耗时（D1 反查 + HMAC + 建 WS + viewers 反查）
       const key = request.headers.get('x-agent-key') || '';
       if (!key) return new Response('missing agent key', { status: 401 });
       const keyId = await sha256Hex(key);
@@ -330,6 +352,7 @@ export class TerminalDO {
       if (!(await verifySecretHash(key, server.agent_key_hash, this.env))) {
         return new Response('bad key', { status: 401 });
       }
+      const tAuth = Date.now();
       const pair = new WebSocketPair();
       this.state.acceptWebSocket(pair[1]);
       // 控制通道（重）连接：说明旧连接已断/网络切换，关闭该服务器旧的终端/文件会话流，
@@ -373,6 +396,7 @@ export class TerminalDO {
         await this.env.DB.prepare('UPDATE servers SET last_seen = ? WHERE id = ?').bind(now, server.id).run();
       } catch { /* 标记失败不影响连接 */ }
       // 连接建立即下发当前上报间隔（省配额：有观看者快采 / 无观看者慢采）
+      const tSetup = Date.now();
       try {
         const vResp = await doPanel(this.env).fetch('https://do.internal/viewers');
         const v = await vResp.json();
@@ -380,6 +404,16 @@ export class TerminalDO {
         this.agentInterval.set(server.id, iv);
         pair[1].send(JSON.stringify({ type: 'set_report_interval', interval: iv }));
       } catch { /* 查询失败则 agent 用自身默认间隔 */ }
+      const connMs = Date.now() - tConn;
+      if (connMs >= SLOW_CONN_MS) {
+        this.logSlow('agent-conn', {
+          sid: server.id,
+          ms: connMs,
+          auth: tAuth - tConn, // D1 反查 servers + HMAC 校验
+          setup: tSetup - tAuth, // acceptWebSocket + 两次 D1 UPDATE（wan_ip / last_seen）
+          viewers: connMs - (tSetup - tConn), // 兜底查 PanelDO /viewers
+        });
+      }
       return new Response(null, { status: 101, webSocket: pair[0] });
     }
 
@@ -678,6 +712,7 @@ export class TerminalDO {
 
   // Hibernation：消息转发（双向对拷 + resize 走控制通道）
   async webSocketMessage(ws, message) {
+    const coldStart = !this.rebuilt; // 本条消息是否触发实例冷重建（evict 后首条，成本最高）
     this.rebuildIndex(); // 休眠唤醒后索引可能已丢，先按附件重建
     // 浏览器侧待鉴权连接（role: user-pending）：首帧必须是 {type:'auth', token}
     const att = ws.deserializeAttachment?.();
@@ -792,6 +827,8 @@ export class TerminalDO {
           }
           if (j && j.type === 'report') {
             const serverId = this.wsServerId(ws);
+            const tReport = Date.now(); // 埋点：整条上报耗时（消息到达 → 落库 + 转发完成）
+            const timing = {};
             // ② 能力门控：agent 自声明支持探活（info.probe_proto，随上报免费到达）才启用 exec 前探活。
             // 旧 agent 不报该字段 → 永不探活、永不误关；声明后探活失败必为真断链 → 可安全 close(4002)。
             // 已登记则跳过（避免每帧都序列化附件）；evict 后由附件恢复，故仅在丢失时重写。
@@ -832,10 +869,26 @@ export class TerminalDO {
                   info: j.info,
                   probes: j.probes,
                   custom: j.custom,
-                });
-                await this.syncAgentInterval(ws, serverId);
+                }, timing);
+                await this.syncAgentInterval(ws, serverId, timing);
               }
             } catch (e) { console.error('handleReport failed:', e); }
+            // 慢上报埋点：把总耗时拆成 D1 行读 / D1 写 / DO 间转发 / 兜底查观看者数，
+            // 用来区分「D1 慢」「MetricsDO 慢」「实例冷启动」三种完全不同的根因。
+            const reportMs = Date.now() - tReport;
+            if (serverId && reportMs >= SLOW_REPORT_MS) {
+              this.logSlow('report', {
+                sid: serverId,
+                ms: reportMs,
+                cold: coldStart ? 1 : 0, // 1 = 这条消息触发了实例重建（evict 后首条）
+                row: timing.row ?? null, // D1 读 servers 行
+                rowHit: timing.rowHit ?? null, // 1 = 行缓存命中，0 = 回查 D1
+                d1: timing.d1 ?? null, // 其余 D1 写（探活/自定义指标/last_seen）
+                fwd: timing.fwd ?? null, // DO→DO fetch 到 MetricsDO（/report）
+                flushed: timing.flushed ?? 0, // 本条是否触发批量转发（5s 节流）
+                viewers: timing.viewers ?? null, // 兜底查 PanelDO /viewers（agentInterval 缺失时）
+              });
+            }
           }
         } catch { /* 忽略非 JSON 的控制消息 */ }
       }
@@ -993,14 +1046,16 @@ export class TerminalDO {
 
   // 省配额策略：观看者数变化由 PanelDO 事件驱动（/rpc/set_viewers 更新 agentInterval 并广播），
   // 上报时仅读内存（0 个 DO 调用）；仅当内存无记录（实例 evict / 新连接）时查 /viewers 兜底初始化。
-  async syncAgentInterval(ws, serverId) {
+  async syncAgentInterval(ws, serverId, timing) {
     if (this.agentInterval.has(serverId)) return; // 事件驱动已维护
+    const tViewers = Date.now();
     let want = REPORT_SLOW_INTERVAL_S;
     try {
       const resp = await doPanel(this.env).fetch('https://do.internal/viewers');
       const v = await resp.json();
       want = (v.count || 0) > 0 ? REPORT_FAST_INTERVAL_S : REPORT_SLOW_INTERVAL_S;
     } catch { /* 兜底慢采 */ }
+    if (timing) timing.viewers = Date.now() - tViewers;
     this.agentInterval.set(serverId, want);
     ws.send(JSON.stringify({ type: 'set_report_interval', interval: want }));
   }

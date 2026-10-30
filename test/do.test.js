@@ -1168,20 +1168,22 @@ test('MetricsDO: /latest 补扫有单轮上限（升级首轮不阻塞面板首�
     await env.DB.prepare('INSERT INTO servers (id, agent_key_id, name, user_id, agent_key_hash) VALUES (?,?,?,?,?)')
       .bind(id, `k${id}`, `s${id}`, 1, 'h').run();
   }
-  st.storage.map.set('l:1', JSON.stringify({ ts: nowMin, cpu: 1 })); // 只有 1 台有快照
-  for (const id of [2, 3]) st.storage.map.set(`m:${id}:${nowMin}`, JSON.stringify({ cpu: id }));
+  // 真正的升级首轮：一条 l: 都没有（连部分快照都没有），全部依赖按机补扫，
+  // 因此这里才真正覆盖「零快照 + 超过上限」的组合（旧用例先写了 l:1，走的是部分缺快照分支）
+  for (const id of [1, 2, 3, 102]) st.storage.map.set(`m:${id}:${nowMin}`, JSON.stringify({ cpu: id }));
   const { inst, call } = mkMetrics(env, st);
   const prefixes = [];
   const orig = inst.listStorage.bind(inst);
   inst.listStorage = async (p, o) => { prefixes.push(p); return orig(p, o); };
 
   const latest = await (await call('/latest')).json();
-  assert.equal(latest[1].cpu, 1);
+  assert.equal(latest[1].cpu, 1, '零快照时由逐机补扫给出指标');
   assert.equal(latest[2].cpu, 2, '补扫覆盖到缺快照的机器');
   assert.equal(latest[3].cpu, 3);
   const backfills = prefixes.filter((p) => p.startsWith('m:'));
   assert.equal(backfills.length, 100, '单轮最多补 100 台');
   assert.equal(prefixes.includes('m:102:'), false, '超出的机器本轮不补（下轮或首帧上报补齐）');
+  assert.equal(latest[102], undefined, '第 101 台之后本轮无数据');
 });
 
 // 冷却状态原先每个冷实例全量 list('alert:') 恢复（50 台 × 4 维 ≈ 200 行/帧）；而 120s 慢采下

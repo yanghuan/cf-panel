@@ -168,7 +168,6 @@ export async function handleReport(env, payload, timing) {
   // 对比剥离 ms——探活耗时 ms 每次探测必然毫秒级抖动，全量 JSON 对比会每帧触发
   // UPDATE（快采 6,240 行写/天/机，「变更才写」对 probes 完全失效）；改用稳定投影
   // [name,ok,code] 对比，仅状态真变时落全量（含当时 ms；前端探活延迟展示随之停更，可接受）
-  // 探活状态：变更才写 probe_json（告警去重状态在 MetricsDO 顺风车处理），写后更新行缓存。
   // 空数组单独处理：它是「本机已无探针配置」的明确声明，必须清空库中旧结果（见 sanitize 注释）。
   let probesCleared = false;
   if (Array.isArray(payload.probes)) {

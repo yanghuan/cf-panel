@@ -366,7 +366,7 @@ function uploadMaxBytesOf(env) {
   const rawMax = Number(env.UPLOAD_MAX_MB);
   const maxMb = Number.isFinite(rawMax) && rawMax > 0
     ? Math.min(rawMax, UPLOAD_ABS_MAX_MB)
-    : 100; // UPLOAD_MAX_DEFAULT
+    : 100; // 默认 100MB
   return maxMb * 1024 * 1024;
 }
 

@@ -1390,6 +1390,47 @@ test('TerminalDO: 上报间隔从连接附件恢复（evict 后不再打 PanelDO
   assert.ok(viewers.length >= 1, '附件无间隔时才查 PanelDO');
 });
 
+test('TerminalDO: pong 刷新往返时间并写入附件（evict 后可恢复）', async () => {
+  const env = makeEnv();
+  const att = { role: 'control', serverId: 1 };
+  const ws = {
+    deserializeAttachment: () => att,
+    serializeAttachment: (a) => { Object.assign(att, a); },
+    send() {}, readyState: 1,
+  };
+  const inst = new TerminalDO(mockState(), env);
+  inst.agents.set(1, ws);
+  await inst.webSocketMessage(ws, JSON.stringify({ type: 'pong', id: 'p-1' }));
+  assert.ok(att.rtt > 0, 'rtt 写进连接附件');
+  // 模拟 evict 唤醒：新实例靠附件恢复 rtt，exec 判据拿到真实时间戳
+  const inst2 = new TerminalDO({ getWebSockets: () => [ws] }, env);
+  inst2.rebuildIndex();
+  assert.equal(inst2.lastRoundTripAt.get(1), att.rtt, '唤醒后 rtt 从附件恢复');
+});
+
+test('TerminalDO: evict 后（附件恢复 probeCapable、无 RTT）exec 乐观放行', async () => {
+  const env = makeEnv();
+  await env.DB.prepare('INSERT INTO servers (agent_key_id, name, user_id, agent_key_hash) VALUES (?,?,?,?)')
+    .bind('k1', 's1', 1, 'h1').run();
+  const jobId = `job_${'b'.repeat(32)}`;
+  await seedExecJob(env, jobId);
+  const sent = [];
+  const att = { role: 'control', serverId: 1, probe: true }; // 只有能力标记，没有 rtt
+  const agentWs = {
+    deserializeAttachment: () => att,
+    serializeAttachment: (a) => { Object.assign(att, a); },
+    send: (m) => sent.push(m), readyState: 1,
+  };
+  const inst = new TerminalDO(mockState(), env);
+  inst.agents.set(1, agentWs);
+  inst.probeCapable.add(1); // 等价于 rebuildIndex 从 att.probe 恢复
+  const res = await inst.fetch(new Request('https://do.internal/rpc/exec/submit', {
+    method: 'POST', body: JSON.stringify({ jobId, serverId: 1, command: 'echo hi', timeoutMs: 5000 }),
+  }));
+  assert.equal(res.status, 200, '冷启动无 RTT 记录时应放行，而不是 503');
+  assert.equal(JSON.parse(sent[0]).type, 'exec', '直接下发命令');
+});
+
 test('TerminalDO: /rpc create 时 agent 离线 → 502 且不残留会话', async () => {
   const env = makeEnv();
   const st = mockState();
@@ -1987,7 +2028,7 @@ test('TerminalDO: 上报顺风车 probe —— report 后发探测帧，pong 刷
   assert.ok(inst.lastRoundTripAt.has(1), 'pong 刷新往返时间，exec 判据随之新鲜');
 });
 
-test('TerminalDO: 链路未验证 → 503 且补发探活，但不关闭连接（避免误断健康连接）', async () => {
+test('TerminalDO: 往返窗口过期 → 503 并补发探活，但不关闭连接', async () => {
   const env = makeEnv();
   await env.DB.prepare('INSERT INTO servers (agent_key_id, name, user_id, agent_key_hash) VALUES (?,?,?,?)')
     .bind('k1', 's1', 1, 'h1').run();
@@ -1995,12 +2036,15 @@ test('TerminalDO: 链路未验证 → 503 且补发探活，但不关闭连接�
   await seedExecJob(env, jobId);
   const sent = [];
   const agentWs = {
+    deserializeAttachment: () => ({ role: 'control', serverId: 1 }),
     send: (m) => sent.push(m), readyState: 1, closed: false,
     close() { this.closed = true; },
   };
   const inst = new TerminalDO(mockState(), env);
   inst.agents.set(1, agentWs);
-  inst.probeCapable.add(1); // 支持探活但没有新鲜往返 → 未验证
+  inst.probeCapable.add(1);
+  // 有记录但已过期（20 分钟 > 900s 窗口）→ 判不可信；与"完全无记录"的乐观放行区分开
+  inst.lastRoundTripAt.set(1, Date.now() - 20 * 60 * 1000);
   const res = await inst.fetch(new Request('https://do.internal/rpc/exec/submit', {
     method: 'POST',
     body: JSON.stringify({ jobId, serverId: 1, command: 'echo hi', timeoutMs: 5000 }),

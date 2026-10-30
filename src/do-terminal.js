@@ -20,9 +20,9 @@ const REPORT_SLOW_INTERVAL_S = 120; // 无人查看：120 秒上报
 const EXEC_DEFAULT_TIMEOUT_MS = 25 * 1000; // MCP exec 默认超时（须 < DO fetch 默认 30s 超时，由内部先返回）
 const EXEC_MAX_TIMEOUT_MS = 25 * 1000;
 const EXEC_TIMEOUT_GRACE_MS = 5 * 1000; // DO 兜底定时器比 agent 实际超时晚 5s：agent 先回执（含部分 stdout），DO 定时器仅兜底防悬挂
-const EXEC_ROUNDTRIP_TTL_MS = 600 * 1000; // exec 判据：窗口内有过成功往返（exec_result 或 probe 的 pong）就信任连接。
-// probe 受 PROBE_REFRESH_MS 节流、且只在 report 到达时发：慢采 120s → 实际约每 3 帧（360s）一次，
-// 窗口取 600s 可容忍丢一次 pong 仍不误判。超过窗口视为链路不可信 → 立即 503 让调用方重试
+const EXEC_ROUNDTRIP_TTL_MS = 900 * 1000; // exec 判据：窗口内有过成功往返（exec_result 或 probe 的 pong）就信任连接。
+// probe 受 PROBE_REFRESH_MS 节流且只在 report 到达时发：慢采 120s → 实际落在 t=0,360,720…（间隔 360s），
+// 窗口取 900s 才能容忍丢一次 pong（720s）仍不误判。超过窗口视为链路不可信 → 立即 503 让调用方重试
 //（命令尚未下发，重试绝对安全）。若日后把 REPORT_SLOW_INTERVAL_S 调大，需同步放大本窗口。
 const PROBE_REFRESH_MS = 300 * 1000; // 上报顺带 probe 的最小间隔。
 // 注意：每条 probe 都会让 agent 回一个 pong，而 pong 是入站 WS 消息 = 一次 DO 请求。
@@ -36,7 +36,8 @@ const AGENT_UPDATE_TIMEOUT_MS = 180 * 1000; // GitHub→Worker→DO→Agent + �
 // 超过阈值才输出一行 JSON；每实例每小时限量，避免埋点自己吃掉可观测性额度。
 const SLOW_REPORT_MS = 1000; // 单条上报（消息到达 → D1 + 转发 MetricsDO 完成）阈值
 const SLOW_CONN_MS = 1000; // agent 控制通道握手（D1 反查 → 101）阈值
-const SLOW_LOG_BUDGET_PER_HOUR = 20; // 每实例每小时上限（4 分片 × 20 = 最多 80 条/小时）
+const SLOW_LOG_BUDGET_PER_HOUR = 20; // 每实例每小时上限。实例包含 TerminalDO/PanelDO/MetricsDO，
+// 且 evict 会清零计数，冷启动频繁时全局上限高于 20×实例数；埋点日志仍只在千条/天量级，可接受。
 // open_terminal/open_file 未确认的重发间隔（3 次 → 9s 窗口，原为 5s×3 = 15s）。
 // setTimeout 会让 DO 在窗口内失去 hibernation 资格并持续计 duration，故缩短窗口；
 // 控制通道重连间隙通常 3~6s，3s 间隔仍能覆盖，3 次后放弃（前端另有自愈兜底）。
@@ -208,11 +209,11 @@ export class TerminalDO {
       //（命令尚未下发，重试绝对安全），同时补发一帧 probe 让下一次调用恢复。
       // 关键：这里不再当场等回执，因此没有 setTimeout，DO 不会因此失去 hibernation 资格。
       if (this.probeCapable.has(serverId)) {
-        if (this.updating.has(serverId)) {
-          await this.failExecJobWithAudit(this.env, jobId, 'agent update in progress');
-          return json({ error: 'agent update in progress' }, 409);
-        }
-        const rttFresh = Date.now() - (this.lastRoundTripAt.get(serverId) || 0) < EXEC_ROUNDTRIP_TTL_MS;
+        const lastRtt = this.lastRoundTripAt.get(serverId) || 0;
+        // 冷启动（内存与附件都没有 rtt）必须乐观放行：evict 不会断开 WS（连接由 hibernation 托管），
+        // 能走到这里说明该连接仍登记在本实例上；真正的半开会由 agent 侧读超时触发重连 → cleanup 清记录。
+        // 若这里一票否决，冷启动后的第一条 exec 必然 503（原语义是当场等 pong 最多 1s 再下发）。
+        const rttFresh = !lastRtt || Date.now() - lastRtt < EXEC_ROUNDTRIP_TTL_MS;
         if (!rttFresh) {
           try { agentWs.send(JSON.stringify({ type: 'probe', id: `p-${crypto.randomUUID()}` })); } catch { /* ignore */ }
           await this.failExecJobWithAudit(this.env, jobId, 'agent link not verified');
@@ -382,9 +383,9 @@ export class TerminalDO {
       // https://do.internal，拿它拼下载 URL 会让 Agent 去连内网地址（DNS 必失败）。
       const panelOrigin = url.searchParams.get('panel_origin') || '';
       if (panelOrigin) {
-        // await：不留下未完成的 promise——未完成 I/O 会让对象失去 hibernation 资格、
-        // 在空闲期持续计 duration。内部是 4 次带索引的 D1 查询（毫秒级），
-        // 且原本也发生在返回 101 之前，握手时序不变。
+        // await：不留下未完成的 promise（未完成 I/O 会让对象失去 hibernation 资格、持续计 duration）。
+        // 代价：101 会晚于原 fire-and-forget 返回——常态 waiting 为空时是 4 次带索引 D1（几十毫秒）；
+        // 队列非空时每条 job 再加一次 markUploadRunning，重连握手最坏慢到几百毫秒。可接受。
         try { await this.resendWaitingUploads(server.id, pair[1], panelOrigin); } catch { /* 失败不阻塞连接 */ }
       }
       // T1 能力来源：不在此处探活——建连时能力未知，探活失败无法安全处理（分不清旧 agent 与真断链）。
@@ -600,6 +601,9 @@ export class TerminalDO {
             if (att.interval === REPORT_FAST_INTERVAL_S || att.interval === REPORT_SLOW_INTERVAL_S) {
               this.agentInterval.set(sid, att.interval);
             }
+            // 最近一次往返时间也随附件恢复：冷启动后 exec 判据能拿到真实时间戳，
+            // 而不是落进"无记录"分支（那会退化成无条件信任）。
+            if (att.rtt) this.lastRoundTripAt.set(sid, Number(att.rtt) || 0);
           }
         }
       } else if (att.role === 'user' || att.role === 'agent') {
@@ -657,6 +661,20 @@ export class TerminalDO {
       if (att && typeof att === 'object') return Number(att.ts) || 0;
     } catch { /* ignore */ }
     return 0;
+  }
+
+  // 记录一次有效往返（pong / exec_result），并把时间戳写进连接附件。
+  // 内存 Map 会随 evict 丢失、附件不会——这样冷启动后 exec 判据仍能拿到"最近一次往返时间"，
+  // 而不是只能靠"无记录即乐观放行"兜底。
+  markRoundTrip(ws, serverId) {
+    const now = Date.now();
+    this.lastRoundTripAt.set(serverId, now);
+    try {
+      const a = ws.deserializeAttachment?.();
+      if (a && typeof a === 'object' && a.role === 'control') {
+        ws.serializeAttachment({ ...a, rtt: now });
+      }
+    } catch { /* 附件写失败退化为纯内存，冷启动走乐观放行 */ }
   }
 
   // 标记该 serverId 支持探活，并把能力写进连接附件：唤醒重建时据此恢复 probeCapable
@@ -777,7 +795,7 @@ export class TerminalDO {
           if (j && j.type === 'pong') {
             const sid = this.wsServerId(ws);
             if (sid) {
-              this.lastRoundTripAt.set(sid, Date.now());
+              this.markRoundTrip(ws, sid); // 同时写附件：evict 后 exec 判据仍拿得到时间戳
               this.markProbeCapable(ws, sid);
             }
             return;
@@ -792,7 +810,7 @@ export class TerminalDO {
           if (j && j.type === 'exec_result') {
             // 成功回执即最强双向存活证明 → 刷新往返时间，使后续 exec 走快路径（零新增延迟）
             const esid = this.wsServerId(ws);
-            if (esid) this.lastRoundTripAt.set(esid, Date.now());
+            if (esid) this.markRoundTrip(ws, esid);
             // 异步路径：终态落 D1 + 写审计。本条消息可能唤醒的是一台刚 evict 的 DO，
             // 状态全部来自 D1/job 行，不依赖内存 Map——这正是异步化的核心验收点。
             if (String(j.exec_id || '').startsWith('job_')) await this.settleExecJob(j.exec_id, j);
@@ -1332,18 +1350,15 @@ export class TerminalDO {
     if (!matched.length && attServerId) matched.push(attServerId);
     for (const serverId of matched) {
       const isCurrent = this.agents.get(serverId) === ws;
+      // 被顶替的旧连接（isCurrent=false）不删 agents/interval：新连接正持有同一 serverId。
+      // 在途异步任务的状态全在 D1（不在内存 Promise 里），顶替连接不影响它们，
+      // 不会让明明还在跑的请求收到假的"agent disconnected"。
       if (isCurrent) {
         this.agents.delete(serverId);
         // 断连即失效：新连接建连时会重新下发间隔并写进附件，旧值留着反而会让
         // 下一帧跳过 syncAgentInterval 而按过期档位上报（快慢采错档）。
         this.agentInterval.delete(serverId);
-      }
-      // 被顶替的旧连接（isCurrent=false）：只释放 per-server 的互斥/能力记录并收敛 D1。
-      // 在途异步任务的状态全在 D1（不在内存 Promise 里），顶替连接不影响它们，
-      // 不会让明明还在跑的请求收到假的"agent disconnected"。
-      if (isCurrent) {
-        // 控制连接已断 → 作废该 serverId 的往返/探活能力记录（新连接上报后重新协商 probe）
-        // 控制通道断开 → 仅清理该 agent（serverId）的待确认，不影响其他服务器/会话
+        // 控制连接已断 → 仅清理该 agent（serverId）的待确认，不影响其他服务器/会话
         for (const [sid, r] of [...this.pendingOpen]) {
           if (r.serverId === serverId) {
             if (r.timer) clearTimeout(r.timer);

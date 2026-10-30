@@ -191,6 +191,8 @@ export class MetricsDO {
   async loadLatestFromHot(serverId, out) {
     const prefix = `m:${serverId}:`;
     let keys;
+    // list 失败只丢这一台（其余机器照常返回）；JSON.parse 单行失败同样跳过——
+    // 三条恢复路径（快照 / 逐机补扫 / D1 清单）的容错必须一致，否则一行坏数据让首查 500。
     try { keys = await this.listStorage(prefix); } catch { return; }
     let best = null;
     for (const k of keys) {
@@ -599,7 +601,7 @@ export class MetricsDO {
       }
     } else if (Date.now() - this.lastPushProbeAt >= PUSH_PROBE_INTERVAL_MS) {
       // 自愈：pushOn 是实例内存，MetricsDO 无 WS 可能在 PanelDO set_push(1) 之后被 evict，
-      // 新实例不知道有人观看 → 面板数据冻结。低频（30s）反查 /viewers，有人看则恢复推送
+      // 新实例不知道有人观看 → 面板数据冻结。低频（PUSH_PROBE_INTERVAL_MS=300s）反查 /viewers，有人看则恢复推送
       this.lastPushProbeAt = Date.now();
       try {
         const vResp = await doPanel(this.env).fetch('https://do.internal/viewers');
@@ -656,65 +658,52 @@ export class MetricsDO {
         return json(out);
       }
       // 仅实例 evict 后（增量 Map 为空）才从 storage 恢复；恢复结果回填增量 Map。
-      // 优先读 `l:<id>` 快照行（每机 1 行）：旧实现扫全量 `m:`（240×N 行 + 逐行 parse），
+      // 主路径读 `l:<id>` 快照行（每机 1 行）：旧实现扫全量 `m:`（240×N 行 + 逐行 parse），
       // 500 台 ≈ 12 万行，面板首连/evict 后首帧会形成一次 CPU 与内存尖峰。
-      let lKeys = null;
-      try { lKeys = await this.listStorage('l:'); } catch { lKeys = null; }
-      if (lKeys === null) return json(out); // Storage 不可用：返回空，等下一帧上报重建
-      if (lKeys.length) {
-        for (const k of lKeys) {
-          const serverId = Number(k.name.slice(2));
-          if (!serverId) continue;
-          let v;
-          try { v = JSON.parse(k.value); } catch { continue; } // 单行损坏不得拖垮整个 /latest
-          const l = {
-            ts: v.ts, cpu: v.cpu, mem_used: v.mem_used, mem_total: v.mem_total,
-            net_in: v.net_in, net_out: v.net_out, extra: v.extra,
-            last_seen_s: this.lastSeenSec.get(serverId),
-          };
-          out[serverId] = l;
-          this.latestByServer.set(serverId, l);
-        }
-        // 快照是「按机」的：某台缺 l:（升级首轮 / 该机快照写失败）不能因为别的机器有快照就
-        // 跳过它——否则冷启动首查会缺这台机器的指标（面板显示 '-' 直到下一帧上报）。
-        // 只为缺快照的机器按前缀补扫（峰值内存 ≈ 一台机器的窗口），已有快照的机器零 Storage 读；
-        // 代价是多一条 D1 读（拿服务器清单），冷启动 + 低频，可接受。
-        // 补扫按机器串行、每轮最多 LATEST_BACKFILL_MAX 台：升级首轮 500 台全缺快照时，
-        // 避免面板首连卡住数秒（缺的那部分下一轮冷启动或首帧上报即补齐）。
-        let ids = [];
-        try {
-          // ORDER BY id：SQLite 可能走覆盖索引扫描（顺序变成 agent_key_id 的字典序），
-        // 加显式排序让「每轮补哪 100 台」可预期且稳定
-        ids = ((await this.env.DB.prepare('SELECT id FROM servers ORDER BY id').all()).results || [])
-            .map((s) => Number(s.id) || 0);
-        } catch { /* D1 不可用：本次只返回已有快照，下一帧上报即补齐 */ }
-        let filled = 0;
-        for (const sid of ids) {
-          if (!sid || out[sid]) continue;
-          if (filled >= LATEST_BACKFILL_MAX) break;
-          filled += 1;
-          await this.loadLatestFromHot(sid, out);
-        }
+      let lKeys = [];
+      try {
+        lKeys = await this.listStorage('l:');
+      } catch {
+        // Storage 不可用：返回空，等下一帧上报重建（不要让整次 /latest 抛错）
         return json(out);
       }
+      for (const k of lKeys) {
+        const serverId = Number(k.name.slice(2));
+        if (!serverId) continue;
+        let v;
+        try { v = JSON.parse(k.value); } catch { continue; } // 单行损坏不得拖垮整个 /latest
+        const l = {
+          ts: v.ts, cpu: v.cpu, mem_used: v.mem_used, mem_total: v.mem_total,
+          net_in: v.net_in, net_out: v.net_out, extra: v.extra,
+          last_seen_s: this.lastSeenSec.get(serverId),
+        };
+        out[serverId] = l;
+        this.latestByServer.set(serverId, l);
+      }
 
-      // 升级兼容：部署前写入的热区还没有 `l:` 快照行 → 退回原全量扫描（此后随上报补齐）
-      const hotKeys = await this.listStorage('m:');
-      for (const k of hotKeys) {
-        const rest = k.name.slice(2); // 去掉 'm:'
-        const sep = rest.indexOf(':');
-        if (sep <= 0) continue;
-        const serverId = Number(rest.slice(0, sep));
-        const ts = Number(rest.slice(sep + 1));
-        const cur = out[serverId];
-        if (!cur || ts > cur.ts) {
-          // 单行损坏容错与 l: 路径、loadLatestFromHot 一致：一行坏数据不得让升级首查 500
-          let v;
-          try { v = JSON.parse(k.value); } catch { continue; }
-          const l = { ts, cpu: v.cpu, mem_used: v.mem_used, mem_total: v.mem_total, net_in: v.net_in, net_out: v.net_out, extra: v.extra, last_seen_s: this.lastSeenSec.get(serverId) };
-          out[serverId] = l;
-          this.latestByServer.set(serverId, l);
-        }
+      // 为「缺 l: 快照」的机器按前缀逐机补扫。三种情况共用这条路径：
+      //   a) 快照是「按机」的：某台缺 l:（该机快照写失败）不能因为别的机器有快照就跳过；
+      //   b) 升级首轮：部署前的热区全都没有 l:，全部走补扫；
+      //   c) 完全没有 l: 行：同上。
+      // 补扫按机器串行、每轮最多 LATEST_BACKFILL_MAX 台——升级首轮 500 台全缺时，
+      // 避免面板首连串行做 500 次前缀 list（缺的那部分下一轮冷启动或首帧上报即补齐）。
+      // 代价是一条 D1 读（拿服务器清单）；已有快照的机器零额外 Storage 读。
+      let ids = [];
+      try {
+        // ORDER BY id：SQLite 可能走覆盖索引扫描（顺序变成 agent_key_id 的字典序），
+        // 加显式排序让「每轮补哪 K 台」可预期且稳定
+        ids = ((await this.env.DB.prepare('SELECT id FROM servers ORDER BY id').all()).results || [])
+          .map((s) => Number(s.id) || 0);
+      } catch {
+        // D1 不可用：本次只返回已有快照（升级首轮则为空），下一帧上报即补齐
+        return json(out);
+      }
+      let filled = 0;
+      for (const sid of ids) {
+        if (!sid || out[sid]) continue;
+        if (filled >= LATEST_BACKFILL_MAX) break;
+        filled += 1;
+        await this.loadLatestFromHot(sid, out);
       }
       return json(out);
     }

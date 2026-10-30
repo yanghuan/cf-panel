@@ -64,8 +64,10 @@ export class TerminalDO {
   }
 
   // 内存互斥可能因 Agent 挂住（不回执、连接仍在）而永不释放——D1 的 deadline 才是权威。
-  // 标记存在但 D1 已判过期（hasActiveAgentUpdate 会顺手收敛）时清掉本地标记，
-  // 避免过期更新继续挡 exec / upload / 新更新 / 终端会话，直到实例 evict。
+  // 标记存在但 D1 已无未过期更新时清掉本地标记，避免过期更新继续挡 exec / upload /
+  // 新更新 / 终端会话，直到实例 evict。
+  // 注意：这里只是「读判据 + 清本地缓存」，不收敛 D1 行（早期版本会顺手 UPDATE 成
+  // expired，现由 settleServerExpired 在创建 upload/update 前统一收敛）。
   // forJobId：调用方正在下发的更新任务 id。它自己当然算 active，必须排除，
   // 否则「上一次更新挂住 → D1 判过期 → 用户重试」的第二条任务会被自己挡住。
   async isUpdating(serverId, forJobId = null) {

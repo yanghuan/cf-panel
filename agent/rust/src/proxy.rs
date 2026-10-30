@@ -181,6 +181,12 @@ pub async fn connect_via_proxy(
 
     // 读 CONNECT 响应头：只到 \r\n\r\n 为止。代理在 200 之后不应再发数据
     // （TLS/WS 握手都由调用方随后发起），若头后还有多余字节，宁可报错也不丢数据。
+    //
+    // 已知兼容性限制：少数代理会在 200 之后**立即捎带**数据（典型是提前转发的 TLS
+    // ServerHello，也可能是一段欢迎/错误提示文本）。这种实现下本函数会直接报
+    // "proxy sent unexpected data after CONNECT response" 并让连接失败——不是 bug，
+    // 而是「不丢数据」优先于「尽量连上」的取舍：静默丢弃这些字节会让后续 TLS 握手
+    // 读到错位的流，失败得更难排查。遇到此类代理请改用直连，或换一个规范的 CONNECT 实现。
     let mut buf: Vec<u8> = Vec::with_capacity(4096);
     let mut tmp = vec![0u8; 4096];
     let head_end = loop {

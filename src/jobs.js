@@ -97,11 +97,13 @@ export async function createExecJob(env, {
       job.command, job.timeout_s, job.idempotency_key, job.created_at, job.deadline_at, job.expires_at
     ).run();
   } catch (e) {
-    // 并发同 key：唯一索引兜底，回查已存在的那一条，语义仍是幂等
+    // 并发同 key：唯一索引兜底，回查已存在的那一条，语义仍是幂等。
+    // 带 expires_at >= now，与上面的预查口径一致：并发的另一条若已过 TTL，
+    // 回查会拿到一条「首查永远选不到」的行，语义就分叉了。
     if (/UNIQUE constraint failed: operation_jobs\.(id|user_id)/.test(String(e && e.message))) {
       const dup = await env.DB
-        .prepare("SELECT * FROM operation_jobs WHERE user_id = ? AND kind = 'exec' AND idempotency_key = ?")
-        .bind(user.id, idempotencyKey)
+        .prepare("SELECT * FROM operation_jobs WHERE user_id = ? AND kind = 'exec' AND idempotency_key = ? AND expires_at >= ?")
+        .bind(user.id, idempotencyKey, now)
         .first();
       if (dup) {
         assertSameIdempotentJob(dup, { serverId, command });

@@ -1115,17 +1115,47 @@ test('MetricsDO: /latest 冷启动为缺 l: 快照的机器逐机补扫（不全
   assert.deepEqual(prefixes, ['l:', 'm:2:'], '只补扫缺快照的那台前缀，不退化成全量 m: 扫描');
 });
 
-// 三条 /latest 恢复路径的容错必须一致：l: 快照、逐机补扫、以及「完全没有 l:」时的
-// 升级回退全量扫描。差一行坏数据就让升级首查 500 是最糟的失败形态。
-test('MetricsDO: 升级回退路径（无 l: 快照）容忍单行损坏', async () => {
+// 升级首轮（一条 l: 都没有）：仍要能给出指标，且不能让整次 /latest 抛错。
+// 该路径现已并入「逐机补扫」，因此同样受 LATEST_BACKFILL_MAX 限制、同样容忍坏行。
+test('MetricsDO: 零快照升级路径走逐机补扫（不扫全量 m:，且容忍坏行）', async () => {
   const env = makeEnv({ ARCHIVE_TO_D1: '0' });
+  await env.DB.prepare('INSERT INTO servers (id, agent_key_id, name, user_id, agent_key_hash) VALUES (?,?,?,?,?)')
+    .bind(1, 'k1', 's1', 1, 'h').run();
   const st = mockState();
   const nowMin = Math.floor(Date.now() / 1000 / 60);
-  st.storage.map.set(`m:1:${nowMin}`, 'not-json'); // 坏行
+  st.storage.map.set(`m:1:${nowMin}`, 'not-json'); // 坏行：不得让首查 500
   st.storage.map.set(`m:1:${nowMin - 1}`, JSON.stringify({ cpu: 5 }));
-  const { call } = mkMetrics(env, st);
+  const { inst, call } = mkMetrics(env, st);
+  const prefixes = [];
+  const orig = inst.listStorage.bind(inst);
+  inst.listStorage = async (p, o) => { prefixes.push(p); return orig(p, o); };
+
   const latest = await (await call('/latest')).json();
   assert.equal(latest[1].cpu, 5, '坏行被跳过，好行照常返回（不得 500）');
+  assert.deepEqual(prefixes, ['l:', 'm:1:'], '只读 l: 再按机补扫，不做全量 m: 扫描');
+});
+
+// 逐机补扫的 list 失败必须只丢那一台，不能让整次 /latest 抛错。
+test('MetricsDO: 补扫时某台 list 失败只丢该台（不影响其它机器与整体响应）', async () => {
+  const env = makeEnv({ ARCHIVE_TO_D1: '0' });
+  for (const id of [1, 2]) {
+    await env.DB.prepare('INSERT INTO servers (id, agent_key_id, name, user_id, agent_key_hash) VALUES (?,?,?,?,?)')
+      .bind(id, `k${id}`, `s${id}`, 1, 'h').run();
+  }
+  const st = mockState();
+  const nowMin = Math.floor(Date.now() / 1000 / 60);
+  st.storage.map.set('l:1', JSON.stringify({ ts: nowMin, cpu: 11 }));
+  st.storage.map.set(`m:2:${nowMin}`, JSON.stringify({ cpu: 22 }));
+  const { inst, call } = mkMetrics(env, st);
+  const orig = inst.listStorage.bind(inst);
+  inst.listStorage = async (p, o) => {
+    if (p === 'm:2:') throw new Error('storage hiccup');
+    return orig(p, o);
+  };
+
+  const latest = await (await call('/latest')).json();
+  assert.equal(latest[1].cpu, 11, '有快照的机器不受影响');
+  assert.equal(latest[2], undefined, '失败的那台本次缺席（下一帧上报补齐）');
 });
 
 // 升级首轮 500 台全缺 l: 时，逐机补扫要串行 500 次前缀 list（面板首连多等数秒）。

@@ -88,12 +88,12 @@
 2. **`/api/servers/:id` 前缀匹配过宽**：`PATCH /api/servers/` / `DELETE /api/servers/` 用 `path.startsWith` + `split('/')[3]`（`src/routes.js:855,896`），因此 `DELETE /api/servers/123/rotate-key` 会删除服务器；功能上无害（需管理员），但建议收紧为正则。
 3. **幂等键不校验目标**：`createExecJob` 命中 `(user_id, kind, idempotency_key)` 后直接返回旧 job（`src/jobs.js:49-55`），若同一 key 换 server/command 复用，会静默拿到另一台机器的结果；竞态兜底查询（`:85-90`）还缺少 `expires_at >= now`，理论上会返回已过期任务。
 4. **`mcpCreateUpload` 的审计是强依赖**：`src/routes.js:1857-1859` 直接 `await ...run()`（REST 版用 best-effort `auditLog`）。审计写失败时上传任务已创建、URL 未返回，单机串行锁被占 10 分钟。
-5. **`markUploadStaged` 失败无终态**：`src/routes.js:1460-1462` 删对象后直接 409，任务停在 `staging` 直到 600s deadline（最终由 `settleExpired(All)` 收敛）。可顺手 `finishUploadJob(false)`。
+5. ~~**`markUploadStaged` 失败无终态**~~ **已核实非问题（首轮误报）**：`claimUploadStaging` 要求 `status='awaiting_upload'` 且置 `staging`，`markUploadStaged` 要求 `staging`——进入 staging 后第二次 claim 不可能成功，故 `markUploadStaged` 返回 false 的唯一原因是该行已被 `settleExpired(All)` 从 `staging` 改成 `expired`，而 `expired` 已是终态。此刻没有需要收敛的残留，删 R2 + 409 是正确行为；**不应**调 `finishUploadJob`（它只接受 expired 覆盖，语义上无意义）。
 6. **终端重连定时器不随关闭取消**：`public/api.js:441-442,487` 的 `setTimeout(() => this.open(...))` 在用户关窗后仍会执行，`api('/api/terminal')` 已创建的服务端会话无人接管（PTY/agent 进程要等 10 分钟 TTL 回收）。`open()` 在请求返回后才发现 `closed`，建议先把定时器句柄存起来并在 `close()` 里清掉。
 7. **i18n 标点残留**：分组标题 `（${count}）`（`public/app.js:548`）、批量删除名单 `join('、')`（`:2641`）、`token.hint` 名单 `join('，')`（`:2858`）、tooltip 的 `：`（`:2243`/`:2778`）在英文界面仍输出中文标点。`test/unit.test.js:929` 只匹配 `[一-龥]`，全角标点漏检。
 8. **`alarm` 闲置判定在冷实例上误判**：`src/do-metrics.js:865` 用 `this.data.size === 0`，冷实例（storage 有行但内存空）会被判为空闲，alarm 退避到 1h；再叠加 `6 × 10min` 的 sweep 判据，fullSweep 可能滑到 2h 一次（仅影响 >keepMin 的 storage 行清理与兜底归档，不再是常态路径）。
 9. **`fetch.rs` 在 async 任务里用 `std::fs::File` 同步写**：`agent/rust/src/fetch.rs:186-277` 的 `write_all` 会阻塞 tokio worker（块很小，影响有限）。项目已统一走 `blocking.rs` 线程池，这里可对齐（或至少在注释里说明取舍）。
-10. **`proxy.rs` 对 CONNECT 响应后的多余字节直接报错**（`:203-205`）：严格的正确性取舍，但少数代理在 200 后立即捎带数据时会误判，值得在注释中保留已知限制（当前注释已提，未提兼容性影响）。
+10. **`proxy.rs` 对 CONNECT 响应后的多余字节直接报错**（`:181`）：**注释已有取舍说明**（「宁可报错也不丢数据」），缺的只是「少数代理在 200 后立即捎带数据时会连接失败」这条兼容性提示——属文案增强，不是遗漏。（六审前已补，`proxy.rs:182-192`）
 
 ## 四、专项核查（本轮重点，未发现新问题）
 
@@ -271,9 +271,9 @@
 
 > 1–4 项不改任何快采/慢采间隔，也不改界面刷新节拍，建议直接实施；第 5 项涉及新鲜度或分片迁移，需单独决策。
 
-## 九、修复验证（2026-10-30 起，提交 `6bb26ce`…`ef3be91`）
+## 九、修复验证（2026-10-30 起，提交 `6bb26ce`…`HEAD`）
 
-修复后 `npm test` → **304/304 通过**；`node scripts/e2e.mjs` → **33/33**（wrangler dev + release agent，含 MCP 17 工具）。Rust 源码未改（仅为 E2E 重新构建了 release 二进制）。
+修复后 `npm test` → **305/305 通过**；`node scripts/e2e.mjs` → **33/33**（wrangler dev + release agent，含 MCP 17 工具）。Rust 侧仅补了 `proxy.rs` 的兼容性注释（无行为改动），E2E 用重新构建的 release 二进制跑。
 
 | 发现 | 状态 | 实现与验证 |
 |---|---|---|
@@ -323,11 +323,18 @@
 | 六审 E `/api/tokens/:id` 同类前缀问题 | ✅ 已修 | DELETE/PATCH 改 `^/api/tokens/(\d+)$`；用例：子路径不删令牌、不改 scopes（还原即变红） |
 | 七审 (1) 列清单两份拷贝 | ✅ 已修 | `SERVER_LIST_COLS` 从 auth.js 导出，PanelDO 复用（不再内联 11 列）；静态断言锁定「单一来源 + 不含 agent 鉴权列 + 覆盖 buildList 所需字段」，把内联清单还原即变红 |
 | 七审 (2) en-US `listSep` 为 `'/ '` | ✅ 已修 | 改为 `', '`（`join` 后 `Beijing, Shanghai`）；中文仍为顿号无空格 |
+| 八审 (1) `/latest` 零快照路径仍是全量 m: 扫描 | ✅ 已修 | 删掉单独的全量回退分支，统一走「按机补扫」：同样受 `LATEST_BACKFILL_MAX`、同样容忍坏行、list 失败只丢该台；用例改为断言只读 `l:` + `m:1:`，另加「补扫 list 失败只丢该台」 |
+| 八审 (2) 幂等兜底查询缺 `expires_at` | ✅ 已修 | 唯一索引冲突后的回查补 `AND expires_at >= ?`，与首查口径一致（否则会返回一条首查永远选不到的行） |
+| 八审 (3) 注释漂移 | ✅ 已修 | `do-terminal.js` 的「会顺手收敛」改为「只读判据、收敛交给 settleServerExpired」；`do-metrics.js` 的「低频（30s）」改为 `PUSH_PROBE_INTERVAL_MS=300s`；顺带修掉一段缩进错乱 |
+| 八审 (4) `markUploadStaged` P4-5 | ✅ 已核实非问题 | 状态机决定该分支只可能是「已被 settleExpired 收敛为 expired」，终态无需再收敛、不应调 `finishUploadJob`；§三 该行已改判（首轮误报） |
+| 八审 (5) `proxy.rs` 兼容性提示 | ✅ 已补 | 原注释已说明取舍，本次补「少数代理 200 后捎带数据 → 连接失败」的已知限制与规避方式（直连/换代理） |
 
 **残余（本轮仍不做）**
 
 1. 「清理帧丢失 / 只删一个探针」已由 alarm 对账收口，残余降级为：**对账周期内（≤1 小时）** 同名探针重新启用可能沿用旧冷却——前提是配了 webhook，最坏造成一次通知抖动。
 2. `settleServerExpired` / `settleExpiredAll` 的收敛路径不写审计（`expired` 的 upload/update 无终态审计行），与「审计只在终态写」的既有取舍一致。
-3. §八 仍剩：C 档（`REPORT_FWD_THROTTLE_S` 5→10、`SHARDS` 4→2、`LAST_SEEN_THROTTLE_S` 60→180、idle 10→5min）、8.7 内存专项（`serverListCache` 条目/字节双限、`data` 热区 LRU、`fetch.rs` 同步写改走 `blocking.rs`）、§三 P4-10 的 `proxy.rs` 兼容性注释（CONNECT 后捎带数据即报错的已知限制）。8.9 前三项与 §8.4 的 5/-10 已闭环。
-4. **历史 P4 已清空**：五审实现 7 条、六审收敛 A–E，均有用例；下表「五审/六审」行即其记录。
+3. §8.5 的四项产品决策未调整：`REPORT_FWD_THROTTLE_S` 5→10、`SHARDS` 4→2、`LAST_SEEN_THROTTLE_S` 60→180、idle 10→5min（都会改界面新鲜度或需迁移动作，待真实额度数据）。
+4. §8.7 内存专项：`serverListCache` 无字节上限、`data` 热区无 LRU、`fetch.rs` 在 async 任务里用 `std::fs::File`（可改走 `blocking.rs`）。
+5. 两处接受的取舍：探针冷却在对账周期内（≤1 小时）可能沿用旧值；`settleExpired(All)` 的收敛路径不写终态审计。
+6. **历史 P4 未清空**：五审实现 7 条、六审/七审收敛 A–E 与列清单重复，均有用例；其余（`markUploadStaged` 误报、`proxy.rs` 文案）已核实为非问题或不影响行为。
 5. **R2 孤儿清理的 cursor 不跨轮持久化**：每轮最多 20 页（2 万对象），若存活对象长期超过该量且前 20 页都不可删（例如缺 `uploaded` 元数据被「宁留不误删」跳过），第 21 页之后的孤儿轮不到。当前 staging 对象随任务清理、规模远到不了 2 万；要彻底闭合可把 cursor 存 `kv_json`，或只在本页有删除时继续翻页。

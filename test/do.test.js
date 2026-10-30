@@ -1426,6 +1426,27 @@ test('TerminalDO: 唤醒重建只沿胜出连接恢复 probeCapable（旧半开�
   assert.ok(closed.includes(4001), '旧连接被关闭');
 });
 
+test('TerminalDO: 唤醒重建只沿胜出连接恢复上报间隔与 rtt（旧半开连接的值不残留）', () => {
+  const env = makeEnv();
+  // 旧连接：按快采 5s 下发过，且有过往返记录；新连接附件两者都没写
+  // （握手时 /viewers 查询失败则不写 interval；刚连上还没 pong 则无 rtt）
+  const oldWs = {
+    deserializeAttachment: () => ({ role: 'control', serverId: 1, ts: 1, interval: 5, rtt: 111 }),
+    send() {}, readyState: 1, close() {},
+  };
+  const newWs = {
+    deserializeAttachment: () => ({ role: 'control', serverId: 1, ts: 2 }),
+    send() {}, readyState: 1, close() {},
+  };
+  const inst = new TerminalDO({ getWebSockets: () => [oldWs, newWs] }, env);
+  inst.rebuildIndex();
+  assert.equal(inst.agents.get(1), newWs, '胜出的是 ts 更大的新连接');
+  assert.equal(inst.agentInterval.has(1), false,
+    '旧连接的快采档位不得残留（syncAgentInterval 以内存已有为短路，残留会按 5s 上报、请求放大 24 倍）');
+  assert.equal(inst.lastRoundTripAt.has(1), false,
+    '旧连接的 rtt 不得残留（否则被判「有过期记录」而误 503，实际应乐观放行）');
+});
+
 test('TerminalDO: 能力撤销同时清附件 rtt（不会在 evict 后被复活）', async () => {
   const env = makeEnv();
   let att = { role: 'control', serverId: 1, probe: true, rtt: 12345 };

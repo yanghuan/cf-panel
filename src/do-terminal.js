@@ -599,10 +599,17 @@ export class TerminalDO {
             // 否则 evict 后会按错误间隔上报（快慢采错档直接放大或浪费配额）。
             if (att.interval === REPORT_FAST_INTERVAL_S || att.interval === REPORT_SLOW_INTERVAL_S) {
               this.agentInterval.set(sid, att.interval);
+            } else {
+              // 与 probe 同理，必须主动撤销：前面遍历到的旧连接可能已 set 过快采 5s，
+              // 而 syncAgentInterval 以「内存已有」为短路条件，残留值会一直生效（请求放大 24 倍）
+              // 且永远不会自我修正，直到该控制连接断开。
+              this.agentInterval.delete(sid);
             }
             // 最近一次往返时间也随附件恢复：冷启动后 exec 判据能拿到真实时间戳，
-            // 而不是落进"无记录"分支（那会退化成无条件信任）。
+            // 而不是落进"无记录"分支（那会退化成无条件信任）。胜出连接没有记录时同样撤销，
+            // 否则会拿旧连接的时间戳判「有过期记录 → 503」，而乐观放行才是对的。
             if (att.rtt) this.lastRoundTripAt.set(sid, Number(att.rtt) || 0);
+            else this.lastRoundTripAt.delete(sid);
             // 探活能力同样只跟随胜出连接，且必须双向同步：旧半开连接的 probe=true 不能复活能力
             // （agent 回滚到不支持 probe 的版本后，会被持续发探测帧、pong 不回，rtt 过期 → exec 误 503）；
             // 胜出连接没有 probe 标记时还要主动撤销，否则上一轮 add 的结果会残留。

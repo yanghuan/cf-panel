@@ -131,7 +131,8 @@ export function makePanelStub(opts = {}) {
 // R2 内存 mock：覆盖生产用到的 API 子集（put/get/head/delete/list）。
 // 不连真实 R2：测试必须可离线运行，且 R2 的最终一致性与计费行为不参与断言。
 // put 支持 string / ArrayBuffer / Uint8Array / ReadableStream / Request.body（流式写入）。
-export function makeR2() {
+export function makeR2(cfg = {}) {
+  const listPageSize = Number(cfg.listPageSize) > 0 ? Number(cfg.listPageSize) : 1000; // 生产每页 ≤1000
   const objects = new Map(); // key -> { data, size, uploaded, customMetadata, httpMetadata }
   const ops = []; // 调用序列，供"是否写入/是否删除"类断言使用
 
@@ -206,9 +207,15 @@ export function makeR2() {
       ops.push({ op: 'list', prefix: opts.prefix });
       const prefix = opts.prefix || '';
       const keys = [...objects.keys()].filter((k) => k.startsWith(prefix)).sort();
+      // 生产语义：按 key 升序、单页 ≤1000、超出用 truncated + cursor 续读（cursor = 上一页末键）
+      const start = opts.cursor ? keys.findIndex((k) => k > opts.cursor) : 0;
+      const from = start < 0 ? keys.length : start;
+      const page = keys.slice(from, from + listPageSize);
+      const truncated = from + page.length < keys.length;
       return {
-        objects: keys.map((k) => ({ key: k, size: objects.get(k).size, uploaded: objects.get(k).uploaded })),
-        truncated: false,
+        objects: page.map((k) => ({ key: k, size: objects.get(k).size, uploaded: objects.get(k).uploaded })),
+        truncated,
+        cursor: truncated ? page[page.length - 1] : undefined,
       };
     },
   };

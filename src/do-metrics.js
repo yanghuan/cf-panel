@@ -67,8 +67,8 @@ export class MetricsDO {
     // 告警去重状态：内存为主，关键变更时持久化到 DO Storage，实例 evict/重启后恢复，避免重复告警
     this.alertLast = new Map(); // `${serverId}:kind` -> 上次触发时间
     this.probeState = new Map(); // `${serverId}:probeName` -> {ok, lastFail}
-    this.alertLoaded = false;
-    this.probeLoaded = false;
+    this.alertLoadedFor = new Set(); // serverId：本实例已恢复该机告警冷却状态
+    this.probeLoadedFor = new Set(); // serverId：本实例已恢复该机探活去重状态
     this.arcCache = new Map(); // serverId -> 已归档水位（分钟），实例内缓存，evict 后从 storage 恢复
     this.arcPersisted = new Map(); // serverId -> 已写进 storage 的水位（降频持久化用，见 ARC_PERSIST_MIN）
     this.lastSweepAt = 0; // 上次 fullSweep 时间戳（ms；持久化跨 evict，见 ensureHousekeepLoaded）
@@ -117,22 +117,26 @@ export class MetricsDO {
     } catch { /* 恢复失败按 0 处理（首次/损坏），下次 alarm 正常判定 */ }
   }
 
-  // 从 DO Storage 惰性恢复告警冷却 / 探活去重状态（实例 evict 后首次使用时加载一次）
-  async ensureAlertLoaded() {
-    if (this.alertLoaded) return;
-    this.alertLoaded = true;
+  // 从 DO Storage 惰性恢复告警冷却 / 探活去重状态。
+  // **按机加载**（每实例每机一次），不再 `list('alert:')` 全量：
+  // 无观看者时 120s 一帧几乎每帧都是新实例，全量 list 会把所有机器的冷却状态（50 台 × 4 维
+  // ≈ 200 行）在每帧重新载入；而绝大多数帧一个指标都没越界（见 checkAlerts 的阈值前置判定），
+  // 根本用不到这些状态。探活同理（只在 probe 列表非空且告警开启时才会用到）。
+  async ensureAlertLoadedFor(serverId) {
+    if (this.alertLoadedFor.has(serverId)) return;
+    this.alertLoadedFor.add(serverId);
     try {
-      const keys = await this.listStorage('alert:');
+      const keys = await this.listStorage(`alert:${serverId}:`);
       for (const k of keys) {
         this.alertLast.set(k.name.slice('alert:'.length), Number(k.value));
       }
-    } catch { /* 加载失败按空状态处理 */ }
+    } catch { /* 加载失败按空状态处理（最坏多告警一次，不丢告警） */ }
   }
-  async ensureProbeLoaded() {
-    if (this.probeLoaded) return;
-    this.probeLoaded = true;
+  async ensureProbeLoadedFor(serverId) {
+    if (this.probeLoadedFor.has(serverId)) return;
+    this.probeLoadedFor.add(serverId);
     try {
-      const keys = await this.listStorage('probe:');
+      const keys = await this.listStorage(`probe:${serverId}:`);
       for (const k of keys) {
         const v = JSON.parse(k.value);
         this.probeState.set(k.name.slice('probe:'.length), { ok: !!v.ok, lastFail: Number(v.lastFail) || 0 });
@@ -745,6 +749,8 @@ export class MetricsDO {
       this.offlineState.delete(serverId);
       this.arcCache.delete(serverId);
       this.arcPersisted.delete(serverId);
+      this.alertLoadedFor.delete(serverId); // 加载标记同步失效（id 不复用，但避免标记集无界增长）
+      this.probeLoadedFor.delete(serverId);
       for (const k of [...this.alertLast.keys()]) {
         if (k.startsWith(`${serverId}:`)) this.alertLast.delete(k);
       }
@@ -822,7 +828,38 @@ export class MetricsDO {
     // 逐机阈值覆盖：16 核与 1 核小机用同一阈值必然误报或漏报，故允许按机覆盖
     const cfg = resolveAlertCfg(await getAlertCfg(this.env), b.alertOverride);
     if (!cfg.enabled || cfg.muted) return; // 免打扰期内不做阈值判定
-    await this.ensureAlertLoaded(); // 恢复持久化冷却状态
+    // 先做纯阈值判定（零 Storage 读）：一个指标都没越界就直接返回。
+    // 冷实例下每帧都可能是一个新实例，旧实现每次都 list('alert:') 全量恢复所有机器的冷却
+    // 状态，而越界才是少数——这一步把绝大多数帧的这次读省掉（越界时才按机恢复，见下）。
+    const breaches = [];
+    // CPU
+    if (b.cpu != null && b.cpu >= cfg.cpu_pct) {
+      breaches.push({ key: `${b.serverId}:cpu`, text: `CPU ${b.cpu.toFixed(1)}% >= ${cfg.cpu_pct}%` });
+    }
+    // 内存（需要 agent 上报 mem_total）
+    if (b.mem_used != null && b.mem_total != null && b.mem_total > 0) {
+      const memPct = (b.mem_used / b.mem_total) * 100;
+      if (memPct >= cfg.mem_pct) {
+        breaches.push({ key: `${b.serverId}:mem`, text: `内存 ${memPct.toFixed(1)}% >= ${cfg.mem_pct}%` });
+      }
+    }
+    // 磁盘（根分区）：新格式 used/total 计算百分比，旧格式 u 回退
+    const rootDisk = b.extra && b.extra.disk && b.extra.disk.find((d) => d.m === '/');
+    if (rootDisk) {
+      const rootPct = rootDisk.used != null && rootDisk.total > 0
+        ? (rootDisk.used / rootDisk.total) * 100
+        : rootDisk.u;
+      if (rootPct != null && rootPct >= cfg.disk_pct) {
+        breaches.push({ key: `${b.serverId}:disk`, text: `磁盘 / ${rootPct.toFixed(1)}% >= ${cfg.disk_pct}%` });
+      }
+    }
+    // 负载（可选，未设置则不启用）
+    if (cfg.load > 0 && b.extra && b.extra.load1 != null && b.extra.load1 >= cfg.load) {
+      breaches.push({ key: `${b.serverId}:load`, text: `负载 ${b.extra.load1} >= ${cfg.load}` });
+    }
+    if (!breaches.length) return;
+
+    await this.ensureAlertLoadedFor(b.serverId); // 确实越界才恢复该机冷却状态
     const now = Date.now();
     const cooldown = cfg.cooldown_min * 60 * 1000;
     const cooledKeys = []; // 本次判定中置冷却的 key（webhook 失败时缩短冷却，见下）
@@ -836,30 +873,8 @@ export class MetricsDO {
       return true;
     };
     const alerts = [];
-    // CPU
-    if (b.cpu != null && b.cpu >= cfg.cpu_pct && await cooled(`${b.serverId}:cpu`)) {
-      alerts.push(`CPU ${b.cpu.toFixed(1)}% >= ${cfg.cpu_pct}%`);
-    }
-    // 内存（需要 agent 上报 mem_total）
-    if (b.mem_used != null && b.mem_total != null && b.mem_total > 0) {
-      const memPct = (b.mem_used / b.mem_total) * 100;
-      if (memPct >= cfg.mem_pct && await cooled(`${b.serverId}:mem`)) {
-        alerts.push(`内存 ${memPct.toFixed(1)}% >= ${cfg.mem_pct}%`);
-      }
-    }
-    // 磁盘（根分区）：新格式 used/total 计算百分比，旧格式 u 回退
-    const rootDisk = b.extra && b.extra.disk && b.extra.disk.find((d) => d.m === '/');
-    if (rootDisk) {
-      const rootPct = rootDisk.used != null && rootDisk.total > 0
-        ? (rootDisk.used / rootDisk.total) * 100
-        : rootDisk.u;
-      if (rootPct != null && rootPct >= cfg.disk_pct && await cooled(`${b.serverId}:disk`)) {
-        alerts.push(`磁盘 / ${rootPct.toFixed(1)}% >= ${cfg.disk_pct}%`);
-      }
-    }
-    // 负载（可选，未设置则不启用）
-    if (cfg.load > 0 && b.extra && b.extra.load1 != null && b.extra.load1 >= cfg.load && await cooled(`${b.serverId}:load`)) {
-      alerts.push(`负载 ${b.extra.load1} >= ${cfg.load}`);
+    for (const x of breaches) {
+      if (await cooled(x.key)) alerts.push(x.text);
     }
     if (alerts.length) {
       const ok = await sendWebhook(cfg, {
@@ -887,7 +902,7 @@ export class MetricsDO {
   async checkProbeAlerts(serverId, serverName, probes, override) {
     const cfg = resolveAlertCfg(await getAlertCfg(this.env), override);
     if (!cfg.enabled || cfg.muted || !Array.isArray(probes)) return;
-    await this.ensureProbeLoaded(); // 恢复持久化探活状态
+    await this.ensureProbeLoadedFor(serverId); // 恢复该机持久化探活状态（按机，见方法注释）
     const now = Date.now();
     const cooldown = cfg.cooldown_min * 60 * 1000;
     for (const p of probes) {

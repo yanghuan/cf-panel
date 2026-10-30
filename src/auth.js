@@ -131,25 +131,29 @@ export function canUpdateAgent(user, server) {
   return false;
 }
 
+// 列表查询的显式列（不用 SELECT *）：agent_key_hash / agent_key_id 只服务 agent 鉴权，
+// 列表与推送都不需要——没有理由把它们读进内存（PanelDO 那份还是面向浏览器的 DO）。
+const SERVER_LIST_COLS = 'id, user_id, name, "group", display_index, description, last_seen, wan_ip, info_json, probe_json, alert_override';
+
 // 按用户权限查询服务器列表（admin 全量；PAT 按白名单+read scope 在 SQL 层过滤，避免查全表再 JS 过滤；member 看自己的）。
 // 三处共用：GET /api/servers、PanelDO 实时推送、MCP list_servers。
 export async function queryServersForUser(env, user) {
   if (isAdmin(user)) {
-    return env.DB.prepare('SELECT * FROM servers ORDER BY "group", display_index, id').all();
+    return env.DB.prepare(`SELECT ${SERVER_LIST_COLS} FROM servers ORDER BY "group", display_index, id`).all();
   }
   if (user.pat) {
     // 只读 scope 是 PAT 访问服务器的前提
     if (!user.pat.scopes.includes(SCOPE_READ)) return { results: [] };
     if (user.pat.serverIDs == null) {
       // server_ids 为 NULL：未限制 → 全部服务器
-      return env.DB.prepare('SELECT * FROM servers ORDER BY "group", display_index, id').all();
+      return env.DB.prepare(`SELECT ${SERVER_LIST_COLS} FROM servers ORDER BY "group", display_index, id`).all();
     }
     // 白名单模式：空数组 → 空集（不再返回全量，与 canAccessServer 的拒绝语义一致）
     const ids = [...new Set(user.pat.serverIDs.map(Number).filter((n) => n > 0))];
     if (!ids.length) return { results: [] };
-    return env.DB.prepare(`SELECT * FROM servers WHERE id IN (${ids.map(() => '?').join(',')}) ORDER BY "group", display_index, id`).bind(...ids).all();
+    return env.DB.prepare(`SELECT ${SERVER_LIST_COLS} FROM servers WHERE id IN (${ids.map(() => '?').join(',')}) ORDER BY "group", display_index, id`).bind(...ids).all();
   }
-  return env.DB.prepare('SELECT * FROM servers WHERE user_id = ? ORDER BY "group", display_index, id').bind(user.id).all();
+  return env.DB.prepare(`SELECT ${SERVER_LIST_COLS} FROM servers WHERE user_id = ? ORDER BY "group", display_index, id`).bind(user.id).all();
 }
 
 // 在线判定宽限期（秒）：与 PanelDO buildList 的过渡期语义对齐——有观看者且距 0→1 切快采

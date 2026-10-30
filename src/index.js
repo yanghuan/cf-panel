@@ -31,6 +31,9 @@ import {
   serverRowCache, reportBatch, setReportFlushAt,
 } from './report.js';
 
+// 本模块专用常量（cron 维护的批量上限，就近定义便于对照使用代码）
+const R2_LIST_MAX_PAGES = 20; // 孤儿清理每轮最多遍历 20 页（R2 每页 ≤1000 对象），其余下轮继续
+
 // ---------------- Worker 入口 ----------------
 
 export default {
@@ -62,9 +65,16 @@ export async function runJobMaintenance(env, now = Math.floor(Date.now() / 1000)
     try { await env.UPLOADS?.delete(key); result.deletedObjects += 1; } catch { /* ignore */ }
   }
   // 孤儿对象：行已不在（或行被手工删了）但 R2 还留着。按前缀扫一遍，超过 TTL 即删。
+  // R2 list 单页最多 1000 个对象、以 truncated/cursor 分页——必须跟随 cursor 续读：
+  // 旧实现忽略 truncated，staging 对象一旦超过一页，后面的孤儿永远清不掉（10GB 额度慢慢被吃）。
+  // 每轮最多 R2_LIST_MAX_PAGES 页，其余下一小时 cron 继续（避免单次 cron 超时）。
   if (env.UPLOADS) {
-    try {
-      const listed = await env.UPLOADS.list({ prefix: UPLOAD_R2_PREFIX });
+    let cursor = null;
+    for (let page = 0; page < R2_LIST_MAX_PAGES; page++) {
+      let listed;
+      try {
+        listed = await env.UPLOADS.list({ prefix: UPLOAD_R2_PREFIX, cursor: cursor || undefined });
+      } catch { break; } // R2 不可用：跳过，下一轮再试
       for (const obj of listed.objects || []) {
         const uploaded = obj.uploaded instanceof Date ? Math.floor(obj.uploaded.getTime() / 1000) : 0;
         // uploaded 缺失时按"未知"处理：保守跳过，避免误删刚写入的对象
@@ -74,7 +84,10 @@ export async function runJobMaintenance(env, now = Math.floor(Date.now() / 1000)
           result.deletedObjects += 1;
         }
       }
-    } catch { /* R2 不可用：跳过，下一轮再试 */ }
+      const next = listed.truncated ? listed.cursor : null;
+      if (!next || next === cursor) break; // 未截断即结束；游标未前进（异常实现）也退出，防死循环
+      cursor = next;
+    }
   }
   return result;
 }

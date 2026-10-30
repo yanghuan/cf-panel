@@ -265,7 +265,7 @@ test('PanelDO: 列表缓存 TTL 内命中、并发 miss 合并、清缓存后失
   let queries = 0;
   const origPrepare = env.DB.prepare.bind(env.DB);
   env.DB.prepare = (sql) => {
-    if (/SELECT \* FROM servers ORDER BY/.test(sql)) queries += 1;
+    if (/FROM servers ORDER BY/.test(sql)) queries += 1;
     return origPrepare(sql);
   };
   const admin = { id: 1, username: 'admin', role: 1 };
@@ -292,6 +292,35 @@ test('PanelDO: 列表缓存 TTL 内命中、并发 miss 合并、清缓存后失
   assert.equal(inst.listCache, null);
   await inst.filterServersCached(admin);
   assert.equal(queries, 3, '清缓存后重新查询');
+});
+
+// 面向浏览器的 DO 不该把 agent_key_hash（agent 鉴权用的哈希）读进内存；同时 info/probe/
+// alert_override 三个 JSON 应在缓存填充时预解析一次，而不是每次推送对每台机器各 parse 三次。
+test('PanelDO: 列表查询不带 agent_key_hash，JSON 字段预解析进缓存', async () => {
+  const env = makeEnv();
+  await insertServer(env, 'k1', 'srv-a');
+  await env.DB.prepare('UPDATE servers SET info_json = ?, probe_json = ?, alert_override = ? WHERE id = 1')
+    .bind(JSON.stringify({ os: 'linux' }), JSON.stringify([{ name: 'web', ok: true }]), JSON.stringify({ cpu_pct: 80 }))
+    .run();
+  const admin = { id: 1, username: 'admin', role: 1 };
+  const inst = new PanelDO({ getWebSockets: () => [] }, env);
+  let sql = '';
+  const origPrepare = env.DB.prepare.bind(env.DB);
+  env.DB.prepare = (s) => { if (/FROM servers ORDER BY/.test(s)) sql = s; return origPrepare(s); };
+
+  const rows = await inst.filterServersCached(admin);
+  assert.doesNotMatch(sql, /\*/, '列表查询不得用 SELECT *');
+  assert.doesNotMatch(sql, /agent_key_hash/, '不得把 agent_key_hash 读进面向浏览器的 DO');
+  assert.equal(rows[0].agent_key_hash, undefined, '行里也不该有该列');
+  assert.equal(rows[0].info.os, 'linux', 'info 在缓存填充时已预解析');
+  assert.equal(rows[0].probes[0].name, 'web', 'probes 预解析');
+  assert.equal(rows[0].alertOverride.cpu_pct, 80, 'alert_override 预解析');
+
+  // 命中缓存：预解析结果被复用（不重复 parse），列表组装仍走同一份数据
+  const list = await inst.buildList(admin, {});
+  assert.equal(list[0].info.os, 'linux');
+  assert.equal(list[0].probes[0].ok, true);
+  assert.equal(list[0].alert_override.cpu_pct, 80);
 });
 
 test('PanelDO latest_push 按观看者权限广播（不查 /latest）', async () => {
@@ -1123,6 +1152,61 @@ test('MetricsDO: /latest 补扫有单轮上限（升级首轮不阻塞面板首�
   const backfills = prefixes.filter((p) => p.startsWith('m:'));
   assert.equal(backfills.length, 100, '单轮最多补 100 台');
   assert.equal(prefixes.includes('m:102:'), false, '超出的机器本轮不补（下轮或首帧上报补齐）');
+});
+
+// 冷却状态原先每个冷实例全量 list('alert:') 恢复（50 台 × 4 维 ≈ 200 行/帧）；而 120s 慢采下
+// 每帧几乎都是新实例。改成「先做零读的阈值判定，越界才按机恢复」后，正常帧零 alert 读。
+test('MetricsDO: 告警冷却状态按需读（未越界不读，越界才按机恢复）', async () => {
+  const env = makeEnv();
+  await env.DB.prepare("INSERT INTO kv_json (key, value) VALUES ('settings', ?)")
+    .bind(JSON.stringify({ alerts: { webhook_url: 'https://example.com/hook', cpu_pct: 90, cooldown_min: 30 } })).run();
+  const st = mockState();
+  const { inst, call } = mkMetrics(env, st);
+  const lists = [];
+  const orig = inst.listStorage.bind(inst);
+  inst.listStorage = async (p, o) => { if (p.startsWith('alert:')) lists.push(p); return orig(p, o); };
+  const cap = captureFetch();
+  try {
+    const nowMin = Math.floor(Date.now() / 1000 / 60);
+    const report = (cpu, minTs) => call('/report', {
+      method: 'POST', body: JSON.stringify({ serverId: 1, serverName: 's1', minTs, cpu }),
+    });
+
+    await report(10, nowMin);
+    assert.deepEqual(lists, [], '未越界：零 alert 读（含冷却状态）');
+    assert.equal(cap.calls.length, 0, '未越界不告警');
+
+    await report(95, nowMin + 1);
+    assert.deepEqual(lists, ['alert:1:'], '越界才按机前缀恢复该机冷却状态');
+    assert.equal(cap.calls.length, 1, '首次越界告警');
+
+    await report(98, nowMin + 2);
+    assert.equal(lists.length, 1, '同实例内该机只恢复一次');
+    assert.equal(cap.calls.length, 1, '冷却期内不重复告警');
+  } finally { cap.restore(); }
+});
+
+// 探活状态同样按机加载：旧实现每次 checkProbeAlerts 都 list('probe:') 全量（500 台 × 探针数）。
+test('MetricsDO: 探活冷却状态按机前缀加载（不再 list 全部 probe:）', async () => {
+  const env = makeEnv();
+  await env.DB.prepare("INSERT INTO kv_json (key, value) VALUES ('settings', ?)")
+    .bind(JSON.stringify({ alerts: { webhook_url: 'https://example.com/hook', cooldown_min: 30 } })).run();
+  const st = mockState();
+  // 另一台机器的残留状态：按机加载时不该被这台机器的帧读进来
+  await st.storage.put('probe:9:web', JSON.stringify({ ok: false, lastFail: Date.now() }));
+  const { inst, call } = mkMetrics(env, st);
+  const lists = [];
+  const orig = inst.listStorage.bind(inst);
+  inst.listStorage = async (p, o) => { if (p.startsWith('probe:')) lists.push(p); return orig(p, o); };
+  const cap = captureFetch();
+  try {
+    await call('/report', {
+      method: 'POST',
+      body: JSON.stringify({ serverId: 1, serverName: 's1', minTs: Math.floor(Date.now() / 1000 / 60), probes: [{ name: 'web', ok: false }] }),
+    });
+    assert.deepEqual(lists, ['probe:1:'], '只加载本机前缀，不扫全部 probe:');
+    assert.equal(inst.probeState.has('9:web'), false, '其他机器的冷却状态不进入本实例内存');
+  } finally { cap.restore(); }
 });
 
 test('MetricsDO: /drop 清理 storage 告警/探活状态', async () => {

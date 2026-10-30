@@ -8,7 +8,7 @@ import assert from 'node:assert/strict';
 import worker, { __internals as I, TerminalDO } from '../src/index.js';
 import { EXEC_CMD_MAX_BYTES, SERVER_DESC_MAX } from '../src/config.js';
 import { settleServerExpired } from '../src/jobs.js';
-import { makeEnv, makePanelStub, makeMetricsStub, requestBuilder } from './helpers.js';
+import { makeEnv, makePanelStub, makeMetricsStub, makeR2, requestBuilder } from './helpers.js';
 
 // node 没有 FixedLengthStream（Workers 才有）：用 TransformStream 搭一个等价物，
 // 让上传测试走真实的 FixedLengthStream 分支（超长写抛错、提前 close 报错、写满才成功）。
@@ -2389,6 +2389,25 @@ test('cron 维护：过期任务收敛为 expired、TTL 到期删行、R2 孤儿
   const r2 = await runJobMaintenance(env, now);
   assert.equal(r2.deletedObjects, 1);
   assert.equal(await env.UPLOADS.head('upload-jobs/job_orphan'), null, '超期孤儿对象回收');
+});
+
+// R2 list 单页 ≤1000 且以 truncated/cursor 分页：旧实现忽略 truncated，staging 对象一旦
+// 超过一页，后面的孤儿永远清不掉（10GB 额度就是这么慢慢被吃掉的）。
+test('cron 维护：R2 孤儿回收跟随 cursor 分页（超过一页也清干净）', async () => {
+  const { runJobMaintenance } = await import('../src/index.js');
+  const env = makeEnv({ UPLOADS: makeR2({ listPageSize: 2 }) }); // 强制每页 2 个，5 个对象 → 3 页
+  const now = Math.floor(Date.now() / 1000);
+  for (let i = 0; i < 5; i++) {
+    const key = `upload-jobs/orphan-${i}`;
+    await env.UPLOADS.put(key, 'x');
+    env.UPLOADS.objects.get(key).uploaded = new Date((now - 90000) * 1000);
+  }
+
+  const r = await runJobMaintenance(env, now);
+  assert.equal(r.deletedObjects, 5, '跨页的孤儿对象全部回收（只清第一页会留下 3 个）');
+  for (let i = 0; i < 5; i++) {
+    assert.equal(await env.UPLOADS.head(`upload-jobs/orphan-${i}`), null, `orphan-${i} 已回收`);
+  }
 });
 
 // streamToR2 曾经"先攒后写"：100MB 上传会在内存里驻留 100MB，而 Workers 上限 128MB，

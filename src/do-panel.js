@@ -95,7 +95,10 @@ export class PanelDO {
     } catch { /* alarm 不可用时仍受 pending 数量硬上限保护 */ }
   }
 
-  // 服务器列表缓存 + 权限过滤（过滤在缓存之上执行，不缓存可越权结论）
+  // 服务器列表缓存 + 权限过滤（过滤在缓存之上执行，不缓存可越权结论）。
+  // 只取展示需要的列：`SELECT *` 会把 `agent_key_hash` 一并载入这个面向浏览器的 DO——
+  // 列表渲染根本用不到它（安全 + 缓存内存）。同时把 info/probe/alert_override 三个 JSON
+  // 在**填充缓存时预解析一次**：旧实现每次推送对每台机器各 JSON.parse 三次（500 台/5s）。
   async filterServersCached(user) {
     const now = Date.now();
     let rows;
@@ -109,9 +112,18 @@ export class PanelDO {
       // 本次结果不得写回缓存，否则会把变更前的行盖上新的 ts（最长 20s 回退）。
       const epoch = this.listEpoch;
       this.listInflight = (async () => {
-        const r = await this.env.DB.prepare('SELECT * FROM servers ORDER BY "group", display_index, id').all();
-        if (epoch === this.listEpoch) this.listCache = { rows: r.results, ts: Date.now() };
-        return r.results;
+        const r = await this.env.DB.prepare(
+          'SELECT id, user_id, name, "group", display_index, description, last_seen, wan_ip, info_json, probe_json, alert_override'
+          + ' FROM servers ORDER BY "group", display_index, id'
+        ).all();
+        const list = (r.results || []).map((s) => ({
+          ...s,
+          info: safeJson(s.info_json),
+          probes: safeJson(s.probe_json),
+          alertOverride: safeJson(s.alert_override),
+        }));
+        if (epoch === this.listEpoch) this.listCache = { rows: list, ts: Date.now() };
+        return list;
       })();
       try {
         rows = await this.listInflight;
@@ -291,10 +303,11 @@ export class PanelDO {
       // 在线判定优先用 MetricsDO 秒级 last_seen_s；D1 last_seen 节流写，仅冷启动兜底
       online: now - (latest[s.id]?.last_seen_s || s.last_seen || 0) < grace,
       wan_ip: s.wan_ip || '',
-      info: safeJson(s.info_json),
-      probes: safeJson(s.probe_json),
+      // info/probes/alert_override 在 filterServersCached 填充缓存时已预解析（见该函数注释）
+      info: s.info || null,
+      probes: s.probes || null,
       // 逐机告警阈值覆盖：与 REST /api/servers 同构，前端编辑弹窗据此回填
-      alert_override: safeJson(s.alert_override),
+      alert_override: s.alertOverride || null,
       metric: latest[s.id] || null,
     }));
   }

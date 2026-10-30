@@ -273,7 +273,7 @@
 
 ## 九、修复验证（2026-10-30，已提交 `6bb26ce` + `0a43f0a`）
 
-修复后 `npm test` → **294/294 通过**；`node scripts/e2e.mjs` → **33/33**（wrangler dev + release agent，含 MCP 17 工具）。Rust 源码未改（仅为 E2E 重新构建了 release 二进制）。
+修复后 `npm test` → **297/297 通过**；`node scripts/e2e.mjs` → **33/33**（wrangler dev + release agent，含 MCP 17 工具）。Rust 源码未改（仅为 E2E 重新构建了 release 二进制）。
 
 | 发现 | 状态 | 实现与验证 |
 |---|---|---|
@@ -288,7 +288,7 @@
 | 文档漂移 10 处 | ✅ 已修 | architecture（120s/300s/事件驱动）、README（异步更新）、agent/README（异步拉取 + 3 个变量）、schema、e2e 17 工具、app.js 注释、设计文档 §7.5；README 保持 CRLF，diff 仅 1 行 |
 | 复核补的游标失败顺序 | ✅ 已修 | `persistDayCursors` 返回失败集合；`flushDayPending` 对本轮游标未落盘的机器**不写 D1**（否则 D1 有增量、游标更早 → 下次重复记账），增量保留到下次重试；新增用例 |
 | 探针状态兜底对账 | ✅ 已修 | alarm 内 `pruneStaleProbeStates`：以 D1 `probe_json` 为准清理残留冷却，覆盖「清理帧丢失」与「只删掉其中一个探针」；门控 = 配了 webhook + 每小时一次（原 10 分钟一次 = 72 万键读/天 → −6×） |
-| A/B 档额度优化 | ✅ 已实施 | `arc` 水位降频（1,440 → 144 写/台/天，含冷启动 `arcPersisted` 初始化）；`fullSweep` 500 行/页分页 + 单机缓冲 + 128 键批量删；`/latest` 冷启动改读 `l:` 快照（288 写/台/天，最坏 720）+ 缺快照逐机补扫；PanelDO 列表缓存 20s + 并发合并 + 失效代际 + 6 条写路径清缓存（带 1s 超时）；`/viewers` 探针 300s；前端更新后不再 2.5s 轮询；`/api/usage` 估算改按服务器数解析 |
+| A/B 档额度优化 | ✅ 已实施（四审补齐三项） | `arc` 水位降频（1,440 → 144 写/台/天，含冷启动 `arcPersisted` 初始化）；`fullSweep` 500 行/页分页 + 单机缓冲 + 128 键批量删；`/latest` 冷启动改读 `l:` 快照（288 写/台/天，最坏 720）+ 缺快照逐机补扫（单轮 ≤100 台）；PanelDO 列表缓存 20s + 并发合并 + 失效代际 + 6 条写路径清缓存（带 1s 超时）+ **列裁剪（不读 agent_key_hash）+ info/probe/alert_override 预解析**；**告警/探活冷却状态按需读**（阈值前置判定 + 按机前缀，正常帧零读）；`/viewers` 探针 300s；前端更新后不再 2.5s 轮询；`/api/usage` 估算改按服务器数解析 |
 | 二审 P3-1 慢采 D1 写偏高 31% | ✅ 已修 | `slow_d1_writes` 3024 → 2304（慢采 `last_seen` 每帧写 720，非 60s 节流的 1,440），note 按两档写明 |
 | 二审 P3-2 `/latest` 回退是全局判断 | ✅ 已修 | 缺 `l:` 的机器按 `m:<id>:` 前缀**逐机补扫**，其余机器零额外读；用例断言只扫 `l:` 与 `m:2:` |
 | 二审 P3-3 文档 `l:` 频率口径 | ✅ 已修 | architecture 补「冷启动首帧必写、最坏 720 写/台/天」 |
@@ -305,9 +305,13 @@
 | 三审 #5 对账失败仍推进时间戳 | ✅ 已修 | `pruneStaleProbeStates` 返回布尔；失败（Storage/D1 抖动或删除失败）不推进 `lastProbePruneAt`，下轮 alarm（10 分钟）重试；用例覆盖 |
 | 三审 #6 本文档标题 | ✅ 已修 | 标题改为 `6bb26ce` + `0a43f0a` |
 | 三审 #7 `slow_do_events` 偏低 | ✅ 已修 | 补探活 pong（288/天 ÷20）与 `/viewers` 自愈反查（288/天）；note 写明构成；快/慢两档都补 |
+| 四审 (1) architecture 措辞自相矛盾 | ✅ 已修 | `l:<id>` 描述与 §九 统一为「写入那一刻的最新帧（= 该分钟首帧），同分钟后续帧只在内存」 |
+| 四审 (2) §8.9 第 1 项只做一半（告警/探活仍全量读） | ✅ 已修 | `ensureAlertLoaded`/`ensureProbeLoaded` 改 `...For(serverId)` 按机前缀加载；`checkAlerts` 先做零读阈值判定，**未越界直接返回**（冷实例每帧的 `list('alert:')` 消失），越界才恢复该机冷却；用例覆盖「未越界零读 / 越界按机读一次」 |
+| 四审 (3) §8.9 第 3 项部分未做 | ✅ 已修 | `filterServersCached` 与 `queryServersForUser` 的 `SELECT *` 改显式列（不再把 `agent_key_hash` 读进面向浏览器的 DO）；`info/probe/alert_override` 在缓存填充时预解析（原先每次推送 × 每台 × 3 次 parse）；用例断言 SQL 无 `*`/无 `agent_key_hash`、字段已预解析 |
+| 四审 (4) §8.4-10 R2 孤儿清理忽略 truncated | ✅ 已修 | `runJobMaintenance` 跟随 `cursor` 分页续读（每轮 ≤`R2_LIST_MAX_PAGES`=20 页），游标未前进则退出防死循环；R2 桩支持 `listPageSize`，用例：5 个孤儿 + 每页 2 → 全部回收 |
 
 **残余（本轮仍不做）**
 
 1. 「清理帧丢失 / 只删一个探针」已由 alarm 对账收口，残余降级为：**对账周期内（≤1 小时）** 同名探针重新启用可能沿用旧冷却——前提是配了 webhook，最坏造成一次通知抖动。
 2. `settleServerExpired` / `settleExpiredAll` 的收敛路径不写审计（`expired` 的 upload/update 无终态审计行），与「审计只在终态写」的既有取舍一致。
-3. §八 的 C 档（`REPORT_FWD_THROTTLE_S` 5→10、`SHARDS` 4→2、`LAST_SEEN_THROTTLE_S` 60→180、idle 10→5min）与 8.7 内存专项（`serverListCache` 上限、`data` 热区 LRU、`fetch.rs` 同步写）仍未实施。
+3. §八 仍剩：C 档（`REPORT_FWD_THROTTLE_S` 5→10、`SHARDS` 4→2、`LAST_SEEN_THROTTLE_S` 60→180、idle 10→5min）、8.7 内存专项（`serverListCache` 条目/字节双限、`data` 热区 LRU、`fetch.rs` 同步写改走 `blocking.rs`）、8.4-10 的 `proxy.rs` 兼容性注释。8.9 前三项与 8.4-5/-10 已闭环。

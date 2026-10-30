@@ -111,7 +111,12 @@ export class TerminalDO {
         this.sessions.delete(sid);
         await this.state.storage.delete('sess:' + sid).catch(() => {}); // 清理持久化会话（await：不留未完成 I/O）
       }
-      this.agentInterval.delete(serverId); // 服务器已删，间隔索引一并作废（id 不复用）
+      // 服务器已删：间隔/往返/探活索引一并作废。servers.id 是 AUTOINCREMENT、不复用，
+      // 留着也不会被新服务器命中，但清理清单与 cleanup 保持一致，避免规则半途而废。
+      this.agentInterval.delete(serverId);
+      this.lastRoundTripAt.delete(serverId);
+      this.lastProbeAt.delete(serverId);
+      this.probeCapable.delete(serverId);
       // 清理该服务器的 open_terminal/open_file 待确认（定时器停止）
       for (const sid of sids) {
         const r = this.pendingOpen.get(sid);
@@ -1369,7 +1374,8 @@ export class TerminalDO {
     if (!matched.length && attServerId) matched.push(attServerId);
     for (const serverId of matched) {
       const isCurrent = this.agents.get(serverId) === ws;
-      // 被顶替的旧连接（isCurrent=false）不删 agents/interval：新连接正持有同一 serverId。
+      // 被顶替的旧连接（isCurrent=false）不删 agents / agentInterval / lastRoundTripAt /
+      // lastProbeAt / probeCapable：新连接正持有同一 serverId，这些值属于它。
       // 在途异步任务的状态全在 D1（不在内存 Promise 里），顶替连接不影响它们，
       // 不会让明明还在跑的请求收到假的"agent disconnected"。
       if (isCurrent) {

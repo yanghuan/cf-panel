@@ -559,7 +559,7 @@ WHERE id=? AND status IN ('queued','running','expired')
 
 DO evict 后内存 Map 全空，但 Agent 的 `exec_result` 到达会唤醒 DO；因状态在 D1，任务仍可完成。这正是本方案的核心验收点。
 
-### 7.4 后续项：把探活并入上报（可删 probe 帧）
+### 7.5 后续项：把探活并入上报（可删 probe 帧）
 
 当前维持 `lastRoundTripAt` 新鲜度的成本是**每机每 360s 一帧 `probe` + 一个 `pong` 入站请求**
 （约 240 次/天/机；相对慢采上报的 720 帧是 +33%，且两帧都不携带业务数据）。

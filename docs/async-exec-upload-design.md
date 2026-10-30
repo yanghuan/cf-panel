@@ -504,7 +504,10 @@ CREATE INDEX IF NOT EXISTS idx_audit_logs_job_id ON audit_logs(job_id);
 
 1. 校验命令长度、serverId、job 仍然合法。
 2. 检查 `updating`、旧同步 `pendingExec`，以及 D1 中该服务器是否正在 agent update。
-3. 可保留现有 1 秒探活（`pendingProbe` 只短暂存在）；探活失败返回错误，不创建长等待。
+3. 链路可信度（仅对声明 `probe_proto` 的 agent）：`lastRoundTripAt` 在 `EXEC_ROUNDTRIP_TTL_MS`（900s）内直接下发。
+   该时间戳由「上报顺风车 probe」的 `pong` 刷新，并同时写入连接附件，evict 后可恢复；
+   **无任何记录**（刚冷启动）→ 乐观放行；**有记录但已过期** → 补发一帧 probe 并返回 503，
+   让调用方重试（命令尚未下发，重试安全）。不再当场等待 pong，也不再使用 `pendingProbe`。
 4. 更新 D1 `status='running', started_at=...`（条件 `status='queued'`）。
 5. 发送 Agent 帧：
 
@@ -551,7 +554,8 @@ WHERE id=? AND status IN ('queued','running','expired')
 2. 条件更新未命中时说明是重复回执（真正的终态已写入），记录 debug 日志并忽略。
    `expired` 是刻意包含的：允许迟到回执把"曾判过期"纠正为真实结果（见 §5.2 的软终态说明），否则命令可能已经执行、调用方却永远看到 expired。
 3. 写 `exec.command` 审计（`duration_ms`、`job_id`）；审计失败不回滚任务结果。
-4. 更新 `lastRoundTripAt`，保留现有探活缓存语义。
+4. 更新 `lastRoundTripAt`，并把时间戳一并写进连接附件（与 `pong` 同源）；evict 后 `rebuildIndex`
+   从附件恢复，后续 exec 仍走快路径。
 
 DO evict 后内存 Map 全空，但 Agent 的 `exec_result` 到达会唤醒 DO；因状态在 D1，任务仍可完成。这正是本方案的核心验收点。
 

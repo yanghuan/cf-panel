@@ -363,7 +363,7 @@ Rust 版以 `#[cfg(unix)]` / `#[cfg(windows)]` 条件编译实现三平台（平
 
 > **实际实现（2026-08，Rust 版）**：采用下述简化协议，以下"magic 帧/多路复用"为初版设计参考（对齐哪吒），当前未使用。
 > - **鉴权**：agent 数据流（`/ws/agent/terminal|file`）用 `X-Agent-Key` 请求头（key 指纹 + 哈希校验）；浏览器流（`/ws/terminal|file`）用**首帧** `{type:"auth", token}`（token 不进 URL，防日志/历史泄露）。
-> - **控制通道**（agent 常驻 WS）：JSON 文本帧 `open_terminal` / `open_file` / `resize {stream_id,rows,cols}` / `set_report_interval {interval}` / `ping`（心跳）/ `exec {exec_id, command, timeout_s}`（一次性命令）/ `probe {id}`（下行探活，仅对声明 `probe_proto` 的 agent）；agent 回执 `terminal_ready` / `file_ready` / `pong {id}` / `exec_result {exec_id, exit_code, stdout, stderr, timed_out}`。自更新使用 Binary 混合帧（`agent_update` JSON 头 + `\n` + ≤48KB 原始字节），最终回 `agent_update_result`。
+> - **控制通道**（agent 常驻 WS）：JSON 文本帧 `open_terminal` / `open_file` / `resize {stream_id,rows,cols}` / `set_report_interval {interval}` / `ping`（心跳）/ `exec {exec_id, command, timeout_s}`（一次性命令）/ `probe {id}`（下行探活，仅对声明 `probe_proto` 的 agent；回执 `pong` 只用于刷新 exec 判据的「最近往返时间」，DO 不等待）；agent 回执 `terminal_ready` / `file_ready` / `pong {id}` / `exec_result {exec_id, exit_code, stdout, stderr, timed_out}`。自更新使用 Binary 混合帧（`agent_update` JSON 头 + `\n` + ≤48KB 原始字节），最终回 `agent_update_result`。
 >   - 异步 exec 的 `exec_id` **就是 `operation_jobs.id`**（`job_` 前缀），DO 收到 `exec_result` 后据此把终态写回 D1。同步旧路径的 `exec_id` 为随机串，两者靠前缀区分，过渡期共存。
 > - **终端数据流**：纯字节透传（输入/输出无帧头，单向直转）；resize 走控制通道（非数据流帧）。
 > - **心跳保活**：控制通道 `ping` + DO 侧 30s 限频心跳下行，防健康连接被误判半开。

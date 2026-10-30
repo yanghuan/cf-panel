@@ -696,9 +696,11 @@ export class TerminalDO {
     this.lastProbeAt.delete(serverId);
     try {
       const a = ws.deserializeAttachment?.();
-      if (a && typeof a === 'object' && a.role === 'control' && a.probe) {
+      if (a && typeof a === 'object' && a.role === 'control' && (a.probe || a.rtt)) {
         const next = { ...a };
         delete next.probe;
+        // 与内存一致：能力撤销即作废往返记录，否则 evict 后 rebuildIndex 会把陈旧 rtt 复活
+        delete next.rtt;
         ws.serializeAttachment(next);
       }
     } catch { /* ignore */ }

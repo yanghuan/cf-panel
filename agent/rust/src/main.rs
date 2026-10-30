@@ -1503,8 +1503,10 @@ async fn dispatch(
     match ty {
         "ping" => {} // 心跳保活，忽略
         "probe" => {
-            // DO exec 前往返探活：原样回 pong（走与 exec_result 相同的回程），让 DO 确认下行
-            // 可达后再下发指令。无 id 忽略。id 为服务端生成的 UUID，无 JSON 转义风险。
+            // DO 侧 exec 判据的探活帧：原样回 pong（走与 exec_result 相同的回程），DO 据此刷新
+            // 「最近往返时间」，用于决定是否信任当前控制连接。注意 DO 不再当场等待本回执
+            //（已无 pendingProbe），回执只用于维持判据新鲜度。无 id 忽略；id 为服务端生成的
+            // UUID，无 JSON 转义风险。
             if let Some(id) = v.get("id").and_then(|x| x.as_str()) {
                 ctrl_enqueue(
                     tx,

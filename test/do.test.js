@@ -1408,6 +1408,24 @@ test('TerminalDO: pong 刷新往返时间并写入附件（evict 后可恢复）
   assert.equal(inst2.lastRoundTripAt.get(1), att.rtt, '唤醒后 rtt 从附件恢复');
 });
 
+test('TerminalDO: 能力撤销同时清附件 rtt（不会在 evict 后被复活）', async () => {
+  const env = makeEnv();
+  let att = { role: 'control', serverId: 1, probe: true, rtt: 12345 };
+  const ws = {
+    deserializeAttachment: () => att,
+    serializeAttachment: (a) => { att = a; },
+    send() {}, readyState: 1,
+  };
+  const inst = new TerminalDO(mockState(), env);
+  inst.agents.set(1, ws);
+  inst.probeCapable.add(1);
+  inst.lastRoundTripAt.set(1, 12345);
+  inst.clearProbeCapable(ws, 1);
+  assert.equal(att.probe, undefined, 'probe 标记被清除');
+  assert.equal(att.rtt, undefined, 'rtt 一并清除，避免陈旧记录被 rebuildIndex 复活');
+  assert.equal(inst.lastRoundTripAt.has(1), false, '内存同步清除');
+});
+
 test('TerminalDO: evict 后（附件恢复 probeCapable、无 RTT）exec 乐观放行', async () => {
   const env = makeEnv();
   await env.DB.prepare('INSERT INTO servers (agent_key_id, name, user_id, agent_key_hash) VALUES (?,?,?,?)')

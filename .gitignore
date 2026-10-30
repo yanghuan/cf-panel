@@ -146,3 +146,6 @@ vite.config.ts.timestamp-*
 .dev.vars
 .wrangler/
 .mcp.json
+
+# CodeBuddy skill 本地凭证（含 API Token，勿提交）
+.codebuddy/skills/*/.env

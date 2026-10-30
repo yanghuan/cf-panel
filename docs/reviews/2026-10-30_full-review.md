@@ -2,7 +2,7 @@
 
 - 基线：`645a69f`（2026-08-28 第 10 轮）→ `490ccd3`（HEAD），**112 个提交**，`src/ public/ agent/rust/src/ migrations/ schema.sql test/ scripts/ docs/` 合计 **+16470 / −1729**。
 - 范围：`src/` 全部 11 模块、`public/` 全部（含 i18n 语言包）、`agent/rust/src` 全部 13 源文件、`test/` 全部、`scripts/e2e.mjs`、`wrangler.toml`、`schema.sql`、`migrations/`、`docs/`。
-- 动态验证：`npm test` → **267/267 通过**（21.1s）；`cargo clippy --all-targets` → **零警告**；E2E 未执行（需 wrangler dev + release 二进制）。
+- 动态验证（**review 当时的基线快照**；修复后的最终数字见 §九）：`npm test` → **267/267 通过**（21.1s）；`cargo clippy --all-targets` → **零警告**；E2E 未执行（需 wrangler dev + release 二进制）。
 - 结论：异步化（exec/upload/agent_update）重构整体质量高，状态机与失败路径显式，安全边界未被削弱。本轮新发现 **1 个 P2（天账在实例 evict 后停止累加）**、7 个 P3、10 个 P4/观察项，另有 10 处文档与实现漂移。
 
 ## 一、改动概览（本轮 review 的主战场）
@@ -331,10 +331,9 @@
 
 **残余（本轮仍不做）**
 
-1. 「清理帧丢失 / 只删一个探针」已由 alarm 对账收口，残余降级为：**对账周期内（≤1 小时）** 同名探针重新启用可能沿用旧冷却——前提是配了 webhook，最坏造成一次通知抖动。
-2. `settleServerExpired` / `settleExpiredAll` 的收敛路径不写审计（`expired` 的 upload/update 无终态审计行），与「审计只在终态写」的既有取舍一致。
+1. **探针冷却残留（已接受的取舍）**：「清理帧丢失 / 只删一个探针」已由 alarm 对账收口，残余降级为：**对账周期内（≤1 小时）** 同名探针重新启用可能沿用旧冷却——前提是配了 webhook，最坏造成一次通知抖动。
+2. **过期任务不写终态审计（已接受的取舍）**：`settleServerExpired` / `settleExpiredAll` 的收敛路径不写审计（`expired` 的 upload/update 无终态审计行），与「审计只在终态写」的既有取舍一致。
 3. §8.5 的四项产品决策未调整：`REPORT_FWD_THROTTLE_S` 5→10、`SHARDS` 4→2、`LAST_SEEN_THROTTLE_S` 60→180、idle 10→5min（都会改界面新鲜度或需迁移动作，待真实额度数据）。
 4. §8.7 内存专项：`serverListCache` 无字节上限、`data` 热区无 LRU、`fetch.rs` 在 async 任务里用 `std::fs::File`（可改走 `blocking.rs`）。
-5. 两处接受的取舍：探针冷却在对账周期内（≤1 小时）可能沿用旧值；`settleExpired(All)` 的收敛路径不写终态审计。
-6. **历史 P4 未清空**：五审实现 7 条、六审/七审收敛 A–E 与列清单重复，均有用例；其余（`markUploadStaged` 误报、`proxy.rs` 文案）已核实为非问题或不影响行为。
-5. **R2 孤儿清理的 cursor 不跨轮持久化**：每轮最多 20 页（2 万对象），若存活对象长期超过该量且前 20 页都不可删（例如缺 `uploaded` 元数据被「宁留不误删」跳过），第 21 页之后的孤儿轮不到。当前 staging 对象随任务清理、规模远到不了 2 万；要彻底闭合可把 cursor 存 `kv_json`，或只在本页有删除时继续翻页。
+5. **历史 P4 未清空**：五审实现 7 条、六审/七审收敛 A–E 与列清单重复，均有用例；其余（`markUploadStaged` 误报、`proxy.rs` 文案）已核实为非问题或不影响行为。
+6. **R2 孤儿清理的 cursor 不跨轮持久化**：每轮最多 20 页（2 万对象），若存活对象长期超过该量且前 20 页都不可删（例如缺 `uploaded` 元数据被「宁留不误删」跳过），第 21 页之后的孤儿轮不到。当前 staging 对象随任务清理、规模远到不了 2 万；要彻底闭合可把 cursor 存 `kv_json`，或只在本页有删除时继续翻页。

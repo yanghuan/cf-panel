@@ -7,7 +7,9 @@ import {
   ONLINE_GRACE_FAST_S, ONLINE_GRACE_SLOW_S, SHARDS, SCOPE_READ,
 } from './config.js';
 import { json, doForShard, doMetrics, safeJson } from './utils.js';
-import { authIdentityByToken, authUserByIdentity, isAdmin } from './auth.js';
+import {
+  authIdentityByToken, authUserByIdentity, isAdmin, SERVER_LIST_COLS,
+} from './auth.js';
 
 // 本模块专用常量（缓存 TTL / 频率下限 / 切快采过渡期，就近定义便于对照使用代码）
 // 服务器列表缓存 TTL。原先 4500ms 是为「前端 3s sync」设计的；现在 sync 只在连接时发一次、
@@ -112,9 +114,10 @@ export class PanelDO {
       // 本次结果不得写回缓存，否则会把变更前的行盖上新的 ts（最长 20s 回退）。
       const epoch = this.listEpoch;
       this.listInflight = (async () => {
+        // 列清单与 auth.js 的 SERVER_LIST_COLS 同源（单一来源）：两份拷贝一旦漂移，
+        // 这里会静默少列（buildList 某个字段变 undefined），而 SELECT * 的错误换种形式回来。
         const r = await this.env.DB.prepare(
-          'SELECT id, user_id, name, "group", display_index, description, last_seen, wan_ip, info_json, probe_json, alert_override'
-          + ' FROM servers ORDER BY "group", display_index, id'
+          `SELECT ${SERVER_LIST_COLS} FROM servers ORDER BY "group", display_index, id`
         ).all();
         const list = (r.results || []).map((s) => ({
           ...s,

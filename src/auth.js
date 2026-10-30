@@ -133,7 +133,7 @@ export function canUpdateAgent(user, server) {
 
 // 列表查询的显式列（不用 SELECT *）：agent_key_hash / agent_key_id 只服务 agent 鉴权，
 // 列表与推送都不需要——没有理由把它们读进内存（PanelDO 那份还是面向浏览器的 DO）。
-const SERVER_LIST_COLS = 'id, user_id, name, "group", display_index, description, last_seen, wan_ip, info_json, probe_json, alert_override';
+export const SERVER_LIST_COLS = 'id, user_id, name, "group", display_index, description, last_seen, wan_ip, info_json, probe_json, alert_override';
 
 // 按用户权限查询服务器列表（admin 全量；PAT 按白名单+read scope 在 SQL 层过滤，避免查全表再 JS 过滤；member 看自己的）。
 // 三处共用：GET /api/servers、PanelDO 实时推送、MCP list_servers。

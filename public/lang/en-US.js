@@ -28,7 +28,7 @@
     'common.unit.day': 'd',
     'common.dash': '—',
     'common.gotIt': 'Got it',
-    'common.listSep': '/ ',
+    'common.listSep': ', ',
     'common.labelValue': '{label}: {value}',
     'common.pctInParen': ' ({v}%)',
     'common.inProgress': '{op}: {dest}',

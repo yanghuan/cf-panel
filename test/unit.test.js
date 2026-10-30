@@ -961,6 +961,24 @@ test('前端：Agent 更新后等推送回传版本号，不再 2.5s 轮询 /api
   assert.match(app, /pushAlive/, '仅当推送停摆时才回退 REST');
 });
 
+// 服务器列表的列清单必须单一来源：auth.js 导出 SERVER_LIST_COLS，PanelDO 复用它。
+// 两份拷贝一旦漂移，PanelDO 会静默少列（buildList 某字段变 undefined），
+// 而「不要 SELECT *」这个初衷会以「漏列」的形式重新出问题。
+test('服务器列表列清单单一来源：do-panel 不得复制 auth 的列清单', () => {
+  const root = nodePath.join(nodePath.dirname(fileURLToPath(import.meta.url)), '..');
+  const panel = nodeFs.readFileSync(nodePath.join(root, 'src/do-panel.js'), 'utf8');
+  assert.match(panel, /SERVER_LIST_COLS/, 'PanelDO 必须复用 auth.js 导出的列清单');
+  assert.doesNotMatch(panel, /SELECT\s+id,\s*user_id,\s*name/, '不得再内联一份列清单');
+  const auth = nodeFs.readFileSync(nodePath.join(root, 'src/auth.js'), 'utf8');
+  assert.match(auth, /export const SERVER_LIST_COLS/, '列清单必须导出，供其它模块复用');
+  // 清单必须自洽：不含鉴权列，含列表渲染用到的全部字段
+  const cols = auth.match(/export const SERVER_LIST_COLS = '([^']+)'/)[1];
+  assert.doesNotMatch(cols, /agent_key_hash|agent_key_id/, '列表查询不得包含 agent 鉴权列');
+  for (const need of ['id', 'name', 'display_index', 'description', 'last_seen', 'wan_ip', 'info_json', 'probe_json', 'alert_override']) {
+    assert.ok(cols.includes(need), `列清单缺少 ${need}（buildList/listServersWithState 依赖）`);
+  }
+});
+
 // 从 src/ 抽取所有 err(..., 'CODE') 的错误码：前端在 api.js 里按 error.<CODE> 查表，
 // 漏一个就退化成英文原文（中文界面里最扎眼的一类不一致）。以代码为源，避免人工维护漂移。
 function extractErrCodes() {

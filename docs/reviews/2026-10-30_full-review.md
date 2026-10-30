@@ -273,7 +273,7 @@
 
 ## 九、修复验证（2026-10-30，已提交 `6bb26ce` + `0a43f0a`）
 
-修复后 `npm test` → **303/303 通过**；`node scripts/e2e.mjs` → **33/33**（wrangler dev + release agent，含 MCP 17 工具）。Rust 源码未改（仅为 E2E 重新构建了 release 二进制）。
+修复后 `npm test` → **304/304 通过**；`node scripts/e2e.mjs` → **33/33**（wrangler dev + release agent，含 MCP 17 工具）。Rust 源码未改（仅为 E2E 重新构建了 release 二进制）。
 
 | 发现 | 状态 | 实现与验证 |
 |---|---|---|
@@ -321,6 +321,8 @@
 | 六审 C `join('、')` 逃过断言 | ✅ 已修 | 改 `join(t('common.listSep'))`，`CPU（%）` 改 `t('monitor.cpu')`；断言扩到单引号字面量（`join('、')` 还原即变红）。顺带修掉上一轮引入的 bug：`const t = swap_total` 遮蔽了 i18n `t()` |
 | 六审 D `IDEMPOTENCY_CONFLICT` 无翻译且测试盲区 | ✅ 已修 | 抽取正则 `\b\w+\.code`（原只匹配 `err.code`，漏 `e.code`）；补齐中英翻译。改完断言立刻抓到缺失，现已通过 |
 | 六审 E `/api/tokens/:id` 同类前缀问题 | ✅ 已修 | DELETE/PATCH 改 `^/api/tokens/(\d+)$`；用例：子路径不删令牌、不改 scopes（还原即变红） |
+| 七审 (1) 列清单两份拷贝 | ✅ 已修 | `SERVER_LIST_COLS` 从 auth.js 导出，PanelDO 复用（不再内联 11 列）；静态断言锁定「单一来源 + 不含 agent 鉴权列 + 覆盖 buildList 所需字段」，把内联清单还原即变红 |
+| 七审 (2) en-US `listSep` 为 `'/ '` | ✅ 已修 | 改为 `', '`（`join` 后 `Beijing, Shanghai`）；中文仍为顿号无空格 |
 
 **残余（本轮仍不做）**
 

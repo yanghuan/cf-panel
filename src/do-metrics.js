@@ -537,11 +537,13 @@ export class MetricsDO {
         // 用「距上次写快照 ≥5 分钟」而不是「minTs % 5 === 0」：后者依赖上报恰好落在 5 的倍数
         // 分钟上，120s 慢采若长期落在同一组分钟（如奇数分钟）就永远不会写，优化静默失效。
         // 首帧（含 evict 后）必写一次，保证冷启动快照总是新鲜的。
-        // 已知取舍：快照取「写入这一刻的最新帧」（与热行同一个 v，不额外算），因此它和热行一样，
-// 只代表该分钟的首帧——后续帧只在内存。整个分钟里快照的「值龄」从 0 增长到 1 个上报周期。
-// 若改为每帧都写快照：快采 +15,840 写/台/天（热行 1,440 → 17,280），慢采 +432（288 → 720）；
-// 而「下一分钟首帧写上一帧的值」这种零额外写的变体反而会恒差一个上报周期（值龄从 1 个周期
-// 起算），所以维持现状：快照只服务冷启动首查，多一个分钟粒度的偏差可接受。
+        // 已知取舍：快照与热行共用同一个 v（= 写入那一刻的最新帧，即该分钟首帧，不额外算），
+        // 并且受 LATEST_KEY_EVERY_MIN 节流——写完之后直到下一次重写都不再刷新。因此冷启动
+        // 读到的快照最多落后「一个节流窗口 + 当前分钟偏移」（分钟级），同分钟后续帧压根不在
+        // 快照里。
+        // 若改为每帧都写快照：快照写量从 288/台/天升到 17,280（快采）/ 720（慢采），只为冷
+        // 启动首查不值得；「下一分钟首帧写上一帧的值」虽零额外写，却恒落后一个上报周期起步，
+        // 同样解决不了节流窗口——维持现状。
         const lastL = this.latestAt.get(b.serverId);
         const wantLatest = lastL == null || minTs - lastL >= LATEST_KEY_EVERY_MIN;
         const entries = { [this.hotKey(b.serverId, minTs)]: JSON.stringify(v) };
@@ -1200,7 +1202,21 @@ export class MetricsDO {
       // 无论是否异常都续排下一次 alarm：防归档/清理/告警因单次失败永久停摆。
       // 闲置（无热区数据且告警关闭）时退避 +1h（零服务器/无上报面板不再 10min 空转 144 次/天）；
       // 新上报经 scheduleArchive 提前拉回（alarmCached 失效后 getAlarm 发现更早需求重新设置）
-      const idle = this.data.size === 0 && !alertOn;
+      //
+      // 判据不能只看 this.data.size：冷实例（evict 后）内存热区本来就是空的，而 Storage 里
+      // 可能有几十台机器的待归档数据——旧实现会把「有数据但刚好被 evict」误判为闲置，把下一轮
+      // alarm 推到 1 小时后，归档与清理最长停摆 1 小时。data 空时补一条 D1 探测（只在冷路径
+      // 触发，热实例直接按内存判定，不增加常态开销）；D1 不可用时保守按非闲置处理。
+      let idle = false;
+      if (!alertOn) {
+        if (this.data.size > 0) {
+          idle = false;
+        } else {
+          try {
+            idle = !(await this.env.DB.prepare('SELECT 1 AS x FROM servers LIMIT 1').first());
+          } catch { idle = false; }
+        }
+      }
       this.alarmCached = Date.now() + (idle ? ARCHIVE_IDLE_INTERVAL_MS : ARCHIVE_INTERVAL_MS);
       try {
         await this.state.storage.setAlarm(this.alarmCached);

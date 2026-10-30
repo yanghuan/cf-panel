@@ -2593,6 +2593,65 @@ test('exec：已过 deadline 的 agent_update 不再阻塞命令', async () => {
   assert.equal(row.status, 'expired', 'settleServerExpired 负责收敛，让出唯一索引');
 });
 
+// 同一用户复用同一个 idempotency_key 去跑另一台机器/另一条命令时，旧实现直接返回旧任务，
+// 调用方会拿到完全不相干的结果（甚至以为新命令已执行）。必须 409，让调用方换 key。
+test('exec 幂等键：跨服务器/跨命令复用必须 409（不得静默返回旧任务）', async () => {
+  const env = makeEnv();
+  const token = await login(env);
+  await addServer(env, token, { name: 'idem-a' });
+  await addServer(env, token, { name: 'idem-b' });
+  const body = { server_id: 1, command: 'echo one', timeout: 5, idempotency_key: 'k-same' };
+
+  const first = await call(env, { method: 'POST', path: '/api/exec-jobs', token, body });
+  assert.equal(first.status, 202);
+  const firstId = (await first.json()).job_id;
+
+  // 同 key + 同 server + 同命令 → 幂等复用（既有语义不变）
+  const again = await call(env, { method: 'POST', path: '/api/exec-jobs', token, body });
+  assert.equal(again.status, 202);
+  const againBody = await again.json();
+  assert.equal(againBody.job_id, firstId);
+  assert.equal(againBody.reused, true);
+
+  // 同 key + 另一台机器 → 409
+  const otherServer = await call(env, {
+    method: 'POST', path: '/api/exec-jobs', token,
+    body: { ...body, server_id: 2 },
+  });
+  assert.equal(otherServer.status, 409);
+  assert.equal((await otherServer.json()).code, 'IDEMPOTENCY_CONFLICT');
+
+  // 同 key + 另一条命令 → 409
+  const otherCmd = await call(env, {
+    method: 'POST', path: '/api/exec-jobs', token,
+    body: { ...body, command: 'echo two' },
+  });
+  assert.equal(otherCmd.status, 409);
+  // 且不得产生新任务
+  const cnt = await env.DB.prepare("SELECT COUNT(*) AS n FROM operation_jobs WHERE kind = 'exec'").first();
+  assert.equal(cnt.n, 1, '冲突时不得插入新任务');
+});
+
+// 路由前缀过宽：DELETE /api/servers/123/rotate-key 曾经命中「删除服务器」分支，
+// 一次拼写错误就把机器和历史数据一起删掉。
+test('路由精确匹配：/api/servers/:id 的子路径不得误命中 PATCH/DELETE', async () => {
+  const env = makeEnv();
+  const token = await login(env);
+  await addServer(env, token, { name: 'keep-me' });
+  const id = (await (await call(env, { path: '/api/servers', token })).json())[0].id;
+
+  const wrongDelete = await call(env, { method: 'DELETE', path: `/api/servers/${id}/rotate-key`, token });
+  assert.notEqual(wrongDelete.status, 200, '子路径不得被当作删除服务器');
+  assert.ok(await env.DB.prepare('SELECT id FROM servers WHERE id = ?').bind(id).first(), '服务器必须还在');
+
+  const wrongPatch = await call(env, {
+    method: 'PATCH', path: `/api/servers/${id}/rotate-key`, token, body: { name: 'hacked' },
+  });
+  assert.notEqual(wrongPatch.status, 200, '子路径不得被当作改名');
+  const row = await env.DB.prepare('SELECT name FROM servers WHERE id = ?').bind(id).first();
+  assert.equal(row.name, 'keep-me', '名称未被改写');
+});
+
 // P2-4 剩余：DO 返回 409/413 时它自己不写 D1，这两条"下发被拒"路径也必须留痕。
 test('exec 下发被拒：DO 返回非 2xx 时也写 exec.command.failed', async () => {
   const env = makeEnv();

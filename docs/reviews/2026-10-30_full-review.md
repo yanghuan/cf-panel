@@ -273,7 +273,7 @@
 
 ## 九、修复验证（2026-10-30，已提交 `6bb26ce` + `0a43f0a`）
 
-修复后 `npm test` → **297/297 通过**；`node scripts/e2e.mjs` → **33/33**（wrangler dev + release agent，含 MCP 17 工具）。Rust 源码未改（仅为 E2E 重新构建了 release 二进制）。
+修复后 `npm test` → **302/302 通过**；`node scripts/e2e.mjs` → **33/33**（wrangler dev + release agent，含 MCP 17 工具）。Rust 源码未改（仅为 E2E 重新构建了 release 二进制）。
 
 | 发现 | 状态 | 实现与验证 |
 |---|---|---|
@@ -309,9 +309,18 @@
 | 四审 (2) §8.9 第 1 项只做一半（告警/探活仍全量读） | ✅ 已修 | `ensureAlertLoaded`/`ensureProbeLoaded` 改 `...For(serverId)` 按机前缀加载；`checkAlerts` 先做零读阈值判定，**未越界直接返回**（冷实例每帧的 `list('alert:')` 消失），越界才恢复该机冷却；用例覆盖「未越界零读 / 越界按机读一次」 |
 | 四审 (3) §8.9 第 3 项部分未做 | ✅ 已修 | `filterServersCached` 与 `queryServersForUser` 的 `SELECT *` 改显式列（不再把 `agent_key_hash` 读进面向浏览器的 DO）；`info/probe/alert_override` 在缓存填充时预解析（原先每次推送 × 每台 × 3 次 parse）；用例断言 SQL 无 `*`/无 `agent_key_hash`、字段已预解析 |
 | 四审 (4) §8.4-10 R2 孤儿清理忽略 truncated | ✅ 已修 | `runJobMaintenance` 跟随 `cursor` 分页续读（每轮 ≤`R2_LIST_MAX_PAGES`=20 页），游标未前进则退出防死循环；R2 桩支持 `listPageSize`，用例：5 个孤儿 + 每页 2 → 全部回收 |
+| 五审 (1) do-terminal 死常量/陈旧注释 | ✅ 已修 | 删 6 个死常量（`EXEC_TIMEOUT_GRACE_MS`/`UPLOAD_CHUNK_BYTES`/`UPLOAD_TIMEOUT_MS`/`UPLOAD_MAX_DEFAULT`/`AGENT_UPDATE_MAX_BYTES`/`AGENT_UPDATE_TIMEOUT_MS`，与 `routes.js` 重复的上限改在本类注释指向真实出处）；`/api/file_upload` 陈旧注释删除，`5s 重发` 改为 `OPEN_ACK_RETRY_MS`（3s） |
+| 五审 (2) `/api/servers/:id` 前缀过宽 | ✅ 已修 | PATCH/DELETE 改 `^/api/servers/(\d+)$` 精确匹配；用例：`DELETE /api/servers/:id/rotate-key` 不再删机、`PATCH .../rotate-key` 不再改名 |
+| 五审 (3) exec 幂等键不校验内容 | ✅ 已修 | `assertSameIdempotentJob`：server/command 不一致 → `IDEMPOTENCY_CONFLICT`（409），两种入口（REST/MCP）同源；用例覆盖同键复用与跨机/跨命令冲突 |
+| 五审 (4) `mcpCreateUpload` 审计硬依赖 | ✅ 已修 | 改走 `auditLog`（内部 try/catch），与 REST 一致：任务已创建、URL 已签发时审计失败不再让调用方拿到 500 |
+| 五审 (5) `TermSession` 重连定时器无守卫 | ✅ 已修 | `retryTimer` 存实例、回调先判 `closed`、`close()` 清定时器——关页面/登出后不再重建幽灵会话 |
+| 五审 (6) i18n 全角标点漏检 | ✅ 已修 | 新增 `common.listSep`/`labelValue`/`pctInParen`/`inProgress`/`server.groupTitle` 五个键（中英各一份），模板内不再硬写 `：（）；，`；单测加「模板字符串不得含全角标点」断言（跳过注释） |
+| 五审 (7) idle 判据冷实例误判 | ✅ 已修 | `data.size === 0` 时补一条 D1 探测（仅冷路径），有服务器即不按闲置退避 1h；D1 不可用保守按非闲置。用例：冷实例有服务器不退避 / 零服务器才退避 |
 
 **残余（本轮仍不做）**
 
 1. 「清理帧丢失 / 只删一个探针」已由 alarm 对账收口，残余降级为：**对账周期内（≤1 小时）** 同名探针重新启用可能沿用旧冷却——前提是配了 webhook，最坏造成一次通知抖动。
 2. `settleServerExpired` / `settleExpiredAll` 的收敛路径不写审计（`expired` 的 upload/update 无终态审计行），与「审计只在终态写」的既有取舍一致。
-3. §八 仍剩：C 档（`REPORT_FWD_THROTTLE_S` 5→10、`SHARDS` 4→2、`LAST_SEEN_THROTTLE_S` 60→180、idle 10→5min）、8.7 内存专项（`serverListCache` 条目/字节双限、`data` 热区 LRU、`fetch.rs` 同步写改走 `blocking.rs`）、8.4-10 的 `proxy.rs` 兼容性注释。8.9 前三项与 8.4-5/-10 已闭环。
+3. §八 仍剩：C 档（`REPORT_FWD_THROTTLE_S` 5→10、`SHARDS` 4→2、`LAST_SEEN_THROTTLE_S` 60→180、idle 10→5min）、8.7 内存专项（`serverListCache` 条目/字节双限、`data` 热区 LRU、`fetch.rs` 同步写改走 `blocking.rs`）、§三 P4-10 的 `proxy.rs` 兼容性注释（CONNECT 后捎带数据即报错的已知限制）。8.9 前三项与 §8.4 的 5/-10 已闭环。
+4. **历史 P4（五审随手修完）**：下表 7 条已在五审实现并补用例，不再列为残余。
+5. **R2 孤儿清理的 cursor 不跨轮持久化**：每轮最多 20 页（2 万对象），若存活对象长期超过该量且前 20 页都不可删（例如缺 `uploaded` 元数据被「宁留不误删」跳过），第 21 页之后的孤儿轮不到。当前 staging 对象随任务清理、规模远到不了 2 万；要彻底闭合可把 cursor 存 `kv_json`，或只在本页有删除时继续翻页。

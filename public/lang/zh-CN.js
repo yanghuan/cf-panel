@@ -27,6 +27,11 @@
     'common.unit.day': '天',
     'common.dash': '—',
     'common.gotIt': '知道了',
+    'common.listSep': '、',
+    'common.labelValue': '{label}：{value}',
+    'common.pctInParen': '（{v}%）',
+    'common.inProgress': '{op}中：{dest}',
+    'server.groupTitle': '{name}（{n}）',
   };
 
   // ---------------- 登录 ----------------

@@ -19,7 +19,6 @@ const REPORT_FAST_INTERVAL_S = 5;  // 有观看者：5 秒上报（快采 28,800
 const REPORT_SLOW_INTERVAL_S = 120; // 无人查看：120 秒上报
 const EXEC_DEFAULT_TIMEOUT_MS = 25 * 1000; // MCP exec 默认超时（须 < DO fetch 默认 30s 超时，由内部先返回）
 const EXEC_MAX_TIMEOUT_MS = 25 * 1000;
-const EXEC_TIMEOUT_GRACE_MS = 5 * 1000; // DO 兜底定时器比 agent 实际超时晚 5s：agent 先回执（含部分 stdout），DO 定时器仅兜底防悬挂
 const EXEC_ROUNDTRIP_TTL_MS = 900 * 1000; // exec 判据：窗口内有过成功往返（exec_result 或 probe 的 pong）就信任连接。
 // probe 受 PROBE_REFRESH_MS 节流且只在 report 到达时发：慢采 120s → 实际落在 t=0,360,720…（间隔 360s），
 // 窗口取 900s 才能容忍丢一次 pong（720s）仍不误判。超过窗口视为链路不可信 → 立即 503 让调用方重试
@@ -27,11 +26,10 @@ const EXEC_ROUNDTRIP_TTL_MS = 900 * 1000; // exec 判据：窗口内有过成功
 const PROBE_REFRESH_MS = 300 * 1000; // 上报顺带 probe 的最小间隔。
 // 注意：每条 probe 都会让 agent 回一个 pong，而 pong 是入站 WS 消息 = 一次 DO 请求。
 // 60s 会让每台机每小时多 60 次请求（约等于上报量翻倍），所以按 5 分钟一次足够维持 exec 判据。
-const UPLOAD_CHUNK_BYTES = 48 * 1024; // /api/file_upload 分片帧数据上限（控制通道入站 64KB，留 JSON 头/边界余量）
-const UPLOAD_TIMEOUT_MS = 120 * 1000; // 上传总超时（流式转发 + agent 写盘；agent 失联时兜底返回，防悬挂）
-const UPLOAD_MAX_DEFAULT = 100 * 1024 * 1024; // 单次上传大小上限默认 100MB（磁盘耗尽防护；agent 端 FILE_LIMIT 500MB 兜底）
-const AGENT_UPDATE_MAX_BYTES = 32 * 1024 * 1024; // 更新包硬上限（远高于当前 2~4MB，防异常 manifest）
-const AGENT_UPDATE_TIMEOUT_MS = 180 * 1000; // GitHub→Worker→DO→Agent + 校验/替换总超时
+// 上传/更新的体积与超时上限不在这里定义：同步上传路径已删除，上传走 upload_jobs
+// （大小上限 uploadMaxBytesOf(env) 在 routes.js，任务窗口在 config.js 的 UPLOAD_JOB_*），
+// 更新走 agent_update 任务（体积校验在 routes.js 的 AGENT_UPDATE_MAX_BYTES，超时在
+// config.js 的 UPDATE_JOB_TIMEOUT_S/GRACE_S）。本类只负责下发指令与接收回执，不再转发字节。
 // 慢路径埋点（定位「DO 唤醒后单条消息为什么贵」）：正常单条处理后端各段都是毫秒级，
 // 超过阈值才输出一行 JSON；每实例每小时限量，避免埋点自己吃掉可观测性额度。
 const SLOW_REPORT_MS = 1000; // 单条上报（消息到达 → D1 + 转发 MetricsDO 完成）阈值
@@ -574,7 +572,7 @@ export class TerminalDO {
     await this.maybeSweep();
   }
 
-  // open_terminal/open_file 确认重发：下发后 5s 未收到 agent 的 *_ready 则重发，最多 3 次
+  // open_terminal/open_file 确认重发：下发后 OPEN_ACK_RETRY_MS（3s）未收到 agent 的 *_ready 则重发，最多 3 次
   // 解决 agent 控制通道重连窗口内指令丢失导致的终端/文件"打不开"（open_file 补齐）
   // 记录 serverId + agentWs 归属：cleanup 断开时只清理关联项，不影响其他服务器/会话
   scheduleOpenAck(agentWs, streamId, serverId, openType) {

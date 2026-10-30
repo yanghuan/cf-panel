@@ -28,6 +28,11 @@
     'common.unit.day': 'd',
     'common.dash': '—',
     'common.gotIt': 'Got it',
+    'common.listSep': '/ ',
+    'common.labelValue': '{label}: {value}',
+    'common.pctInParen': ' ({v}%)',
+    'common.inProgress': '{op}: {dest}',
+    'server.groupTitle': '{name} ({n})',
   };
 
   // ---------------- Login ----------------

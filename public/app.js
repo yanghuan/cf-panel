@@ -556,7 +556,7 @@
         : '';
       // data-group 存内部标识（哨兵/真实组名）：updateServerCards 用它比对分组结构，
       // 显示名会随语言与计数变化，不能做结构标识
-      return `<h3 class="group-title" data-group="${escapeHtml(g)}"><span class="g-name">${escapeHtml(groupLabel(g))}（${count}）</span>${sortBtns}</h3>`;
+      return `<h3 class="group-title" data-group="${escapeHtml(g)}"><span class="g-name">${escapeHtml(t('server.groupTitle', { name: groupLabel(g), n: count }))}</span>${sortBtns}</h3>`;
     };
     box.innerHTML = groups.map((g) => `
       ${gTitle(g, byGroup(g).length)}
@@ -2049,7 +2049,7 @@
     if (op === 'copy') fileSess.copy(srcPath, dest);
     else fileSess.move(srcPath, dest);
     closeFileSelector();
-    $('#file-msg').textContent = `${op === 'copy' ? t('common.copy') : t('file.move')}中：${dest}`;
+    $('#file-msg').textContent = t('common.inProgress', { op: op === 'copy' ? t('common.copy') : t('file.move'), dest });
   }
 
   // 上传/下载入口：状态机在 FileSession（api.js），这里只负责 UI 接线。
@@ -2084,7 +2084,7 @@
       $('#btn-file-cancel').classList.add('hidden');
       if (failed.length) {
         toast(t('file.uploadBatchSummaryFail', { ok, n: failed.length }), 4000);
-        $('#file-msg').textContent = `${t('file.uploadBatchFailList', { list: failed.join('；') })}`;
+        $('#file-msg').textContent = `${t('file.uploadBatchFailList', { list: failed.join(t('common.listSep')) })}`;
       }
       return;
     }
@@ -2251,7 +2251,7 @@
       const v = ctx.raw;
       if (v == null) return '';
       const u = units[ctx.dataset.label];
-      return `${ctx.dataset.label}：${typeof u === 'function' ? u(v) : v}${typeof u === 'string' ? u : ''}`;
+      return t('common.labelValue', { label: ctx.dataset.label, value: `${typeof u === 'function' ? u(v) : v}${typeof u === 'string' ? u : ''}` });
     };
 
     // CPU：独立图（%）
@@ -2275,18 +2275,18 @@
           if (s == null) return '';
           const mb = +(s / 1048576).toFixed(1);
           const t = r.extra && r.extra.swap_total;
-          if (t > 0) return `Swap：${mb} MB / ${+(t / 1048576).toFixed(1)} MB（${swapPctOf(r)}%）`;
-          return `Swap：${mb} MB`;
+          if (t > 0) return `${t('common.labelValue', { label: 'Swap', value: `${mb} MB / ${+(t / 1048576).toFixed(1)} MB` })}${t('common.pctInParen', { v: swapPctOf(r) })}`;
+          return t('common.labelValue', { label: 'Swap', value: `${mb} MB` });
         }
         if (r.mem_used == null) return '';
         const mmb = +(r.mem_used / 1048576).toFixed(1);
         if (r.mem_total > 0) return t('monitor.tipMemFull', { v: mmb, t: +(r.mem_total / 1048576).toFixed(1), p: memPctOf(r) });
         return t('monitor.tipMemShort', { v: mmb });
       },
-      [[t('monitor.mem'), lastVal(memPctData)], ['Swap', lastVal(swapPctData)]].filter(([, v]) => v != null).map(([d, v]) => `${d}：${v}%`).join(' · '),
+      [[t('monitor.mem'), lastVal(memPctData)], ['Swap', lastVal(swapPctData)]].filter(([, v]) => v != null).map(([d, v]) => t('common.labelValue', { label: d, value: `${v}%` })).join(' · '),
       (m) => [memPctOf(m), swapPctOf(m)].map((v) => (v == null ? null : v + '%')),
       '%',
-      ([mem, swap]) => [[t('monitor.mem'), mem], ['Swap', swap]].filter(([, v]) => v != null).map(([d, v]) => `${d}：${v}`).join(' · '),
+      ([mem, swap]) => [[t('monitor.mem'), mem], ['Swap', swap]].filter(([, v]) => v != null).map(([d, v]) => t('common.labelValue', { label: d, value: `${v}` })).join(' · '),
       undefined, 2);
     // 负载：1/5/15 分钟三条线（无单位），独立图
     const load1Data = rows.map((r) => (r && r.extra && r.extra.load1 != null ? Number(r.extra.load1) : null));
@@ -2375,13 +2375,13 @@
       { label: 'TCP', data: tcpData, ...lineCfg('#22d3ee', 'transparent') },
       { label: 'UDP', data: udpData, ...lineCfg('#f472b6', 'transparent') },
     ], null,
-      [['TCP', lastVal(tcpData)], ['UDP', lastVal(udpData)]].filter(([, v]) => v != null).map(([d, v]) => `${d}：${v}`).join(' · '),
+      [['TCP', lastVal(tcpData)], ['UDP', lastVal(udpData)]].filter(([, v]) => v != null).map(([d, v]) => t('common.labelValue', { label: d, value: `${v}` })).join(' · '),
       (m) => {
         const e = (m && m.extra) || {};
         return [e.tcp, e.udp].map((v) => (v == null ? null : v));
       },
       '',
-      ([tcp, udp]) => [['TCP', tcp], ['UDP', udp]].filter(([, v]) => v != null).map(([d, v]) => `${d}：${v}`).join(' · '),
+      ([tcp, udp]) => [['TCP', tcp], ['UDP', udp]].filter(([, v]) => v != null).map(([d, v]) => t('common.labelValue', { label: d, value: `${v}` })).join(' · '),
       undefined, 2);
     // 进程数：extra.procs（整数），独立图
     const procsData = rows.map((r) => (r && r.extra && r.extra.procs != null ? r.extra.procs : null));
@@ -2580,7 +2580,7 @@
               toast(t('server.installedWaiting', { build: result.build_id || target || '' }), 8000);
             }
           } catch (e) {
-            failed.push(`${name}：${e.message}`);
+            failed.push(t('common.labelValue', { label: name, value: e.message }));
             toast(t('server.updateFailed', { err: e.message }), 6000);
           } finally {
             updatingAgents.delete(id);
@@ -2786,7 +2786,7 @@
             callbacks: {
               label: (ctx) => (ctx.dataset.label === t('stats.datasetAvail')
                 ? t('stats.tipAvail', { v: pctText(ctx.raw) })
-                : `${ctx.dataset.label}：${fmtBytes(ctx.raw || 0)}`),
+                : t('common.labelValue', { label: ctx.dataset.label, value: fmtBytes(ctx.raw || 0) })),
             },
           },
         },
@@ -2866,7 +2866,7 @@
     try {
       const list = await api('/api/servers');
       $('#tok-hint').textContent = list.length
-        ? t('token.hint', { list: list.map((s) => `${s.id}=${s.name}`).join('，') })
+        ? t('token.hint', { list: list.map((s) => `${s.id}=${s.name}`).join(t('common.listSep')) })
         : t('token.hintEmpty');
     } catch { /* 加载失败则不提示 */ }
   }

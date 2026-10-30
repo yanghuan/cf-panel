@@ -928,6 +928,14 @@ test('i18n：app.js 面向用户的提示不得残留中文字面量', () => {
   // 代码注释里的中文不在 i18n 范围内（注释是给维护者看的）。
   assert.doesNotMatch(app, /toast\('[^']*[一-龥]/, '单引号 toast 文案须走 t()');
   assert.doesNotMatch(app, /toast\(`[^`]*[一-龥]/, '模板 toast 文案须走 t()');
+  // 只查汉字会漏掉「全角标点」：`${label}：${v}` 这类拼接在 en-US 下也是中文标点。
+  // 逐行扫描；先剥掉行尾 `//` 注释（注释不进 UI，且可能把匹配带到下一行）。
+  const badPunct = app.split('\n')
+    .map((raw, i) => [(raw.split(' //')[0]), i + 1])
+    .filter(([line]) => !/^\s*(\/\/|\*|\/\*)/.test(line))
+    .filter(([line]) => /`[^`]*[\uFF08\uFF09\uFF1A\uFF1B\uFF0C]/.test(line))
+    .map(([, n]) => n);
+  assert.deepEqual(badPunct, [], `模板字符串内不得直接写全角标点（应走 i18n key）：第 ${badPunct.join(', ')} 行`);
   assert.match(app, /const \{ t \} = CfI18n/, 'app.js 须解构 t()');
   assert.match(app, /CfI18n\.applyDom\(\)/, '启动时须填充静态 DOM 文案');
 });

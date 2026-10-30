@@ -414,6 +414,7 @@
       this.closed = false;
       this.retries = 0;
       this.noDataTimer = null; // 连接后无数据超时（open_terminal 可能丢失）
+      this.retryTimer = null; // 断线重连的定时器（close() 必须能取消，否则会重建幽灵会话）
       this.rebuilding = false; // 无响应重建中，避免与 onclose 重连重复
     }
     get connected() { return this.ws && this.ws.readyState === 1; }
@@ -484,7 +485,13 @@
       if (this.retries < TERM_RETRY_MAX) {
         this.retries += 1;
         this.term.write(`\r\n\x1b[90m${t('term.connecting', { n: this.retries })}\x1b[0m\r\n`);
-        setTimeout(() => this.open(this.serverId), this.retries * 1000);
+        // 重连定时器必须可被 close() 取消：否则关掉标签页/退出登录后，定时器仍会唤醒
+        // open() 重新建会话与 WS（幽灵终端，服务端要等到会话超时才回收）。
+        if (this.retryTimer) clearTimeout(this.retryTimer);
+        this.retryTimer = setTimeout(() => {
+          this.retryTimer = null;
+          if (!this.closed) this.open(this.serverId);
+        }, this.retries * 1000);
       } else {
         this.term.write(`\r\n${t('term.closed')}\x1b[0m\r\n`);
       }
@@ -495,6 +502,7 @@
       if (this.closed) return;
       this.closed = true;
       if (this.noDataTimer) { clearTimeout(this.noDataTimer); this.noDataTimer = null; }
+      if (this.retryTimer) { clearTimeout(this.retryTimer); this.retryTimer = null; } // 取消挂起的重连
       try { this.ws && this.ws.close(); } catch { /* ignore */ }
       this.term.dispose();
     }

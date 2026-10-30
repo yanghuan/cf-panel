@@ -1209,6 +1209,28 @@ test('MetricsDO: 探活冷却状态按机前缀加载（不再 list 全部 probe
   } finally { cap.restore(); }
 });
 
+// 冷实例（evict 后）内存热区必然为空，但 Storage 里可能仍有待归档数据。旧判据只看
+// this.data.size，会把这种情况误判为闲置 → 下一轮 alarm 推到 1 小时后（归档/清理停摆）。
+test('MetricsDO: idle 判据不受冷实例 data 为空影响（有服务器就不退避 1h）', async () => {
+  const env = makeEnv(); // 未配置 webhook → alertOn=false
+  await insertServer(env, 'k1', 's1'); // 有服务器 = 有数据可归档
+  const st = mockState();
+  const { inst } = mkMetrics(env, st);
+  assert.equal(inst.data.size, 0, '前提：冷实例内存热区为空');
+
+  await inst.alarm();
+  const delay = inst.alarmCached - Date.now();
+  assert.ok(delay < 11 * 60 * 1000, `有服务器时不应退避 1h（实际 ${Math.round(delay / 60000)} 分钟）`);
+});
+
+test('MetricsDO: 真的没有服务器时才退避 1h（省额度）', async () => {
+  const env = makeEnv();
+  const { inst } = mkMetrics(env, mockState());
+  await inst.alarm();
+  const delay = inst.alarmCached - Date.now();
+  assert.ok(delay > 55 * 60 * 1000, `零服务器应退避约 1h（实际 ${Math.round(delay / 60000)} 分钟）`);
+});
+
 test('MetricsDO: /drop 清理 storage 告警/探活状态', async () => {
   const env = makeEnv();
   await env.DB.prepare("INSERT INTO kv_json (key, value) VALUES ('settings', ?)")

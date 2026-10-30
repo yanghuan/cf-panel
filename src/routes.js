@@ -413,9 +413,19 @@ async function dispatchExecJob(env, user, { server, command, timeoutS, ip, idemp
   if (await hasActiveAgentUpdate(env, server.id)) {
     return { status: 409, payload: { error: 'agent update in progress' } };
   }
-  const { job, reused } = await createExecJob(env, {
-    user, serverId: server.id, command, timeoutS, clientIp: ip, idempotencyKey,
-  });
+  let created;
+  try {
+    created = await createExecJob(env, {
+      user, serverId: server.id, command, timeoutS, clientIp: ip, idempotencyKey,
+    });
+  } catch (e) {
+    // 幂等键被同一用户的另一台机器/另一条命令占用：拒绝而不是返回不相干的结果
+    if (e.code === 'IDEMPOTENCY_CONFLICT') {
+      return { status: 409, payload: { error: e.message, code: 'IDEMPOTENCY_CONFLICT' } };
+    }
+    throw e;
+  }
+  const { job, reused } = created;
   // 幂等命中：不重复下发，直接把已有任务交回调用方
   if (reused) {
     return {
@@ -852,9 +862,12 @@ async function handleApiInner(request, env) {
   }
 
   // PATCH /api/servers/:id —— 仅管理员；修改名称/分组/序号/告警覆盖（不动 agent key，在线状态不受影响）
-  if (method === 'PATCH' && path.startsWith('/api/servers/')) {
+  // 用精确匹配（^/api/servers/<digits>$）而不是 startsWith：否则 PATCH /api/servers/1/rotate-key
+  // 之类的子路径也会命中本节，被当成"改服务器 1"执行（DELETE 那条同理，误删风险更大）。
+  const patchOneMatch = path.match(/^\/api\/servers\/(\d+)$/);
+  if (method === 'PATCH' && patchOneMatch) {
     if (!isAdmin(user)) return err('forbidden', 403, 'FORBIDDEN');
-    const id = Number(path.split('/')[3]) || 0;
+    const id = Number(patchOneMatch[1]) || 0;
     const server = await env.DB.prepare('SELECT name, "group", display_index, alert_override, description FROM servers WHERE id = ?').bind(id).first();
     if (!server) return err('not found', 404, 'NOT_FOUND');
     const body = await request.json().catch(() => ({}));
@@ -894,9 +907,12 @@ async function handleApiInner(request, env) {
   }
 
   // DELETE /api/servers/:id —— 仅管理员；级联清理（D1 历史数据 + 各 DO 残留 + 审计）
-  if (method === 'DELETE' && path.startsWith('/api/servers/')) {
+  // 精确匹配的理由同 PATCH：旧实现 startsWith 会让 DELETE /api/servers/123/rotate-key
+  // 直接走到这里，把"轮换 key 的拼写错误"变成真删机器（连带历史数据）。
+  const deleteOneMatch = path.match(/^\/api\/servers\/(\d+)$/);
+  if (method === 'DELETE' && deleteOneMatch) {
     if (!isAdmin(user)) return err('forbidden', 403, 'FORBIDDEN');
-    const id = Number(path.split('/')[3]) || 0;
+    const id = Number(deleteOneMatch[1]) || 0;
     const name = await deleteServerCascade(env, user, ip, id);
     if (name === null) return err('not found', 404, 'NOT_FOUND');
     return json({ ok: true });
@@ -1906,10 +1922,15 @@ async function mcpCreateUpload(user, env, args, url, ip) {
   const token = await signJobToken('content', job.id, server.id, '', env, JOB_URL_TTL_S);
   // 上传通道走 /mcp/（CF Access 放行区，签名 URL 供 curl 直传不受拦截）
   const uploadUrl = `${publicOrigin(url)}/mcp/upload-jobs/${job.id}/content?token=${encodeURIComponent(token)}`;
-  // 这里只记"请求上传"；真正的 file.upload 在 Agent 成功 commit 后由 DO 写入
-  await env.DB.prepare('INSERT INTO audit_logs (user_id, username, client_ip, action, target_server_id, detail, job_id) VALUES (?,?,?,?,?,?,?)')
-    .bind(user.id, user.username, ip, 'file.upload.request', server.id, path, job.id)
-    .run();
+  // 这里只记"请求上传"；真正的 file.upload 在 Agent 成功 commit 后由 DO 写入。
+  // 走 auditLog（内部 try/catch）：任务已经创建、签名 URL 也已签发，此处若因 D1 抖动抛错，
+  // 调用方会收到失败但任务实际存在（重试又撞 UPLOAD_BUSY），还会丢掉已在跑的任务句柄。
+  // 与 REST 路径（auditLog）保持一致：审计失败只记日志，不阻断主流程。
+  await auditLog(env, {
+    userId: user.id, username: user.username, ip,
+    action: 'file.upload.request', serverId: server.id,
+    detail: path, jobId: job.id,
+  });
   return {
     job_id: job.id,
     status: job.status, // awaiting_upload

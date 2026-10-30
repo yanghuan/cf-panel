@@ -42,6 +42,9 @@ const ARCHIVE_IDLE_INTERVAL_MS = 60 * 60 * 1000; // 闲置（无数据且告警�
 // 注意：每次冷启动的首帧必写一次（否则 evict 后快照会一直停在旧值），因此「慢采 120s +
 // 每帧都落在新实例」的最坏情况是 720 写/台/天——仍低于热行 1,440，且换来冷启动 O(N)。
 const LATEST_KEY_EVERY_MIN = 5;
+// /latest 冷启动为「缺 l: 快照」的机器补扫时的单轮上限：升级首轮可能 500 台全缺，
+// 串行补扫会让面板首连多等数秒；缺的部分由下一轮冷启动或该机首帧上报补齐。
+const LATEST_BACKFILL_MAX = 100;
 const LATEST_PUSH_INTERVAL_MS = 5000; // 上报驱动聚合推送间隔（有观看者时 ≥5s 推一次全部 latest 给 PanelDO；
 // 单机时被 REPORT_FWD_THROTTLE_S=5s 钳制（MetricsDO 每 5s 收帧），多机时聚合多台上报防推送风暴）
 // pushOn 自愈反查 /viewers 的间隔（MetricsDO evict 丢失 pushOn 时）。
@@ -530,8 +533,11 @@ export class MetricsDO {
         // 用「距上次写快照 ≥5 分钟」而不是「minTs % 5 === 0」：后者依赖上报恰好落在 5 的倍数
         // 分钟上，120s 慢采若长期落在同一组分钟（如奇数分钟）就永远不会写，优化静默失效。
         // 首帧（含 evict 后）必写一次，保证冷启动快照总是新鲜的。
-        // 已知取舍：快照取该分钟的首帧（与热行同一个 v，不额外算），冷启动最多多一个分钟粒度的
-        // 偏差；要取分钟内最后一帧就得每帧都写快照（+1,440 写/台/天），不值得。
+        // 已知取舍：快照取「写入这一刻的最新帧」（与热行同一个 v，不额外算），因此它和热行一样，
+// 只代表该分钟的首帧——后续帧只在内存。整个分钟里快照的「值龄」从 0 增长到 1 个上报周期。
+// 若改为每帧都写快照：快采 +15,840 写/台/天（热行 1,440 → 17,280），慢采 +432（288 → 720）；
+// 而「下一分钟首帧写上一帧的值」这种零额外写的变体反而会恒差一个上报周期（值龄从 1 个周期
+// 起算），所以维持现状：快照只服务冷启动首查，多一个分钟粒度的偏差可接受。
         const lastL = this.latestAt.get(b.serverId);
         const wantLatest = lastL == null || minTs - lastL >= LATEST_KEY_EVERY_MIN;
         const entries = { [this.hotKey(b.serverId, minTs)]: JSON.stringify(v) };
@@ -665,14 +671,22 @@ export class MetricsDO {
         }
         // 快照是「按机」的：某台缺 l:（升级首轮 / 该机快照写失败）不能因为别的机器有快照就
         // 跳过它——否则冷启动首查会缺这台机器的指标（面板显示 '-' 直到下一帧上报）。
-        // 只为缺快照的机器按前缀补扫（峰值内存仍是一台机器的窗口），其余机器零额外读。
+        // 只为缺快照的机器按前缀补扫（峰值内存 ≈ 一台机器的窗口），已有快照的机器零 Storage 读；
+        // 代价是多一条 D1 读（拿服务器清单），冷启动 + 低频，可接受。
+        // 补扫按机器串行、每轮最多 LATEST_BACKFILL_MAX 台：升级首轮 500 台全缺快照时，
+        // 避免面板首连卡住数秒（缺的那部分下一轮冷启动或首帧上报即补齐）。
         let ids = [];
         try {
-          ids = ((await this.env.DB.prepare('SELECT id FROM servers').all()).results || [])
+          // ORDER BY id：SQLite 可能走覆盖索引扫描（顺序变成 agent_key_id 的字典序），
+        // 加显式排序让「每轮补哪 100 台」可预期且稳定
+        ids = ((await this.env.DB.prepare('SELECT id FROM servers ORDER BY id').all()).results || [])
             .map((s) => Number(s.id) || 0);
         } catch { /* D1 不可用：本次只返回已有快照，下一帧上报即补齐 */ }
+        let filled = 0;
         for (const sid of ids) {
           if (!sid || out[sid]) continue;
+          if (filled >= LATEST_BACKFILL_MAX) break;
+          filled += 1;
           await this.loadLatestFromHot(sid, out);
         }
         return json(out);
@@ -688,7 +702,9 @@ export class MetricsDO {
         const ts = Number(rest.slice(sep + 1));
         const cur = out[serverId];
         if (!cur || ts > cur.ts) {
-          const v = JSON.parse(k.value);
+          // 单行损坏容错与 l: 路径、loadLatestFromHot 一致：一行坏数据不得让升级首查 500
+          let v;
+          try { v = JSON.parse(k.value); } catch { continue; }
           const l = { ts, cpu: v.cpu, mem_used: v.mem_used, mem_total: v.mem_total, net_in: v.net_in, net_out: v.net_out, extra: v.extra, last_seen_s: this.lastSeenSec.get(serverId) };
           out[serverId] = l;
           this.latestByServer.set(serverId, l);
@@ -938,15 +954,17 @@ export class MetricsDO {
   //   1) 「有 → 无」的清理帧可能丢（probesCleared 只挂在那一次变更帧上，同机 5s 批内被覆盖
   //      或 flush 前 evict 就没了）——库里 probe_json 已在 handleReport 里清空，但 Storage 键还在；
   //   2) 只删掉其中一个探针（其余保留）时没有任何信号——那个名字的冷却会一直留到下次启用。
-  // 频率极低（alarm），一次 list + 一次 D1 读；evict 无关（状态可从 D1 重新推导）。
+  // 频率极低（alarm + 每小时门控），一次 list + 一次 D1 读；evict 无关（状态可从 D1 重新推导）。
+  // 返回 true = 本轮完成（调用方据此推进时间戳）；false = 有失败（Storage/D1 不可用或删除失败），
+  // 调用方**不推进**时间戳，下轮 alarm（10 分钟）重试——避免抖动一次就白等一小时。
   async pruneStaleProbeStates() {
     let keys;
-    try { keys = await this.listStorage('probe:'); } catch { return; } // Storage 不可用：下轮再对账
-    if (!keys.length) return;
+    try { keys = await this.listStorage('probe:'); } catch { return false; } // Storage 不可用：下轮再对账
+    if (!keys.length) return true; // 本实例没有任何探活状态，本轮无事可做
     let rows;
     try {
       rows = (await this.env.DB.prepare('SELECT id, probe_json FROM servers').all()).results || [];
-    } catch { return; } // D1 不可用：不做任何删除（宁留不误删）
+    } catch { return false; } // D1 不可用：不做任何删除（宁留不误删）
     const alive = new Map(); // serverId -> Set(当前配置里的探针名)
     const unknown = new Set(); // probe_json 解析失败/格式未知的机器：跳过，避免误删
     for (const s of rows) {
@@ -959,13 +977,14 @@ export class MetricsDO {
         alive.set(sid, new Set(list.map((p) => String((p && p.name) || ''))));
       } catch { unknown.add(sid); }
     }
+    let ok = true;
     for (const k of keys) {
       const suffix = k.name.slice('probe:'.length); // `${serverId}:${name}`
       const sep = suffix.indexOf(':');
       const sid = sep > 0 ? Number(suffix.slice(0, sep)) : 0;
       if (!sid) { // 畸形键：无人认领，直接删
         this.probeState.delete(suffix);
-        try { await this.state.storage.delete(k.name); } catch { /* 下轮重试 */ }
+        try { await this.state.storage.delete(k.name); } catch { ok = false; }
         continue;
       }
       if (unknown.has(sid)) continue; // 配置解析失败：不删（宁可留着，也不能误删正在生效的冷却）
@@ -973,8 +992,9 @@ export class MetricsDO {
       const names = alive.get(sid); // 服务器行已删除时 undefined → 下面一并清掉
       if (names && names.has(name)) continue;
       this.probeState.delete(suffix);
-      try { await this.state.storage.delete(k.name); } catch { /* 下轮重试 */ }
+      try { await this.state.storage.delete(k.name); } catch { ok = false; }
     }
+    return ok;
   }
 
   // 离线/恢复告警：状态存 DO Storage（重启不丢，避免重复告警）。
@@ -1076,9 +1096,14 @@ export class MetricsDO {
     //   2) 每小时最多一次（时间戳落 housekeep 跨 evict），而不是每个 10 分钟 alarm 都扫。
     if (alertOn && now - this.lastProbePruneAt >= PROBE_PRUNE_INTERVAL_MS) {
       try {
-        await this.pruneStaleProbeStates();
-        this.lastProbePruneAt = now;
-        housekeepChanged = true;
+        // 只有本轮真的完成（false = Storage/D1 抖动或有键删除失败）才推进时间戳，
+        // 否则要白等一小时才重试
+        if (await this.pruneStaleProbeStates()) {
+          this.lastProbePruneAt = now;
+          housekeepChanged = true;
+        } else {
+          console.error('probe state prune incomplete; retry next alarm');
+        }
       } catch (e) {
         console.error('probe state prune failed:', e);
       }

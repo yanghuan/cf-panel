@@ -1233,7 +1233,9 @@ test('用量观测：/api/usage 仅管理员可访问，返回用量估算（P2 
   assert.equal(est2.d1_writes, 3024 * 2);
   assert.equal(est2.slow_d1_writes, 2304 * 2);
   assert.ok(est2.do_events > est2.slow_do_events, '有人观看时 DO 请求应显著高于慢采');
-  assert.equal(est2.do_events, Math.round(17280 / 20 * 2 + 17280 * (2 + 1) + 144));
+  // 构成：入站 ÷20 + 分片转发 + 推送 + 探活 pong（288/天 ÷20）+ /viewers 自愈反查 + alarm
+  assert.equal(est2.do_events, Math.round(17280 / 20 * 2 + 17280 * (2 + 1) + 288 / 20 * 2 + 288 + 144));
+  assert.equal(est2.slow_do_events, Math.round(720 / 20 * 2 + 720 * 2 + 288 / 20 * 2 + 288 + 144));
   // PAT（非管理员）403
   const pat = await (await call(env, { method: 'POST', path: '/api/tokens', token: adminToken, body: { name: 'r', scopes: ['server:read'] } })).json();
   assert.equal((await call(env, { path: '/api/usage', token: pat.token })).status, 403);

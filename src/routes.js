@@ -1600,11 +1600,14 @@ async function collectUsageView(env) {
   } catch { /* D1 不可用：按 0 台估算 */ }
   const FAST_FRAMES = 17280; // 快采 5s：86,400/5
   const SLOW_FRAMES = 720;   // 慢采 120s：86,400/120
+  const PONG_PER_DAY = 288;  // 探活 pong 入站：probe 每 300s 一帧（PROBE_REFRESH_MS），÷20 折算
+  const VIEWERS_PROBE_PER_DAY = 288; // pushOn 因 evict 丢失后的 /viewers 自愈反查：每 300s 一次
   const activeShards = Math.min(SHARDS, servers); // 有快采机器的分片数上限
   return {
     note: 'Worker 计数为实例级（evict/重启清零，趋势参考）；MetricsDO 计数每 10 分钟 alarm 汇总到 storage（跨 evict 保留）。'
       + '每日估算按「服务器数 × 采样档位」解析：面板三列为「24h 有人观看」上界（快采 5s），'
-      + '无人观看的慢采（120s）见 slow_* 字段；DO 请求已按 WS 入站 20:1 折算并计入分片转发与推送；'
+      + '无人观看的慢采（120s）见 slow_* 字段；DO 请求已按 WS 入站 20:1 折算，并计入分片转发、'
+      + '每 5s 推送、探活 pong（每 300s）与 /viewers 自愈反查（每 300s）；'
       + 'D1 写/机/天 = metrics_min 1,440 + metrics_day 144 + last_seen（快采 60s 节流 1,440 → 3,024；慢采每帧写 720 → 2,304）。',
     api,
     metrics_do: doUsage,
@@ -1612,14 +1615,20 @@ async function collectUsageView(env) {
       servers,
       shards: SHARDS,
       report_frames: FAST_FRAMES * servers,
-      // DO 请求：入站（÷20）+ 每活跃分片 5s 一次转发 + 每 5s 一次推送 + alarm 144
-      do_events: Math.round((FAST_FRAMES / 20) * servers + FAST_FRAMES * (activeShards + 1) + 144),
+      // DO 请求：入站（÷20）+ 每活跃分片 5s 一次转发 + 每 5s 一次推送 + 探活 pong + 自愈反查 + alarm
+      do_events: Math.round(
+        (FAST_FRAMES / 20) * servers + FAST_FRAMES * (activeShards + 1)
+        + (PONG_PER_DAY / 20) * servers + VIEWERS_PROBE_PER_DAY + 144
+      ),
       d1_writes: 3024 * servers,
-      // 无人观看（慢采）对照：入站（÷20）+ 逐帧转发 + 探针 pong（240/天 ÷20）+ alarm。
+      // 无人观看（慢采）对照：入站（÷20）+ 逐帧转发 + 探活 pong + 自愈反查 + alarm。
       // D1 写不同档：快采 last_seen 按 60s 节流 = 1,440，慢采每帧都写（120s）= 720；
       // metrics_min 1,440 + metrics_day 144 两档相同 → 快采 3,024 / 慢采 2,304。
       slow_report_frames: SLOW_FRAMES * servers,
-      slow_do_events: Math.round((SLOW_FRAMES / 20) * servers + SLOW_FRAMES * servers + (240 / 20) * servers + 144),
+      slow_do_events: Math.round(
+        (SLOW_FRAMES / 20) * servers + SLOW_FRAMES * servers
+        + (PONG_PER_DAY / 20) * servers + VIEWERS_PROBE_PER_DAY + 144
+      ),
       slow_d1_writes: 2304 * servers,
     },
   };

@@ -1086,6 +1086,45 @@ test('MetricsDO: /latest 冷启动为缺 l: 快照的机器逐机补扫（不全
   assert.deepEqual(prefixes, ['l:', 'm:2:'], '只补扫缺快照的那台前缀，不退化成全量 m: 扫描');
 });
 
+// 三条 /latest 恢复路径的容错必须一致：l: 快照、逐机补扫、以及「完全没有 l:」时的
+// 升级回退全量扫描。差一行坏数据就让升级首查 500 是最糟的失败形态。
+test('MetricsDO: 升级回退路径（无 l: 快照）容忍单行损坏', async () => {
+  const env = makeEnv({ ARCHIVE_TO_D1: '0' });
+  const st = mockState();
+  const nowMin = Math.floor(Date.now() / 1000 / 60);
+  st.storage.map.set(`m:1:${nowMin}`, 'not-json'); // 坏行
+  st.storage.map.set(`m:1:${nowMin - 1}`, JSON.stringify({ cpu: 5 }));
+  const { call } = mkMetrics(env, st);
+  const latest = await (await call('/latest')).json();
+  assert.equal(latest[1].cpu, 5, '坏行被跳过，好行照常返回（不得 500）');
+});
+
+// 升级首轮 500 台全缺 l: 时，逐机补扫要串行 500 次前缀 list（面板首连多等数秒）。
+// 每轮最多补 LATEST_BACKFILL_MAX 台，其余由下一轮冷启动或首帧上报补齐。
+test('MetricsDO: /latest 补扫有单轮上限（升级首轮不阻塞面板首连）', async () => {
+  const env = makeEnv({ ARCHIVE_TO_D1: '0' });
+  const st = mockState();
+  const nowMin = Math.floor(Date.now() / 1000 / 60);
+  for (let id = 1; id <= 102; id++) {
+    await env.DB.prepare('INSERT INTO servers (id, agent_key_id, name, user_id, agent_key_hash) VALUES (?,?,?,?,?)')
+      .bind(id, `k${id}`, `s${id}`, 1, 'h').run();
+  }
+  st.storage.map.set('l:1', JSON.stringify({ ts: nowMin, cpu: 1 })); // 只有 1 台有快照
+  for (const id of [2, 3]) st.storage.map.set(`m:${id}:${nowMin}`, JSON.stringify({ cpu: id }));
+  const { inst, call } = mkMetrics(env, st);
+  const prefixes = [];
+  const orig = inst.listStorage.bind(inst);
+  inst.listStorage = async (p, o) => { prefixes.push(p); return orig(p, o); };
+
+  const latest = await (await call('/latest')).json();
+  assert.equal(latest[1].cpu, 1);
+  assert.equal(latest[2].cpu, 2, '补扫覆盖到缺快照的机器');
+  assert.equal(latest[3].cpu, 3);
+  const backfills = prefixes.filter((p) => p.startsWith('m:'));
+  assert.equal(backfills.length, 100, '单轮最多补 100 台');
+  assert.equal(prefixes.includes('m:102:'), false, '超出的机器本轮不补（下轮或首帧上报补齐）');
+});
+
 test('MetricsDO: /drop 清理 storage 告警/探活状态', async () => {
   const env = makeEnv();
   await env.DB.prepare("INSERT INTO kv_json (key, value) VALUES ('settings', ?)")
@@ -2620,6 +2659,17 @@ test('MetricsDO: 探活状态兜底对账每小时最多一次（读放大门控
   await inst.alarm(); // 同一小时内：跳过对账
   assert.equal(lists, 1, '一小时内不再重复对账');
   assert.equal(st.storage.map.has('probe:1:db'), true, '本轮未清理（下轮再来，不影响正确性）');
+
+  // 对账失败（Storage 抖动）不得推进时间戳：否则一次抖动要白等一小时才重试
+  inst.lastProbePruneAt = 0;
+  const orig2 = inst.listStorage.bind(inst);
+  inst.listStorage = async (p, o) => {
+    if (p === 'probe:') throw new Error('storage down');
+    return orig2(p, o);
+  };
+  await inst.alarm();
+  assert.equal(inst.lastProbePruneAt, 0, '失败不推进时间戳，下轮 alarm（10 分钟）重试');
+  inst.listStorage = orig2;
 });
 
 test('MetricsDO: 未配置 webhook 时不对账探活状态（状态不产生通知，省读）', async () => {

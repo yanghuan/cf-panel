@@ -1659,7 +1659,7 @@ test('TerminalDO: 活跃会话超绝对 TTL 强制回收（H-04）', async () =>
   const userWs = { closed: false, close() { this.closed = true; } };
   inst.sessions.set('0-old', { streamId: '0-old', serverId: 1, creatorUserId: 1, createdAt: now - 4 * 3600 * 1000 - 1000, userWs, agentWs: null, userBuf: [], agentBuf: [] });
   inst.sessions.set('0-live', { streamId: '0-live', serverId: 1, creatorUserId: 1, createdAt: now - 1000, userWs: { close() {} }, agentWs: null, userBuf: [], agentBuf: [] });
-  inst.maybeSweep();
+  await inst.maybeSweep();
   assert.equal(inst.sessions.has('0-old'), false, '超绝对 TTL 被回收（即使有连接）');
   assert.equal(userWs.closed, true, '连接被关闭');
   assert.equal(inst.sessions.has('0-live'), true, '未超 TTL 保留');
@@ -1677,14 +1677,14 @@ test('TerminalDO: maybeSweep 活跃会话按绝对 TTL 排 alarm，到期准时�
   const inst = new TerminalDO(st, env);
   const createdAt = Date.now() - 1000;
   inst.sessions.set('1-a', { streamId: '1-a', serverId: 1, creatorUserId: 1, createdAt, type: 'terminal', userWs: { readyState: 1 }, agentWs: null, userBuf: [] });
-  inst.maybeSweep();
+  await inst.maybeSweep();
   assert.ok(st.storage.alarmTs != null, '活跃会话也排 alarm');
   assert.equal(st.storage.alarmTs, createdAt + 4 * 3600 * 1000 + 1000, 'alarm 对齐绝对 TTL');
   // 模拟 4h 后：maybeSweep 强制回收（即使连接仍活跃）
   const live = { closed: false, close() { this.closed = true; } };
   inst.sessions.get('1-a').createdAt = Date.now() - (4 * 3600 * 1000 + 1000);
   inst.sessions.get('1-a').userWs = live;
-  inst.maybeSweep();
+  await inst.maybeSweep();
   assert.equal(live.closed, true, '超绝对 TTL 强制关闭连接');
   assert.equal(inst.sessions.has('1-a'), false, '会话已回收');
 });
@@ -2224,18 +2224,18 @@ test('TerminalDO: cleanup 按归属清理 pendingOpen，跨服务器/会话隔�
   inst.pendingOpen.set('2-b', { tries: 0, timer: null, serverId: 2, agentWs: ctl2, type: 'open_file' });
 
   // server1 控制通道断开 → 只清 server1 的待确认
-  inst.cleanup(ctl1);
+  await inst.cleanup(ctl1);
   assert.equal(inst.agents.has(1), false);
   assert.equal(inst.pendingOpen.has('1-a'), false, 'server1 待确认被清理');
   assert.equal(inst.pendingOpen.has('2-b'), true, 'server2 待确认不受影响');
 
   // 会话 1-a 的 agent 数据流断开 → 清该会话待确认并回收会话，不影响 server2
-  inst.cleanup(agentFlow);
+  await inst.cleanup(agentFlow);
   assert.equal(inst.sessions.has('1-a'), false, '1-a 两端断开被回收');
   assert.equal(inst.pendingOpen.has('2-b'), true, 'server2 待确认仍保留');
 
   // server2 控制通道断开 → 全部清空
-  inst.cleanup(ctl2);
+  await inst.cleanup(ctl2);
   assert.equal(inst.agents.size, 0);
   assert.equal(inst.pendingOpen.size, 0, 'server2 断开后 pendingOpen 清空');
 });
@@ -2771,8 +2771,8 @@ test('断线收敛 D1：exec/update 立即 failed，upload 保持可恢复', asy
   const inst = new TerminalDO(mockState(), env);
   const ws = { deserializeAttachment: () => ({ role: 'control', serverId: 1 }), send() {}, readyState: 1, close() {} };
   inst.agents.set(1, ws);
-  inst.cleanup(ws);
-  // cleanup 是同步的，收敛在后台任务里：等一拍
+  await inst.cleanup(ws);
+  // cleanup 内部已 await D1 收敛（settleJobsOnDisconnect）；留一拍兜住将来改回 fire-and-forget 的情况
   await new Promise((r) => setTimeout(r, 30));
 
   const get = async (id) => (await env.DB.prepare('SELECT status, error FROM operation_jobs WHERE id = ?').bind(id).first());
@@ -2896,7 +2896,7 @@ test('superseded 旧连接：cleanup 仍释放 updating（不依赖 map 命中�
   // 重连：新连接顶替
   inst.agents.set(1, ws2);
   // 旧连接的 close 事件这才到达（异步）
-  inst.cleanup(ws1);
+  await inst.cleanup(ws1);
 
   assert.equal(inst.updating.has(1), false, '被顶替的旧连接也必须释放 updating');
   assert.equal(inst.agents.get(1), ws2, '不能误删当前连接的索引');
@@ -3051,7 +3051,7 @@ test('cleanup(会话 ws) 不得误清控制连接的互斥与探活状态', asyn
     userWs: sessWs, agentWs: null, creatorUserId: 1, creatorUser: 'admin',
     createdAt: Date.now(), clientIp: '', auth: null,
   });
-  inst.cleanup(sessWs);
+  await inst.cleanup(sessWs);
 
   assert.equal(inst.updating.has(1), true, '关会话页不得释放更新互斥');
   assert.equal(inst.probeCapable.has(1), true, '关会话页不得丢掉探活能力');

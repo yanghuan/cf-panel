@@ -15,6 +15,8 @@ const LATEST_CACHE_TTL_MS = 4000; // MetricsDO /latest 共享缓存 TTL（多观
 const SYNC_MIN_INTERVAL_MS = 2000; // sync 频率下限（<2s 忽略，防任意消息/高频触发全链路）
 const WS_AUTH_TIMEOUT_MS = 10 * 1000; // WS 建连后必须在 10s 内发送 auth 首帧
 const MAX_PENDING_WS = 128; // 单个 PanelDO 未鉴权连接上限，防耗尽 Hibernation WebSocket 配额
+const VIEWERS_RPC_TIMEOUT_MS = 1000; // 观看者广播/推送开关的 RPC 上限：必须 <2s 的前端 sync 间隔，
+// 也保证 await 它们时不会把消息处理拖成秒级（未完成 I/O 会让 DO 失去 hibernation 资格、持续计 duration）
 const PANEL_SWITCH_GRACE_MS = 30 * 1000; // 观看者 0→1 后在线判定用慢宽限的过渡期：Agent 切快采并完成首帧上报前，
 // 用 15s 快宽限会把慢采周期中（120s 内无上报）的节点误判离线；30s 后快宽限正常生效
 
@@ -164,15 +166,20 @@ export class PanelDO {
   // 观看者数变化事件 → 各分片 agent 切快/慢采（省配额：0→1 立即快采，1→0 恢复慢采）。
   // 取代每次上报查询 /viewers（上报链 DO 事件 3→2/帧）。
   async broadcastViewers(count) {
+    // 并行 + 单请求超时：串行时最坏 4×超时 会把调用方（各分片）拖动数秒。
+    // 调用方已改为 await，这里必须给出确定性上限，否则一次慢分片就会变成 pending I/O。
+    const calls = [];
     for (let i = 0; i < SHARDS; i++) {
-      try {
-        await doForShard(this.env, i).fetch('https://do.internal/rpc/set_viewers', {
+      calls.push(
+        doForShard(this.env, i).fetch('https://do.internal/rpc/set_viewers', {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
           body: JSON.stringify({ count }),
-        });
-      } catch { /* 分片暂不可达，后续上报兜底 */ }
+          signal: AbortSignal.timeout(VIEWERS_RPC_TIMEOUT_MS),
+        }).catch(() => { /* 分片暂不可达，后续上报兜底 */ }),
+      );
     }
+    await Promise.all(calls);
   }
 
   // 客户端首帧鉴权（{type:'auth', token}）；通过后发一次 sync 拉初始列表，之后被动收推送
@@ -199,8 +206,9 @@ export class PanelDO {
       const authed = (this.state.getWebSockets?.() || []).filter((w) => isViewerAttachment(attachmentOf(w)));
       if (authed.length === 1) {
         this.fastSince = Date.now(); // 过渡期内（30s）在线判定用慢宽限，防切快采前短暂误判离线
-        this.broadcastViewers(1);
-        this.setPush(1); // 开启上报驱动推送
+        // await：不留下未完成的 promise（未完成 I/O 会让对象失去 hibernation 资格、持续计 duration）。
+        // 两个调用都带 1s 上限，最坏只把首帧处理拖慢 1s，且失败仍被内部 catch 吞掉。
+        await Promise.all([this.broadcastViewers(1), this.setPush(1)]); // 切快采 + 开启上报驱动推送
       }
       return;
     }
@@ -276,6 +284,7 @@ export class PanelDO {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ on }),
+        signal: AbortSignal.timeout(VIEWERS_RPC_TIMEOUT_MS),
       });
     } catch { /* 通知失败：MetricsDO 保持旧状态（无人看时无上报 → 不推，无碍） */ }
   }
@@ -304,8 +313,8 @@ export class PanelDO {
       .filter((w) => w !== ws && isViewerAttachment(attachmentOf(w)));
     if (authed.length === 0) {
       this.fastSince = 0;
-      this.broadcastViewers(0);
-      this.setPush(0); // 无人观看停止推送
+      // 同 0→1：await 避免在关闭钩子里留下未完成的 I/O（1s 上限，失败内部吞掉）
+      await Promise.all([this.broadcastViewers(0), this.setPush(0)]); // 恢复慢采 + 停止推送
     }
   }
 

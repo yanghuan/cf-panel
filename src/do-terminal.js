@@ -32,6 +32,10 @@ const AGENT_UPDATE_TIMEOUT_MS = 180 * 1000; // GitHub→Worker→DO→Agent + �
 const SLOW_REPORT_MS = 1000; // 单条上报（消息到达 → D1 + 转发 MetricsDO 完成）阈值
 const SLOW_CONN_MS = 1000; // agent 控制通道握手（D1 反查 → 101）阈值
 const SLOW_LOG_BUDGET_PER_HOUR = 20; // 每实例每小时上限（4 分片 × 20 = 最多 80 条/小时）
+// open_terminal/open_file 未确认的重发间隔（3 次 → 9s 窗口，原为 5s×3 = 15s）。
+// setTimeout 会让 DO 在窗口内失去 hibernation 资格并持续计 duration，故缩短窗口；
+// 控制通道重连间隙通常 3~6s，3s 间隔仍能覆盖，3 次后放弃（前端另有自愈兜底）。
+const OPEN_ACK_RETRY_MS = 3 * 1000;
 
 export class TerminalDO {
   constructor(state, env) {
@@ -66,7 +70,9 @@ export class TerminalDO {
   }
 
   async fetch(request) {
-    this.maybeSweep();
+    // await：maybeSweep 内部有 storage 删除/arm，不等它结束就会留下未完成 I/O，
+    // 阻止对象回到 hibernateable 状态（空闲期持续计 duration）。
+    await this.maybeSweep();
     this.rebuildIndex(); // 休眠唤醒后内存索引可能已丢，先从存活的 WS 附件重建
     const url = new URL(request.url);
     const path = url.pathname;
@@ -100,7 +106,7 @@ export class TerminalDO {
         try { sess.userWs && sess.userWs.close(); } catch { /* ignore */ }
         try { sess.agentWs && sess.agentWs.close(); } catch { /* ignore */ }
         this.sessions.delete(sid);
-        this.state.storage.delete('sess:' + sid).catch(() => {}); // 清理持久化会话
+        await this.state.storage.delete('sess:' + sid).catch(() => {}); // 清理持久化会话（await：不留未完成 I/O）
       }
       // 清理该服务器的 open_terminal/open_file 待确认（定时器停止）
       for (const sid of sids) {
@@ -378,7 +384,10 @@ export class TerminalDO {
       // https://do.internal，拿它拼下载 URL 会让 Agent 去连内网地址（DNS 必失败）。
       const panelOrigin = url.searchParams.get('panel_origin') || '';
       if (panelOrigin) {
-        this.resendWaitingUploads(server.id, pair[1], panelOrigin).catch(() => { /* 失败不阻塞连接 */ });
+        // await：不留下未完成的 promise——未完成 I/O 会让对象失去 hibernation 资格、
+        // 在空闲期持续计 duration。内部是 4 次带索引的 D1 查询（毫秒级），
+        // 且原本也发生在返回 101 之前，握手时序不变。
+        try { await this.resendWaitingUploads(server.id, pair[1], panelOrigin); } catch { /* 失败不阻塞连接 */ }
       }
       // T1 能力来源：不在此处探活——建连时能力未知，探活失败无法安全处理（分不清旧 agent 与真断链）。
       // 改为由 agent 在上报里自声明（info.probe_proto，见 report 分支）；声明后 exec 前探活失败
@@ -484,7 +493,7 @@ export class TerminalDO {
         if (sess.userWs) { try { sess.userWs.close(); } catch { /* ignore */ } }
         if (sess.agentWs) { try { sess.agentWs.close(); } catch { /* ignore */ } }
         this.sessions.delete(sid);
-        this.state.storage.delete('sess:' + sid).catch(() => {}); // 清理持久化会话
+        await this.state.storage.delete('sess:' + sid).catch(() => {}); // 清理持久化会话（await：不留未完成 I/O）
         continue;
       }
       if (sess.userWs || sess.agentWs) {
@@ -494,7 +503,7 @@ export class TerminalDO {
       }
       if (now - sess.createdAt > SESSION_TTL_MS) {
         this.sessions.delete(sid);
-        this.state.storage.delete('sess:' + sid).catch(() => {}); // 清理持久化会话
+        await this.state.storage.delete('sess:' + sid).catch(() => {}); // 清理持久化会话（await：不留未完成 I/O）
       } else {
         next = Math.min(next, sess.createdAt + SESSION_TTL_MS);
       }
@@ -544,10 +553,10 @@ export class TerminalDO {
         try { agentWs.send(JSON.stringify({ type: r.type, stream_id: streamId })); } catch { /* ignore */ }
       }
       r.tries += 1;
-      if (r.tries < 3) r.timer = setTimeout(retry, 5000);
+      if (r.tries < 3) r.timer = setTimeout(retry, OPEN_ACK_RETRY_MS);
       else this.pendingOpen.delete(streamId); // 3 次后放弃（前端有自愈兜底）
     };
-    rec.timer = setTimeout(retry, 5000);
+    rec.timer = setTimeout(retry, OPEN_ACK_RETRY_MS);
   }
 
   // Hibernation：DO 实例空闲冻结后，WebSocket 连接由 workerd 托管持久，但本类
@@ -653,6 +662,8 @@ export class TerminalDO {
   probeAgent(ws, serverId, timeoutMs) {
     return new Promise((resolve) => {
       const id = `p-${crypto.randomUUID()}`;
+      // 这里的 setTimeout 刻意保留：1s 上限是 exec 前探活的语义本身（无 pong 即判下行不可达、
+      // 快速失败），且只在 30s 往返缓存过期时出现，不参与空闲期。改成 alarm 会让探活变成秒级。
       const timer = setTimeout(() => {
         this.pendingProbe.delete(id);
         resolve(false);
@@ -1265,14 +1276,16 @@ export class TerminalDO {
 
   async webSocketClose(ws) {
     this.rebuildIndex(); // 确保索引完整后再清理，否则休眠唤醒后的断连无法正确解除
-    this.cleanup(ws);
+    await this.cleanup(ws);
   }
   async webSocketError(ws) {
     this.rebuildIndex();
-    this.cleanup(ws);
+    await this.cleanup(ws);
   }
 
-  cleanup(ws) {
+  // async：内部有 storage 删除与 D1 收敛，必须等它们结束——否则会留下未完成的 promise，
+  // 让对象在断连后失去 hibernation 资格、持续计 duration。
+  async cleanup(ws) {
     for (const [sid, sess] of this.sessions) {
       if (sess.userWs === ws) {
         sess.userWs = null;
@@ -1292,7 +1305,7 @@ export class TerminalDO {
       }
       if (!sess.userWs && !sess.agentWs) {
         this.sessions.delete(sid);
-        this.state.storage.delete('sess:' + sid).catch(() => {}); // 清理持久化会话
+        await this.state.storage.delete('sess:' + sid).catch(() => {}); // 清理持久化会话（await：不留未完成 I/O）
       }
     }
     // serverId 的定位不能只靠 map 值相等：重连时新连接会先把旧连接 close(4001) 再把
@@ -1343,7 +1356,9 @@ export class TerminalDO {
       // D1 收敛只对"真正的断开"做：被顶替的旧连接说明 Agent 已重连、任务还在新连接上跑，
       // 此时判 failed 会误杀正在进行的命令。upload 一律交给重连时的 requeueOrphanUploads。
       if (isCurrent) {
-        this.settleJobsOnDisconnect(serverId).catch(() => { /* 失败由 deadline 兜底 */ });
+        // await：D1 收敛不留成未完成 promise（未完成 I/O 会阻止 hibernation）。
+        // 只查一次带索引的 operation_jobs，失败仍由任务 deadline 兜底。
+        await this.settleJobsOnDisconnect(serverId).catch(() => { /* 失败由 deadline 兜底 */ });
       }
     }
   }

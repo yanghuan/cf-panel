@@ -20,8 +20,10 @@ const REPORT_SLOW_INTERVAL_S = 120; // 无人查看：120 秒上报
 const EXEC_DEFAULT_TIMEOUT_MS = 25 * 1000; // MCP exec 默认超时（须 < DO fetch 默认 30s 超时，由内部先返回）
 const EXEC_MAX_TIMEOUT_MS = 25 * 1000;
 const EXEC_TIMEOUT_GRACE_MS = 5 * 1000; // DO 兜底定时器比 agent 实际超时晚 5s：agent 先回执（含部分 stdout），DO 定时器仅兜底防悬挂
-const EXEC_ROUNDTRIP_TTL_MS = 30 * 1000; // exec 前探活缓存：近期已有成功往返（exec_result/probe）则跳过探活，频繁 exec 零新增延迟
-const EXEC_PROBE_TIMEOUT_MS = 1000; // exec 前探活等待上限；跨区 agent RTT 可达数百 ms，取 1s 防误判下行不可达而误断连
+const EXEC_ROUNDTRIP_TTL_MS = 180 * 1000; // exec 判据：窗口内有过成功往返（exec_result 或 probe 的 pong）就信任连接。
+// 新鲜度由「上报顺风车 probe」维持（≤120s 一次），所以正常情况下永远命中、exec 零等待；
+// 超过窗口视为链路不可信 → 立即 503 让调用方重试（命令尚未下发，重试绝对安全）。
+const PROBE_REFRESH_MS = 60 * 1000; // 上报顺带 probe 的最小间隔：出站帧不计费，也不需要等回执
 const UPLOAD_CHUNK_BYTES = 48 * 1024; // /api/file_upload 分片帧数据上限（控制通道入站 64KB，留 JSON 头/边界余量）
 const UPLOAD_TIMEOUT_MS = 120 * 1000; // 上传总超时（流式转发 + agent 写盘；agent 失联时兜底返回，防悬挂）
 const UPLOAD_MAX_DEFAULT = 100 * 1024 * 1024; // 单次上传大小上限默认 100MB（磁盘耗尽防护；agent 端 FILE_LIMIT 500MB 兜底）
@@ -45,10 +47,10 @@ export class TerminalDO {
     this.agents = new Map(); // serverId -> 控制 WS
     this.agentInterval = new Map(); // serverId -> 当前下发的上报间隔（秒），避免重复下发
     this.pendingOpen = new Map(); // streamId -> {tries, timer, type} open_terminal/open_file 确认重发
-    this.pendingProbe = new Map(); // probeId -> {resolve, timer, serverId} exec 前往返探活等待 pong
+    this.lastProbeAt = new Map(); // serverId -> 上次发出 probe 帧的时间（上报顺风车节流，防每帧都发）
     this.updating = new Set(); // serverId -> Agent 更新进行中（与上传/更新互斥，防 Binary 帧交错）
     this.lastPingAt = new Map(); // serverId -> 上次心跳时间（控制通道保活，防健康连接被 read -t 180 误判半开）
-    this.lastRoundTripAt = new Map(); // serverId -> 上次确认双向可达时间（exec_result/pong），exec 前探活据此跳过
+    this.lastRoundTripAt = new Map(); // serverId -> 上次确认双向可达时间（exec_result/pong），exec 据此信任连接
     this.probeCapable = new Set(); // serverId -> agent 已回 pong（支持 exec 前探活）；未支持则 exec 直接下发（向后兼容旧 agent）
     this.rebuilt = false; // 本实例是否已按附件重建过索引（唤醒后只重建一次，见 rebuildIndex）
     this.slowLogAt = 0; // 埋点日志的小时窗口起点（ms）
@@ -200,25 +202,20 @@ export class TerminalDO {
         await this.failExecJobWithAudit(this.env, jobId, 'agent offline');
         return json({ error: 'agent offline', code: 'AGENT_OFFLINE' }, 503);
       }
-      // 探活（≤1s，仅对声明 probe_proto 的 agent）：失败即判下行不可达，命令尚未下发，
-      // 调用方重试绝对安全。探活期间状态可能已变，必须重校验（同同步路径的 TOCTOU 处理）。
+      // 链路可信度（仅对声明 probe_proto 的 agent）：往返时间由「上报顺风车 probe」的 pong 维持。
+      // 窗口内命中 → 直接下发（零等待）；窗口外说明 pong 已连续丢失 → 判不可信，立即让调用方重试
+      //（命令尚未下发，重试绝对安全），同时补发一帧 probe 让下一次调用恢复。
+      // 关键：这里不再当场等回执，因此没有 setTimeout，DO 不会因此失去 hibernation 资格。
       if (this.probeCapable.has(serverId)) {
+        if (this.updating.has(serverId)) {
+          await this.failExecJobWithAudit(this.env, jobId, 'agent update in progress');
+          return json({ error: 'agent update in progress' }, 409);
+        }
         const rttFresh = Date.now() - (this.lastRoundTripAt.get(serverId) || 0) < EXEC_ROUNDTRIP_TTL_MS;
         if (!rttFresh) {
-          const ok = await this.probeAgent(agentWs, serverId, EXEC_PROBE_TIMEOUT_MS);
-          if (this.agents.get(serverId) !== agentWs) {
-            await this.failExecJobWithAudit(this.env, jobId, 'agent reconnected');
-            return json({ error: 'agent reconnected, please retry', code: 'AGENT_OFFLINE' }, 502);
-          }
-          if (this.updating.has(serverId)) {
-            await this.failExecJobWithAudit(this.env, jobId, 'agent update in progress');
-            return json({ error: 'agent update in progress' }, 409);
-          }
-          if (!ok) {
-            try { agentWs.close(4002, 'exec probe failed'); } catch { /* ignore */ }
-            await this.failExecJobWithAudit(this.env, jobId, 'agent unreachable');
-            return json({ error: 'agent unreachable', code: 'AGENT_OFFLINE' }, 502);
-          }
+          try { agentWs.send(JSON.stringify({ type: 'probe', id: `p-${crypto.randomUUID()}` })); } catch { /* ignore */ }
+          await this.failExecJobWithAudit(this.env, jobId, 'agent link not verified');
+          return json({ error: 'agent link not verified, please retry', code: 'AGENT_OFFLINE' }, 503);
         }
       }
       // queued -> running 是条件更新：未命中说明任务已被其它路径收敛（过期/取消），不再下发
@@ -657,31 +654,6 @@ export class TerminalDO {
     return 0;
   }
 
-  // T1：向候选控制连接发一次带 id 的探活，等 agent 回 pong（走与 exec_result 完全相同的回程）。
-  // 收到 → 双向可用；超时/发送异常 → 下行不可达。resolve 幂等，只会生效一次。
-  probeAgent(ws, serverId, timeoutMs) {
-    return new Promise((resolve) => {
-      const id = `p-${crypto.randomUUID()}`;
-      // 这里的 setTimeout 刻意保留：1s 上限是 exec 前探活的语义本身（无 pong 即判下行不可达、
-      // 快速失败），且只在 30s 往返缓存过期时出现，不参与空闲期。改成 alarm 会让探活变成秒级。
-      const timer = setTimeout(() => {
-        this.pendingProbe.delete(id);
-        resolve(false);
-      }, timeoutMs);
-      this.pendingProbe.set(id, {
-        serverId,
-        resolve: (ok) => { clearTimeout(timer); this.pendingProbe.delete(id); resolve(ok); },
-      });
-      try {
-        ws.send(JSON.stringify({ type: 'probe', id }));
-      } catch {
-        clearTimeout(timer);
-        this.pendingProbe.delete(id);
-        resolve(false);
-      }
-    });
-  }
-
   // 标记该 serverId 支持探活，并把能力写进连接附件：唤醒重建时据此恢复 probeCapable
   // （serializeAttachment 为本地序列化，零网络/存储开销）。能力来源：agent 自声明（report 的
   // info.probe_proto）或探活成功（pong）。
@@ -698,6 +670,7 @@ export class TerminalDO {
   clearProbeCapable(ws, serverId) {
     this.probeCapable.delete(serverId);
     this.lastRoundTripAt.delete(serverId);
+    this.lastProbeAt.delete(serverId);
     try {
       const a = ws.deserializeAttachment?.();
       if (a && typeof a === 'object' && a.role === 'control' && a.probe) {
@@ -794,16 +767,13 @@ export class TerminalDO {
             const cid = this.wsServerId(ws);
             if (cid) this.agents.set(cid, ws);
           }
-          // T1 探活回执：证明该控制连接双向可用 → resolve 探活、刷新往返时间并落能力
+          // 探活回执：证明该控制连接双向可用（与 exec_result 同等效力）。
+          // 不再按 id 关联 Promise（已无等待方）——无条件按连接归属刷新，供 exec 判据使用。
           if (j && j.type === 'pong') {
-            const p = this.pendingProbe.get(j.id);
-            if (p) {
-              p.resolve(true);
-              if (p.serverId) {
-                // 探活成功即一次有效往返（与 exec_result 同等效力），刷新缓存使紧邻的 exec 走快路径
-                this.lastRoundTripAt.set(p.serverId, Date.now());
-                this.markProbeCapable(ws, p.serverId);
-              }
+            const sid = this.wsServerId(ws);
+            if (sid) {
+              this.lastRoundTripAt.set(sid, Date.now());
+              this.markProbeCapable(ws, sid);
             }
             return;
           }
@@ -865,6 +835,13 @@ export class TerminalDO {
               if (nowP - lastP > 30000) {
                 this.lastPingAt.set(serverId, nowP);
                 try { ws.send(JSON.stringify({ type: 'ping' })); } catch { /* ignore */ }
+              }
+              // 顺风车探活：report 本身只证明上行通，这里补一个下行探测帧（出站不计费），
+              // agent 回 pong 后刷新 lastRoundTripAt —— exec 判据因此始终新鲜，无需当场等待回执。
+              // 没有等待方，所以不需要 pending 表，也不产生 setTimeout。
+              if (this.probeCapable.has(serverId) && nowP - (this.lastProbeAt.get(serverId) || 0) > PROBE_REFRESH_MS) {
+                this.lastProbeAt.set(serverId, nowP);
+                try { ws.send(JSON.stringify({ type: 'probe', id: `p-${crypto.randomUUID()}` })); } catch { /* ignore */ }
               }
             }
             try {
@@ -1334,11 +1311,7 @@ export class TerminalDO {
       // 在途异步任务的状态全在 D1（不在内存 Promise 里），顶替连接不影响它们，
       // 不会让明明还在跑的请求收到假的"agent disconnected"。
       if (isCurrent) {
-        // 控制连接已断 → 作废该 serverId 的往返/探活能力记录（新连接会重新协商 probe），
-        // 并立即失败在途探活（否则 /rpc/exec 的探活要等 EXEC_PROBE_TIMEOUT_MS 超时才返回）
-        for (const [, r] of [...this.pendingProbe]) {
-          if (r.serverId === serverId) r.resolve(false);
-        }
+        // 控制连接已断 → 作废该 serverId 的往返/探活能力记录（新连接上报后重新协商 probe）
         // 控制通道断开 → 仅清理该 agent（serverId）的待确认，不影响其他服务器/会话
         for (const [sid, r] of [...this.pendingOpen]) {
           if (r.serverId === serverId) {
@@ -1347,8 +1320,9 @@ export class TerminalDO {
           }
         }
       }
-      // 以下两项与"是不是当前连接"无关：被顶替的旧连接也要释放，否则永久 409。
+      // 以下几项与"是不是当前连接"无关：被顶替的旧连接也要释放，否则永久 409。
       this.lastRoundTripAt.delete(serverId);
+      this.lastProbeAt.delete(serverId);
       this.probeCapable.delete(serverId);
       // 控制连接断开 → 释放更新互斥：更新进程已随连接丢失，标记不能留到
       // DO evict，否则该机器在本实例存活期内一直 409（D1 侧已终态，纯内存泄漏）

@@ -1925,40 +1925,28 @@ test('TerminalDO: rebuildIndex 唤醒后只重建一次（不复活已摘除的�
   assert.equal(inst.agents.has(1), false, '已摘除的连接不会被再次重建复活');
 });
 
-test('TerminalDO: exec 探活——已协商 probe 时先探活，pong 后正常下发', async () => {
+test('TerminalDO: 上报顺风车 probe —— report 后发探测帧，pong 刷新往返时间', async () => {
   const env = makeEnv();
-  await env.DB.prepare('INSERT INTO servers (agent_key_id, name, user_id, agent_key_hash) VALUES (?,?,?,?)')
-    .bind('k1', 's1', 1, 'h1').run();
-  const jobId = `job_${'f'.repeat(32)}`;
-  await seedExecJob(env, jobId);
+  await insertServer(env, 'k1', 'srv1');
   const sent = [];
-  const agentWs = { send: (m) => sent.push(m), readyState: 1 };
+  const agentWs = {
+    deserializeAttachment: () => ({ role: 'control', serverId: 1 }),
+    send: (m) => sent.push(m), readyState: 1,
+  };
   const inst = new TerminalDO(mockState(), env);
   inst.agents.set(1, agentWs);
-  inst.probeCapable.add(1); // agent 已证明支持 probe
-  const pending = inst.fetch(new Request('https://do.internal/rpc/exec/submit', {
-    method: 'POST',
-    body: JSON.stringify({ jobId, serverId: 1, command: 'echo hi', timeoutMs: 5000 }),
-  }));
-  await new Promise((r) => setTimeout(r, 0));
-  const probe = JSON.parse(sent[0]);
-  assert.equal(probe.type, 'probe', '先发探活而非 exec');
-  await inst.webSocketMessage(agentWs, JSON.stringify({ type: 'pong', id: probe.id }));
-  const res = await pending;
-  assert.equal(res.status, 200);
-  assert.equal((await res.json()).status, 'running');
-  const cmd = JSON.parse(sent[1]);
-  assert.equal(cmd.type, 'exec', 'pong 后下发 exec');
-  assert.equal(cmd.exec_id, jobId, '帧里的 exec_id 就是 job_id');
+  inst.probeCapable.add(1);
   await inst.webSocketMessage(agentWs, JSON.stringify({
-    type: 'exec_result', exec_id: jobId, stdout: 'hi', stderr: '', exit_code: 0, timed_out: false,
+    type: 'report', cpu: 1, info: { probe_proto: 1 },
   }));
-  const row = await env.DB.prepare('SELECT status, stdout FROM operation_jobs WHERE id = ?').bind(jobId).first();
-  assert.equal(row.status, 'succeeded');
-  assert.equal(row.stdout, 'hi');
+  const probe = sent.map((m) => JSON.parse(m)).find((m) => m.type === 'probe');
+  assert.ok(probe && probe.id, 'report 顺带发出探活帧（出站消息不计费）');
+  assert.equal(inst.lastRoundTripAt.has(1), false, '尚未收到 pong');
+  await inst.webSocketMessage(agentWs, JSON.stringify({ type: 'pong', id: probe.id }));
+  assert.ok(inst.lastRoundTripAt.has(1), 'pong 刷新往返时间，exec 判据随之新鲜');
 });
 
-test('TerminalDO: exec 探活失败（下行不可达）→ 立即 502 并关闭连接', async () => {
+test('TerminalDO: 链路未验证 → 503 且补发探活，但不关闭连接（避免误断健康连接）', async () => {
   const env = makeEnv();
   await env.DB.prepare('INSERT INTO servers (agent_key_id, name, user_id, agent_key_hash) VALUES (?,?,?,?)')
     .bind('k1', 's1', 1, 'h1').run();
@@ -1966,24 +1954,23 @@ test('TerminalDO: exec 探活失败（下行不可达）→ 立即 502 并关闭
   await seedExecJob(env, jobId);
   const sent = [];
   const agentWs = {
-    send: (m) => sent.push(m), readyState: 1, closed: false, code: 0,
-    close(c) { this.closed = true; this.code = c; },
+    send: (m) => sent.push(m), readyState: 1, closed: false,
+    close() { this.closed = true; },
   };
   const inst = new TerminalDO(mockState(), env);
   inst.agents.set(1, agentWs);
-  inst.probeCapable.add(1);
+  inst.probeCapable.add(1); // 支持探活但没有新鲜往返 → 未验证
   const res = await inst.fetch(new Request('https://do.internal/rpc/exec/submit', {
     method: 'POST',
     body: JSON.stringify({ jobId, serverId: 1, command: 'echo hi', timeoutMs: 5000 }),
   }));
-  assert.equal(res.status, 502);
-  assert.equal((await res.json()).error, 'agent unreachable');
+  assert.equal(res.status, 503);
+  assert.equal((await res.json()).error, 'agent link not verified, please retry');
   assert.equal(sent.length, 1, '只发探活，未把命令发进虚空');
   assert.equal(JSON.parse(sent[0]).type, 'probe');
-  assert.equal(agentWs.closed, true, '下行不可达 → 关闭连接触发重连');
-  assert.equal(agentWs.code, 4002);
+  assert.equal(agentWs.closed, false, '只是未验证，不判死连接');
   const row = await env.DB.prepare('SELECT status FROM operation_jobs WHERE id = ?').bind(jobId).first();
-  assert.equal(row.status, 'failed', '探活失败 → 任务落 failed');
+  assert.equal(row.status, 'failed', '未验证拒绝 → 任务落 failed，不留排队态');
 });
 
 test('TerminalDO: 未协商 probe 的 agent（旧版）exec 直接下发，不做探活', async () => {
@@ -2026,20 +2013,17 @@ test('TerminalDO: 上报处理抛错（D1 故障）仍发送保活心跳（E）'
 
 test('TerminalDO: 探活能力写入连接附件，唤醒重建后恢复（evict 后 T1 不失效）', async () => {
   const env = makeEnv();
-  const sent = [];
   const att = { role: 'control', serverId: 1, ts: 1 };
   const ws = {
     deserializeAttachment: () => att,
     serializeAttachment: (a) => { Object.assign(att, a); },
-    send: (m) => sent.push(m), readyState: 1,
+    send() {}, readyState: 1,
   };
   const inst = new TerminalDO(mockState(), env);
   inst.agents.set(1, ws);
   inst.probeCapable.add(1);
-  const pending = inst.probeAgent(ws, 1, 1000);
-  await new Promise((r) => setTimeout(r, 0));
-  await inst.webSocketMessage(ws, JSON.stringify({ type: 'pong', id: JSON.parse(sent[0]).id }));
-  await pending;
+  // 回执不再关联 Promise（探活由上报顺风车发出、无等待方），pong 直接按连接归属刷新
+  await inst.webSocketMessage(ws, JSON.stringify({ type: 'pong', id: 'p-wake' }));
   assert.equal(att.probe, true, 'pong 后能力写入连接附件');
 
   // 模拟 evict 唤醒：新实例据附件恢复 probeCapable
@@ -2082,26 +2066,27 @@ test('TerminalDO: 探活成功（pong）刷新往返时间 → 紧邻 exec 不�
   const jobId = `job_${'8'.repeat(32)}`;
   await seedExecJob(env, jobId);
   const sent = [];
-  const agentWs = { send: (m) => sent.push(m), readyState: 1 };
+  const agentWs = {
+    deserializeAttachment: () => ({ role: 'control', serverId: 1 }),
+    send: (m) => sent.push(m), readyState: 1,
+  };
   const inst = new TerminalDO(mockState(), env);
   inst.agents.set(1, agentWs);
   inst.probeCapable.add(1);
-  // 单独触发一次探活并回 pong（不经 exec）
-  const probe = inst.probeAgent(agentWs, 1, 1000);
-  await new Promise((r) => setTimeout(r, 0));
-  await inst.webSocketMessage(agentWs, JSON.stringify({ type: 'pong', id: JSON.parse(sent[0]).id }));
-  assert.equal(await probe, true);
+  // 顺风车探活的回执：pong 无条件按连接归属刷新往返时间（已无等待方）
+  await inst.webSocketMessage(agentWs, JSON.stringify({ type: 'pong', id: 'p-1' }));
   assert.ok(inst.lastRoundTripAt.has(1), 'pong 刷新往返时间');
 
-  // 紧邻的 exec：往返缓存新鲜 → 直接下发，不重复探活
+  // 紧邻的 exec：往返窗口新鲜 → 直接下发，不重复探活
   const pending = inst.fetch(new Request('https://do.internal/rpc/exec/submit', {
     method: 'POST', body: JSON.stringify({ jobId, serverId: 1, command: 'echo hi', timeoutMs: 5000 }),
   }));
   const res = await pending;
   assert.equal(res.status, 200);
   assert.equal((await res.json()).status, 'running');
-  assert.equal(JSON.parse(sent[1]).type, 'exec', 'pong 已刷新往返 → exec 直接下发（不再探活）');
-  assert.equal(JSON.parse(sent[1]).exec_id, jobId, '帧里的 exec_id 就是 job_id');
+  assert.equal(sent.length, 1, '往返新鲜时不发探活帧，只下发 exec');
+  assert.equal(JSON.parse(sent[0]).type, 'exec', 'pong 已刷新往返 → exec 直接下发（不再探活）');
+  assert.equal(JSON.parse(sent[0]).exec_id, jobId, '帧里的 exec_id 就是 job_id');
   await inst.webSocketMessage(agentWs, JSON.stringify({
     type: 'exec_result', exec_id: jobId, stdout: '', stderr: '', exit_code: 0, timed_out: false,
   }));
@@ -2130,34 +2115,7 @@ test('TerminalDO: agent 降级不再声明 probe_proto → 清除能力与附件
   assert.equal(att.probe, undefined, '附件标记同步清除');
 });
 
-test('TerminalDO: 探活期间连接被重连替换 → 拒绝下发（不让命令进虚空）', async () => {
-  const env = makeEnv();
-  await env.DB.prepare('INSERT INTO servers (agent_key_id, name, user_id, agent_key_hash) VALUES (?,?,?,?)')
-    .bind('k1', 's1', 1, 'h1').run();
-  const jobId = `job_${'7'.repeat(32)}`;
-  await seedExecJob(env, jobId);
-  const sent = [];
-  const oldWs = { send: (m) => sent.push(m), readyState: 1 };
-  const newWs = { send: () => {}, readyState: 1 };
-  const inst = new TerminalDO(mockState(), env);
-  inst.agents.set(1, oldWs);
-  inst.probeCapable.add(1);
-  const pending = inst.fetch(new Request('https://do.internal/rpc/exec/submit', {
-    method: 'POST', body: JSON.stringify({ jobId, serverId: 1, command: 'echo hi', timeoutMs: 5000 }),
-  }));
-  await new Promise((r) => setTimeout(r, 0));
-  assert.equal(JSON.parse(sent[0]).type, 'probe');
-  inst.agents.set(1, newWs); // 探活期间发生重连：索引被替换
-  await inst.webSocketMessage(oldWs, JSON.stringify({ type: 'pong', id: JSON.parse(sent[0]).id }));
-  const res = await pending;
-  assert.equal(res.status, 502);
-  assert.equal((await res.json()).error, 'agent reconnected, please retry');
-  assert.equal(sent.length, 1, '未把命令发往已失效的旧连接');
-  const row = await env.DB.prepare('SELECT status FROM operation_jobs WHERE id = ?').bind(jobId).first();
-  assert.equal(row.status, 'failed', '重连拒绝 → 任务落 failed');
-});
-
-test('TerminalDO: 探活期间开始 Agent 更新 → exec 让路（409）', async () => {
+test('TerminalDO: agent 更新中 → exec 立即 409（不探活、不下发任何帧）', async () => {
   const env = makeEnv();
   await env.DB.prepare('INSERT INTO servers (agent_key_id, name, user_id, agent_key_hash) VALUES (?,?,?,?)')
     .bind('k1', 's1', 1, 'h1').run();
@@ -2168,17 +2126,13 @@ test('TerminalDO: 探活期间开始 Agent 更新 → exec 让路（409）', asy
   const inst = new TerminalDO(mockState(), env);
   inst.agents.set(1, agentWs);
   inst.probeCapable.add(1);
-  const pending = inst.fetch(new Request('https://do.internal/rpc/exec/submit', {
+  inst.updating.add(1); // 更新进行中：互斥判定优先于链路新鲜度
+  const res = await inst.fetch(new Request('https://do.internal/rpc/exec/submit', {
     method: 'POST', body: JSON.stringify({ jobId, serverId: 1, command: 'echo hi', timeoutMs: 5000 }),
   }));
-  await new Promise((r) => setTimeout(r, 0));
-  assert.equal(JSON.parse(sent[0]).type, 'probe');
-  inst.updating.add(1); // 探活期间开始更新（探活后复查捕获，exec 让路）
-  await inst.webSocketMessage(agentWs, JSON.stringify({ type: 'pong', id: JSON.parse(sent[0]).id }));
-  const res = await pending;
   assert.equal(res.status, 409);
   assert.equal((await res.json()).error, 'agent update in progress');
-  assert.equal(sent.length, 1, '未与二进制更新帧交错');
+  assert.equal(sent.length, 0, '未下发任何帧（不与二进制更新帧交错，也不浪费探活）');
   const row = await env.DB.prepare('SELECT status FROM operation_jobs WHERE id = ?').bind(jobId).first();
   assert.equal(row.status, 'failed', '更新让路 → 任务落 failed');
 });

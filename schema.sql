@@ -70,7 +70,7 @@ CREATE INDEX IF NOT EXISTS idx_audit_logs_job_id ON audit_logs(job_id); -- 迁�
 CREATE TABLE IF NOT EXISTS operation_jobs (
   id                TEXT PRIMARY KEY,
   kind              TEXT    NOT NULL,          -- exec / upload / agent_update（应用层校验）
-  status            TEXT    NOT NULL,          -- 见 src/jobs.js JOBS_STATES
+  status            TEXT    NOT NULL,          -- 见 src/jobs.js JOB_TERMINAL_STATES / ACTIVE_STATES
   user_id           INTEGER NOT NULL,
   username          TEXT    NOT NULL,
   client_ip         TEXT,

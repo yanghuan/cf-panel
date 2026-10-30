@@ -754,6 +754,7 @@ async function handleApiInner(request, env) {
         .bind(user.id, user.username, clientIp(request), 'server.create'),
     ]);
     serverListCacheClear();
+    await clearPanelListCache(env);
     return json({
       agent_key: key,
       wss_base: agentWssBase(url),
@@ -790,6 +791,7 @@ async function handleApiInner(request, env) {
       );
       await env.DB.batch(stmts);
       serverListCacheClear();
+      await clearPanelListCache(env);
       results.push(...ids.map((id) => ({ id, ok: true })));
     } else if (op === 'delete') {
       // 逐台串行：级联清理含多次 DO 调用，并发会让分片 drop_server 互相踩踏；
@@ -884,6 +886,7 @@ async function handleApiInner(request, env) {
         .bind(user.id, user.username, clientIp(request), 'server.update', id, `${server.name} → ${name}`),
     ]);
     serverListCacheClear();
+    await clearPanelListCache(env);
     // 覆盖值随上报帧下发（report.js 行缓存），显式清缓存使它立即生效而非等 60s TTL
     serverRowCache.delete(id);
     return json({
@@ -1288,6 +1291,7 @@ async function handleApiInner(request, env) {
       .bind(user.id, user.username, clientIp(request), 'server.reorder', null, `拖拽排序 ${seen.size} 台服务器`));
     await env.DB.batch(stmts); // 原子：任一失败整体回滚，不存在部分排序生效
     serverListCacheClear();
+    await clearPanelListCache(env);
     return json({ ok: true });
   }
 
@@ -1566,6 +1570,15 @@ function serverListCacheClear() {
   serverRowCache.clear(); // 行缓存同步失效
 }
 
+// 清 PanelDO 侧列表缓存。Worker 侧 serverListCache 只影响 REST 列表；观看者的推送走
+// PanelDO 自己的缓存（TTL 20s）。改名/分组/排序若只清 Worker 侧，下一次推送会把旧值
+// 回推给前端（最多 20s 的"改名又变回去"）。失败只记日志，由 TTL 兜底。
+async function clearPanelListCache(env) {
+  try {
+    await doPanel(env).fetch('https://do.internal/rpc/clear_list_cache', { method: 'POST' });
+  } catch { /* 清失败由 PanelDO TTL 兜底 */ }
+}
+
 // 用量观测公共构建（REST /api/usage 与 MCP get_usage 共用，避免两处重复实现漂移）：
 // Worker 请求计数（实例级）+ MetricsDO 上报/查询计数（10min alarm 汇总，跨 evict 保留）
 async function collectUsageView(env) {
@@ -1573,17 +1586,36 @@ async function collectUsageView(env) {
   try {
     doUsage = await (await doMetrics(env).fetch('https://do.internal/usage')).json();
   } catch { /* 用量读取失败不影响 */ }
-  const reportFrames = Number(doUsage.persisted?.report || 0);
   const api = {};
   for (const [k, v] of apiCounts) api[k] = v;
+  // 每日估算：按「服务器数 × 采样档位」解析，不再用「累计帧数 × 猜的系数」。
+  // 旧公式（report_frames 直接取累计值、do_events=frames×2、d1_writes=frames×0.5）与实际构成不符：
+  // 既没有 WS 入站 20:1 折算、也没按分片聚合，快采高估 D1 写约 3 倍、慢采低估约 6 倍。
+  let servers = 0;
+  try {
+    servers = Number((await env.DB.prepare('SELECT COUNT(*) AS n FROM servers').first())?.n) || 0;
+  } catch { /* D1 不可用：按 0 台估算 */ }
+  const FAST_FRAMES = 17280; // 快采 5s：86,400/5
+  const SLOW_FRAMES = 720;   // 慢采 120s：86,400/120
+  const activeShards = Math.min(SHARDS, servers); // 有快采机器的分片数上限
   return {
-    note: 'Worker 计数为实例级（evict/重启清零，趋势参考）；MetricsDO 计数每 10 分钟 alarm 汇总到 storage（跨 evict 保留）。',
+    note: 'Worker 计数为实例级（evict/重启清零，趋势参考）；MetricsDO 计数每 10 分钟 alarm 汇总到 storage（跨 evict 保留）。'
+      + '每日估算按「服务器数 × 采样档位」解析：面板三列为「24h 有人观看」上界（快采 5s），'
+      + '无人观看的慢采（120s）见 slow_* 字段；DO 请求已按 WS 入站 20:1 折算并计入分片转发与推送；'
+      + 'D1 写/机/天 = metrics_min 1,440 + last_seen 1,440（60s 节流）+ metrics_day 144。',
     api,
     metrics_do: doUsage,
     estimates_per_day: {
-      report_frames: reportFrames, // 上报帧：快采 17,280/天/机、慢采 720/天/机
-      do_events: reportFrames * 2, // 每帧上报链约 2 个 DO 事件（report + 推送/告警顺风车）
-      d1_writes: Math.round(reportFrames * 0.5), // last_seen 60s 节流(~0.08/帧) + custom 去重 + info/probe 变更
+      servers,
+      shards: SHARDS,
+      report_frames: FAST_FRAMES * servers,
+      // DO 请求：入站（÷20）+ 每活跃分片 5s 一次转发 + 每 5s 一次推送 + alarm 144
+      do_events: Math.round((FAST_FRAMES / 20) * servers + FAST_FRAMES * (activeShards + 1) + 144),
+      d1_writes: 3024 * servers,
+      // 无人观看（慢采）对照：入站（÷20）+ 逐帧转发 + 探针 pong（240/天 ÷20）+ alarm
+      slow_report_frames: SLOW_FRAMES * servers,
+      slow_do_events: Math.round((SLOW_FRAMES / 20) * servers + SLOW_FRAMES * servers + (240 / 20) * servers + 144),
+      slow_d1_writes: 3024 * servers,
     },
   };
 }
@@ -1676,12 +1708,6 @@ async function agentUpdateCore(env, user, id, ip, requestUrl) {
       'AGENT_UPGRADE_REQUIRED'
     );
   }
-  // 更新是高权限供应链操作：审计写失败则 fail closed，不执行远端替换。
-  await env.DB.prepare(
-    'INSERT INTO audit_logs (user_id, username, client_ip, action, target_server_id, detail) VALUES (?,?,?,?,?,?)'
-  ).bind(user.id, user.username, ip, 'agent.update.request', id,
-    `${info.agent_version || 'unknown'} → ${manifest.build_id} (${platform})`).run();
-
   // 异步路径：只创建任务 + 下发元数据与短期资产 URL。
   // Worker 不再下载 Release 再流式转给 DO —— DO 在这条链路上 0 字节参与。
   let job;
@@ -1694,6 +1720,19 @@ async function agentUpdateCore(env, user, id, ip, requestUrl) {
     });
   } catch (e) {
     if (e.code === 'UPDATE_BUSY') return err('an agent update is already in progress for this server', 409, 'UPDATE_BUSY');
+    throw e;
+  }
+  // 审计必须在任务创建成功之后：UPDATE_BUSY 等纯判定拒绝若先写审计，会留下一条
+  // "已请求更新"而版本未动，事后排查会误判为下发失败（见上方"纯判定必须放在写审计之前"）。
+  // 更新是高权限供应链操作：审计写失败仍 fail closed —— 不通知 DO 执行远端替换，
+  // 并把任务收敛为 failed 让出单机串行锁（否则会白占 210s 直到过期）。
+  try {
+    await env.DB.prepare(
+      'INSERT INTO audit_logs (user_id, username, client_ip, action, target_server_id, detail) VALUES (?,?,?,?,?,?)'
+    ).bind(user.id, user.username, ip, 'agent.update.request', id,
+      `${info.agent_version || 'unknown'} → ${manifest.build_id} (${platform})`).run();
+  } catch (e) {
+    await failJob(env, job.id, 'audit write failed').catch(() => {});
     throw e;
   }
   const assetToken = await signJobToken(
@@ -1953,6 +1992,7 @@ async function mcpAddServer(user, env, args, ip, url) {
       .bind(user.id, user.username, ip, 'server.create'),
   ]);
   serverListCacheClear();
+  await clearPanelListCache(env);
   // 回查 id（不依赖 batch meta，测试/真实环境一致）
   const created = await env.DB.prepare('SELECT id FROM servers WHERE agent_key_id = ?').bind(keyId).first();
   const id = created ? created.id : 0;
@@ -2002,6 +2042,7 @@ async function mcpUpdateServer(user, env, args, ip) {
       .bind(user.id, user.username, ip, 'server.update', server.id, `${server.name} → ${name}`),
   ]);
   serverListCacheClear();
+  await clearPanelListCache(env);
   serverRowCache.delete(server.id); // 覆盖值随上报帧下发，清缓存立即生效
   return {
     ok: true, server_id: server.id, name, group, display_index: displayIndex,

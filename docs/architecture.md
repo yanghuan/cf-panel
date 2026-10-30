@@ -95,7 +95,7 @@ JSON-RPC 2.0：`initialize` / `tools/list` / `tools/call` / `ping`；通知返�
 
 #### 3.2.2 告警通知与多用户
 
-- **Webhook 告警**：`handleReport` 每次上报后做阈值检查（CPU/内存/磁盘根分区/负载），同类告警带冷却去抖（内存 Map）；**离线/恢复告警**在 MetricsDO 的 alarm 中扫描 `servers.last_seen`，状态存 DO Storage（重启不重复告警）。触发时 **POST JSON**（结构化 `event/title/server/message/details/time`）到配置的 Webhook 地址，任意渠道（企业微信/钉钉/Telegram/邮件网关等）由用户侧对接。**告警配置存 D1 `settings.alerts`**（网页设置弹窗填写，`getAlertCfg` 带 60s 缓存读取，保存时清缓存即时生效），不使用环境变量。
+- **Webhook 告警**：`handleReport` 每次上报后做阈值检查（CPU/内存/磁盘根分区/负载），同类告警带冷却去抖（内存 Map）；**离线/恢复告警**在 MetricsDO 的 alarm 中扫描 `servers.last_seen`，状态存 DO Storage（重启不重复告警）。触发时 **POST JSON**（结构化 `event/title/server/message/details/time`）到配置的 Webhook 地址，任意渠道（企业微信/钉钉/Telegram/邮件网关等）由用户侧对接。**告警配置存 D1 `settings.alerts`**（网页设置弹窗填写，`getAlertCfg` 带 5 分钟缓存读取（`SETTINGS_TTL_MS`），保存时清缓存即时生效），不使用环境变量。
 - **多用户**：`PANEL_USERS="user:pass,user:pass"` 环境变量，登录匹配签发 JWT（`uid`+`username`）；未配置时回退 `PANEL_PASSWORD` 单管理员。所有用户同权限（管理员），按用户分配服务器可后续恢复 `users` 表逻辑。
 
 ### 3.3 Durable Object — WebSocket 中转核心
@@ -128,11 +128,12 @@ DO 是整个设计的心脏，对应哪吒 Dashboard 里那两个 `io.Copy` 的�
   - 窗口依据：归档线为 60 分钟，且 `>1h` 的查询必然读 D1（`db.js queryMonitorRows`）——**热区超出归档线的部分对查询结果零贡献，只是同一批数据的第二份副本**。原 720（12h）是 6 倍冗余，直接放大 DO storage 行数、`fullSweep` 全扫量与每帧 `trim` 成本；240 保留归档线 4 倍余量（覆盖增量归档滞后 + fullSweep 1h 兜底周期）。
   - `ARCHIVE_TO_D1=0` 时热区是唯一存储，**自动回退 720** 以保住 12h 可查历史（此时忽略 `METRICS_KEEP_MIN` 的缩短值）。
   - `trim` 按分钟门控（同分钟多帧只裁一次）并依赖「键升序插入」早退，常态 O(1)；条目数超出窗口跨度时退回全扫兜底。
-- **alarm 批量归档**：约每小时 fullSweep 一轮，从 DO Storage 恢复全量行后按 **100 行/批**写 D1（`metrics_min`，保留 30 天）；归档线 60 分钟；归档关闭时仅按热区保留线清理。常态归档由 `/report` 热写路径的增量归档完成，fullSweep 只兜底水位滞后/实例 evict 的残留。
+- **alarm 批量归档**：约每小时 fullSweep 一轮，**按 500 行/页分页扫描**热区（旧实现一次 `list` 全量载入，240×N 行在数百台规模接近 isolate 内存上限），每台机器处理完立即释放；D1 按 **100 行/批**写入（`metrics_min`，保留 30 天），源行按 **128 键/批**删除。归档线 60 分钟；归档关闭时仅按热区保留线清理。常态归档由 `/report` 热写路径的增量归档完成，fullSweep 只兜底水位滞后/实例 evict 的残留。归档水位 `arc:<id>` **降频落盘**（每推进 10 分钟写一次，evict 后最多重放 10 行，`INSERT OR IGNORE` 幂等）。
+- **latest 快照**：热写路径每机每 5 分钟顺带写一份 `l:<id>`（同一次 `put`），`/latest` 冷启动据此 O(N) 恢复；否则要扫整个热区（240×N 行 + 逐行 `JSON.parse`）。
 - **离线/恢复告警**：同一 alarm 周期（约 10 分钟，空闲退避 1 小时）扫描 `last_seen`，状态存 DO Storage 防重启重复告警。
 - **写放大控制**：`last_seen` 60 秒节流、监控行每分钟聚合、自定义指标按 key 去重，D1 写入量与服务器数线性且系数极小。
 
-**容量边界（设计预期）**：单 DO 单线程串行处理全部上报。双档采样（无人观看 60s / 有人 5s，见 §3.5 省配额策略）下，**数百台（建议 ≤500）规模无压力**；超过此量级时 `/report` 吞吐与 alarm 单轮时长会成为瓶颈，届时需按 `server_id` 哈希将 MetricsDO 分片（热区/归档/告警各自独立，无跨机状态，可直接平移）。
+**容量边界（设计预期）**：单 DO 单线程串行处理全部上报。双档采样（无人观看 120s / 有人 5s，见 §3.5 省配额策略）下，**数百台（建议 ≤500）规模无压力**；超过此量级时 `/report` 吞吐与 alarm 单轮时长会成为瓶颈，届时需按 `server_id` 哈希将 MetricsDO 分片（热区/归档/告警各自独立，无跨机状态，可直接平移）。
 
 ### 3.4 外部 Agent
 部署在每台目标机器上（复用哪吒 agent 思路，实现选型见 3.5）：
@@ -227,7 +228,7 @@ done
 - resize：控制 WS 收到 `{type:resize,...}` → `stty -F <slave路径>` 改 winsize → 内核发 `SIGWINCH`，`vim`/`top` 跟着变尺寸。
 - 监控上报：后台循环每 `REPORT_INTERVAL`（默认 120s）采集一次，JSON 写入 FIFO；控制通道 websocat 以 FIFO 为 stdin，数据自动经 WS 上行，服务端识别 `{type:"report"}` 落监控热区——**免 crontab、免独立脚本**。
 - 上报内容：固定列（CPU/内存/网络速率）+ `extra` JSON（Swap/磁盘/负载/温度/进程数/TCP-UDP 连接数，紧凑短 key 不压缩）+ `info`（OS/内核/IP，服务端比对变化才更新 `servers.info_json`）。网络速率由 agent 对 `/proc/net/dev` 累计值做差分，避免累计值当速率。
-- **省配额策略**：PanelDO 暴露 `/viewers` RPC（只统计 attachment 角色为 `viewer` 的已鉴权前端）；TerminalDO 在 agent 控制通道建立与每次上报后查询它，通过 `{type:"set_report_interval", interval}` 下发间隔（仅变化时）：有观看者 5s 快采、无人 120s 低频采样——配额从"时刻满采"降到"只在有人看时满采"。首位观看者上线时 PanelDO 还会向各分片广播 `/rpc/set_viewers`，agent 立即切快采（免等下一次上报）。agent 端把下发的间隔写入 `$TMP_DIR/report-interval`，上报循环每次唤醒后读取。
+- **省配额策略**：PanelDO 暴露 `/viewers` RPC（只统计 attachment 角色为 `viewer` 的已鉴权前端）；观看者数变化由 PanelDO 事件驱动广播（`/rpc/set_viewers`），TerminalDO 把间隔写进连接附件、唤醒重建时零请求读回；仅当附件缺失（升级前的老连接）才兜底查一次 `/viewers`，通过 `{type:"set_report_interval", interval}` 下发间隔（仅变化时）：有观看者 5s 快采、无人 120s 低频采样——配额从"时刻满采"降到"只在有人看时满采"。首位观看者上线时 PanelDO 还会向各分片广播 `/rpc/set_viewers`，agent 立即切快采（免等下一次上报）。agent 端把下发的间隔写入 `$TMP_DIR/report-interval`，上报循环每次唤醒后读取。
 - **文件管理**：与终端同构的独立会话——面板 `POST /api/file/open` 创建会话并下发 `open_file` 指令，agent 连回 `/ws/agent/file` 处理（**Rust 版内置实现，无独立脚本**）。JSON 行协议：`list`（目录列表，支持通配符过滤）/`read`/`write`（**Binary 混合帧 = JSON 头 + `\n` + 原始字节，无 base64 膨胀**；分块 512KB、`write` 按确认推进、临时文件 + 原子 rename）+ `zip`（**目录打包**：agent 手写 STORED ZIP 到临时文件，返回路径/大小，前端分段拉取完成后发 `delete` 清理）/`rename`/`delete`。写、删、改名受系统路径保护；ZIP 属只读下载，仅拒绝打包文件系统根。所有文件系统预检/遍历/写入统一进入带超时、并发上限和熔断的 `file_blocking`。浏览器经 `/ws/file/{sid}` 透传；前端将列表条目视为不可信输入并白名单化类型/数值，`FileSession.open` 用代际守卫防乱序响应串台。服务端复用 TerminalDO 会话注册表/权限/清理，DO 只做双向透传。
 - 权衡：Shell 版零解释器依赖、部署极简；但并发弱、进程多、每终端 +9MB。已实现 **Rust 版（`agent/rust/`）替代**：实测内存 1.9MB（全静态 musl）、单进程、无外部二进制依赖，协议一致可无缝替换；Shell 版废弃保留参考。
 

@@ -195,12 +195,35 @@ export async function deleteStagingObject(env, job) {
   }
 }
 
-// 互斥：该服务器是否有进行中的 agent update（更新会重启 Agent，禁止与 exec 交错）
-export async function hasActiveAgentUpdate(env, serverId) {
+// 互斥：该服务器是否有进行中的 agent update（更新会重启 Agent，禁止与 exec 交错）。
+// 判据必须带 deadline_at：Agent 未回执且连接未断（更新内部挂住/进程未退出）时，任务会一直停在
+// queued/waiting_agent/running；只看 status 的话，本机 exec/upload 会被 409 挡住最长到下一次
+// cron（1h）——期间没有任何路径会收敛它（settleExpiredAll 每小时第 17 分才跑）。
+// excludeJobId：排除「本次要下发的那个任务」——它自己当然是 active 的，
+// 不排除会让 DO 在下发新更新时被自己刚创建的 D1 行挡住（旧更新挂住后重试的路径）。
+export async function hasActiveAgentUpdate(env, serverId, excludeJobId = null) {
+  const now = nowSec();
   const row = await env.DB.prepare(
-    "SELECT 1 AS x FROM operation_jobs WHERE server_id = ? AND kind = 'agent_update' AND status IN ('queued','waiting_agent','running') LIMIT 1"
-  ).bind(serverId).first();
-  return !!row;
+    `SELECT 1 AS x FROM operation_jobs
+      WHERE server_id = ? AND kind = 'agent_update'
+        AND status IN ('queued','waiting_agent','running') AND deadline_at > ?
+        AND id != ?
+      LIMIT 1`
+  ).bind(serverId, now, excludeJobId || '').first();
+  if (row) return true;
+  // 过期行仍占着部分唯一索引（idx_operation_jobs_active_update 不含 deadline），
+  // 会让 createAgentUpdateJob 误判 UPDATE_BUSY（最长到 cron）。此处顺手收敛：
+  // 条件 UPDATE，天然幂等；与 settleServerExpired 的语义一致（迟到回执仍可纠正，见 finishUpdateJob）。
+  try {
+    await env.DB.prepare(
+      `UPDATE operation_jobs
+          SET status = 'expired', error = COALESCE(error, 'expired before completion'), finished_at = ?,
+              duration_ms = CASE WHEN started_at IS NULL THEN NULL ELSE (? - started_at) * 1000 END
+        WHERE server_id = ? AND kind = 'agent_update'
+          AND status IN ('queued','waiting_agent','running') AND deadline_at <= ?`
+    ).bind(now, now, serverId, now).run();
+  } catch { /* 收敛失败不影响互斥判定（下次调用重试） */ }
+  return false;
 }
 
 // ---- upload 任务 ----
@@ -211,14 +234,21 @@ export async function hasActiveAgentUpdate(env, serverId) {
 // 这里只处理"这台机器"，把被过期任务占着的部分唯一索引让出来——否则
 // awaiting_upload / update running 的任务过了 deadline 但没人轮询、cron 未跑到时，
 // createUploadJob 仍会返回 UPLOAD_BUSY，最长挡到 expires_at（24h）。
-export async function settleServerExpired(env, serverId, now = nowSec()) {
+//
+// 只处理 upload / agent_update：只有这两类占单机串行唯一索引（schema.sql 的部分唯一索引）。
+// 不加 kind 过滤时，一台机器积压的几十条过期 exec 会占满 LIMIT，真正挡路的那条 upload
+// 反而选不到（SQL 无 ORDER BY 时不保证顺序）；ORDER BY deadline_at 保证最老的先收敛。
+export async function settleServerExpired(env, serverId, now = nowSec(), kinds = ['upload', 'agent_update']) {
+  const kindPlaceholders = kinds.map(() => '?').join(',');
   const rows = await env.DB.prepare(
     `SELECT id, kind, r2_key, user_id, username, client_ip, server_id, command, started_at, finished_at
        FROM operation_jobs
       WHERE server_id = ? AND deadline_at < ?
+        AND kind IN (${kindPlaceholders})
         AND status IN ('queued','awaiting_upload','staging','staged','waiting_agent','running')
+      ORDER BY deadline_at
       LIMIT 20`
-  ).bind(serverId, now).all();
+  ).bind(serverId, now, ...kinds).all();
   for (const job of rows.results || []) {
     const placeholders = ACTIVE_STATES.map(() => '?').join(',');
     const res = await env.DB.prepare(

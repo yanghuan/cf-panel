@@ -10,7 +10,11 @@ import { json, doForShard, doMetrics, safeJson } from './utils.js';
 import { authIdentityByToken, authUserByIdentity, isAdmin } from './auth.js';
 
 // 本模块专用常量（缓存 TTL / 频率下限 / 切快采过渡期，就近定义便于对照使用代码）
-const LIST_CACHE_TTL_MS = 4500; // 服务器列表缓存 TTL：> 前端 3s sync 间隔（错开同频，消除单观看者 miss）
+// 服务器列表缓存 TTL。原先 4500ms 是为「前端 3s sync」设计的；现在 sync 只在连接时发一次、
+// 推送是 5s 节拍 → 4.5s TTL 每次推送必然 miss（每 5s 一次 SELECT * FROM servers）。
+// 改为 20s：推送 1/4 命中，500 台规模 17,280 次全表读/天 → 4,320。
+// 列表字段的变更（增删改/排序）由各写入路径显式调 /rpc/clear_list_cache，不依赖 TTL 生效。
+const LIST_CACHE_TTL_MS = 20000;
 const LATEST_CACHE_TTL_MS = 4000; // MetricsDO /latest 共享缓存 TTL（多观看者 sync 共享，DO 事件 −50%）
 const SYNC_MIN_INTERVAL_MS = 2000; // sync 频率下限（<2s 忽略，防任意消息/高频触发全链路）
 const WS_AUTH_TIMEOUT_MS = 10 * 1000; // WS 建连后必须在 10s 内发送 auth 首帧
@@ -31,7 +35,9 @@ export class PanelDO {
   constructor(state, env) {
     this.state = state;
     this.env = env;
-    this.listCache = null; // {rows, ts} 服务器列表缓存（TTL 4500ms，多观看者共享，降 D1 读）
+    this.listCache = null; // {rows, ts} 服务器列表缓存（TTL 20s，多观看者共享，降 D1 读）
+    this.listInflight = null; // 并发 miss 合并：N 个观看者同时 sync/推送只打一条 SQL
+    this.listEpoch = 0; // 失效代际：清缓存后递增，防止在途查询把变更前的行写回缓存
     this.latestCache = null; // {data, ts} MetricsDO /latest 共享缓存（TTL 4s，sync 链 DO 事件 −50%）
     this.syncAt = new Map(); // ws -> 上次 sync 时间（频率下限 <2s 忽略，防刷）
     this.authCache = new Map(); // 身份键（PAT HMAC / JWT claims）→ {user, ts}，不缓存 bearer 明文
@@ -95,10 +101,23 @@ export class PanelDO {
     let rows;
     if (this.listCache && now - this.listCache.ts < LIST_CACHE_TTL_MS) {
       rows = this.listCache.rows;
+    } else if (this.listInflight) {
+      // 并发 miss 合并：同一时刻多个观看者的 sync/latest_push 共享同一条查询
+      rows = await this.listInflight;
     } else {
-      const r = await this.env.DB.prepare('SELECT * FROM servers ORDER BY "group", display_index, id').all();
-      rows = r.results;
-      this.listCache = { rows, ts: now };
+      // 快照代际：查询在途期间若发生 server 增删改（clear_list_cache 递增 listEpoch），
+      // 本次结果不得写回缓存，否则会把变更前的行盖上新的 ts（最长 20s 回退）。
+      const epoch = this.listEpoch;
+      this.listInflight = (async () => {
+        const r = await this.env.DB.prepare('SELECT * FROM servers ORDER BY "group", display_index, id').all();
+        if (epoch === this.listEpoch) this.listCache = { rows: r.results, ts: Date.now() };
+        return r.results;
+      })();
+      try {
+        rows = await this.listInflight;
+      } finally {
+        this.listInflight = null; // 失败也不留死 promise（下次重新查）
+      }
     }
     if (isAdmin(user)) return rows;
     if (user.pat) {
@@ -124,9 +143,12 @@ export class PanelDO {
       this.authCache.clear();
       return json({ ok: true });
     }
-    // 内部 RPC：服务器增删改后清列表缓存（否则已删服务器最多 4.5s 内仍出现在推送列表；清失败由 TTL 兜底）
+    // 内部 RPC：服务器增删改/排序后清列表缓存（否则已删服务器仍会出现在推送列表、
+    // 改名/排序会被旧缓存回退；清失败由 TTL 兜底）。所有写入路径都应调用（见 routes.js）。
     if (url.pathname === '/rpc/clear_list_cache' && request.method === 'POST') {
       this.listCache = null;
+      this.listInflight = null;
+      this.listEpoch += 1; // 在途查询的结果作废
       this.latestCache = null;
       return json({ ok: true });
     }

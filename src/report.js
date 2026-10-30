@@ -99,6 +99,9 @@ export function sanitizeReportPayload(p) {
     out.extra = null;
   }
   // probes：条数上限 + 只保留已知键（name/ok/code/ms，agent 合法上报字段）
+  // 三态语义必须保留：null = 未上报该字段（保持库中原值，兼容旧 agent）；
+  // [] = agent 明确声明「本机没有探针配置」（PROBES 被删除）→ 清空库中旧结果，
+  // 否则卡片会一直显示过期的绿/红徽章（错误的服务健康信息）。
   if (Array.isArray(p.probes)) {
     out.probes = [];
     for (const pr of p.probes.slice(0, PROBES_MAX)) {
@@ -110,7 +113,7 @@ export function sanitizeReportPayload(p) {
       if (ms != null) o.ms = ms;
       out.probes.push(o);
     }
-    if (!out.probes.length) out.probes = null;
+    // 注意：不要在这里把 [] 归一为 null——那正是「删配置后徽章永久残留」的根因
   } else {
     out.probes = null;
   }
@@ -165,16 +168,27 @@ export async function handleReport(env, payload, timing) {
   // 对比剥离 ms——探活耗时 ms 每次探测必然毫秒级抖动，全量 JSON 对比会每帧触发
   // UPDATE（快采 6,240 行写/天/机，「变更才写」对 probes 完全失效）；改用稳定投影
   // [name,ok,code] 对比，仅状态真变时落全量（含当时 ms；前端探活延迟展示随之停更，可接受）
+  // 探活状态：变更才写 probe_json（告警去重状态在 MetricsDO 顺风车处理），写后更新行缓存。
+  // 空数组单独处理：它是「本机已无探针配置」的明确声明，必须清空库中旧结果（见 sanitize 注释）。
+  let probesCleared = false;
   if (Array.isArray(payload.probes)) {
-    const proj = (list) => JSON.stringify(list.map((p) => [p.name, !!p.ok, p.code ?? null]));
-    let prevProj = null;
-    if (server.probe_json) {
-      try { prevProj = proj(JSON.parse(server.probe_json)); } catch { prevProj = null; }
-    }
-    if (proj(payload.probes) !== prevProj) {
-      const probeJson = JSON.stringify(payload.probes);
-      await env.DB.prepare('UPDATE servers SET probe_json = ? WHERE id = ?').bind(probeJson, payload.serverId).run();
-      serverRowCache.set(payload.serverId, { ...server, probe_json: probeJson, ts: Date.now() });
+    if (!payload.probes.length) {
+      if (server.probe_json) {
+        await env.DB.prepare('UPDATE servers SET probe_json = NULL WHERE id = ?').bind(payload.serverId).run();
+        serverRowCache.set(payload.serverId, { ...server, probe_json: null, ts: Date.now() });
+        probesCleared = true; // 通知 MetricsDO 一并清掉去重状态（否则同名探针重新启用会沿用旧冷却）
+      }
+    } else {
+      const proj = (list) => JSON.stringify(list.map((p) => [p.name, !!p.ok, p.code ?? null]));
+      let prevProj = null;
+      if (server.probe_json) {
+        try { prevProj = proj(JSON.parse(server.probe_json)); } catch { prevProj = null; }
+      }
+      if (proj(payload.probes) !== prevProj) {
+        const probeJson = JSON.stringify(payload.probes);
+        await env.DB.prepare('UPDATE servers SET probe_json = ? WHERE id = ?').bind(probeJson, payload.serverId).run();
+        serverRowCache.set(payload.serverId, { ...server, probe_json: probeJson, ts: Date.now() });
+      }
     }
   }
   // 自定义监控项：按降采样桶（默认 5 分钟）直写 D1；同桶同指标只写一次。
@@ -229,6 +243,8 @@ export async function handleReport(env, payload, timing) {
     net_out: payload.net_out ?? null,
     extra: payload.extra ?? null,     // 扩展监控项对象 → 序列化存入 extra 列
     probes: payload.probes ?? null,
+    // 仅在有「有探针 → 无探针」变更时携带：常态帧不带，避免每帧多一个字段
+    ...(probesCleared ? { probesCleared: true } : {}),
     // 逐机告警阈值覆盖（servers.alert_override 原始 JSON），随帧下发供 MetricsDO 判定，
     // 免得告警路径每帧多一次 D1 查询（行缓存已承担读取成本）
     alertOverride: server.alert_override ?? null,

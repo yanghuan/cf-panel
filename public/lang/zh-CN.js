@@ -584,7 +584,20 @@
     'error.BATCH_IDS_REQUIRED': '请选择要操作的服务器',
     'error.BATCH_TOO_MANY': '一次最多操作 100 台',
     'error.GROUP_TOO_LONG': '分组名过长',
-    'error.UPLOAD_TOO_LARGE': '文件超过大小上限',
+    'error.DESCRIPTION_TOO_LONG': '描述过长（最多 500 字）',
+    'error.COMMAND_REQUIRED': '命令不能为空',
+    'error.PATH_REQUIRED': '路径不能为空（需为绝对路径）',
+    'error.LENGTH_REQUIRED': '上传请求缺少 Content-Length，无法确认文件大小',
+    'error.TOO_LARGE': '文件超过大小上限',
+    'error.AGENT_UPDATE_BUSY': '该服务器正在更新 Agent，请稍后再试',
+    'error.AGENT_UPGRADE_REQUIRED': 'Agent 版本过旧，不支持在线更新，请手动升级',
+    'error.UPLOAD_BUSY': '该服务器已有进行中的上传任务，请等待完成',
+    'error.UPLOAD_CLAIMED': '该上传任务已被占用',
+    'error.UPDATE_BUSY': '该服务器已有进行中的 Agent 更新',
+    'error.JOB_NOT_AWAITING_UPLOAD': '上传任务状态已变化，当前链接已失效',
+    'error.ORDER_ITEMS_REQUIRED': '排序项不能为空',
+    'error.ORDER_TOO_MANY': '一次最多排序 500 项',
+    'error.ORDER_BAD_ITEM': '排序项格式不正确',
   };
 
   window.CfI18n.register(

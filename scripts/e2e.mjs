@@ -3,7 +3,7 @@
 // cf-panel E2E 测试（Node >= 22，零外部依赖：fetch + WebSocket 内置）
 // 验证链路：wrangler dev → D1 建表 → 登录 → 注册服务器 →
 //           agent 控制通道上线 → 监控上报落库 → 终端双向透传 →
-//           文件上传/下载 → MCP 全量工具（16 个）
+//           文件上传/下载 → MCP 全量工具（17 个，含 get_operation）
 // 用法：node scripts/e2e.mjs
 // 环境变量：E2E_PORT（默认 8787）、E2E_PASSWORD（默认读 .dev.vars）
 //           AGENT_CMD（默认 agent/rust/target/release/cf-panel-agent）

@@ -336,6 +336,38 @@ test('PATCH /api/servers/:id：部分字段更新（不再 500）', async () => 
   assert.equal(logs.results.length, 3);
 });
 
+// PanelDO 的列表缓存 TTL 提到 20s 后，改名/排序若只清 Worker 侧缓存，下一次推送
+// （5s 节拍）会把旧名字回推给前端——必须同步清 PanelDO 侧缓存。
+test('服务器写入路径：同时清 PanelDO 列表缓存（改名/排序/新建/批量分组）', async () => {
+  const env = makeEnv();
+  const token = await login(env);
+  const clearCalls = () => env.PANEL.calls.filter((u) => u.includes('/rpc/clear_list_cache')).length;
+
+  await addServer(env, token, { name: 'c1' });
+  assert.equal(clearCalls(), 1, '创建服务器后清 PanelDO 列表缓存');
+  const id = (await (await call(env, { path: '/api/servers', token })).json())[0].id;
+
+  env.PANEL.calls.length = 0;
+  assert.equal((await call(env, { method: 'PATCH', path: `/api/servers/${id}`, token, body: { name: 'c2' } })).status, 200);
+  assert.equal(clearCalls(), 1, '改名后清 PanelDO 列表缓存');
+
+  env.PANEL.calls.length = 0;
+  const order = await call(env, {
+    method: 'PUT', path: '/api/servers/order', token,
+    body: { items: [{ id, group: 'g' }] },
+  });
+  assert.equal(order.status, 200);
+  assert.equal(clearCalls(), 1, '排序后清 PanelDO 列表缓存');
+
+  env.PANEL.calls.length = 0;
+  const batch = await call(env, {
+    method: 'POST', path: '/api/servers/batch', token,
+    body: { op: 'update-group', ids: [id], group: 'g2' },
+  });
+  assert.equal(batch.status, 200);
+  assert.equal(clearCalls(), 1, '批量改分组后清 PanelDO 列表缓存');
+});
+
 test('删除服务器：清理历史数据 + 审计日志 + 通知 DO 断开 agent', async () => {
   const env = makeEnv();
   const token = await login(env);
@@ -504,6 +536,30 @@ test('probe_json 仅 ms 抖动不触发写，状态变化才落库', async () =>
   await I.handleReport(env, { serverId: id, probes: [{ name: 'web', ok: false, code: 502, ms: 88 }] });
   row = await env.DB.prepare('SELECT probe_json FROM servers WHERE id = ?').bind(id).first();
   assert.ok(row.probe_json.includes('502'), 'code 变化写 D1');
+});
+
+// agent 删掉 PROBES 并重启后会明确上报 probes: []；若把它归一为 null（旧实现），
+// 库里 probe_json 永不更新，卡片会一直显示过期的绿/红徽章（错误的服务健康信息）。
+test('探活：上报空数组清空旧结果（删除 PROBES 后徽章不残留）', async () => {
+  const env = makeEnv();
+  const token = await login(env);
+  await addServer(env, token, { name: 'node-p0' });
+  const list = await (await call(env, { path: '/api/servers', token })).json();
+  const id = list[0].id;
+
+  await I.handleReport(env, { serverId: id, probes: [{ name: 'web', ok: true, code: 200, ms: 5 }] });
+  let row = await env.DB.prepare('SELECT probe_json FROM servers WHERE id = ?').bind(id).first();
+  assert.ok(row.probe_json.includes('web'), '先写入探针结果');
+
+  // 未上报该字段（旧 agent / 非探活帧）：保持原值
+  await I.handleReport(env, { serverId: id });
+  row = await env.DB.prepare('SELECT probe_json FROM servers WHERE id = ?').bind(id).first();
+  assert.ok(row.probe_json.includes('web'), '未上报该字段时不得清空');
+
+  // 明确上报空数组（配置被移除）：清空，并通知 MetricsDO 清去重状态
+  await I.handleReport(env, { serverId: id, probes: [] });
+  row = await env.DB.prepare('SELECT probe_json FROM servers WHERE id = ?').bind(id).first();
+  assert.equal(row.probe_json, null, '空数组必须清空 probe_json');
 });
 
 test('服务器行缓存 + MetricsDO 转发节流（降额）', async () => {
@@ -1155,7 +1211,21 @@ test('用量观测：/api/usage 仅管理员可访问，返回用量估算（P2 
   assert.ok('api' in body, '含 Worker 请求计数');
   assert.ok('metrics_do' in body, '含 MetricsDO 用量');
   assert.ok('estimates_per_day' in body, '含每日估算');
-  assert.ok(body.estimates_per_day.report_frames >= 0);
+  const est = body.estimates_per_day;
+  assert.equal(est.servers, 0);
+  assert.equal(est.report_frames, 0, '无服务器时为 0（不再随累计帧数变化）');
+  assert.equal(est.d1_writes, 0);
+
+  // 有服务器时按解析公式缩放：帧 = 17,280/台/天，D1 写 = 3,024/台/天
+  await addServer(env, adminToken, { name: 'u1' });
+  await addServer(env, adminToken, { name: 'u2' });
+  const est2 = (await (await call(env, { path: '/api/usage', token: adminToken })).json()).estimates_per_day;
+  assert.equal(est2.servers, 2);
+  assert.equal(est2.report_frames, 17280 * 2);
+  assert.equal(est2.slow_report_frames, 720 * 2);
+  assert.equal(est2.d1_writes, 3024 * 2);
+  assert.ok(est2.do_events > est2.slow_do_events, '有人观看时 DO 请求应显著高于慢采');
+  assert.equal(est2.do_events, Math.round(17280 / 20 * 2 + 17280 * (2 + 1) + 144));
   // PAT（非管理员）403
   const pat = await (await call(env, { method: 'POST', path: '/api/tokens', token: adminToken, body: { name: 'r', scopes: ['server:read'] } })).json();
   assert.equal((await call(env, { path: '/api/usage', token: pat.token })).status, 403);
@@ -1311,10 +1381,16 @@ test('Agent 更新：仅管理员、能力检查、Release 流式中转与审计
     });
     const updToken = (await patUpdRes.json()).token;
     // 单机串行：上一次更新（管理员触发）的任务仍在 running，第二次必须 409 —— 这正是
-    // 部分唯一索引要防的"二进制更新帧与另一个更新交错"。先把它收敛掉再验证 PAT 能触发。
+    // 部分唯一索引要防的"二进制更新帧与另一个更新交错"。
+    // 被 409 拒绝的请求不得留下 agent.update.request 审计：审计代表"已下发更新"，
+    // 给拒绝也记一条会让事后排查误判为"下发成功但版本没变"。
     assert.equal((await call(env, {
       method: 'POST', path: '/api/servers/1/agent-update', token: updToken,
     })).status, 409, '同一服务器的第二个更新必须被串行锁拒绝');
+    const busyAudit = await env.DB.prepare(
+      "SELECT COUNT(*) AS n FROM audit_logs WHERE action = 'agent.update.request' AND username LIKE 'token:%'"
+    ).first();
+    assert.equal(busyAudit.n, 0, '被 409 拒绝的更新不得写 agent.update.request 审计');
     await env.DB.prepare("UPDATE operation_jobs SET status = 'succeeded' WHERE server_id = 1 AND kind = 'agent_update'").run();
     const updByPat = await call(env, {
       method: 'POST', path: '/api/servers/1/agent-update', token: updToken,
@@ -1334,7 +1410,7 @@ test('Agent 更新：仅管理员、能力检查、Release 流式中转与审计
     const patAudits = await env.DB.prepare(
       "SELECT username, action FROM audit_logs WHERE action LIKE 'agent.update.%' AND username LIKE 'token:%' ORDER BY id"
     ).all();
-    assert.ok(patAudits.results.length >= 2, 'PAT 触发的更新写入审计（request + installed）');
+    assert.equal(patAudits.results.length, 1, 'PAT 触发的成功更新写入且仅写入一条 request 审计');
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -2433,6 +2509,51 @@ test('upload job：创建前收敛本机过期任务，释放被占的串行锁'
   assert.equal(res.status, 202, '过期任务不应阻塞新上传');
   const row = await env.DB.prepare('SELECT status FROM operation_jobs WHERE id = ?').bind('job_old').first();
   assert.equal(row.status, 'expired', '旧任务应被顺带收敛为 expired');
+});
+
+// 过期任务不限 kind 时会占满 LIMIT：一台机器积压 25 条过期 exec，真正挡路的过期 upload
+// 排在最后选不到 → 新上传仍 409 UPLOAD_BUSY。加 kind 过滤 + ORDER BY deadline_at 后才能收敛。
+test('upload job：大量过期 exec 不占用收敛名额（只收敛 upload/update）', async () => {
+  const env = makeEnv();
+  const token = await login(env);
+  await addServer(env, token, { name: 'many-stale' });
+  const now = Math.floor(Date.now() / 1000);
+  const ins = (id, kind, status) => env.DB.prepare(
+    `INSERT INTO operation_jobs (id, kind, status, user_id, username, server_id, command, target_path, overwrite, size_bytes, created_at, deadline_at, expires_at)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`
+  ).bind(
+    id, kind, status, 1, 'admin', 1,
+    kind === 'exec' ? 'echo x' : null, kind === 'upload' ? '/opt/old' : null, 0, 10,
+    now - 5000, now - 4000, now + 86400,
+  ).run();
+  for (let i = 0; i < 25; i++) await ins(`job_x${i}`, 'exec', 'running');
+  await ins('job_up', 'upload', 'awaiting_upload'); // 插在最后：无 ORDER BY 时最容易被 LIMIT 挤掉
+
+  const res = await call(env, { method: 'POST', path: '/api/upload-jobs', token, body: { server_id: 1, path: '/opt/new' } });
+  assert.equal(res.status, 202, '挡路的过期 upload 必须被收敛，不能因过期 exec 占满 LIMIT 而 UPLOAD_BUSY');
+  const row = await env.DB.prepare('SELECT status FROM operation_jobs WHERE id = ?').bind('job_up').first();
+  assert.equal(row.status, 'expired', '过期的 upload 任务应被收敛为 expired');
+});
+
+// 过期但没人轮询的 agent_update（Agent 未回执、连接未断）会一直停在 running：
+// 判据只看 status 时，该机 exec/upload 会被 409 挡住最长到下一次 cron（1h）。
+test('exec：已过 deadline 的 agent_update 不再阻塞命令', async () => {
+  const env = makeEnv();
+  const token = await login(env);
+  await addServer(env, token, { name: 'stale-update' });
+  const now = Math.floor(Date.now() / 1000);
+  await env.DB.prepare(
+    `INSERT INTO operation_jobs (id, kind, status, user_id, username, server_id, created_at, deadline_at, expires_at)
+     VALUES ('job_upd','agent_update','running',1,'admin',1,?,?,?)`
+  ).bind(now - 900, now - 300, now + 86400).run();
+
+  const res = await call(env, {
+    method: 'POST', path: '/api/exec-jobs', token,
+    body: { server_id: 1, command: 'echo ok', timeout: 5 },
+  });
+  assert.equal(res.status, 202, '已过 deadline 的更新任务不得继续挡 exec');
+  const row = await env.DB.prepare('SELECT status FROM operation_jobs WHERE id = ?').bind('job_upd').first();
+  assert.equal(row.status, 'expired', '命中过期行时顺手收敛，让出 agent_update 的唯一索引');
 });
 
 // P2-4 剩余：DO 返回 409/413 时它自己不写 D1，这两条"下发被拒"路径也必须留痕。

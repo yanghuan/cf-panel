@@ -387,7 +387,7 @@ Webhook 出站安全：仅允许 HTTP(S)，拒绝 URL 内嵌凭据、本地域�
 | POST | `/api/servers` | 添加服务器（`name` 必填，`group`/`sort_order`/`description` 可选），返回一次性 agent 配置 |
 | PATCH | `/api/servers/:id` | 改名称 / 分组 / 描述 / 序号 / 告警阈值覆盖（`description` 传空串清除、`alert_override` 传 `null` 清除） |
 | POST | `/api/servers/:id/rotate-key` | 轮换 agent key（旧 key 立即失效并断连，历史保留） |
-| POST | `/api/servers/:id/agent-update` | 流式更新 Agent（需节点 `ALLOW_SELF_UPDATE=1`） |
+| POST | `/api/servers/:id/agent-update` | 异步更新 Agent：创建任务并下发元数据，Agent 经资产代理自行拉取（需节点 `ALLOW_SELF_UPDATE=1`） |
 | POST | `/api/servers/batch` | 批量操作：`op=update-group`（单事务）或 `delete`（逐台级联），`ids` 上限 100 |
 | DELETE | `/api/servers/:id` | 删除服务器（含历史清理与断连） |
 | GET | `/api/agent/latest` | 最新 Agent Release 清单摘要（5 分钟缓存） |

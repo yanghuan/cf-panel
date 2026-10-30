@@ -52,13 +52,42 @@ export class TerminalDO {
     this.agentInterval = new Map(); // serverId -> 当前下发的上报间隔（秒），避免重复下发
     this.pendingOpen = new Map(); // streamId -> {tries, timer, type} open_terminal/open_file 确认重发
     this.lastProbeAt = new Map(); // serverId -> 上次发出 probe 帧的时间（上报顺风车节流，防每帧都发）
-    this.updating = new Set(); // serverId -> Agent 更新进行中（与上传/更新互斥，防 Binary 帧交错）
+    // serverId -> 进行中更新的 jobId（与上传/更新互斥，防 Binary 帧交错）。
+    // 用 Map 而非 Set：必须能区分「遗留的旧标记」与「本次要下发的任务」——
+    // 旧更新挂住（D1 已判过期）后，新的更新任务会被自己的 D1 行挡住直到实例 evict；
+    // 且旧任务的迟到回执不得清掉新任务的标记（否则两者会交错）。
+    this.updating = new Map();
     this.lastPingAt = new Map(); // serverId -> 上次心跳时间（控制通道保活，防健康连接被 read -t 180 误判半开）
     this.lastRoundTripAt = new Map(); // serverId -> 上次确认双向可达时间（exec_result/pong），exec 据此信任连接
     this.probeCapable = new Set(); // serverId -> agent 已回 pong（支持 exec 前探活）；未支持则 exec 直接下发（向后兼容旧 agent）
     this.rebuilt = false; // 本实例是否已按附件重建过索引（唤醒后只重建一次，见 rebuildIndex）
     this.slowLogAt = 0; // 埋点日志的小时窗口起点（ms）
     this.slowLogCount = 0; // 本窗口已输出条数（每实例独立）
+  }
+
+  // 内存互斥可能因 Agent 挂住（不回执、连接仍在）而永不释放——D1 的 deadline 才是权威。
+  // 标记存在但 D1 已判过期（hasActiveAgentUpdate 会顺手收敛）时清掉本地标记，
+  // 避免过期更新继续挡 exec / upload / 新更新 / 终端会话，直到实例 evict。
+  // forJobId：调用方正在下发的更新任务 id。它自己当然算 active，必须排除，
+  // 否则「上一次更新挂住 → D1 判过期 → 用户重试」的第二条任务会被自己挡住。
+  async isUpdating(serverId, forJobId = null) {
+    const marked = this.updating.get(serverId);
+    if (marked != null && forJobId && marked === forJobId) return false; // 就是本次要下发的任务
+    // 无论本地有没有标记都要问 D1：evict 后本地 Map 为空，但另一实例（或 evict 前）下发的
+    // 更新仍在跑——只看本地标记会让 exec/upload 与 self-replace 交错（原实现就是「本地标记
+    // 或 D1 任务」双轨判定，不能因短路本地标记而丢掉 D1 这一轨）。
+    let active;
+    try {
+      active = await hasActiveAgentUpdate(this.env, serverId, forJobId);
+    } catch {
+      // D1 暂不可用：有本地标记时保守拦截，避免与 self-replace 交错；无标记时无法判定，
+      // 但任务本身也要写 D1（刚还可用），按未更新放行由后续帧兜底
+      return marked != null;
+    }
+    if (active) return true;
+    // D1 里已没有「其它」未过期更新：本地标记属于已过期/已收敛的任务，清掉
+    if (marked != null) this.updating.delete(serverId);
+    return false;
   }
 
   // 慢路径埋点：只在超过阈值时输出一行 JSON，且每实例每小时限量。
@@ -131,7 +160,7 @@ export class TerminalDO {
       const body = await request.json();
       if (body.op === 'create' || body.op === 'open_file') {
         const isFile = body.op === 'open_file';
-        if (this.updating.has(body.serverId)) return json({ error: 'agent update in progress' }, 409);
+        if (await this.isUpdating(body.serverId)) return json({ error: 'agent update in progress' }, 409);
         // 先确认 agent 在线，离线时不创建/不落盘（避免失败会话残留）
         const agentWs = this.agents.get(body.serverId);
         if (!agentWs) return json({ error: 'agent offline', code: 'AGENT_OFFLINE' }, 502);
@@ -200,7 +229,7 @@ export class TerminalDO {
 
       // 互斥：内存里的同步更新标记 + D1 里的异步更新任务（双轨期两者都要看）。
       // exec 之间、exec 与 upload 之间不互斥——保持与旧路径一致的并发语义。
-      if (this.updating.has(serverId) || await hasActiveAgentUpdate(this.env, serverId)) {
+      if (await this.isUpdating(serverId)) {
         await this.failExecJobWithAudit(this.env, jobId, 'agent update in progress');
         return json({ error: 'agent update in progress' }, 409);
       }
@@ -250,7 +279,7 @@ export class TerminalDO {
       const downloadUrl = String(body.downloadUrl || '');
       const size = Number(body.size) || 0;
       if (!jobId || !serverId || !targetPath || !downloadUrl) return err('bad request', 400);
-      if (this.updating.has(serverId) || await hasActiveAgentUpdate(this.env, serverId)) {
+      if (await this.isUpdating(serverId)) {
         await failJob(this.env, jobId, 'agent update in progress');
         return json({ error: 'agent update in progress' }, 409);
       }
@@ -295,7 +324,8 @@ export class TerminalDO {
       const serverId = Number(body.serverId) || 0;
       const downloadUrl = String(body.downloadUrl || '');
       if (!jobId || !serverId || !downloadUrl) return err('bad request', 400);
-      if (this.updating.has(serverId)) {
+      // 排除本任务自身：它刚落库（queued）且未过期，不排除会被 D1 判成「另一个更新」
+      if (await this.isUpdating(serverId, jobId)) {
         await failJob(this.env, jobId, 'agent update already in progress');
         return json({ error: 'agent update in progress' }, 409);
       }
@@ -310,7 +340,7 @@ export class TerminalDO {
       }
       if (!(await markUpdateRunning(this.env, jobId))) return json({ error: 'job not runnable' }, 409);
       // 内存互斥只覆盖本次更新窗口；跨实例/evict 的互斥由 D1 的部分唯一索引保证
-      this.updating.add(serverId);
+      this.updating.set(serverId, jobId);
       try {
         agentWs.send(JSON.stringify({
           type: 'agent_update_fetch', job_id: jobId, update_id: jobId,
@@ -319,7 +349,7 @@ export class TerminalDO {
           sha256: String(body.sha256 || ''),
         }));
       } catch {
-        this.updating.delete(serverId);
+        if (this.updating.get(serverId) === jobId) this.updating.delete(serverId);
         await failJob(this.env, jobId, 'failed to send agent_update_fetch');
         return json({ error: 'failed to send agent_update_fetch' }, 502);
       }
@@ -1045,7 +1075,7 @@ export class TerminalDO {
     // 更新期间不下发上传：Agent 正在 self-replace，此时发 upload_fetch 会与升级竞争。
     // 首次下发路径查了同样的互斥（/rpc/upload/submit），重发路径必须一致。
     // 任务留在 waiting_agent，更新结束后的下一次重连会再试。
-    if (this.updating.has(serverId) || await hasActiveAgentUpdate(this.env, serverId)) return;
+    if (await this.isUpdating(serverId)) return;
     // 先收敛：断开期间处于 running 的 upload 不可能再收到回执
     await requeueOrphanUploads(this.env, serverId);
     // 已过 deadline 的 waiting_agent 不再重发（否则旧包会延迟覆盖生产文件），
@@ -1219,8 +1249,9 @@ export class TerminalDO {
     const job = await finishUpdateJob(this.env, jobId, { ok, error: finalErr });
     // 无论成功失败都要释放内存互斥：updating 只在 send 抛错时清过，
     // 成功后不清会让这台机器在本 DO 实例存活期内再也无法 exec/upload（反复 409）。
-    if (job) this.updating.delete(job.server_id);
-    else if (row) this.updating.delete(row.server_id);
+    // 必须校验 jobId：旧任务（曾判过期）的迟到回执不能清掉新任务的标记，否则两者会交错。
+    const sid = job ? job.server_id : (row ? row.server_id : 0);
+    if (sid && this.updating.get(sid) === jobId) this.updating.delete(sid);
     if (!job) return;
     try {
       await this.env.DB.prepare(

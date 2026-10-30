@@ -932,6 +932,76 @@ test('i18n：app.js 面向用户的提示不得残留中文字面量', () => {
   assert.match(app, /CfI18n\.applyDom\(\)/, '启动时须填充静态 DOM 文案');
 });
 
+// 卡片「更新 Agent」tooltip 的 from 必须取自 s.info（对象）；曾误取字符串变量 info.agent_version，
+// 结果 t('server.updateTip', { from: undefined }) 原样输出「当前 {from} → …」。
+test('i18n：Agent 更新 tooltip 的 from 取自 s.info.agent_version（不得残留字面量占位符）', () => {
+  const root = nodePath.join(nodePath.dirname(fileURLToPath(import.meta.url)), '..');
+  const app = nodeFs.readFileSync(nodePath.join(root, 'public/app.js'), 'utf8');
+  const card = app.slice(app.indexOf('function cardHtml'), app.indexOf('function cardHtml') + 3000);
+  assert.doesNotMatch(card, /from: info\.agent_version/, 'info 是字符串，取 .agent_version 恒为 undefined');
+  assert.match(card, /from: \(s\.info && s\.info\.agent_version\)/, '必须从 s.info 取版本号');
+});
+
+// 更新完成后要等新的 agent_version 回传：推送已经带 info.agent_version，
+// 原先每 2.5s 拉一次 /api/servers → 一次更新白打 36 次 Worker 请求 + 36 次全表读。
+test('前端：Agent 更新后等推送回传版本号，不再 2.5s 轮询 /api/servers', () => {
+  const root = nodePath.join(nodePath.dirname(fileURLToPath(import.meta.url)), '..');
+  const app = nodeFs.readFileSync(nodePath.join(root, 'public/app.js'), 'utf8');
+  assert.doesNotMatch(app, /setTimeout\(\(r\) => r, 2500\)/, '不得保留 2.5s 轮询');
+  assert.match(app, /pushAlive/, '仅当推送停摆时才回退 REST');
+});
+
+// 从 src/ 抽取所有 err(..., 'CODE') 的错误码：前端在 api.js 里按 error.<CODE> 查表，
+// 漏一个就退化成英文原文（中文界面里最扎眼的一类不一致）。以代码为源，避免人工维护漂移。
+function extractErrCodes() {
+  const root = nodePath.join(nodePath.dirname(fileURLToPath(import.meta.url)), '..');
+  const dir = nodePath.join(root, 'src');
+  const codes = new Set();
+  for (const f of nodeFs.readdirSync(dir).filter((x) => x.endsWith('.js'))) {
+    const src = nodeFs.readFileSync(nodePath.join(dir, f), 'utf8');
+    // err.code = 'CODE'（jobs.js 抛错用）
+    for (const m of src.matchAll(/err\.code\s*=\s*'([A-Z][A-Z0-9_]+)'/g)) codes.add(m[1]);
+    // err(msg, status, 'CODE')：按括号配对扫描，避免多行调用被正则截断
+    for (let i = src.indexOf('err('); i >= 0; i = src.indexOf('err(', i + 4)) {
+      if (i > 0 && /[\w.]/.test(src[i - 1])) continue; // 跳过 xxxErr(
+      let depth = 0;
+      let buf = '';
+      for (let j = i + 3; j < src.length; j++) {
+        const ch = src[j];
+        if (ch === '(') depth++;
+        else if (ch === ')') { depth--; if (depth === 0) break; }
+        buf += ch;
+      }
+      const found = [...buf.matchAll(/'([A-Z][A-Z0-9_]+)'/g)].map((x) => x[1]);
+      if (found.length) codes.add(found[found.length - 1]); // 最后一个大写字符串实参即 code
+    }
+  }
+  return [...codes].sort();
+}
+
+test('i18n：后端全部错误码都有 zh-CN / en-US 翻译', () => {
+  globalThis.window = globalThis;
+  const store = new Map();
+  globalThis.localStorage = {
+    getItem: (k) => (store.has(k) ? store.get(k) : null),
+    setItem: (k, v) => store.set(k, String(v)),
+    removeItem: (k) => store.delete(k),
+  };
+  globalThis.document = { documentElement: {}, querySelectorAll: () => [] };
+  const root = nodePath.join(nodePath.dirname(fileURLToPath(import.meta.url)), '..');
+  for (const f of ['public/i18n.js', 'public/lang/zh-CN.js', 'public/lang/en-US.js']) {
+    (0, eval)(nodeFs.readFileSync(nodePath.join(root, f), 'utf8'));
+  }
+  const i18n = globalThis.CfI18n;
+  const codes = extractErrCodes();
+  assert.ok(codes.length > 15, `应抽取到全部后端错误码，实际 ${codes.length}：${codes.join(',')}`);
+  for (const locale of ['zh-CN', 'en-US']) {
+    i18n.setLocale(locale);
+    const missing = codes.filter((c) => i18n.t('error.' + c) === 'error.' + c);
+    assert.deepEqual(missing, [], `${locale} 缺少错误码翻译：${missing.join(', ')}`);
+  }
+});
+
 test('终端多标签：会话表取代单例，关闭时三类资源都要释放（静态断言）', () => {
   const root = nodePath.join(nodePath.dirname(fileURLToPath(import.meta.url)), '..');
   const app = nodeFs.readFileSync(nodePath.join(root, 'public/app.js'), 'utf8');

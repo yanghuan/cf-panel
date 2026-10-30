@@ -231,17 +231,28 @@
         }
       }
       toast(t('server.installedWaiting', { build: target }), 15000);
-      // 任务成功 = 资产已替换并触发重启；再等新的版本号上报（推送/短轮询双保险）
-      const deadline = Date.now() + 90000;
+      // 任务成功 = 资产已替换并触发重启；等新的版本号经推送回来（info.agent_version 随
+      // 上报帧进入 serversCache）。原先每 2.5s 拉一次 /api/servers：一次更新白打 36 次
+      // Worker 请求 + 全表读。现在只读本地缓存；仅当推送停摆（WS 断开）才降频回退 REST。
+      const startedAt = Date.now();
+      const deadline = startedAt + 90000;
+      let lastPullAt = startedAt;
       while (Date.now() < deadline) {
-        await new Promise((r) => setTimeout(r, 2500));
-        const list = await api('/api/servers');
-        serversCache = Array.isArray(list) ? list : serversCache;
+        await new Promise((r) => setTimeout(r, 1000));
         const server = serversCache.find((s) => s.id === id);
-        updateServerCards();
         if (server && server.online && server.info && server.info.agent_version === target) {
           toast(t('server.updatedTo', { name, target }));
           return;
+        }
+        // 推送正常时 lastPushAt 每 5s 刷新；15s 没有推送说明 WS 有问题，才回退拉一次
+        const pushAlive = Date.now() - Math.max(lastPushAt, startedAt) < 15000;
+        if (!pushAlive && Date.now() - lastPullAt >= 15000) {
+          lastPullAt = Date.now();
+          try {
+            const list = await api('/api/servers');
+            serversCache = Array.isArray(list) ? list : serversCache;
+            updateServerCards();
+          } catch { /* 拉取失败下轮再试 */ }
         }
       }
       toast(t('server.updateNoComeback'), 10000);
@@ -400,7 +411,7 @@
     const ip = (s.wan_ip || (s.info && s.info.ip4) || '').trim();
     const info = s.info ? [s.info.os, up].filter(Boolean).join(' · ') : up;
     const updateBtn = agentUpdateAvailable(s)
-      ? `<button data-act="agent-update" data-id="${s.id}" data-name="${escapeHtml(s.name)}" title="${escapeHtml(t('server.updateTip', { from: info.agent_version, to: latestAgent.build_id }))}" ${updatingAgents.has(s.id) ? 'disabled' : ''}>${updatingAgents.has(s.id) ? escapeHtml(t('server.updating')) : escapeHtml(t('server.updateAgent'))}</button>`
+      ? `<button data-act="agent-update" data-id="${s.id}" data-name="${escapeHtml(s.name)}" title="${escapeHtml(t('server.updateTip', { from: (s.info && s.info.agent_version) || '-', to: latestAgent.build_id }))}" ${updatingAgents.has(s.id) ? 'disabled' : ''}>${updatingAgents.has(s.id) ? escapeHtml(t('server.updating')) : escapeHtml(t('server.updateAgent'))}</button>`
       : '';
     const sel = selectedServers.has(s.id);
     // 有描述 → 名字可点击查看（文本从 serversCache 现取，不内嵌进 DOM：描述可达 500 字，
@@ -3093,7 +3104,7 @@
 
   let tokenCreateBusy = false;
   async function createToken() {
-    if (tokenCreateBusy) return; // 防重复提交：双击会创建出两个同名令牌（后端 name 无唯一约束）
+    if (tokenCreateBusy) return; // 防重复提交：双击会先撞应用层查重（后端另有唯一索引兜底并发）
     const scopes = [];
     if ($('#tok-read').checked) scopes.push('server:read');
     if ($('#tok-exec').checked) scopes.push('server:exec');

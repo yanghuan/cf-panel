@@ -16,6 +16,13 @@ import { getAlertCfg, resolveAlertCfg, SETTINGS_CACHE } from './db.js';
 const METRICS_KEEP_MIN = 240;
 const METRICS_KEEP_MIN_NO_ARCHIVE = 720;
 const ARCHIVE_INTERVAL_MS = 10 * 60 * 1000; // 归档周期
+// 归档水位（arc:<id>）持久化降频：每跨一分钟写一次 = 1,440 写/台/天（与热行同量）。
+// 改为每推进 10 分钟写一次（−90%）：evict 后最多重放 10 行，INSERT OR IGNORE 幂等，
+// 不丢历史也不重复计数；内存水位仍逐分钟推进，查询与归档判定不受影响。
+const ARC_PERSIST_MIN = 10;
+// fullSweep 每页读取的热区行数。旧实现一次 list 全量载入（240×N 行，500 台 ≈ 12 万行），
+// 分页后峰值内存 ≈ 一页 + 当前机器的窗口。SQLite 后端的 list 支持 limit/startAfter。
+const SWEEP_PAGE_ROWS = 500;
 const METRICS_RETENTION_DAYS = 30; // D1 历史保留期（天），过期行每日清理
 const AUDIT_RETENTION_DAYS = 90; // 审计日志保留期（天），过期行随每日清理删除
 // 按天账保留期（天，默认 3 年 = 1095）。
@@ -26,9 +33,17 @@ const AUDIT_RETENTION_DAYS = 90; // 审计日志保留期（天），过期行�
 const METRICS_DAY_RETENTION_DAYS = 1095;
 const PRUNE_INTERVAL_MS = 24 * 60 * 60 * 1000; // 保留期清理周期
 const ARCHIVE_IDLE_INTERVAL_MS = 60 * 60 * 1000; // 闲置（无数据且告警关闭）时 alarm 退避间隔（1h）
+// latest 冷启动快照行（`l:<id>`）的写入间隔（分钟）：1 行/机，实例常驻时 ≈ +288 写/台/天。
+// 它把 /latest 冷启动从「全量扫热区（240×N 行 + 逐行 JSON.parse）」降成「读 N 行」。
+// 注意：每次冷启动的首帧必写一次（否则 evict 后快照会一直停在旧值），因此「慢采 120s +
+// 每帧都落在新实例」的最坏情况是 720 写/台/天——仍低于热行 1,440，且换来冷启动 O(N)。
+const LATEST_KEY_EVERY_MIN = 5;
 const LATEST_PUSH_INTERVAL_MS = 5000; // 上报驱动聚合推送间隔（有观看者时 ≥5s 推一次全部 latest 给 PanelDO；
 // 单机时被 REPORT_FWD_THROTTLE_S=5s 钳制（MetricsDO 每 5s 收帧），多机时聚合多台上报防推送风暴）
-const PUSH_PROBE_INTERVAL_MS = 30 * 1000; // pushOn 自愈反查 /viewers 的间隔（MetricsDO evict 丢失 pushOn 时）
+// pushOn 自愈反查 /viewers 的间隔（MetricsDO evict 丢失 pushOn 时）。
+// 300s：无观看者时该项最多 288 请求/天（原 30s 是 2,880）。代价只是「evict 后恢复推送」
+// 的延迟从 ≤30s 变成 ≤5min——期间界面靠前端兜底刷新，采样与告警不受影响。
+const PUSH_PROBE_INTERVAL_MS = 300 * 1000;
 const RETRY_BACKOFF_MS = 60 * 1000; // 告警 webhook 送达失败后的重试退避（失败只退避 1 分钟，而非静默整个冷却期）
 
 // 内存热区（12h 秒回）+ alarm 归档 D1（默认开启，ARCHIVE_TO_D1=0 可关闭）；
@@ -48,12 +63,14 @@ export class MetricsDO {
     this.alertLoaded = false;
     this.probeLoaded = false;
     this.arcCache = new Map(); // serverId -> 已归档水位（分钟），实例内缓存，evict 后从 storage 恢复
+    this.arcPersisted = new Map(); // serverId -> 已写进 storage 的水位（降频持久化用，见 ARC_PERSIST_MIN）
     this.lastSweepAt = 0; // 上次 fullSweep 时间戳（ms；持久化跨 evict，见 ensureHousekeepLoaded）
     this.lastPruneAt = 0; // 上次保留期清理时间戳（ms；同上，替代易被 evict 重置的内存计数）
     this.housekeepLoaded = false; // 家政状态（fullSweep/prune 时间）是否已从 storage 恢复
     this.lastSeenSec = new Map(); // serverId -> 最后上报秒（内存，/latest 在线判定用；evict 后由 D1 last_seen 兜底）
     this.alarmCached = null; // 实例内已知的下一次 alarm 时间戳；避免每帧上报都 getAlarm（DO Storage 读）
     this.latestByServer = new Map(); // serverId -> 最新指标 {ts, ..., last_seen_s}（/report 热写 O(1) 维护，/latest 直接 O(S) 返回）
+    this.latestAt = new Map(); // serverId -> 上次写 `l:` 快照的分钟（降频，见 LATEST_KEY_EVERY_MIN）
     this.offlineLoaded = false; // 离线告警状态是否已从 storage 一次性加载（惰性）
     this.offlineState = new Map(); // serverId -> 'on'|'off'（内存副本，避免每机逐个 getAlarm）
     this.usage = { report: 0, latest: 0, query: 0 }; // 用量观测：本周期（10min）计数，周期末累计到 storage
@@ -66,9 +83,14 @@ export class MetricsDO {
     // 按天统计（流量累计 / 可用率 / 重启检测）：
     // dayPending = 待落 D1 的增量（flush 后清空，D1 侧用 UPSERT 累加，故幂等）；
     // dayAccum = 每机的累加游标（lastSec 上次累加时刻、uptimeMin 上次开机时长）。
-    // 两者都是实例内存：evict 后最多丢一个 flush 周期（10 分钟）的增量，已落库的天账不受影响。
+    // 游标**必须跨实例存活**：本 DO 无 WS 时两次 alarm 之间常被 evict，慢采（120s）下
+    // 几乎每帧都落在新实例上——纯内存游标会让首帧 dt 恒为 0，流量与可用率分母静默停止增长
+    //（功能存在但给出错误数字）。故游标随 alarm 每 10 分钟持久化到 Storage（daycur:<id>），
+    // 冷启动优先从 Storage 恢复，缺失时用 D1 servers.last_seen 播种（见 ensureDayCursor）。
     this.dayPending = new Map(); // `${serverId}:${day}` -> { serverId, day, bytesIn, bytesOut, onlineMin, totalMin, uptimeMin, restarts }
     this.dayAccum = new Map(); // serverId -> { lastSec, uptimeMin }
+    this.dayCurLoaded = new Set(); // serverId：本实例已尝试恢复游标（Storage → D1 播种）
+    this.dayCurDirty = new Set(); // serverId：游标有变化，待下次 alarm 持久化
   }
 
   // 家政状态（lastSweepAt/lastPruneAt）从 storage 惰性恢复（持久化跨实例 evict，
@@ -116,23 +138,30 @@ export class MetricsDO {
   hotPrefix(serverId) {
     return `m:${serverId}:`;
   }
-  // 兼容 storage.list 返回格式：CF 生产为 {keys:[{name,value}]}，wrangler dev --local 为 Map
-  async listStorage(prefix) {
-    const res = await this.state.storage.list({ prefix });
+  // 兼容 storage.list 返回格式：CF 生产为 {keys:[{name,value}]}，wrangler dev --local 为 Map。
+  // opts 透传 {limit, startAfter} 供 fullSweep 分页（SQLite 后端全量 list 会把所有 value 载入内存）。
+  async listStorage(prefix, opts = {}) {
+    const res = await this.state.storage.list({ prefix, ...opts });
     if (res instanceof Map) return [...res.entries()].map(([name, value]) => ({ name, value }));
     if (Array.isArray(res)) return res;
     if (Array.isArray(res && res.keys)) return res.keys;
     return [];
   }
-  // 从 storage 加载某服务器热区到内存缓存（实例 evict 后首次访问时恢复）
+  // 从 storage 加载某服务器热区到内存缓存（实例 evict 后首次访问时恢复）。
+  // 合并而不是替换：热写路径每分钟只把首帧落 storage（同分钟后续帧只在内存），
+  // 直接 set 会把内存中更新的一帧覆盖回 storage 的旧值——首次 /query 读到分钟内首帧，
+  // 且该分钟跨过归档线时会把陈旧值写进 D1（只读查询污染后续写入）。
+  // 内存里已有的分钟一律以内存为准（同实例内热写路径是唯一写入者，内存值必然更新）。
   async loadHot(serverId) {
-    const items = await this.listStorage(this.hotPrefix(serverId));
-    const m = new Map();
+    const prefix = this.hotPrefix(serverId);
+    const items = await this.listStorage(prefix);
+    let m = this.data.get(serverId);
+    if (!m) { m = new Map(); this.data.set(serverId, m); }
     for (const k of items) {
-      const ts = Number(k.name.slice(this.hotPrefix(serverId).length));
+      const ts = Number(k.name.slice(prefix.length));
+      if (m.has(ts)) continue;
       m.set(ts, JSON.parse(k.value));
     }
-    this.data.set(serverId, m);
     this.hotLoaded.add(serverId);
     return m;
   }
@@ -225,7 +254,15 @@ export class MetricsDO {
     }
     if (maxArchived > arcTs && fallbackOk) {
       this.arcCache.set(serverId, maxArchived);
-      try { await this.state.storage.put(arcKey, String(maxArchived)); } catch { /* 水位持久化失败不影响 */ }
+      // 降频持久化：只在推进 ≥ARC_PERSIST_MIN 分钟时落盘（见常量注释）。
+      // 失败时不更新 arcPersisted，下一帧继续尝试——内存水位仍然前进，不影响本次归档。
+      const persisted = this.arcPersisted.get(serverId);
+      if (persisted == null || maxArchived - persisted >= ARC_PERSIST_MIN) {
+        try {
+          await this.state.storage.put(arcKey, String(maxArchived));
+          this.arcPersisted.set(serverId, maxArchived);
+        } catch { /* 水位持久化失败不影响 */ }
+      }
     }
   }
 
@@ -234,6 +271,64 @@ export class MetricsDO {
   //   1) metrics_min 只保留 30 天，且 7 天后按 ts%5 降采样只剩 1/5 采样点；
   //   2) 更关键——"离线时长"在 metrics_min 里根本没有行，离线期间无上报，事后无从反推。
   // 因此每个观测区间在发生的当下就结算进 metrics_day（1 行/机/天，保留期远长于 30 天）。
+
+  // 恢复某机的天账累加游标（每实例每机一次）。
+  // 为什么单独一个 async 方法：accumulateDay 在每帧热路径上且是同步的，恢复要读 Storage/D1。
+  // 为什么必须恢复：慢采/无观看者时 MetricsDO 几乎每帧都在新实例上，纯内存游标会让首帧
+  // dt 恒为 0 —— 流量与可用率分母静默停止增长（不是崩溃，是给出错误数字）。
+  // 优先级：Storage 游标（= 已记账边界，最准）→ D1 last_seen（60s 节流写，粒度够 120s 慢采）。
+  async ensureDayCursor(serverId) {
+    if (this.dayCurLoaded.has(serverId)) return;
+    this.dayCurLoaded.add(serverId);
+    if (this.dayAccum.has(serverId)) return; // 本实例已累加过，内存游标最新
+    let lastSec = 0;
+    let uptimeMin = null;
+    try {
+      const raw = await this.state.storage.get(`daycur:${serverId}`);
+      if (raw) {
+        const cur = JSON.parse(raw);
+        lastSec = Number(cur.lastSec) || 0;
+        uptimeMin = cur.uptimeMin == null ? null : Number(cur.uptimeMin);
+      }
+    } catch { /* 恢复失败退回 D1 播种 */ }
+    if (!(lastSec > 0)) {
+      try {
+        const row = await this.env.DB.prepare('SELECT last_seen FROM servers WHERE id = ?').bind(serverId).first();
+        lastSec = Number(row && row.last_seen) || 0;
+      } catch { /* D1 不可用：按首帧语义处理（少记一段，但不会多记） */ }
+    }
+    if (!(lastSec > 0)) return;
+    // 时钟回拨时游标不得落在未来：dt 为负会被 accumulateDay 忽略，导致该机天账永久停滞
+    const nowSec = Math.floor(Date.now() / 1000);
+    if (lastSec > nowSec) lastSec = nowSec;
+    this.dayAccum.set(serverId, { lastSec, uptimeMin });
+  }
+
+  // 游标持久化（alarm 内、D1 写之前执行）。
+  // 顺序不能反：若先写 D1 再写游标，evict 会造成「数据已入库、游标还停在更早时刻」，
+  // 下次冷启动把这区间再记一遍（多记）；反过来只会少记一个周期，符合本模块
+  // 「宁可少记，不可多记」的既有取舍（与 flushDayPending 先清空再写同理）。
+  async persistDayCursors() {
+    const failed = new Set();
+    if (!this.dayCurDirty.size) return failed;
+    for (const serverId of [...this.dayCurDirty]) {
+      const st = this.dayAccum.get(serverId);
+      try {
+        // 逐键写（不用 put(entries) 对象形式）：写入量按 key 计费，与批量同价；
+        // 逐键失败只影响该机（下次 alarm 重试），不会让整批一起丢。
+        if (st) {
+          await this.state.storage.put(
+            `daycur:${serverId}`,
+            JSON.stringify({ lastSec: st.lastSec, uptimeMin: st.uptimeMin }),
+          );
+        }
+        this.dayCurDirty.delete(serverId);
+      } catch {
+        failed.add(serverId); // 保留 dirty，且本轮不写该机的 D1 增量（见 flushDayPending）
+      }
+    }
+    return failed;
+  }
 
   // 取（或创建）某机某天的待落库增量记录（统一入口，避免多处重复拼 key）
   dayRec(serverId, day) {
@@ -279,6 +374,8 @@ export class MetricsDO {
   // 区间内超出 DAY_ONLINE_GAP_S 的部分判为离线（只补分母、不补分子），
   // 否则"离线 3 天后恢复上报"的那一帧会把整段离线时间算成在线，可用率恒显示 100%。
   accumulateDay(serverId, nowSec, netIn, netOut, uptimeSec) {
+    // 兜底分支只在「从未有游标」（首帧 / Storage 与 D1 都无记录）时命中：
+    // 调用方已用 ensureDayCursor 恢复，正常路径不会走这里
     const st = this.dayAccum.get(serverId) || { lastSec: nowSec, uptimeMin: null };
     const dt = nowSec - st.lastSec;
     if (dt > 0) {
@@ -299,14 +396,35 @@ export class MetricsDO {
       st.uptimeMin = uptimeMin;
     }
     this.dayAccum.set(serverId, st);
+    this.dayCurDirty.add(serverId);
   }
 
   // 离线补账（alarm 调用）：彻底掉线的机器不再上报 → accumulateDay 不触发 →
   // 可用率分母停止增长，长时间离线反而显示 100%（分子分母同时不涨）。
   // 此处为每台已知机器补记「上次累加 → 离线确认点」的离线时长（只补分母）。
-  sweepOfflineDaySpans(nowSec) {
-    for (const [serverId, lastSeen] of this.lastSeenSec) {
-      const st = this.dayAccum.get(serverId);
+  //
+  // 必须查 D1 而不是遍历内存 lastSeenSec：慢采/无观看者时实例在两次 alarm 之间常被 evict，
+  // 冷实例的 lastSeenSec 是空的——那样「整段时间都在别的实例上报」的机器会被完全跳过
+  //（与天账游标丢失同源，见 ensureDayCursor）。
+  async sweepOfflineDaySpans(nowSec) {
+    let rows = [];
+    try {
+      rows = (await this.env.DB.prepare('SELECT id, last_seen FROM servers').all()).results || [];
+    } catch { return; } // D1 不可用：本轮不补账（只影响分母），下次 alarm 重试
+    for (const s of rows) {
+      const serverId = Number(s.id) || 0;
+      if (!serverId) continue;
+      const lastSeen = Math.max(Number(s.last_seen) || 0, this.lastSeenSec.get(serverId) || 0);
+      // 从未上报过的机器不补：否则会把「建站至今」整段记成离线，一次写几百天分行
+      if (!(lastSeen > 0)) continue;
+      let st = this.dayAccum.get(serverId);
+      if (!st) {
+        // 只为「疑似已离线」的机器恢复游标：在线机器（last_seen 新鲜）直接跳过，
+        // 避免冷实例每次 alarm 对全部机器各做一次 Storage 读
+        if (nowSec - lastSeen <= DAY_ONLINE_GAP_S) continue;
+        await this.ensureDayCursor(serverId);
+        st = this.dayAccum.get(serverId);
+      }
       const since = st ? st.lastSec : lastSeen;
       const dt = nowSec - since;
       if (dt <= DAY_ONLINE_GAP_S) continue;
@@ -314,16 +432,21 @@ export class MetricsDO {
       const offlineSec = dt - DAY_ONLINE_GAP_S;
       this.addDaySpan(serverId, since, offlineSec, false, 0, 0);
       if (st) st.lastSec = since + offlineSec;
+      this.dayCurDirty.add(serverId);
     }
   }
 
   // 把内存增量落 D1（UPSERT 累加），alarm 每 10 分钟一次。
-  // 先清空 pending 再写：即使写入失败也不重复累加（宁可少记，不可多记）。
-  // 代价是实例 evict 会丢失最多一个 flush 周期（≤10 分钟）的增量，已落库天账不受影响。
+  // 先持久化游标、再清空 pending 并写：即使写入失败/中途 evict 也不重复累加
+  //（宁可少记，不可多记）。代价是实例 evict 会丢失最多一个 flush 周期（≤10 分钟）的增量。
+  // 游标写失败的那台机器本轮不写 D1：否则「D1 有增量、游标停在更早」会在下次冷启动
+  // 按旧游标把同一区间再记一遍——这正是上面想避免的「多记」。
   async flushDayPending() {
+    const cursorFailed = await this.persistDayCursors();
     if (!this.dayPending.size) return;
-    const rows = [...this.dayPending.values()];
-    this.dayPending.clear();
+    const rows = [...this.dayPending.values()].filter((r) => !cursorFailed.has(r.serverId));
+    for (const r of rows) this.dayPending.delete(`${r.serverId}:${r.day}`);
+    if (!rows.length) return;
     for (let i = 0; i < rows.length; i += 100) {
       const batch = rows.slice(i, i + 100).map((r) => this.env.DB.prepare(
         `INSERT INTO metrics_day (server_id, day, bytes_in, bytes_out, online_min, total_min, uptime_min, restarts)
@@ -367,10 +490,25 @@ export class MetricsDO {
         this.trimMin.set(b.serverId, minTs);
         this.trim(m);
       }
-      // storage.put 按分钟去重——同分钟多帧只写 1 次；put 失败不更新 putMin，下帧自动重试
+      // storage.put 按分钟去重——同分钟多帧只写 1 次；put 失败不更新 putMin，下帧自动重试。
+      // 同时按 LATEST_KEY_EVERY_MIN 维护一份 `l:<id>` 快照行：/latest 冷启动据此 O(N) 恢复，
+      // 不再全量扫热区（240×N 行）。批量 put 计费按 key 不变，只少一次 round trip。
       if (this.putMin.get(b.serverId) !== minTs) {
-        await this.state.storage.put(this.hotKey(b.serverId, minTs), JSON.stringify(v));
+        // 用「距上次写快照 ≥5 分钟」而不是「minTs % 5 === 0」：后者依赖上报恰好落在 5 的倍数
+        // 分钟上，120s 慢采若长期落在同一组分钟（如奇数分钟）就永远不会写，优化静默失效。
+        // 首帧（含 evict 后）必写一次，保证冷启动快照总是新鲜的。
+        const lastL = this.latestAt.get(b.serverId);
+        const wantLatest = lastL == null || minTs - lastL >= LATEST_KEY_EVERY_MIN;
+        const entries = { [this.hotKey(b.serverId, minTs)]: JSON.stringify(v) };
+        if (wantLatest) {
+          entries[`l:${b.serverId}`] = JSON.stringify({
+            ts: minTs, cpu: v.cpu, mem_used: v.mem_used, mem_total: v.mem_total,
+            net_in: v.net_in, net_out: v.net_out, extra: v.extra,
+          });
+        }
+        await this.state.storage.put(entries);
         this.putMin.set(b.serverId, minTs);
+        if (wantLatest) this.latestAt.set(b.serverId, minTs); // put 成功才推进
       }
       // 秒级最后上报时间（内存，/latest 在线判定用，比 D1 last_seen 节流更实时）
       const nowSec = Math.floor(Date.now() / 1000);
@@ -378,6 +516,8 @@ export class MetricsDO {
       // 按天统计（流量累计 / 可用率）：单独 try——它只是旁路账本，
       // 任何失败都不得影响监控存储主链路（热写/归档）
       try {
+        // 先恢复游标（冷实例首帧必需）：否则 dt 恒为 0，流量/可用率静默为 0
+        await this.ensureDayCursor(b.serverId);
         this.accumulateDay(b.serverId, nowSec, b.net_in, b.net_out, b.extra && b.extra.uptime);
       } catch (e) {
         console.error('accumulateDay failed:', e);
@@ -389,7 +529,12 @@ export class MetricsDO {
     // 告警/探活去重判定搭本次 /report 调用顺风车（零额外请求）；失败不影响监控存储
     try {
       if (b.serverName) await this.checkAlerts(b);
-      if (Array.isArray(b.probes)) await this.checkProbeAlerts(b.serverId, b.serverName, b.probes, b.alertOverride);
+      if (Array.isArray(b.probes) && b.probes.length) {
+        await this.checkProbeAlerts(b.serverId, b.serverName, b.probes, b.alertOverride);
+      } else if (b.probesCleared) {
+        // agent 明确上报「本机已无探针」：清掉去重状态（与库中 probe_json 一起失效）
+        await this.clearProbeState(b.serverId);
+      }
     } catch { /* 告警失败不影响监控存储 */ }
     // 上报驱动聚合推送——有观看者且距上次 ≥5s 时，把全部 latest 一次推给 PanelDO 广播。
     // 上报驱动不引入定时器（MetricsDO 休眠不受影响）；PanelDO → 前端为出站消息不计费
@@ -463,10 +608,32 @@ export class MetricsDO {
         }
         return json(out);
       }
-      // 仅实例 evict 后（增量 Map 为空）才全量扫 storage 恢复；恢复结果同时回填增量 Map，
-      // 避免面板 3s 轮询对 DO Storage 的全量读取放大（机器多时收益明显）
-      const keys = await this.listStorage('m:');
-      for (const k of keys) {
+      // 仅实例 evict 后（增量 Map 为空）才从 storage 恢复；恢复结果回填增量 Map。
+      // 优先读 `l:<id>` 快照行（每机 1 行）：旧实现扫全量 `m:`（240×N 行 + 逐行 parse），
+      // 500 台 ≈ 12 万行，面板首连/evict 后首帧会形成一次 CPU 与内存尖峰。
+      let lKeys = null;
+      try { lKeys = await this.listStorage('l:'); } catch { lKeys = null; }
+      if (lKeys === null) return json(out); // Storage 不可用：返回空，等下一帧上报重建
+      if (lKeys.length) {
+        for (const k of lKeys) {
+          const serverId = Number(k.name.slice(2));
+          if (!serverId) continue;
+          let v;
+          try { v = JSON.parse(k.value); } catch { continue; } // 单行损坏不得拖垮整个 /latest
+          const l = {
+            ts: v.ts, cpu: v.cpu, mem_used: v.mem_used, mem_total: v.mem_total,
+            net_in: v.net_in, net_out: v.net_out, extra: v.extra,
+            last_seen_s: this.lastSeenSec.get(serverId),
+          };
+          out[serverId] = l;
+          this.latestByServer.set(serverId, l);
+        }
+        return json(out);
+      }
+
+      // 升级兼容：部署前写入的热区还没有 `l:` 快照行 → 退回原全量扫描（此后随上报补齐）
+      const hotKeys = await this.listStorage('m:');
+      for (const k of hotKeys) {
         const rest = k.name.slice(2); // 去掉 'm:'
         const sep = rest.indexOf(':');
         if (sep <= 0) continue;
@@ -495,17 +662,26 @@ export class MetricsDO {
       this.putMin.delete(serverId);
       this.hotLoaded.delete(serverId);
       this.latestByServer.delete(serverId);
+      this.latestAt.delete(serverId);
       this.lastSeenSec.delete(serverId);
       this.pendingArcRetry.delete(serverId);
       this.trimMin.delete(serverId);
-      // 清理该服务器的告警冷却、探活、离线状态与归档水位（内存 + storage）。
+      // 天账：游标与待落库增量一并清理（否则删掉的机器在 alarm 里继续记账/补分母）
+      this.dayAccum.delete(serverId);
+      this.dayCurLoaded.delete(serverId);
+      this.dayCurDirty.delete(serverId);
+      for (const k of [...this.dayPending.keys()]) {
+        if (k.startsWith(`${serverId}:`)) this.dayPending.delete(k);
+      }
+      // 清理该服务器的告警冷却、探活、离线状态、归档水位与天账游标（内存 + storage）。
       // 两类前缀 list 互相隔离；即使某次 list 失败，也仍尝试删除可精确定位的状态键。
-      const stateKeys = [`alert:offline:${serverId}`, `arc:${serverId}`];
+      const stateKeys = [`alert:offline:${serverId}`, `arc:${serverId}`, `daycur:${serverId}`, `l:${serverId}`];
       try { stateKeys.push(...(await this.listStorage(`alert:${serverId}:`)).map((k) => k.name)); } catch { /* ignore */ }
       try { stateKeys.push(...(await this.listStorage(`probe:${serverId}:`)).map((k) => k.name)); } catch { /* ignore */ }
       await Promise.allSettled([...new Set(stateKeys)].map((name) => this.state.storage.delete(name)));
       this.offlineState.delete(serverId);
       this.arcCache.delete(serverId);
+      this.arcPersisted.delete(serverId);
       for (const k of [...this.alertLast.keys()]) {
         if (k.startsWith(`${serverId}:`)) this.alertLast.delete(k);
       }
@@ -694,6 +870,66 @@ export class MetricsDO {
     }
   }
 
+  // agent 明确上报「本机已无探针」（PROBES 被删除）时清理去重状态。
+  // 只清内存不够：实例 evict 后 ensureProbeLoaded 会把 Storage 里的旧键读回来，
+  // 同名探针重新启用时会沿用旧冷却，或把「上次遗留的 down」误判为已告警而不发 probe_down。
+  // 由 handleReport 的 probesCleared 帧触发（仅「有 → 无」变更时一次，非常态路径）。
+  // 注意：这个信号可能丢（同机 5s 批内被覆盖、flush 前 evict），故 alarm 里另有
+  // pruneStaleProbeStates 以 D1 probe_json 为准做兜底对账。
+  async clearProbeState(serverId) {
+    for (const k of [...this.probeState.keys()]) {
+      if (k.startsWith(`${serverId}:`)) this.probeState.delete(k);
+    }
+    try {
+      const keys = await this.listStorage(`probe:${serverId}:`);
+      await Promise.all(keys.map((k) => this.state.storage.delete(k.name)));
+    } catch { /* Storage 不可用：内存已清；旧键最多让重新启用的同名探针多重置一次冷却 */ }
+  }
+
+  // 探活状态兜底对账（alarm 调用，≈10 分钟一次）：以 D1 的 `servers.probe_json`（当前配置的
+  // 探针列表）为准，删掉已不存在的探针冷却状态。两件事只能靠它收口：
+  //   1) 「有 → 无」的清理帧可能丢（probesCleared 只挂在那一次变更帧上，同机 5s 批内被覆盖
+  //      或 flush 前 evict 就没了）——库里 probe_json 已在 handleReport 里清空，但 Storage 键还在；
+  //   2) 只删掉其中一个探针（其余保留）时没有任何信号——那个名字的冷却会一直留到下次启用。
+  // 频率极低（alarm），一次 list + 一次 D1 读；evict 无关（状态可从 D1 重新推导）。
+  async pruneStaleProbeStates() {
+    let keys;
+    try { keys = await this.listStorage('probe:'); } catch { return; } // Storage 不可用：下轮再对账
+    if (!keys.length) return;
+    let rows;
+    try {
+      rows = (await this.env.DB.prepare('SELECT id, probe_json FROM servers').all()).results || [];
+    } catch { return; } // D1 不可用：不做任何删除（宁留不误删）
+    const alive = new Map(); // serverId -> Set(当前配置里的探针名)
+    const unknown = new Set(); // probe_json 解析失败/格式未知的机器：跳过，避免误删
+    for (const s of rows) {
+      const sid = Number(s.id) || 0;
+      if (!sid) continue;
+      if (!s.probe_json) { alive.set(sid, new Set()); continue; } // 明确「无探针」
+      try {
+        const list = JSON.parse(s.probe_json);
+        if (!Array.isArray(list)) { unknown.add(sid); continue; }
+        alive.set(sid, new Set(list.map((p) => String((p && p.name) || ''))));
+      } catch { unknown.add(sid); }
+    }
+    for (const k of keys) {
+      const suffix = k.name.slice('probe:'.length); // `${serverId}:${name}`
+      const sep = suffix.indexOf(':');
+      const sid = sep > 0 ? Number(suffix.slice(0, sep)) : 0;
+      if (!sid) { // 畸形键：无人认领，直接删
+        this.probeState.delete(suffix);
+        try { await this.state.storage.delete(k.name); } catch { /* 下轮重试 */ }
+        continue;
+      }
+      if (unknown.has(sid)) continue; // 配置解析失败：不删（宁可留着，也不能误删正在生效的冷却）
+      const name = suffix.slice(sep + 1);
+      const names = alive.get(sid); // 服务器行已删除时 undefined → 下面一并清掉
+      if (names && names.has(name)) continue;
+      this.probeState.delete(suffix);
+      try { await this.state.storage.delete(k.name); } catch { /* 下轮重试 */ }
+    }
+  }
+
   // 离线/恢复告警：状态存 DO Storage（重启不丢，避免重复告警）。
   // 降额：未配置 webhook 时无法送达，跳过扫描（零成本）；在线判定复用增量 latest 的秒级 last_seen_s；
   // 状态一次性 list 加载到内存（避免每机逐个 get）。
@@ -783,12 +1019,20 @@ export class MetricsDO {
       alertOn = true;
     }
     if (alertOn) await this.checkOfflineAlerts();
+    // 探活状态兜底对账：清理「配置里已不存在」的探针冷却（单帧清理信号可能丢，且覆盖不到
+    // 「只删掉其中一个探针」的场景）。与 alertOn 无关——状态残留与告警开关无关，只在被重新
+    // 启用时才伤人，所以无条件对账（无 probe 状态时只是一次空 list）。
+    try {
+      await this.pruneStaleProbeStates();
+    } catch (e) {
+      console.error('probe state prune failed:', e);
+    }
     const now = Date.now();
     let housekeepChanged = false;
     // 按天统计结算（流量/可用率）：先补记离线机器的可用率分母，再把内存增量落 D1。
     // 独立于归档开关（ARCHIVE_TO_D1）：天账是长期账本，不应因关闭分钟归档而停摆。
     try {
-      this.sweepOfflineDaySpans(Math.floor(now / 1000));
+      await this.sweepOfflineDaySpans(Math.floor(now / 1000));
       await this.flushDayPending();
     } catch (e) {
       console.error('metrics_day settlement failed:', e);
@@ -873,112 +1117,140 @@ export class MetricsDO {
     }
   }
 
-  // 全量 sweep（降频，≈1 小时一次）：>12h 热区行清理 + 兜底归档（水位之后的行 INSERT OR IGNORE）。
-  // 常态归档由 /report 增量完成；此处仅兜底异常（水位滞后/实例 evict 后恢复）与执行 12h 上限清理。
+  // 全量 sweep（降频，≈1 小时一次）：>keepMin 热区行清理 + 兜底归档（水位之后的行 INSERT OR IGNORE）。
+  // 常态归档由 /report 增量完成；此处仅兜底异常（水位滞后/实例 evict 后恢复）与执行窗口上限清理。
+  //
+  // 分页 + 按服务器缓冲：旧实现一次 list('m:') 把整个热区读进内存（240×N 行，500 台 ≈ 12 万行、
+  // 50–100MB，叠加 rowsByServer 结构逼近 128MB 上限）。键按字典序返回、同机行必然连续，
+  // 因此按页读取、只保留「当前服务器」的窗口（≤keepMin 行）即可，内存与单轮耗时都收敛。
   async fullSweep(archiveOn) {
     const archiveCutoff = Math.floor(Date.now() / 1000 / 60) - ARCHIVE_AFTER_MIN;
     const keepCutoff = Math.floor(Date.now() / 1000 / 60) - this.keepMin();
-    const rowsByServer = new Map();
-    let keys;
-    try {
-      keys = await this.listStorage('m:');
-    } catch (e) {
-      console.error('fullSweep storage list failed:', e);
-      return false;
-    }
-    for (const k of keys) {
-      const rest = k.name.slice(2); // 去掉 'm:'
-      const sep = rest.indexOf(':');
-      if (sep <= 0) continue;
-      const serverId = Number(rest.slice(0, sep));
-      const ts = Number(rest.slice(sep + 1));
-      if (!Number.isInteger(serverId) || !Number.isFinite(ts)) continue;
-      if (!rowsByServer.has(serverId)) rowsByServer.set(serverId, []);
-      rowsByServer.get(serverId).push({ name: k.name, ts, value: k.value });
-    }
-
+    const PAGE = SWEEP_PAGE_ROWS;
     let complete = true;
-    for (const [serverId, rows] of rowsByServer) {
-      let effectiveArcTs = archiveOn ? this.arcCache.get(serverId) : Number.POSITIVE_INFINITY;
-      if (archiveOn && effectiveArcTs == null) {
-        try {
-          effectiveArcTs = Number(await this.state.storage.get(`arc:${serverId}`)) || 0;
-          this.arcCache.set(serverId, effectiveArcTs);
-        } catch (e) {
-          console.error(`fullSweep watermark read failed (server=${serverId}):`, e);
-          complete = false;
-          continue;
+    let startAfter = null;
+    let buf = null; // { serverId, rows }
+    for (;;) {
+      let page;
+      try {
+        page = await this.listStorage('m:', startAfter ? { limit: PAGE, startAfter } : { limit: PAGE });
+      } catch (e) {
+        console.error('fullSweep storage list failed:', e);
+        return false;
+      }
+      if (!page.length) break; // 没有更多行
+      for (const k of page) {
+        const rest = k.name.slice(2); // 去掉 'm:'
+        const sep = rest.indexOf(':');
+        if (sep <= 0) continue;
+        const serverId = Number(rest.slice(0, sep));
+        const ts = Number(rest.slice(sep + 1));
+        if (!Number.isInteger(serverId) || !Number.isFinite(ts)) continue;
+        if (!buf || buf.serverId !== serverId) {
+          // 切换服务器：上一台已完整读完，立即处理并释放
+          if (buf) complete = (await this.sweepServerRows(buf, archiveOn, archiveCutoff, keepCutoff)) && complete;
+          buf = { serverId, rows: [] };
         }
+        buf.rows.push({ name: k.name, ts, value: k.value });
+      }
+      // 以「返回空页」为终止条件，而不是「本页不满 limit」：后者依赖后端严格按 limit 返回，
+      // 一旦实现侧把单页压得更小就会提前结束（漏扫后面的机器）。多一次空页读取 ≈ 1 次/小时。
+      const lastKey = page[page.length - 1].name;
+      if (startAfter && lastKey <= startAfter) break; // 防御：游标没有前进（后端/桩未按 startAfter 返回）
+      startAfter = lastKey;
+    }
+    if (buf) complete = (await this.sweepServerRows(buf, archiveOn, archiveCutoff, keepCutoff)) && complete;
+    return complete;
+  }
+
+  // fullSweep 的单机单元：把该机热区中已跨归档线的行落 D1，再删掉已被持久水位覆盖的源行。
+  // 返回 false 表示本轮有失败（下次 sweep 重试；INSERT OR IGNORE / 条件删除都幂等）。
+  async sweepServerRows({ serverId, rows }, archiveOn, archiveCutoff, keepCutoff) {
+    let complete = true;
+    let effectiveArcTs = archiveOn ? this.arcCache.get(serverId) : Number.POSITIVE_INFINITY;
+    if (archiveOn && effectiveArcTs == null) {
+      try {
+        effectiveArcTs = Number(await this.state.storage.get(`arc:${serverId}`)) || 0;
+        this.arcCache.set(serverId, effectiveArcTs);
+        this.arcPersisted.set(serverId, effectiveArcTs);
+      } catch (e) {
+        // 水位读不到：本轮跳过该机（不归档也不删源），下轮重试
+        console.error(`fullSweep watermark read failed (server=${serverId}):`, e);
+        return false;
+      }
+    }
+
+    const candidates = archiveOn
+      ? rows.filter((row) => row.ts <= archiveCutoff && row.ts > effectiveArcTs)
+      : [];
+    if (candidates.length) {
+      const stmts = [];
+      try {
+        for (const row of candidates) {
+          const v = JSON.parse(row.value);
+          // 数值归一化：历史坏数值不得让整批归档失败。
+          stmts.push(
+            this.env.DB.prepare(
+              'INSERT OR IGNORE INTO metrics_min (server_id, ts, cpu, mem_used, mem_total, net_in, net_out, extra) VALUES (?,?,?,?,?,?,?,?)'
+            ).bind(
+              serverId, row.ts,
+              numOrNull(v.cpu), numOrNull(v.mem_used), numOrNull(v.mem_total),
+              numOrNull(v.net_in), numOrNull(v.net_out),
+              v.extra ? JSON.stringify(v.extra) : null
+            )
+          );
+        }
+      } catch (e) {
+        // 无法解析的源行必须保留，不能越过它推进同服务器水位（也跳过本机删除）
+        console.error(`fullSweep row decode failed (server=${serverId}):`, e);
+        return false;
       }
 
-      const candidates = archiveOn
-        ? rows.filter((row) => row.ts <= archiveCutoff && row.ts > effectiveArcTs)
-        : [];
-      if (candidates.length) {
-        const stmts = [];
+      let archived = true;
+      // 每台服务器独立提交；任一批失败时不删该服务器任何新源行、不推进水位。
+      // 已成功批次下轮由 INSERT OR IGNORE 安全重放，避免跨批次水位越过失败区间。
+      for (let i = 0; i < stmts.length; i += 100) {
         try {
-          for (const row of candidates) {
-            const v = JSON.parse(row.value);
-            // 数值归一化：历史坏数值不得让整批归档失败。
-            stmts.push(
-              this.env.DB.prepare(
-                'INSERT OR IGNORE INTO metrics_min (server_id, ts, cpu, mem_used, mem_total, net_in, net_out, extra) VALUES (?,?,?,?,?,?,?,?)'
-              ).bind(
-                serverId, row.ts,
-                numOrNull(v.cpu), numOrNull(v.mem_used), numOrNull(v.mem_total),
-                numOrNull(v.net_in), numOrNull(v.net_out),
-                v.extra ? JSON.stringify(v.extra) : null
-              )
-            );
-          }
+          await this.env.DB.batch(stmts.slice(i, i + 100));
         } catch (e) {
-          // 无法解析的源行必须保留，不能越过它推进同服务器水位。
-          console.error(`fullSweep row decode failed (server=${serverId}):`, e);
+          console.error(`fullSweep batch failed (server=${serverId}, rows=${stmts.length}):`, e);
+          archived = false;
           complete = false;
-          continue;
-        }
-
-        let archived = true;
-        // 每台服务器独立提交；任一批失败时不删该服务器任何新源行、不推进水位。
-        // 已成功批次下轮由 INSERT OR IGNORE 安全重放，避免跨批次水位越过失败区间。
-        for (let i = 0; i < stmts.length; i += 100) {
-          try {
-            await this.env.DB.batch(stmts.slice(i, i + 100));
-          } catch (e) {
-            console.error(`fullSweep batch failed (server=${serverId}, rows=${stmts.length}):`, e);
-            archived = false;
-            complete = false;
-            break;
-          }
-        }
-        if (archived) {
-          const nextArcTs = candidates.reduce((max, row) => Math.max(max, row.ts), effectiveArcTs);
-          try {
-            // 先持久化水位再删源；失败时保留源行，下轮幂等重放。
-            await this.state.storage.put(`arc:${serverId}`, String(nextArcTs));
-            this.arcCache.set(serverId, nextArcTs);
-            effectiveArcTs = nextArcTs;
-          } catch (e) {
-            console.error(`fullSweep watermark write failed (server=${serverId}):`, e);
-            complete = false;
-          }
+          break;
         }
       }
-
-      // 仅删除已被持久水位覆盖的源行；归档关闭时按 12h 热区策略直接清理。
-      for (const row of rows) {
-        if (row.ts > keepCutoff || (archiveOn && row.ts > effectiveArcTs)) continue;
+      if (archived) {
+        const nextArcTs = candidates.reduce((max, row) => Math.max(max, row.ts), effectiveArcTs);
         try {
-          await this.state.storage.delete(row.name);
-          const memory = this.data.get(serverId);
-          if (memory) {
-            memory.delete(row.ts);
-            if (memory.size === 0) this.data.delete(serverId);
-          }
+          // 先持久化水位再删源；失败时保留源行，下轮幂等重放。
+          await this.state.storage.put(`arc:${serverId}`, String(nextArcTs));
+          this.arcCache.set(serverId, nextArcTs);
+          this.arcPersisted.set(serverId, nextArcTs); // fullSweep 直接落盘，同步降频游标
+          effectiveArcTs = nextArcTs;
         } catch (e) {
-          console.error(`fullSweep source delete failed (${row.name}):`, e);
+          console.error(`fullSweep watermark write failed (server=${serverId}):`, e);
           complete = false;
         }
+      }
+    }
+
+    // 仅删除已被持久水位覆盖的源行；归档关闭时按热区窗口直接清理。
+    // 批量删（生产 API 上限 128 键/次）：500 台每小时约 3 万行 → ~235 次 await，原来是 3 万次，
+    // 单轮 duration 因此大幅下降。
+    const doomed = rows.filter((row) => !(row.ts > keepCutoff || (archiveOn && row.ts > effectiveArcTs)));
+    for (let i = 0; i < doomed.length; i += 128) {
+      const chunk = doomed.slice(i, i + 128);
+      try {
+        await this.state.storage.delete(chunk.map((r) => r.name));
+      } catch (e) {
+        console.error(`fullSweep source delete failed (server=${serverId}, rows=${chunk.length}):`, e);
+        complete = false;
+        continue; // 剩下的源行仍在，下轮重试
+      }
+      const memory = this.data.get(serverId);
+      if (memory) {
+        for (const row of chunk) memory.delete(row.ts);
+        if (memory.size === 0) this.data.delete(serverId);
       }
     }
     return complete;

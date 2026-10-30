@@ -70,6 +70,9 @@ AGENT_KEY=<面板添加服务器时生成的 key> \
 | `AGENT_SELF_RESTART` | 0 | =1 在更新并清理会话后主动启动新版本；使用 systemd/launchd/服务包装器时保持 0 |
 | `AGENT_DNS_MODE` | auto | 域名解析方式：`auto`（自建解析优先、失败回落系统）/ `udp`（只用自建，失败不回落）/ `system`（只用系统解析器） |
 | `AGENT_WSS_IP` | 空 | 直接连接该 IP、跳过 DNS；`AGENT_WSS_URL` 仍用于 TLS 的 SNI 与证书校验 |
+| `AGENT_TLS_ROOTS` | webpki | TLS 根证书来源：`webpki`（内置 Mozilla 根，各平台统一）/ `native`（系统证书池，认 `SSL_CERT_FILE`） |
+| `AGENT_LENIENT_WS` | 0 | =1 时 ws/wss 均用宽松握手（只校验 101 + Sec-WebSocket-Accept，兼容剥 `Connection/Upgrade` 头的 MITM 代理） |
+| `AGENT_PROXY_URL` | 空 | `http://[user:pass@]host:port`：WS 与下载均经该代理 CONNECT（未设回落 `PROXY_URL`；代理失败不回落直连） |
 
 > 探活暂不支持 `https://`（http/tcp 支持）；wss 连接不受影响。
 
@@ -102,7 +105,7 @@ Try again`），再叠加断线退避就成了"半天连不上"。glibc 的解�
 
 旧版 Agent 不会上报 `update_protocol`，需先手动替换一次为包含本功能的版本；此后的发布才会出现自动更新按钮。
 
-更新包由 Worker 流式中转到控制 WebSocket（48KB 二进制帧，不整包占内存），Agent 在当前可执行文件同目录 staging，严格校验 offset/总大小/SHA-256，并执行候选文件 `--version` 复核 build id；通过后保留 `<当前文件>.bak`，再由 `self-replace` 跨平台替换。更新会关闭现有终端/文件会话。
+更新包不再经 Worker 中转：面板只下发任务元数据与短期签名 URL，Agent 自己经资产代理（`/mcp/agent-update-asset`）拉取并流式落盘到当前可执行文件同目录的 staging，严格校验总大小/SHA-256，并执行候选文件 `--version` 复核 build id；通过后保留 `<当前文件>.bak`，再由 `self-replace` 跨平台替换。更新会关闭现有终端/文件会话。
 
 更新成功后必须有重启方式（二选一）：
 

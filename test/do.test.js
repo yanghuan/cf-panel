@@ -18,16 +18,30 @@ function mockState(store = {}) {
       return map.has(k) ? map.get(k) : undefined;
     },
     async put(k, v) {
+      // 生产 API 支持 put(entries) 批量写：按 key 逐个写入（计费按 key，语义一致）
+      if (k && typeof k === 'object') {
+        for (const [kk, vv] of Object.entries(k)) map.set(kk, vv);
+        return;
+      }
       map.set(k, v);
     },
     async delete(k) {
+      // 生产 API 支持 delete(keys[])：一次最多 128 键
+      if (Array.isArray(k)) {
+        for (const kk of k) map.delete(kk);
+        return;
+      }
       map.delete(k);
     },
     async list(opts = {}) {
       const prefix = opts.prefix || '';
+      // 与生产一致：按 key 字典序返回，支持 startAfter / limit（分页）
       const keys = [];
-      for (const [k, v] of map) {
-        if (k.startsWith(prefix)) keys.push({ name: k, value: v });
+      for (const [k, v] of [...map.entries()].sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))) {
+        if (!k.startsWith(prefix)) continue;
+        if (opts.startAfter && k <= opts.startAfter) continue;
+        keys.push({ name: k, value: v });
+        if (opts.limit && keys.length >= opts.limit) break;
       }
       return { keys };
     },
@@ -51,6 +65,23 @@ function insertServer(env, keyId, name, extra = {}) {
   return env.DB.prepare(
     'INSERT INTO servers (agent_key_id, name, user_id, agent_key_hash, last_seen) VALUES (?,?,?,?,?)'
   ).bind(keyId, name, 1, 'h', extra.last_seen ?? null).run();
+}
+
+// 指定 id 插入服务器：天账相关用例的 serverId 是硬编码的（7/11/21…），不能依赖自增
+function insertServerWithId(env, id, lastSeen = null) {
+  return env.DB.prepare(
+    'INSERT INTO servers (id, agent_key_id, name, user_id, agent_key_hash, last_seen) VALUES (?,?,?,?,?,?)'
+  ).bind(id, `k${id}`, `s${id}`, 1, 'h', lastSeen).run();
+}
+
+// 内存 updating 标记的权威在 D1：TerminalDO.isUpdating 会把「没有未过期 job」的残留标记清掉。
+// 用例若只 add 标记会被判过期，这里同时种一条未过期的 agent_update 行（贴近真实链路）。
+function seedActiveUpdate(env, serverId = 1) {
+  const now = Math.floor(Date.now() / 1000);
+  return env.DB.prepare(
+    `INSERT INTO operation_jobs (id, kind, status, user_id, username, server_id, created_at, deadline_at, expires_at)
+     VALUES (?, 'agent_update', 'running', 1, 'admin', ?, ?, ?, ?)`
+  ).bind(`job_upd_${serverId}`, serverId, now - 10, now + 200, now + 86400).run();
 }
 
 test.beforeEach(() => I.__reset());
@@ -224,6 +255,43 @@ test('MetricsDO: 首帧兜底失败置 pendingArcRetry，后续帧重试成功�
   assert.equal(Number(await state.storage.get('arc:1')), minTs, '推进水位');
   const rows = await env.DB.prepare('SELECT * FROM metrics_min WHERE server_id = 1').all();
   assert.equal(rows.results.length, 2, '滞后行与跨线行均归档');
+});
+
+// 列表缓存 TTL 从 4.5s 提到 20s 后，命中率决定了 D1 读的量级；并发 miss 必须合并，
+// 否则 N 个观看者同时 sync 仍会各打一条全表查询。
+test('PanelDO: 列表缓存 TTL 内命中、并发 miss 合并、清缓存后失效', async () => {
+  const env = makeEnv();
+  await insertServer(env, 'k1', 'srv-a');
+  let queries = 0;
+  const origPrepare = env.DB.prepare.bind(env.DB);
+  env.DB.prepare = (sql) => {
+    if (/SELECT \* FROM servers ORDER BY/.test(sql)) queries += 1;
+    return origPrepare(sql);
+  };
+  const admin = { id: 1, username: 'admin', role: 1 };
+  const inst = new PanelDO({ getWebSockets: () => [] }, env);
+
+  await inst.filterServersCached(admin);
+  await inst.filterServersCached(admin);
+  assert.equal(queries, 1, 'TTL 内第二个调用必须命中缓存');
+
+  inst.listCache = null; // 模拟 TTL 过期
+  const [a, b, c] = await Promise.all([
+    inst.filterServersCached(admin), inst.filterServersCached(admin), inst.filterServersCached(admin),
+  ]);
+  assert.equal(queries, 2, '并发 miss 只允许一条 SQL');
+  assert.equal(a.length, 1);
+  assert.equal(b[0].id, 1);
+  assert.equal(c[0].name, 'srv-a');
+
+  // 清缓存后在途查询的结果不得回填（否则改名结果会被旧行盖住 20s）
+  inst.listCache = null;
+  const epoch = inst.listEpoch;
+  await inst.fetch(new Request('https://do.internal/rpc/clear_list_cache', { method: 'POST' }));
+  assert.equal(inst.listEpoch, epoch + 1, '清缓存递增代际');
+  assert.equal(inst.listCache, null);
+  await inst.filterServersCached(admin);
+  assert.equal(queries, 3, '清缓存后重新查询');
 });
 
 test('PanelDO latest_push 按观看者权限广播（不查 /latest）', async () => {
@@ -941,6 +1009,56 @@ test('MetricsDO: 探活状态持久化，新实例恢复去重', async () => {
     await call2('/report', { method: 'POST', body: JSON.stringify({ serverId: 1, serverName: 's1', minTs: nowMin, probes: [{ name: 'web', ok: false }] }) });
     assert.equal(cap.calls.length, 1, '新实例恢复探活状态，冷却内不重复告警');
   } finally { cap.restore(); }
+});
+
+test('MetricsDO: probes 清空（删 PROBES）后清除探活去重状态（内存 + Storage）', async () => {
+  const env = makeEnv({ ARCHIVE_TO_D1: '0' });
+  const st = mockState();
+  const { inst, call } = mkMetrics(env, st);
+  const nowMin = Math.floor(Date.now() / 1000 / 60);
+  // 历史失败状态（内存 + Storage 各一份）：只清内存的话 evict 后会被重新加载
+  inst.probeState.set('7:web', { ok: false, lastFail: Date.now() });
+  await st.storage.put('probe:7:web', JSON.stringify({ ok: false, lastFail: Date.now() }));
+
+  // agent 删掉 PROBES 后上报空数组：handleReport 在「有 → 无」变更帧挂 probesCleared
+  await call('/report', {
+    method: 'POST',
+    body: JSON.stringify({ serverId: 7, minTs: nowMin, probes: [], probesCleared: true }),
+  });
+
+  assert.equal(inst.probeState.has('7:web'), false, '内存去重状态必须清除');
+  assert.equal(st.storage.map.has('probe:7:web'), false, 'Storage 去重状态必须清除（evict 后不得复活）');
+});
+
+// 单帧的 probesCleared 可能丢（同机 5s 批内被覆盖、flush 前 evict），且「只删掉其中一个探针」
+// 没有任何信号。alarm 里以 D1 probe_json 为准做对账，把这两种残留都收口。
+test('MetricsDO: alarm 兜底清理已不在配置里的探针状态（丢帧/只删一个也能收口）', async () => {
+  const env = makeEnv({ ARCHIVE_TO_D1: '0' });
+  const ins = (id, probeJson) => env.DB.prepare(
+    'INSERT INTO servers (id, agent_key_id, name, user_id, agent_key_hash, probe_json) VALUES (?,?,?,?,?,?)'
+  ).bind(id, `k${id}`, `s${id}`, 1, 'h', probeJson).run();
+  await ins(1, JSON.stringify([{ name: 'web', ok: true }])); // 只剩 web：db 是已删除的探针
+  await ins(3, 'not-a-json'); // 配置损坏：解析失败时不得误删
+  // 服务器 2 没有任何行（已删除）→ 残留状态也要清
+
+  const st = mockState();
+  const { inst } = mkMetrics(env, st);
+  const fail = { ok: false, lastFail: 1 };
+  for (const k of ['1:web', '1:db', '2:web', '3:web']) {
+    inst.probeState.set(k, fail);
+    await st.storage.put(`probe:${k}`, JSON.stringify(fail));
+  }
+
+  await inst.pruneStaleProbeStates();
+
+  assert.equal(inst.probeState.has('1:web'), true, '仍配置的探针状态必须保留');
+  assert.equal(st.storage.map.has('probe:1:web'), true);
+  assert.equal(inst.probeState.has('1:db'), false, '已删除的探针必须清掉（覆盖「只删掉其中一个」）');
+  assert.equal(st.storage.map.has('probe:1:db'), false);
+  assert.equal(inst.probeState.has('2:web'), false, '服务器已删除的残留也要清');
+  assert.equal(st.storage.map.has('probe:2:web'), false);
+  assert.equal(inst.probeState.has('3:web'), true, 'probe_json 解析失败时不得误删');
+  assert.equal(st.storage.map.has('probe:3:web'), true);
 });
 
 test('MetricsDO: /drop 清理 storage 告警/探活状态', async () => {
@@ -2287,7 +2405,8 @@ test('TerminalDO: agent 更新中 → exec 立即 409（不探活、不下发任
   const inst = new TerminalDO(mockState(), env);
   inst.agents.set(1, agentWs);
   inst.probeCapable.add(1);
-  inst.updating.add(1); // 更新进行中：互斥判定优先于链路新鲜度
+  await seedActiveUpdate(env, 1); // D1 侧存在未过期更新：内存标记才算数（isUpdating）
+  inst.updating.set(1, 'job_upd_1'); // 更新进行中：互斥判定优先于链路新鲜度
   const res = await inst.fetch(new Request('https://do.internal/rpc/exec/submit', {
     method: 'POST', body: JSON.stringify({ jobId, serverId: 1, command: 'echo hi', timeoutMs: 5000 }),
   }));
@@ -2296,6 +2415,158 @@ test('TerminalDO: agent 更新中 → exec 立即 409（不探活、不下发任
   assert.equal(sent.length, 0, '未下发任何帧（不与二进制更新帧交错，也不浪费探活）');
   const row = await env.DB.prepare('SELECT status FROM operation_jobs WHERE id = ?').bind(jobId).first();
   assert.equal(row.status, 'failed', '更新让路 → 任务落 failed');
+});
+
+test('TerminalDO: 过期 update 的本地互斥标记按 D1 deadline 清除（不永久挡住 exec/终端）', async () => {
+  const env = makeEnv();
+  await env.DB.prepare('INSERT INTO servers (agent_key_id, name, user_id, agent_key_hash) VALUES (?,?,?,?)')
+    .bind('k1', 's1', 1, 'h1').run();
+  const now = Math.floor(Date.now() / 1000);
+  await env.DB.prepare(
+    `INSERT INTO operation_jobs (id, kind, status, user_id, username, server_id, created_at, deadline_at, expires_at)
+     VALUES ('job_upd_stale','agent_update','running',1,'admin',1,?,?,?)`
+  ).bind(now - 900, now - 300, now + 86400).run();
+  const inst = new TerminalDO(mockState(), env);
+  inst.updating.set(1, 'job_upd_stale'); // Agent 挂住不回执、连接仍在：内存标记永不释放
+  assert.equal(await inst.isUpdating(1), false, 'D1 已判过期 → 不再视为更新中');
+  assert.equal(inst.updating.has(1), false, '本地残留标记必须清除');
+  const row = await env.DB.prepare("SELECT status FROM operation_jobs WHERE id = 'job_upd_stale'").first();
+  assert.equal(row.status, 'expired', '顺手收敛过期任务，让出唯一索引');
+
+  // 未过期时仍必须拦（不误放行）
+  await seedActiveUpdate(env, 2);
+  const inst2 = new TerminalDO(mockState(), env);
+  inst2.updating.set(2, 'job_upd_2');
+  assert.equal(await inst2.isUpdating(2), true, '未过期的更新仍须互斥');
+});
+
+// evict 后新实例的 updating 是空的，但另一实例（或 evict 前）下发的更新仍在跑：
+// 此时只看本地标记会放行 exec，与 self-replace 交错。必须始终以 D1 为准。
+test('TerminalDO: 冷实例无本地标记时仍按 D1 拦截进行中的更新', async () => {
+  const env = makeEnv();
+  await seedActiveUpdate(env, 1);
+  const inst = new TerminalDO(mockState(), env); // 模拟 evict 后的新实例
+  assert.equal(inst.updating.size, 0);
+  assert.equal(await inst.isUpdating(1), true, 'D1 有未过期更新时必须拦截（不得因本地无标记而放行）');
+});
+
+// 旧更新挂住（无回执、连接仍在）时内存标记不会释放；此时用户重试更新，新任务刚入库
+// （queued、未过期）——若不排除「本次要下发的任务」，isUpdating 会被新任务自己的 D1 行挡住，
+// 重试永远 409（只能等实例 evict）。旧任务的迟到回执同样不得清掉新任务的标记。
+test('TerminalDO: 旧更新挂住后新任务仍可下发（互斥标记按 jobId 判定）', async () => {
+  const env = makeEnv();
+  await env.DB.prepare('INSERT INTO servers (agent_key_id, name, user_id, agent_key_hash) VALUES (?,?,?,?)')
+    .bind('k1', 's1', 1, 'h1').run();
+  const now = Math.floor(Date.now() / 1000);
+  const ins = (id, status, deadline) => env.DB.prepare(
+    `INSERT INTO operation_jobs (id, kind, status, user_id, username, server_id, created_at, deadline_at, expires_at)
+     VALUES (?, 'agent_update', ?, 1, 'admin', 1, ?, ?, ?)`
+  ).bind(id, status, now - 900, deadline, now + 86400).run();
+  await ins('job_old_upd', 'running', now - 300); // A：上次更新，已过期（挂住无回执）
+  // A 先被 createAgentUpdateJob 的 settleServerExpired 收敛（唯一索引随之让出），B 才能插入
+  await env.DB.prepare("UPDATE operation_jobs SET status = 'expired' WHERE id = 'job_old_upd'").run();
+  await ins('job_new_upd', 'queued', now + 200);  // B：本次重试新建的任务
+
+  const inst = new TerminalDO(mockState(), env);
+  inst.updating.set(1, 'job_old_upd');
+  assert.equal(await inst.isUpdating(1, 'job_new_upd'), false, '新任务不得被旧标记挡住');
+  assert.equal(inst.updating.has(1), false, '旧标记应被清除');
+
+  // B 运行期间 exec 仍必须被拦（互斥没有被误放开）
+  inst.updating.set(1, 'job_new_upd');
+  assert.equal(await inst.isUpdating(1), true, '未过期更新仍须互斥');
+
+  // A 的迟到回执不得释放 B 的标记（否则 exec 会与 B 的 self-replace 交错）
+  await inst.settleUpdateJob('job_old_upd', { ok: false, error: 'late' });
+  assert.equal(inst.updating.get(1), 'job_new_upd', '旧任务的迟到回执不得清掉新任务的标记');
+});
+
+// 旧实现一次 list('m:') 把整个热区读进内存（240×N 行）。分页后必须保证：
+// 跨页时同一台机器的行不丢、每台机器处理完即可释放、源行用批量 delete 清理。
+test('MetricsDO: fullSweep 分页处理热区（小页也能扫全）且批量删除', async () => {
+  const env = makeEnv();
+  const st = mockState();
+  const { inst } = mkMetrics(env, st);
+  const nowMin = Math.floor(Date.now() / 1000 / 60);
+  for (let sid = 1; sid <= 3; sid++) {
+    st.storage.map.set(`arc:${sid}`, String(nowMin - 400)); // 水位已覆盖全部行 → 走删除分支
+    for (let i = 0; i < 5; i++) {
+      st.storage.map.set(`m:${sid}:${nowMin - 300 + i}`, JSON.stringify({ cpu: sid * 10 + i }));
+    }
+  }
+  // 强制每页 2 行（模拟后端把 limit 压得更小）：验证跨页缓冲与「空页才停」的终止条件
+  const origList = st.storage.list.bind(st.storage);
+  st.storage.list = async (opts = {}) => origList({ ...opts, limit: 2 });
+  let batchDeletes = 0;
+  const origDelete = st.storage.delete.bind(st.storage);
+  st.storage.delete = async (k) => { if (Array.isArray(k)) batchDeletes += 1; return origDelete(k); };
+
+  assert.equal(await inst.fullSweep(true), true, '分页扫描应完整完成');
+  const rows = await env.DB.prepare('SELECT COUNT(*) AS c FROM metrics_min').first();
+  assert.equal(rows.c, 15, '三台各 5 行全部归档（跨页不丢）');
+  const hotLeft = [...st.storage.map.keys()].filter((k) => k.startsWith('m:'));
+  assert.deepEqual(hotLeft, [], '被水位覆盖的源行全部删除');
+  assert.ok(batchDeletes <= 3, `应按服务器批量删（每次 ≤128 键），实际 ${batchDeletes} 次`);
+  assert.ok(st.storage.map.has('arc:1'), '水位键保留');
+});
+
+// /latest 冷启动（面板首连/evict 后）原来扫全量热区（240×N 行 + 逐行 parse）。
+// 现在读每机一份的 l: 快照行；旧数据没有 l: 时才回退全扫（升级兼容）。
+test('MetricsDO: /latest 冷启动读 l: 快照，不全量扫热区', async () => {
+  const env = makeEnv({ ARCHIVE_TO_D1: '0' });
+  const st = mockState();
+  const nowMin = Math.floor(Date.now() / 1000 / 60);
+  st.storage.map.set('l:1', JSON.stringify({ ts: nowMin - 5, cpu: 42, mem_used: 3 }));
+  for (let i = 0; i < 50; i++) st.storage.map.set(`m:1:${nowMin - i}`, JSON.stringify({ cpu: 1 }));
+
+  const { inst, call } = mkMetrics(env, st);
+  const prefixes = [];
+  const orig = inst.listStorage.bind(inst);
+  inst.listStorage = async (p, o) => { prefixes.push(p); return orig(p, o); };
+  const latest = await (await call('/latest')).json();
+  assert.equal(latest[1].cpu, 42, '冷启动返回快照值');
+  assert.deepEqual(prefixes, ['l:'], '只读 l: 快照，不扫 m:（50 行热区一行都没读）');
+});
+
+test('MetricsDO: l: 快照降频写（首帧必写，之后每 5 分钟一次）', async () => {
+  const env = makeEnv({ ARCHIVE_TO_D1: '0' });
+  const st = mockState();
+  const { call } = mkMetrics(env, st);
+  const nowMin = Math.floor(Date.now() / 1000 / 60);
+  const base = nowMin - 20; // 不看分钟奇偶：按「距上次写」计时，避免 120s 慢采永远不命中 5 的倍数
+  await call('/report', { method: 'POST', body: JSON.stringify({ serverId: 1, minTs: base, cpu: 7 }) });
+  assert.equal(JSON.parse(st.storage.map.get('l:1')).cpu, 7, '首帧（含 evict 后）必写快照');
+  await call('/report', { method: 'POST', body: JSON.stringify({ serverId: 1, minTs: base + 1, cpu: 8 }) });
+  assert.equal(JSON.parse(st.storage.map.get('l:1')).cpu, 7, '1 分钟后不重写');
+  await call('/report', { method: 'POST', body: JSON.stringify({ serverId: 1, minTs: base + 5, cpu: 9 }) });
+  const snap = JSON.parse(st.storage.map.get('l:1'));
+  assert.equal(snap.cpu, 9, '距上次写满 5 分钟再写');
+  assert.equal(snap.ts, base + 5);
+});
+
+// 归档水位原先每跨一分钟写一次（1,440 写/台/天，与热行同量）。降频到 10 分钟后，
+// 内存水位照常逐分钟推进，只是落盘间隔变大（evict 后最多重放 10 行，幂等）。
+test('MetricsDO: 归档水位降频持久化（10 分钟内不重复写 arc:）', async () => {
+  const env = makeEnv();
+  const st = mockState();
+  const { call } = mkMetrics(env, st);
+  const nowMin = Math.floor(Date.now() / 1000 / 60);
+  const m1 = nowMin - 70; // 归档线之前
+  const arcWrites = [];
+  const origPut = st.storage.put.bind(st.storage);
+  st.storage.put = async (k, v) => {
+    if (typeof k === 'string' && k.startsWith('arc:')) arcWrites.push(k);
+    else if (k && typeof k === 'object') for (const kk of Object.keys(k)) if (kk.startsWith('arc:')) arcWrites.push(kk);
+    return origPut(k, v);
+  };
+
+  await call('/report', { method: 'POST', body: JSON.stringify({ serverId: 1, minTs: m1, cpu: 1 }) });
+  assert.equal(Number(st.storage.map.get('arc:1')), m1, '首次推进立即落盘');
+  await call('/report', { method: 'POST', body: JSON.stringify({ serverId: 1, minTs: m1 + 1, cpu: 2 }) });
+  assert.equal(Number(st.storage.map.get('arc:1')), m1, '推进 1 分钟不重复写');
+  await call('/report', { method: 'POST', body: JSON.stringify({ serverId: 1, minTs: m1 + 10, cpu: 3 }) });
+  assert.equal(Number(st.storage.map.get('arc:1')), m1 + 10, '推进满 10 分钟落盘');
+  assert.equal(arcWrites.length, 2, '三次上报只写两次水位');
 });
 
 test('MetricsDO: 归档超过 100 行分批 batch 落 D1', async () => {
@@ -2353,6 +2624,20 @@ test('TerminalDO: cleanup 按归属清理 pendingOpen，跨服务器/会话隔�
   await inst.cleanup(ctl2);
   assert.equal(inst.agents.size, 0);
   assert.equal(inst.pendingOpen.size, 0, 'server2 断开后 pendingOpen 清空');
+});
+
+test('MetricsDO: 同分钟多帧后首次 /query 返回最新帧（loadHot 不得回退到 storage 首帧）', async () => {
+  const env = makeEnv({ ARCHIVE_TO_D1: '0' });
+  const { call } = mkMetrics(env, mockState());
+  const nowMin = Math.floor(Date.now() / 1000 / 60);
+  // 热写路径每分钟只把首帧落 storage，后续帧只更新内存
+  await call('/report', { method: 'POST', body: JSON.stringify({ serverId: 1, minTs: nowMin, cpu: 10 }) });
+  await call('/report', { method: 'POST', body: JSON.stringify({ serverId: 1, minTs: nowMin, cpu: 90 }) });
+
+  // 首次 /query 触发 loadHot（从 storage 恢复）：必须与内存合并，不能整体替换
+  const q = await (await call('/query?server_id=1&limit=10')).json();
+  assert.equal(q.length, 1);
+  assert.equal(q[0].cpu, 90, '/query 必须返回分钟内最新帧（合并而非覆盖）');
 });
 
 // ---------------- MetricsDO：按天统计（流量累计 / 可用率 / 重启检测） ----------------
@@ -2423,19 +2708,90 @@ test('MetricsDO: 长时间离线只补可用率分母——可用率不得虚高
 
 test('MetricsDO: 离线机器由 alarm 补记分母（不再上报也不虚高）', async () => {
   const env = makeEnv({ ARCHIVE_TO_D1: '0' });
-  const { inst } = mkMetrics(env, mockState());
+  const state = mockState();
+  await insertServerWithId(env, 11, daySafeBase());
+  const { inst } = mkMetrics(env, state);
   const base = daySafeBase();
+  await inst.ensureDayCursor(11);
   inst.accumulateDay(11, base, 0, 0, 100);
   inst.lastSeenSec.set(11, base);
-  await inst.flushDayPending(); // 先落一次在线段
+  await inst.flushDayPending(); // 先落一次在线段（同时持久化游标）
 
-  // 模拟 2 小时后 alarm：该机再无上报 → 补记离线时长（只补分母）
-  inst.sweepOfflineDaySpans(base + 2 * 3600);
-  await inst.flushDayPending();
+  // 模拟 2 小时后 alarm，且实例已被 evict（新实例内存游标与 lastSeenSec 均为空）：
+  // 必须仍能从 D1 servers.last_seen 认出该机并补分母——否则「整段时间都在别的实例上报」
+  // 的机器永远补不到分母，长时间离线反而显示 100%
+  const cold = new MetricsDO(state, env);
+  await cold.sweepOfflineDaySpans(base + 2 * 3600);
+  await cold.flushDayPending();
 
   const r = await env.DB.prepare('SELECT * FROM metrics_day WHERE server_id = 11').first();
   assert.ok(r.total_min > 100, `离线 2 小时应补约 120 分钟分母，实际 ${r.total_min}`);
   assert.ok(r.online_min < 6, `分子不得随分母增长，实际 ${r.online_min}`);
+});
+
+test('MetricsDO: 实例 evict 后天账继续累加（游标持久化跨实例）', async () => {
+  const env = makeEnv({ ARCHIVE_TO_D1: '0' });
+  const state = mockState();
+  const base = daySafeBase();
+  const a = new MetricsDO(state, env);
+  await a.ensureDayCursor(7);
+  a.accumulateDay(7, base, 100, 200, 3600);
+  await a.flushDayPending(); // 落 D1 + 持久化游标
+
+  // 第二个实例（模拟 evict）：内存里没有任何游标，必须从 Storage 恢复后继续累加
+  const b = new MetricsDO(state, env);
+  await b.ensureDayCursor(7);
+  b.accumulateDay(7, base + 120, 100, 200, 3720);
+  await b.flushDayPending();
+
+  const r = await env.DB.prepare('SELECT * FROM metrics_day WHERE server_id = 7').first();
+  assert.ok(Math.abs(r.total_min - 2) < 1e-6, `跨实例两帧应累计 2 分钟，实际 ${r.total_min}`);
+  assert.ok(Math.abs(r.online_min - 2) < 1e-6, '两帧都在线：分子等于分母');
+  assert.equal(r.bytes_in, 12000, '入站 = 100 B/s × 120s');
+  assert.equal(r.bytes_out, 24000, '出站 = 200 B/s × 120s');
+});
+
+test('MetricsDO: 游标缺失时用 D1 last_seen 播种（慢采首帧不丢区间）', async () => {
+  const env = makeEnv({ ARCHIVE_TO_D1: '0' });
+  const state = mockState(); // 空 Storage：首次部署/游标被清
+  const base = daySafeBase();
+  await insertServerWithId(env, 21, base);
+
+  const inst = new MetricsDO(state, env);
+  await inst.ensureDayCursor(21);
+  inst.accumulateDay(21, base + 120, 50, 60, 3600); // 慢采间隔 120s
+  await inst.flushDayPending();
+
+  const r = await env.DB.prepare('SELECT * FROM metrics_day WHERE server_id = 21').first();
+  assert.ok(r.total_min > 0, `首帧必须借助 D1 播种补上区间，实际 ${r.total_min}`);
+  assert.ok(Math.abs(r.total_min - 2) < 1e-6, `120s 慢采应记 2 分钟，实际 ${r.total_min}`);
+  assert.equal(r.bytes_in, 6000, '入站 = 50 B/s × 120s');
+});
+
+test('MetricsDO: 游标持久化失败时本轮不写 D1（避免下次按旧游标重复记账）', async () => {
+  const env = makeEnv({ ARCHIVE_TO_D1: '0' });
+  const state = mockState();
+  const inst = new MetricsDO(state, env);
+  const base = daySafeBase();
+  inst.dayAccum.set(7, { lastSec: base, uptimeMin: null });
+  inst.dayCurDirty.add(7);
+  inst.accumulateDay(7, base + 120, 100, 100, 100);
+  assert.equal(inst.dayPending.size, 1);
+
+  const origPut = state.storage.put.bind(state.storage);
+  state.storage.put = async (k, v) => {
+    if (k === 'daycur:7') throw new Error('storage down');
+    return origPut(k, v);
+  };
+  await inst.flushDayPending();
+  let row = await env.DB.prepare('SELECT * FROM metrics_day WHERE server_id = 7').first();
+  assert.equal(row, null, '游标没落盘时不得写增量（否则下次冷启动会重复记账）');
+  assert.equal(inst.dayPending.size, 1, '增量保留到下次 flush');
+
+  state.storage.put = origPut; // 恢复后重试：游标与增量一起落库
+  await inst.flushDayPending();
+  row = await env.DB.prepare('SELECT * FROM metrics_day WHERE server_id = 7').first();
+  assert.ok(row && Math.abs(row.total_min - 2) < 1e-6, '恢复后应补写 2 分钟');
 });
 
 test('MetricsDO: uptime 下降沿计为重启（与可用率互补）', async () => {
@@ -2525,7 +2881,8 @@ test('TerminalDO /rpc/exec/submit：Agent 离线 / 更新中 → 任务落 faile
   const updId = `job_${'c'.repeat(32)}`;
   await seedExecJob(env, updId);
   inst.agents.set(1, { send() {}, readyState: 1, close() {} });
-  inst.updating.add(1);
+  await seedActiveUpdate(env, 1); // isUpdating 以 D1 deadline 为准，标记需有对应活动任务
+  inst.updating.set(1, 'job_upd_1');
   const upd = await inst.fetch(new Request('https://do.internal/rpc/exec/submit', {
     method: 'POST', body: JSON.stringify({ jobId: updId, serverId: 1, command: 'id', timeoutMs: 5000 }),
   }));
@@ -3006,7 +3363,7 @@ test('superseded 旧连接：cleanup 仍释放 updating（不依赖 map 命中�
   const ws1 = mk();
   const ws2 = mk();
   inst.agents.set(1, ws1);
-  inst.updating.add(1);
+  inst.updating.set(1, 'job_superseded');
 
   // 重连：新连接顶替
   inst.agents.set(1, ws2);
@@ -3150,7 +3507,7 @@ test('cleanup(会话 ws) 不得误清控制连接的互斥与探活状态', asyn
     send() {}, readyState: 1, close() {},
   };
   inst.agents.set(1, controlWs);
-  inst.updating.add(1);
+  inst.updating.set(1, 'job_sess');
   inst.probeCapable.add(1);
   inst.lastRoundTripAt.set(1, Date.now());
 

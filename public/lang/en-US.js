@@ -586,7 +586,20 @@
     'error.BATCH_IDS_REQUIRED': 'Select servers first',
     'error.BATCH_TOO_MANY': 'At most 100 servers per batch',
     'error.GROUP_TOO_LONG': 'Group name too long',
-    'error.UPLOAD_TOO_LARGE': 'File exceeds the size limit',
+    'error.DESCRIPTION_TOO_LONG': 'Description too long (max 500 characters)',
+    'error.COMMAND_REQUIRED': 'Command is required',
+    'error.PATH_REQUIRED': 'Path is required (must be absolute)',
+    'error.LENGTH_REQUIRED': 'Upload requires Content-Length to verify the file size',
+    'error.TOO_LARGE': 'File exceeds the size limit',
+    'error.AGENT_UPDATE_BUSY': 'An agent update is in progress for this server',
+    'error.AGENT_UPGRADE_REQUIRED': 'Agent is too old for online update — upgrade it manually',
+    'error.UPLOAD_BUSY': 'Another upload is in progress for this server',
+    'error.UPLOAD_CLAIMED': 'This upload has already been claimed',
+    'error.UPDATE_BUSY': 'An agent update is already in progress for this server',
+    'error.JOB_NOT_AWAITING_UPLOAD': 'This upload link is no longer valid',
+    'error.ORDER_ITEMS_REQUIRED': 'Sort items are required',
+    'error.ORDER_TOO_MANY': 'At most 500 sort items',
+    'error.ORDER_BAD_ITEM': 'Invalid sort item',
   };
 
   window.CfI18n.register(

@@ -559,16 +559,17 @@ WHERE id=? AND status IN ('queued','running','expired')
 
 DO evict 后内存 Map 全空，但 Agent 的 `exec_result` 到达会唤醒 DO；因状态在 D1，任务仍可完成。这正是本方案的核心验收点。
 
-### 7.5 后续项：把探活并入上报（可删 probe 帧）
+### 7.5 探活现状：已并入上报调度，`probe`/`pong` 帧仍在（零额外请求仍未达成）
 
-当前维持 `lastRoundTripAt` 新鲜度的成本是**每机每 360s 一帧 `probe` + 一个 `pong` 入站请求**
-（约 240 次/天/机；相对慢采上报的 720 帧是 +33%，且两帧都不携带业务数据）。
+`lastRoundTripAt` 的新鲜度已改为「上报顺风车」：DO 收到 `report` 时若距上次探活 ≥ `PROBE_REFRESH_MS`
+（300s）才补发一帧 `probe`，agent 回 `pong`（慢采下实际落在 t=0,360,720…）。这消除了「逐帧探活」，
+但**每机每 360s 仍有一帧 `probe` + 一个 `pong` 入站请求**（约 240 次/天/机；相对慢采上报的 720 帧
+是 +33%，且两帧都不携带业务数据）——本节原本的目标「零额外请求」尚未达成。
 
-既有的 30s `ping` 已保证健康连接有下行流量，可让 agent 在 `report` 里夹带「上次收到下行帧的时间」，
-DO 据此刷新判据 —— 零额外请求，`probe`/`pong` 可整体删除。
+彻底方案：既有的 30s `ping` 已保证健康连接有下行流量，可让 agent 在 `report` 里夹带
+「上次收到下行帧的时间」，DO 据此刷新判据 —— 零额外请求，`probe`/`pong` 可整体删除。
 
-落地前提：agent 发版（`probe_proto` 升版，DO 对旧版保留现有 probe 回退），因此列为后续项，
-不与本次改动混做。
+落地前提：agent 发版（`probe_proto` 升版，DO 对旧版保留现有 probe 回退），因此仍列为后续项。
 
 ## 8. Upload / Agent Update 异步接口
 

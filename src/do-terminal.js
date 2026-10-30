@@ -61,6 +61,34 @@ export class TerminalDO {
     this.rebuilt = false; // 本实例是否已按附件重建过索引（唤醒后只重建一次，见 rebuildIndex）
     this.slowLogAt = 0; // 埋点日志的小时窗口起点（ms）
     this.slowLogCount = 0; // 本窗口已输出条数（每实例独立）
+    // 冷启动计数器：每小时汇总一行 [cold]，用来判断「对象是否被 evict 过」。
+    // 健康实例每条消息都是冷启动（cold ≈ req）；从未被回收的实例 cold = 0 ——
+    // 这是区分「代码执行慢」与「平台不回收实例」最直接的一条证据，也是开工单的关键数据。
+    this.statHour = ''; // 计数器所属小时（UTC，YYYYMMDDHH）
+    this.statReq = 0; // 本小时收到的 report 帧数
+    this.statCold = 0; // 其中处于冷启动（本实例首次处理）的帧数
+  }
+
+  // 每小时第一次被唤起时，把上个小时的统计打出来并归零。
+  // 只在跨小时时触发，日志量 = 每实例每小时 1 条（4 分片 ≈ 96 条/天），可忽略。
+  rollHourStat(now) {
+    const d = new Date(now);
+    const hour = `${d.getUTCFullYear()}${String(d.getUTCMonth() + 1).padStart(2, '0')}`
+      + `${String(d.getUTCDate()).padStart(2, '0')}${String(d.getUTCHours()).padStart(2, '0')}`;
+    if (hour === this.statHour) return;
+    if (this.statHour && this.statReq > 0) {
+      try {
+        console.error(`[cold] ${JSON.stringify({
+          hour: this.statHour, // 统计所属小时（UTC）
+          req: this.statReq, // 该小时收到的 report 帧数
+          cold: this.statCold, // 其中冷启动帧数；≈req = 每条都要重建，0 = 从未被回收
+          rebuilt: this.rebuilt ? 1 : 0, // 打点时本实例是否已重建索引
+        })}`);
+      } catch { /* ignore */ }
+    }
+    this.statHour = hour;
+    this.statReq = 0;
+    this.statCold = 0;
   }
 
   // 内存互斥可能因 Agent 挂住（不回执、连接仍在）而永不释放——D1 的 deadline 才是权威。
@@ -885,6 +913,11 @@ export class TerminalDO {
             const serverId = this.wsServerId(ws);
             const tReport = Date.now(); // 埋点：整条上报耗时（消息到达 → 落库 + 转发完成）
             const timing = {};
+            // 冷启动统计：coldStart 在函数顶部已取（rebuildIndex 之前），这里只累加计数。
+            // 每小时跨点时输出上一小时的 [cold] 行（见 rollHourStat）。
+            this.rollHourStat(tReport);
+            this.statReq += 1;
+            if (coldStart) this.statCold += 1;
             // ② 能力门控：agent 自声明支持探活（info.probe_proto，随上报免费到达）才启用 exec 前探活。
             // 旧 agent 不报该字段 → 永不探活、永不误关；声明后探活失败必为真断链 → 可安全 close(4002)。
             // 已登记则跳过（避免每帧都序列化附件）；evict 后由附件恢复，故仅在丢失时重写。

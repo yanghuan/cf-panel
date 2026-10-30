@@ -1786,6 +1786,41 @@ test('TerminalDO: 被顶替的旧连接 close 不清新连接的探活能力与�
   assert.equal(inst.lastRoundTripAt.has(1), false, '真正断开时才清往返记录');
 });
 
+test('TerminalDO: 跨小时输出 [cold] 统计（区分冷启动与常驻）', async () => {
+  const env = makeEnv();
+  const ws = {
+    deserializeAttachment: () => ({ role: 'control', serverId: 1 }),
+    send() {}, readyState: 1,
+  };
+  const inst = new TerminalDO(mockState(), env);
+  inst.agents.set(1, ws);
+  const lines = [];
+  const origError = console.error;
+  console.error = (...a) => lines.push(a.map(String).join(' '));
+  try {
+    // 第一条：冷启动（rebuilt=false）
+    await inst.webSocketMessage(ws, JSON.stringify({ type: 'report', cpu: 1 }));
+    assert.equal(inst.statReq, 1, '本小时累计 1 帧');
+    assert.equal(inst.statCold, 1, '首帧算冷启动');
+    // 同小时再来一条：不再是冷启动
+    await inst.webSocketMessage(ws, JSON.stringify({ type: 'report', cpu: 2 }));
+    assert.equal(inst.statReq, 2);
+    assert.equal(inst.statCold, 1, '同一实例后续帧不是冷启动');
+    // 模拟跨小时：把 statHour 改成上个小时，再触发一次
+    inst.statHour = '2026010100';
+    await inst.webSocketMessage(ws, JSON.stringify({ type: 'report', cpu: 3 }));
+    const cold = lines.filter((l) => l.startsWith('[cold]'));
+    assert.equal(cold.length, 1, '跨小时输出恰好一行');
+    const stat = JSON.parse(cold[0].replace('[cold] ', ''));
+    assert.equal(stat.hour, '2026010100', '记录的是上一小时');
+    assert.equal(stat.req, 2, '上一小时共 2 帧');
+    assert.equal(stat.cold, 1, '其中 1 帧是冷启动');
+    assert.equal(inst.statReq, 1, '新小时重新计数');
+  } finally {
+    console.error = origError;
+  }
+});
+
 test('TerminalDO: 能力撤销同时清附件 rtt（不会在 evict 后被复活）', async () => {
   const env = makeEnv();
   let att = { role: 'control', serverId: 1, probe: true, rtt: 12345 };

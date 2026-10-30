@@ -20,9 +20,10 @@ const REPORT_SLOW_INTERVAL_S = 120; // 无人查看：120 秒上报
 const EXEC_DEFAULT_TIMEOUT_MS = 25 * 1000; // MCP exec 默认超时（须 < DO fetch 默认 30s 超时，由内部先返回）
 const EXEC_MAX_TIMEOUT_MS = 25 * 1000;
 const EXEC_TIMEOUT_GRACE_MS = 5 * 1000; // DO 兜底定时器比 agent 实际超时晚 5s：agent 先回执（含部分 stdout），DO 定时器仅兜底防悬挂
-const EXEC_ROUNDTRIP_TTL_MS = 420 * 1000; // exec 判据：窗口内有过成功往返（exec_result 或 probe 的 pong）就信任连接。
-// 窗口取 probe 间隔的 1.4 倍：正常情况下 probe 每 300s 一次，窗口内至少命中一次、exec 零等待；
-// 超过窗口视为链路不可信 → 立即 503 让调用方重试（命令尚未下发，重试绝对安全）。
+const EXEC_ROUNDTRIP_TTL_MS = 600 * 1000; // exec 判据：窗口内有过成功往返（exec_result 或 probe 的 pong）就信任连接。
+// probe 受 PROBE_REFRESH_MS 节流、且只在 report 到达时发：慢采 120s → 实际约每 3 帧（360s）一次，
+// 窗口取 600s 可容忍丢一次 pong 仍不误判。超过窗口视为链路不可信 → 立即 503 让调用方重试
+//（命令尚未下发，重试绝对安全）。若日后把 REPORT_SLOW_INTERVAL_S 调大，需同步放大本窗口。
 const PROBE_REFRESH_MS = 300 * 1000; // 上报顺带 probe 的最小间隔。
 // 注意：每条 probe 都会让 agent 回一个 pong，而 pong 是入站 WS 消息 = 一次 DO 请求。
 // 60s 会让每台机每小时多 60 次请求（约等于上报量翻倍），所以按 5 分钟一次足够维持 exec 判据。
@@ -109,6 +110,7 @@ export class TerminalDO {
         this.sessions.delete(sid);
         await this.state.storage.delete('sess:' + sid).catch(() => {}); // 清理持久化会话（await：不留未完成 I/O）
       }
+      this.agentInterval.delete(serverId); // 服务器已删，间隔索引一并作废（id 不复用）
       // 清理该服务器的 open_terminal/open_file 待确认（定时器停止）
       for (const sid of sids) {
         const r = this.pendingOpen.get(sid);
@@ -583,10 +585,6 @@ export class TerminalDO {
         const sid = Number(att.serverId);
         if (sid > 0) {
           if (att.probe) this.probeCapable.add(sid); // 附件标记支持探活 → 唤醒后恢复能力（见 pong 分支）
-          // 上报间隔也随附件恢复：evict 后首帧就不必再查 PanelDO /viewers 或重发帧
-          if (att.interval === REPORT_FAST_INTERVAL_S || att.interval === REPORT_SLOW_INTERVAL_S) {
-            this.agentInterval.set(sid, att.interval);
-          }
           // caps 随连接附件恢复：supportsFetch 读的就是它，漏恢复会让 evict 后的异步任务被判
           // "不支持异步"而永久失败（agent 明明支持）。
           // 同 serverId 多条控制连接（冻结唤醒后旧半开连接与新连接并存）：保留最新（ts 最大）
@@ -597,6 +595,11 @@ export class TerminalDO {
           } else {
             if (prev && prev !== ws) { try { prev.close(4001, 'superseded on rebuild'); } catch { /* ignore */ } }
             this.agents.set(sid, ws);
+            // 上报间隔随附件恢复，且只跟随胜出的连接：旧半开连接的旧值不能覆盖新连接，
+            // 否则 evict 后会按错误间隔上报（快慢采错档直接放大或浪费配额）。
+            if (att.interval === REPORT_FAST_INTERVAL_S || att.interval === REPORT_SLOW_INTERVAL_S) {
+              this.agentInterval.set(sid, att.interval);
+            }
           }
         }
       } else if (att.role === 'user' || att.role === 'agent') {
@@ -1329,7 +1332,12 @@ export class TerminalDO {
     if (!matched.length && attServerId) matched.push(attServerId);
     for (const serverId of matched) {
       const isCurrent = this.agents.get(serverId) === ws;
-      if (isCurrent) this.agents.delete(serverId);
+      if (isCurrent) {
+        this.agents.delete(serverId);
+        // 断连即失效：新连接建连时会重新下发间隔并写进附件，旧值留着反而会让
+        // 下一帧跳过 syncAgentInterval 而按过期档位上报（快慢采错档）。
+        this.agentInterval.delete(serverId);
+      }
       // 被顶替的旧连接（isCurrent=false）：只释放 per-server 的互斥/能力记录并收敛 D1。
       // 在途异步任务的状态全在 D1（不在内存 Promise 里），顶替连接不影响它们，
       // 不会让明明还在跑的请求收到假的"agent disconnected"。

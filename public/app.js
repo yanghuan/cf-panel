@@ -2256,7 +2256,7 @@
 
     // CPU：独立图（%）
     const cpuData = rows.map((r) => r.cpu);
-    mkChart('CPU（%）', [{ label: 'CPU', data: cpuData, ...lineCfg('#3b82f6', 'rgba(59,130,246,.12)'), fill: true }], tipWith({ CPU: (v) => v.toFixed(1) + '%' }),
+    mkChart(t('monitor.cpu'), [{ label: 'CPU', data: cpuData, ...lineCfg('#3b82f6', 'rgba(59,130,246,.12)'), fill: true }], tipWith({ CPU: (v) => v.toFixed(1) + '%' }),
       lastVal(cpuData) != null ? `${lastVal(cpuData).toFixed(1)}%` : '',
       (m) => (m.cpu == null ? null : m.cpu.toFixed(1) + '%'),
       '%', undefined, undefined, 1);
@@ -2274,8 +2274,12 @@
           const s = r.extra && r.extra.swap;
           if (s == null) return '';
           const mb = +(s / 1048576).toFixed(1);
-          const t = r.extra && r.extra.swap_total;
-          if (t > 0) return `${t('common.labelValue', { label: 'Swap', value: `${mb} MB / ${+(t / 1048576).toFixed(1)} MB` })}${t('common.pctInParen', { v: swapPctOf(r) })}`;
+          // 变量名不能叫 t：会遮蔽 i18n 的 t()（此处要继续调用它拼文案）
+          const total = r.extra && r.extra.swap_total;
+          if (total > 0) {
+            const totalMb = +(total / 1048576).toFixed(1);
+            return `${t('common.labelValue', { label: 'Swap', value: `${mb} MB / ${totalMb} MB` })}${t('common.pctInParen', { v: swapPctOf(r) })}`;
+          }
           return t('common.labelValue', { label: 'Swap', value: `${mb} MB` });
         }
         if (r.mem_used == null) return '';
@@ -2649,7 +2653,7 @@
   function batchDelete() {
     const ids = [...selectedServers];
     if (!ids.length) return;
-    const names = ids.map((id) => (serversCache.find((s) => s.id === id) || {}).name || `#${id}`).join('、');
+    const names = ids.map((id) => (serversCache.find((s) => s.id === id) || {}).name || `#${id}`).join(t('common.listSep'));
     confirmDialog(
       `${t('server.deleteBatchTitle', { n: ids.length })}\n${t('server.deleteBatchBody', { names })}`,
       async () => {

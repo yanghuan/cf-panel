@@ -419,6 +419,18 @@
     }
     get connected() { return this.ws && this.ws.readyState === 1; }
 
+    // 排一次重连（_onClose 断线与 open().catch 建会话失败共用同一条路径）。
+    // 定时器必须可被 close() 取消：否则关标签页/退出登录后它仍会唤醒 open() 重建会话，
+    // 服务端要等到 TTL 才回收（幽灵 PTY）。
+    scheduleRetry() {
+      if (this.closed) return;
+      if (this.retryTimer) clearTimeout(this.retryTimer);
+      this.retryTimer = setTimeout(() => {
+        this.retryTimer = null;
+        if (!this.closed) this.open(this.serverId);
+      }, this.retries * 1000);
+    }
+
     // 建会话 + WS + auth + fit + resize + noData 自愈
     open(serverId) {
       this.serverId = serverId;
@@ -440,7 +452,10 @@
           if (this.retries < TERM_RETRY_MAX) {
             this.retries += 1;
             this.term.write(`\r\n${t('term.createFailedRetry', { err: e.message, n: this.retries })}\r\n`);
-            setTimeout(() => this.open(this.serverId), this.retries * 1000);
+            // 与 _onClose 的重连共用 retryTimer：close() 之后不得再唤醒 open()，
+            // 否则会打一次 /api/terminal、服务端建出会话后被 .then 里的 closed 守卫丢弃，
+            // 留下一个直到 TTL 才回收的幽灵 PTY。
+            this.scheduleRetry();
           } else {
             this.term.write(`\r\n${t('term.createFailed', { err: e.message })}\r\n`);
           }
@@ -485,13 +500,7 @@
       if (this.retries < TERM_RETRY_MAX) {
         this.retries += 1;
         this.term.write(`\r\n\x1b[90m${t('term.connecting', { n: this.retries })}\x1b[0m\r\n`);
-        // 重连定时器必须可被 close() 取消：否则关掉标签页/退出登录后，定时器仍会唤醒
-        // open() 重新建会话与 WS（幽灵终端，服务端要等到会话超时才回收）。
-        if (this.retryTimer) clearTimeout(this.retryTimer);
-        this.retryTimer = setTimeout(() => {
-          this.retryTimer = null;
-          if (!this.closed) this.open(this.serverId);
-        }, this.retries * 1000);
+        this.scheduleRetry();
       } else {
         this.term.write(`\r\n${t('term.closed')}\x1b[0m\r\n`);
       }

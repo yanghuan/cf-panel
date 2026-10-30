@@ -1129,9 +1129,12 @@ async function handleApiInner(request, env) {
     }
     return err('method not allowed', 405);
   }
-  if (method === 'DELETE' && path.startsWith('/api/tokens/')) {
+  // 精确匹配：与 /api/servers/:id 同款防护——旧写法 startsWith 会让
+  // DELETE /api/tokens/5/whatever 也命中这里，把路径拼写错误变成真删令牌。
+  const tokenDeleteMatch = path.match(/^\/api\/tokens\/(\d+)$/);
+  if (method === 'DELETE' && tokenDeleteMatch) {
     if (!isAdmin(user)) return err('forbidden', 403, 'FORBIDDEN');
-    const id = Number(path.split('/')[3]) || 0;
+    const id = Number(tokenDeleteMatch[1]) || 0;
     const res = await env.DB.prepare('DELETE FROM api_tokens WHERE id = ?').bind(id).run();
     if (!res.meta.changes) return err(`token not found (id=${id})`, 404);
     // PAT 撤销即时生效：清 PanelDO 鉴权缓存，已建观看者连接下个推送（≤5s）内关闭
@@ -1144,9 +1147,10 @@ async function handleApiInner(request, env) {
   // 只更新显式传入的字段（未传=保持原值）；令牌明文不可改（库里只有 HMAC），换密文请新建。
   // **仅 JWT 管理员**：改 scopes 等价于签发权限——若放开给 admin PAT，就把上一条
   // 「panel:admin 只能由 JWT 管理员签发」的熔断绕开了（自己改自己的令牌即可重开提权链）。
-  if (method === 'PATCH' && path.startsWith('/api/tokens/')) {
+  const tokenPatchMatch = path.match(/^\/api\/tokens\/(\d+)$/);
+  if (method === 'PATCH' && tokenPatchMatch) {
     if (!isJwtAdmin(user)) return err('token scopes can only be changed by a logged-in admin', 403, 'FORBIDDEN');
-    const id = Number(path.split('/')[3]) || 0;
+    const id = Number(tokenPatchMatch[1]) || 0;
     const row = await env.DB.prepare('SELECT id, name, scopes, server_ids, expires_at FROM api_tokens WHERE id = ?').bind(id).first();
     if (!row) return err('token not found', 404);
     const body = await request.json().catch(() => ({}));

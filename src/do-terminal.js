@@ -487,8 +487,6 @@ export class TerminalDO {
     return new Response('not found', { status: 404 });
   }
 
-  // /api/file_upload 核心：流式读 body → 自动切 ≤48KB 分片 → 控制通道 Binary 混合帧 → 等 upload_result。
-  // 客户端零分片逻辑（curl --data-binary @file 一行）；分片顺序由 offset 严格保证（agent 端校验）。
   // 控制通道（重）连接时调用：关闭该服务器旧的终端/文件会话流。
   // agent 侧 websocat 收到 close → 退出 → 触发清理链（kill pty/bash/脚本），防半开残留。
   dropAgentSessions(serverId) {

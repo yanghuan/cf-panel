@@ -596,6 +596,7 @@
     'error.PATH_REQUIRED': 'Path is required (must be absolute)',
     'error.LENGTH_REQUIRED': 'Upload requires Content-Length to verify the file size',
     'error.TOO_LARGE': 'File exceeds the size limit',
+    'error.IDEMPOTENCY_CONFLICT': 'This idempotency key was already used for a different command or server — use a new key',
     'error.AGENT_UPDATE_BUSY': 'An agent update is in progress for this server',
     'error.AGENT_UPGRADE_REQUIRED': 'Agent is too old for online update — upgrade it manually',
     'error.UPLOAD_BUSY': 'Another upload is in progress for this server',

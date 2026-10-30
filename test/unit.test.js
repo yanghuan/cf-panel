@@ -930,12 +930,14 @@ test('i18n：app.js 面向用户的提示不得残留中文字面量', () => {
   assert.doesNotMatch(app, /toast\(`[^`]*[一-龥]/, '模板 toast 文案须走 t()');
   // 只查汉字会漏掉「全角标点」：`${label}：${v}` 这类拼接在 en-US 下也是中文标点。
   // 逐行扫描；先剥掉行尾 `//` 注释（注释不进 UI，且可能把匹配带到下一行）。
+  // 模板串与普通字符串字面量都要查——`join('、')` 这种单引号写法同样是硬编码中文标点。
+  const BAD = '\\uFF08\\uFF09\\uFF1A\\uFF1B\\uFF0C\\u3001';
   const badPunct = app.split('\n')
     .map((raw, i) => [(raw.split(' //')[0]), i + 1])
     .filter(([line]) => !/^\s*(\/\/|\*|\/\*)/.test(line))
-    .filter(([line]) => /`[^`]*[\uFF08\uFF09\uFF1A\uFF1B\uFF0C]/.test(line))
+    .filter(([line]) => new RegExp(`\`[^\`]*[${BAD}]`).test(line) || new RegExp(`'[^']*[${BAD}]'`).test(line))
     .map(([, n]) => n);
-  assert.deepEqual(badPunct, [], `模板字符串内不得直接写全角标点（应走 i18n key）：第 ${badPunct.join(', ')} 行`);
+  assert.deepEqual(badPunct, [], `字符串字面量内不得直接写全角标点（应走 i18n key）：第 ${badPunct.join(', ')} 行`);
   assert.match(app, /const \{ t \} = CfI18n/, 'app.js 须解构 t()');
   assert.match(app, /CfI18n\.applyDom\(\)/, '启动时须填充静态 DOM 文案');
 });
@@ -967,8 +969,10 @@ function extractErrCodes() {
   const codes = new Set();
   for (const f of nodeFs.readdirSync(dir).filter((x) => x.endsWith('.js'))) {
     const src = nodeFs.readFileSync(nodePath.join(dir, f), 'utf8');
-    // err.code = 'CODE'（jobs.js 抛错用）
-    for (const m of src.matchAll(/err\.code\s*=\s*'([A-Z][A-Z0-9_]+)'/g)) codes.add(m[1]);
+    // xxx.code = 'CODE'：jobs.js 里既有 `err.code`（err 是局部错误变量名），也有 `e.code`。
+    // 只匹配 err.code 会漏掉后者（IDEMPOTENCY_CONFLICT 就是这么逃过覆盖检查的），
+    // 故按「任意标识符.code」抽取——这些赋值点出现在 src 里就是对外契约的一部分。
+    for (const m of src.matchAll(/\b[a-zA-Z_$][\w$]*\.code\s*=\s*'([A-Z][A-Z0-9_]+)'/g)) codes.add(m[1]);
     // err(msg, status, 'CODE')：按括号配对扫描，避免多行调用被正则截断
     for (let i = src.indexOf('err('); i >= 0; i = src.indexOf('err(', i + 4)) {
       if (i > 0 && /[\w.]/.test(src[i - 1])) continue; // 跳过 xxxErr(

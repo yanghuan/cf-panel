@@ -2652,6 +2652,28 @@ test('路由精确匹配：/api/servers/:id 的子路径不得误命中 PATCH/DE
   assert.equal(row.name, 'keep-me', '名称未被改写');
 });
 
+// 与 servers 同款前缀问题：/api/tokens/:id 的子路径不得误命中删除/修改。
+test('路由精确匹配：/api/tokens/:id 的子路径不得误命中 DELETE/PATCH', async () => {
+  const env = makeEnv();
+  const token = await login(env);
+  const created = await (await call(env, {
+    method: 'POST', path: '/api/tokens', token, body: { name: 'keep-token', scopes: ['server:read'] },
+  })).json();
+  const id = (await env.DB.prepare('SELECT id FROM api_tokens WHERE name = ?').bind('keep-token').first()).id;
+
+  const del = await call(env, { method: 'DELETE', path: `/api/tokens/${id}/whatever`, token });
+  assert.notEqual(del.status, 200, '子路径不得被当作删除令牌');
+  assert.ok(await env.DB.prepare('SELECT id FROM api_tokens WHERE id = ?').bind(id).first(), '令牌仍在');
+
+  const patch = await call(env, {
+    method: 'PATCH', path: `/api/tokens/${id}/whatever`, token, body: { scopes: ['panel:admin'] },
+  });
+  assert.notEqual(patch.status, 200, '子路径不得被当作改权限');
+  const row = await env.DB.prepare('SELECT scopes FROM api_tokens WHERE id = ?').bind(id).first();
+  assert.ok(row.scopes.includes('server:read'), 'scopes 未被改写');
+  assert.ok(created.token, '令牌创建成功（前提校验）');
+});
+
 // P2-4 剩余：DO 返回 409/413 时它自己不写 D1，这两条"下发被拒"路径也必须留痕。
 test('exec 下发被拒：DO 返回非 2xx 时也写 exec.command.failed', async () => {
   const env = makeEnv();

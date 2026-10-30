@@ -594,6 +594,7 @@
     'error.PATH_REQUIRED': '路径不能为空（需为绝对路径）',
     'error.LENGTH_REQUIRED': '上传请求缺少 Content-Length，无法确认文件大小',
     'error.TOO_LARGE': '文件超过大小上限',
+    'error.IDEMPOTENCY_CONFLICT': '幂等键已用于另一条命令或另一台服务器，请换一个新的 key',
     'error.AGENT_UPDATE_BUSY': '该服务器正在更新 Agent，请稍后再试',
     'error.AGENT_UPGRADE_REQUIRED': 'Agent 版本过旧，不支持在线更新，请手动升级',
     'error.UPLOAD_BUSY': '该服务器已有进行中的上传任务，请等待完成',

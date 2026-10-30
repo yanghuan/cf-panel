@@ -1447,6 +1447,25 @@ test('TerminalDO: 唤醒重建只沿胜出连接恢复上报间隔与 rtt（旧�
     '旧连接的 rtt 不得残留（否则被判「有过期记录」而误 503，实际应乐观放行）');
 });
 
+test('TerminalDO: 被顶替的旧连接 close 不清新连接的探活能力与往返记录', async () => {
+  const env = makeEnv();
+  const mk = (ts) => ({ deserializeAttachment: () => ({ role: 'control', serverId: 1, ts }), send() {}, readyState: 1, close() {} });
+  const oldWs = mk(1);
+  const newWs = mk(2);
+  const inst = new TerminalDO(mockState(), env);
+  inst.agents.set(1, newWs); // 新连接已接管
+  inst.probeCapable.add(1); // 新连接刚登记的能力
+  inst.lastRoundTripAt.set(1, 12345);
+  await inst.cleanup(oldWs); // 旧连接的 close 事件延迟到达
+  assert.equal(inst.probeCapable.has(1), true, '被顶替连接的 close 不得清除新连接的能力');
+  assert.equal(inst.lastRoundTripAt.get(1), 12345, '往返记录同样保留');
+  assert.equal(inst.agents.get(1), newWs, '当前连接不变');
+  // 真正的断开（isCurrent）才清理
+  await inst.cleanup(newWs);
+  assert.equal(inst.probeCapable.has(1), false, '真正断开时才清能力');
+  assert.equal(inst.lastRoundTripAt.has(1), false, '真正断开时才清往返记录');
+});
+
 test('TerminalDO: 能力撤销同时清附件 rtt（不会在 evict 后被复活）', async () => {
   const env = makeEnv();
   let att = { role: 'control', serverId: 1, probe: true, rtt: 12345 };

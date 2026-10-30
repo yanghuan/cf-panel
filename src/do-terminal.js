@@ -215,6 +215,8 @@ export class TerminalDO {
         // 若这里一票否决，冷启动后的第一条 exec 必然 503（原语义是当场等 pong 最多 1s 再下发）。
         const rttFresh = !lastRtt || Date.now() - lastRtt < EXEC_ROUNDTRIP_TTL_MS;
         if (!rttFresh) {
+          // 记一次发送时间：不记会绕过顺风车节流，下一帧 report 立刻再补一帧 probe
+          this.lastProbeAt.set(serverId, Date.now());
           try { agentWs.send(JSON.stringify({ type: 'probe', id: `p-${crypto.randomUUID()}` })); } catch { /* ignore */ }
           await this.failExecJobWithAudit(this.env, jobId, 'agent link not verified');
           return json({ error: 'agent link not verified, please retry', code: 'AGENT_OFFLINE' }, 503);
@@ -1382,13 +1384,14 @@ export class TerminalDO {
             this.pendingOpen.delete(sid);
           }
         }
+        // 连接级状态只在真正断开时清：被顶替说明新连接已接管，这些值属于新连接，
+        // 无条件清会让刚登记的探活能力/往返记录丢失（退化为乐观放行，最长 120s 后才由下一帧 report 恢复）。
+        this.lastRoundTripAt.delete(serverId);
+        this.lastProbeAt.delete(serverId);
+        this.probeCapable.delete(serverId);
       }
-      // 以下几项与"是不是当前连接"无关：被顶替的旧连接也要释放，否则永久 409。
-      this.lastRoundTripAt.delete(serverId);
-      this.lastProbeAt.delete(serverId);
-      this.probeCapable.delete(serverId);
-      // 控制连接断开 → 释放更新互斥：更新进程已随连接丢失，标记不能留到
-      // DO evict，否则该机器在本实例存活期内一直 409（D1 侧已终态，纯内存泄漏）
+      // 更新互斥与连接无关：被顶替的旧连接也要释放，否则该机器在本实例存活期内一直 409
+      //（更新进程已随连接丢失，D1 侧已终态，纯内存泄漏）
       this.updating.delete(serverId);
       // D1 收敛只对"真正的断开"做：被顶替的旧连接说明 Agent 已重连、任务还在新连接上跑，
       // 此时判 failed 会误杀正在进行的命令。upload 一律交给重连时的 requeueOrphanUploads。

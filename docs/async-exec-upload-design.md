@@ -503,7 +503,7 @@ CREATE INDEX IF NOT EXISTS idx_audit_logs_job_id ON audit_logs(job_id);
 行为：
 
 1. 校验命令长度、serverId、job 仍然合法。
-2. 检查 `updating`、旧同步 `pendingExec`，以及 D1 中该服务器是否正在 agent update。
+2. 检查 `updating` 与 D1 中该服务器是否正在 agent update（旧同步 `pendingExec` 已在阶段 E 随同步路径一并删除）。
 3. 链路可信度（仅对声明 `probe_proto` 的 agent）：`lastRoundTripAt` 在 `EXEC_ROUNDTRIP_TTL_MS`（900s）内直接下发。
    该时间戳由「上报顺风车 probe」的 `pong` 刷新，并同时写入连接附件，evict 后可恢复；
    **无任何记录**（刚冷启动）→ 乐观放行；**有记录但已过期** → 补发一帧 probe 并返回 503，

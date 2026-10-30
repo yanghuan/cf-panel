@@ -585,7 +585,6 @@ export class TerminalDO {
       if (att.role === 'control') {
         const sid = Number(att.serverId);
         if (sid > 0) {
-          if (att.probe) this.probeCapable.add(sid); // 附件标记支持探活 → 唤醒后恢复能力（见 pong 分支）
           // caps 随连接附件恢复：supportsFetch 读的就是它，漏恢复会让 evict 后的异步任务被判
           // "不支持异步"而永久失败（agent 明明支持）。
           // 同 serverId 多条控制连接（冻结唤醒后旧半开连接与新连接并存）：保留最新（ts 最大）
@@ -604,6 +603,11 @@ export class TerminalDO {
             // 最近一次往返时间也随附件恢复：冷启动后 exec 判据能拿到真实时间戳，
             // 而不是落进"无记录"分支（那会退化成无条件信任）。
             if (att.rtt) this.lastRoundTripAt.set(sid, Number(att.rtt) || 0);
+            // 探活能力同样只跟随胜出连接，且必须双向同步：旧半开连接的 probe=true 不能复活能力
+            // （agent 回滚到不支持 probe 的版本后，会被持续发探测帧、pong 不回，rtt 过期 → exec 误 503）；
+            // 胜出连接没有 probe 标记时还要主动撤销，否则上一轮 add 的结果会残留。
+            if (att.probe) this.probeCapable.add(sid);
+            else this.probeCapable.delete(sid);
           }
         }
       } else if (att.role === 'user' || att.role === 'agent') {
@@ -684,7 +688,11 @@ export class TerminalDO {
     this.probeCapable.add(serverId);
     try {
       const a = ws.deserializeAttachment?.();
-      if (a && typeof a === 'object' && a.role === 'control') ws.serializeAttachment({ ...a, probe: true });
+      // 已标过就跳过：pong 路径紧邻 markRoundTrip（附件刚写过一次），
+      // 常态下只需一次序列化，仅首次 pong 走两次。
+      if (a && typeof a === 'object' && a.role === 'control' && a.probe !== true) {
+        ws.serializeAttachment({ ...a, probe: true });
+      }
     } catch { /* ignore */ }
   }
 

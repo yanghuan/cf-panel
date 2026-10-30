@@ -1408,6 +1408,24 @@ test('TerminalDO: pong 刷新往返时间并写入附件（evict 后可恢复）
   assert.equal(inst2.lastRoundTripAt.get(1), att.rtt, '唤醒后 rtt 从附件恢复');
 });
 
+test('TerminalDO: 唤醒重建只沿胜出连接恢复 probeCapable（旧半开连接不复活能力）', async () => {
+  const env = makeEnv();
+  const closed = [];
+  const oldWs = {
+    deserializeAttachment: () => ({ role: 'control', serverId: 1, ts: 1, probe: true }),
+    send() {}, readyState: 1, close(c) { closed.push(c); },
+  };
+  const newWs = {
+    deserializeAttachment: () => ({ role: 'control', serverId: 1, ts: 2 }), // 回滚后的新连接：不声明 probe
+    send() {}, readyState: 1, close() {},
+  };
+  const inst = new TerminalDO({ getWebSockets: () => [oldWs, newWs] }, env);
+  inst.rebuildIndex();
+  assert.equal(inst.agents.get(1), newWs, '胜出的是 ts 更大的新连接');
+  assert.equal(inst.probeCapable.has(1), false, '旧连接的 probe 标记不得复活能力（否则对旧 agent 持续探测→误 503）');
+  assert.ok(closed.includes(4001), '旧连接被关闭');
+});
+
 test('TerminalDO: 能力撤销同时清附件 rtt（不会在 evict 后被复活）', async () => {
   const env = makeEnv();
   let att = { role: 'control', serverId: 1, probe: true, rtt: 12345 };

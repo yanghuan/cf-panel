@@ -20,10 +20,12 @@ const REPORT_SLOW_INTERVAL_S = 120; // 无人查看：120 秒上报
 const EXEC_DEFAULT_TIMEOUT_MS = 25 * 1000; // MCP exec 默认超时（须 < DO fetch 默认 30s 超时，由内部先返回）
 const EXEC_MAX_TIMEOUT_MS = 25 * 1000;
 const EXEC_TIMEOUT_GRACE_MS = 5 * 1000; // DO 兜底定时器比 agent 实际超时晚 5s：agent 先回执（含部分 stdout），DO 定时器仅兜底防悬挂
-const EXEC_ROUNDTRIP_TTL_MS = 180 * 1000; // exec 判据：窗口内有过成功往返（exec_result 或 probe 的 pong）就信任连接。
-// 新鲜度由「上报顺风车 probe」维持（≤120s 一次），所以正常情况下永远命中、exec 零等待；
+const EXEC_ROUNDTRIP_TTL_MS = 420 * 1000; // exec 判据：窗口内有过成功往返（exec_result 或 probe 的 pong）就信任连接。
+// 窗口取 probe 间隔的 1.4 倍：正常情况下 probe 每 300s 一次，窗口内至少命中一次、exec 零等待；
 // 超过窗口视为链路不可信 → 立即 503 让调用方重试（命令尚未下发，重试绝对安全）。
-const PROBE_REFRESH_MS = 60 * 1000; // 上报顺带 probe 的最小间隔：出站帧不计费，也不需要等回执
+const PROBE_REFRESH_MS = 300 * 1000; // 上报顺带 probe 的最小间隔。
+// 注意：每条 probe 都会让 agent 回一个 pong，而 pong 是入站 WS 消息 = 一次 DO 请求。
+// 60s 会让每台机每小时多 60 次请求（约等于上报量翻倍），所以按 5 分钟一次足够维持 exec 判据。
 const UPLOAD_CHUNK_BYTES = 48 * 1024; // /api/file_upload 分片帧数据上限（控制通道入站 64KB，留 JSON 头/边界余量）
 const UPLOAD_TIMEOUT_MS = 120 * 1000; // 上传总超时（流式转发 + agent 写盘；agent 失联时兜底返回，防悬挂）
 const UPLOAD_MAX_DEFAULT = 100 * 1024 * 1024; // 单次上传大小上限默认 100MB（磁盘耗尽防护；agent 端 FILE_LIMIT 500MB 兜底）
@@ -84,10 +86,7 @@ export class TerminalDO {
       const body = await request.json();
       const want = (Number(body.count) || 0) > 0 ? REPORT_FAST_INTERVAL_S : REPORT_SLOW_INTERVAL_S;
       for (const [serverId, w] of this.agents) {
-        if (this.agentInterval.get(serverId) !== want) {
-          this.agentInterval.set(serverId, want);
-          try { w.send(JSON.stringify({ type: 'set_report_interval', interval: want })); } catch { /* ignore */ }
-        }
+        if (this.agentInterval.get(serverId) !== want) this.applyAgentInterval(w, serverId, want);
       }
       return json({ ok: true });
     }
@@ -407,8 +406,7 @@ export class TerminalDO {
         const vResp = await doPanel(this.env).fetch('https://do.internal/viewers');
         const v = await vResp.json();
         const iv = (v.count || 0) > 0 ? REPORT_FAST_INTERVAL_S : REPORT_SLOW_INTERVAL_S;
-        this.agentInterval.set(server.id, iv);
-        pair[1].send(JSON.stringify({ type: 'set_report_interval', interval: iv }));
+        this.applyAgentInterval(pair[1], server.id, iv);
       } catch { /* 查询失败则 agent 用自身默认间隔 */ }
       const connMs = Date.now() - tConn;
       if (connMs >= SLOW_CONN_MS) {
@@ -585,6 +583,10 @@ export class TerminalDO {
         const sid = Number(att.serverId);
         if (sid > 0) {
           if (att.probe) this.probeCapable.add(sid); // 附件标记支持探活 → 唤醒后恢复能力（见 pong 分支）
+          // 上报间隔也随附件恢复：evict 后首帧就不必再查 PanelDO /viewers 或重发帧
+          if (att.interval === REPORT_FAST_INTERVAL_S || att.interval === REPORT_SLOW_INTERVAL_S) {
+            this.agentInterval.set(sid, att.interval);
+          }
           // caps 随连接附件恢复：supportsFetch 读的就是它，漏恢复会让 evict 后的异步任务被判
           // "不支持异步"而永久失败（agent 明明支持）。
           // 同 serverId 多条控制连接（冻结唤醒后旧半开连接与新连接并存）：保留最新（ts 最大）
@@ -1033,9 +1035,17 @@ export class TerminalDO {
   }
 
   // 省配额策略：观看者数变化由 PanelDO 事件驱动（/rpc/set_viewers 更新 agentInterval 并广播），
-  // 上报时仅读内存（0 个 DO 调用）；仅当内存无记录（实例 evict / 新连接）时查 /viewers 兜底初始化。
+  // 上报时仅读内存（0 个 DO 调用）。内存丢失（实例 evict）时**先读连接附件**——附件随连接存活，
+  // 读它零请求；只有附件也没有（升级前的老连接）才查 /viewers 兜底。
   async syncAgentInterval(ws, serverId, timing) {
     if (this.agentInterval.has(serverId)) return; // 事件驱动已维护
+    const att = ws.deserializeAttachment?.();
+    const cached = Number(att && typeof att === 'object' ? att.interval : 0);
+    if (cached === REPORT_FAST_INTERVAL_S || cached === REPORT_SLOW_INTERVAL_S) {
+      // 附件命中：agent 侧本来就知道这个间隔，无需重发，也不产生任何 DO 调用
+      this.agentInterval.set(serverId, cached);
+      return;
+    }
     const tViewers = Date.now();
     let want = REPORT_SLOW_INTERVAL_S;
     try {
@@ -1044,8 +1054,21 @@ export class TerminalDO {
       want = (v.count || 0) > 0 ? REPORT_FAST_INTERVAL_S : REPORT_SLOW_INTERVAL_S;
     } catch { /* 兜底慢采 */ }
     if (timing) timing.viewers = Date.now() - tViewers;
-    this.agentInterval.set(serverId, want);
-    ws.send(JSON.stringify({ type: 'set_report_interval', interval: want }));
+    this.applyAgentInterval(ws, serverId, want);
+  }
+
+  // 下发上报间隔：更新内存 + 发帧 + 写进连接附件。
+  // 附件随连接持久化，实例 evict 后内存 Map 清空也能零请求恢复（原实现每条消息都要
+  // 查一次 PanelDO /viewers，实测占 PanelDO 请求的八成以上）。
+  applyAgentInterval(ws, serverId, interval) {
+    this.agentInterval.set(serverId, interval);
+    try { ws.send(JSON.stringify({ type: 'set_report_interval', interval })); } catch { /* ignore */ }
+    try {
+      const a = ws.deserializeAttachment?.();
+      if (a && typeof a === 'object' && a.role === 'control' && a.interval !== interval) {
+        ws.serializeAttachment({ ...a, interval });
+      }
+    } catch { /* 附件写失败只影响 evict 后省下的那次查询 */ }
   }
 
   // Agent 能力查询：异步拉取能力由 report 的 info 携带（upload_fetch_proto / update_fetch_proto），

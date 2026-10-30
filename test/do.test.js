@@ -1349,6 +1349,47 @@ test('TerminalDO: /rpc/set_viewers 按观看者数切换快/慢采', async () =>
   ]);
 });
 
+test('TerminalDO: 上报间隔从连接附件恢复（evict 后不再打 PanelDO /viewers）', async () => {
+  // 自定义 PANEL stub：记录 /viewers 调用次数
+  const viewers = [];
+  const env = makeEnv({
+    PANEL: {
+      idFromName: () => 'panel-main',
+      get: () => ({
+        fetch: async (url) => {
+          viewers.push(String(url));
+          return new Response(JSON.stringify({ count: 0 }), { status: 200 });
+        },
+      }),
+    },
+  });
+  await insertServer(env, 'k1', 'srv1');
+  // 路径 A：附件里已有上次下发的间隔（evict 后内存 Map 空，但附件还在）
+  const sent = [];
+  let att = { role: 'control', serverId: 1, interval: 120 };
+  const ws = {
+    deserializeAttachment: () => att,
+    serializeAttachment: (a) => { att = a; },
+    send: (m) => sent.push(m), readyState: 1,
+  };
+  const inst = new TerminalDO(mockState(), env);
+  inst.agents.set(1, ws);
+  await inst.webSocketMessage(ws, JSON.stringify({ type: 'report', cpu: 1 }));
+  assert.equal(viewers.length, 0, '附件命中时不查 PanelDO /viewers（省一次 DO 请求）');
+  assert.equal(inst.agentInterval.get(1), 120, '间隔从附件恢复进内存');
+  assert.equal(
+    sent.filter((m) => String(m).includes('set_report_interval')).length, 0,
+    'agent 侧已知间隔，不重发',
+  );
+
+  // 路径 B：附件没有 interval（升级前的老连接）→ 才走 /viewers 兜底
+  const ws2 = { deserializeAttachment: () => ({ role: 'control', serverId: 1 }), send: () => {}, readyState: 1 };
+  const inst2 = new TerminalDO(mockState(), env);
+  inst2.agents.set(1, ws2);
+  await inst2.webSocketMessage(ws2, JSON.stringify({ type: 'report', cpu: 1 }));
+  assert.ok(viewers.length >= 1, '附件无间隔时才查 PanelDO');
+});
+
 test('TerminalDO: /rpc create 时 agent 离线 → 502 且不残留会话', async () => {
   const env = makeEnv();
   const st = mockState();

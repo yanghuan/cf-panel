@@ -7,6 +7,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import worker, { __internals as I, TerminalDO } from '../src/index.js';
 import { EXEC_CMD_MAX_BYTES, SERVER_DESC_MAX } from '../src/config.js';
+import { settleServerExpired } from '../src/jobs.js';
 import { makeEnv, makePanelStub, makeMetricsStub, requestBuilder } from './helpers.js';
 
 // node 没有 FixedLengthStream（Workers 才有）：用 TransformStream 搭一个等价物，
@@ -366,6 +367,11 @@ test('服务器写入路径：同时清 PanelDO 列表缓存（改名/排序/新
   });
   assert.equal(batch.status, 200);
   assert.equal(clearCalls(), 1, '批量改分组后清 PanelDO 列表缓存');
+
+  // PanelDO 不可达时写请求必须照常成功（清缓存是尽力而为，带 1s 超时；失败由 TTL 兜底）
+  env.PANEL.get = () => ({ fetch: async () => { throw new Error('panel down'); } });
+  const renamed = await call(env, { method: 'PATCH', path: `/api/servers/${id}`, token, body: { name: 'c3' } });
+  assert.equal(renamed.status, 200, '清缓存失败不得拖垮写请求');
 });
 
 test('删除服务器：清理历史数据 + 审计日志 + 通知 DO 断开 agent', async () => {
@@ -1223,7 +1229,9 @@ test('用量观测：/api/usage 仅管理员可访问，返回用量估算（P2 
   assert.equal(est2.servers, 2);
   assert.equal(est2.report_frames, 17280 * 2);
   assert.equal(est2.slow_report_frames, 720 * 2);
+  // D1 写两档不同：快采 last_seen 60s 节流 1,440，慢采每帧写 720（metrics_min/metrics_day 相同）
   assert.equal(est2.d1_writes, 3024 * 2);
+  assert.equal(est2.slow_d1_writes, 2304 * 2);
   assert.ok(est2.do_events > est2.slow_do_events, '有人观看时 DO 请求应显著高于慢采');
   assert.equal(est2.do_events, Math.round(17280 / 20 * 2 + 17280 * (2 + 1) + 144));
   // PAT（非管理员）403
@@ -2552,8 +2560,16 @@ test('exec：已过 deadline 的 agent_update 不再阻塞命令', async () => {
     body: { server_id: 1, command: 'echo ok', timeout: 5 },
   });
   assert.equal(res.status, 202, '已过 deadline 的更新任务不得继续挡 exec');
-  const row = await env.DB.prepare('SELECT status FROM operation_jobs WHERE id = ?').bind('job_upd').first();
-  assert.equal(row.status, 'expired', '命中过期行时顺手收敛，让出 agent_update 的唯一索引');
+  // 互斥判据是只读的（每次开终端/exec 都多一条 0 行 UPDATE 是纯浪费）：
+  // 过期行仍占着 agent_update 的部分唯一索引，但那条索引只在「创建 agent_update」时才挡路，
+  // 而 createAgentUpdateJob 会先调 settleServerExpired 收敛——所以这里不做副作用断言。
+  let row = await env.DB.prepare('SELECT status FROM operation_jobs WHERE id = ?').bind('job_upd').first();
+  assert.equal(row.status, 'running', '只是读取判据，不得顺带改状态');
+
+  // 创建新更新时的收敛路径（同一台机器）：过期行让位后新任务才能插入
+  await settleServerExpired(env, 1);
+  row = await env.DB.prepare('SELECT status FROM operation_jobs WHERE id = ?').bind('job_upd').first();
+  assert.equal(row.status, 'expired', 'settleServerExpired 负责收敛，让出唯一索引');
 });
 
 // P2-4 剩余：DO 返回 409/413 时它自己不写 D1，这两条"下发被拒"路径也必须留痕。

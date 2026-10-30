@@ -1061,6 +1061,31 @@ test('MetricsDO: alarm 兜底清理已不在配置里的探针状态（丢帧/�
   assert.equal(st.storage.map.has('probe:3:web'), true);
 });
 
+// 快照是「按机」的：只要有任意一台写过 l:，就只为缺快照的机器按前缀补扫，
+// 不能让这些机器（升级首轮 / 该机快照写失败）在冷启动首查里缺指标。
+test('MetricsDO: /latest 冷启动为缺 l: 快照的机器逐机补扫（不全量扫 m:）', async () => {
+  const env = makeEnv({ ARCHIVE_TO_D1: '0' });
+  await env.DB.prepare('INSERT INTO servers (id, agent_key_id, name, user_id, agent_key_hash) VALUES (?,?,?,?,?)')
+    .bind(1, 'k1', 's1', 1, 'h').run();
+  await env.DB.prepare('INSERT INTO servers (id, agent_key_id, name, user_id, agent_key_hash) VALUES (?,?,?,?,?)')
+    .bind(2, 'k2', 's2', 1, 'h').run();
+  const st = mockState();
+  const nowMin = Math.floor(Date.now() / 1000 / 60);
+  st.storage.map.set('l:1', JSON.stringify({ ts: nowMin - 1, cpu: 42 })); // 机器 1 有快照
+  for (let i = 0; i < 30; i++) {
+    st.storage.map.set(`m:2:${nowMin - i}`, JSON.stringify({ cpu: 100 + i })); // 机器 2 只有热区
+  }
+  const { inst, call } = mkMetrics(env, st);
+  const prefixes = [];
+  const orig = inst.listStorage.bind(inst);
+  inst.listStorage = async (p, o) => { prefixes.push(p); return orig(p, o); };
+
+  const latest = await (await call('/latest')).json();
+  assert.equal(latest[1].cpu, 42, '有快照的机器读 l:');
+  assert.equal(latest[2].cpu, 100, '缺快照的机器由 m:2: 补扫出最新一帧');
+  assert.deepEqual(prefixes, ['l:', 'm:2:'], '只补扫缺快照的那台前缀，不退化成全量 m: 扫描');
+});
+
 test('MetricsDO: /drop 清理 storage 告警/探活状态', async () => {
   const env = makeEnv();
   await env.DB.prepare("INSERT INTO kv_json (key, value) VALUES ('settings', ?)")
@@ -2430,8 +2455,11 @@ test('TerminalDO: 过期 update 的本地互斥标记按 D1 deadline 清除（�
   inst.updating.set(1, 'job_upd_stale'); // Agent 挂住不回执、连接仍在：内存标记永不释放
   assert.equal(await inst.isUpdating(1), false, 'D1 已判过期 → 不再视为更新中');
   assert.equal(inst.updating.has(1), false, '本地残留标记必须清除');
+  // isUpdating 只读（不顺手 UPDATE：那是每次开终端/exec 都要付的写语句）——
+  // 过期行占的唯一索引只在「创建 agent_update」时挡路，由 createAgentUpdateJob 的
+  // settleServerExpired 收敛（见 api 用例「已过 deadline 的 agent_update 不再阻塞命令」）。
   const row = await env.DB.prepare("SELECT status FROM operation_jobs WHERE id = 'job_upd_stale'").first();
-  assert.equal(row.status, 'expired', '顺手收敛过期任务，让出唯一索引');
+  assert.equal(row.status, 'running', '只读判据不得改状态');
 
   // 未过期时仍必须拦（不误放行）
   await seedActiveUpdate(env, 2);
@@ -2567,6 +2595,69 @@ test('MetricsDO: 归档水位降频持久化（10 分钟内不重复写 arc:）'
   await call('/report', { method: 'POST', body: JSON.stringify({ serverId: 1, minTs: m1 + 10, cpu: 3 }) });
   assert.equal(Number(st.storage.map.get('arc:1')), m1 + 10, '推进满 10 分钟落盘');
   assert.equal(arcWrites.length, 2, '三次上报只写两次水位');
+});
+
+// 兜底对账要 list 全部 probe: 键（500 台 × 10 探针 ≈ 5,000 键），按 10 分钟 alarm 扫
+// 是 72 万键读/天。门控：仅告警开启 + 每小时最多一次，时间戳落 housekeep 跨 evict。
+test('MetricsDO: 探活状态兜底对账每小时最多一次（读放大门控）', async () => {
+  const env = makeEnv();
+  await env.DB.prepare("INSERT INTO kv_json (key, value) VALUES ('settings', ?)")
+    .bind(JSON.stringify({ alerts: { webhook_url: 'https://example.com/hook', cpu_pct: 90, cooldown_min: 30 } }))
+    .run();
+  const st = mockState();
+  const { inst } = mkMetrics(env, st);
+  let lists = 0;
+  const orig = inst.listStorage.bind(inst);
+  inst.listStorage = async (p, o) => { if (p === 'probe:') lists += 1; return orig(p, o); };
+  await st.storage.put('probe:1:web', JSON.stringify({ ok: false, lastFail: 1 })); // 服务器 1 已删除
+
+  await inst.alarm(); // 首轮：告警开启 + 从未对账 → 扫一次并清掉孤儿键
+  assert.equal(lists, 1, '本轮对账一次');
+  assert.equal(st.storage.map.has('probe:1:web'), false, '服务器已删除的残留被清掉');
+  assert.ok(inst.lastProbePruneAt > 0, '对账时间戳已记录');
+
+  await st.storage.put('probe:1:db', JSON.stringify({ ok: false, lastFail: 1 }));
+  await inst.alarm(); // 同一小时内：跳过对账
+  assert.equal(lists, 1, '一小时内不再重复对账');
+  assert.equal(st.storage.map.has('probe:1:db'), true, '本轮未清理（下轮再来，不影响正确性）');
+});
+
+test('MetricsDO: 未配置 webhook 时不对账探活状态（状态不产生通知，省读）', async () => {
+  const env = makeEnv();
+  await env.DB.prepare("INSERT INTO kv_json (key, value) VALUES ('settings', ?)")
+    .bind(JSON.stringify({ alerts: { cpu_pct: 90 } })) // 无 webhook_url → alertOn=false
+    .run();
+  const st = mockState();
+  const { inst } = mkMetrics(env, st);
+  let lists = 0;
+  const orig = inst.listStorage.bind(inst);
+  inst.listStorage = async (p, o) => { if (p === 'probe:') lists += 1; return orig(p, o); };
+  await st.storage.put('probe:1:web', JSON.stringify({ ok: false, lastFail: 1 }));
+
+  await inst.alarm();
+  assert.equal(lists, 0, '未配置 webhook：不扫描探活状态');
+  assert.equal(st.storage.map.has('probe:1:web'), true, '状态保留，配置 webhook 后的首轮再对账');
+});
+
+// 冷启动（evict 后）的 arcPersisted 必须从 storage 初始化，否则每个新实例的首轮归档都会
+// 立刻写一次水位——慢采 + 频繁 evict 时降频就白做了（1,440 写/台/天）。
+test('MetricsDO: 冷启动首轮也参与水位降频（arcPersisted 从 storage 初始化）', async () => {
+  const env = makeEnv();
+  const nowMin = Math.floor(Date.now() / 1000 / 60);
+  const m1 = nowMin - 70;
+  const st = mockState({ 'arc:1': String(m1) });
+  const { call } = mkMetrics(env, st);
+  const writes = [];
+  const origPut = st.storage.put.bind(st.storage);
+  st.storage.put = async (k, v) => {
+    if (typeof k === 'string' && k.startsWith('arc:')) writes.push(k);
+    else if (k && typeof k === 'object') for (const kk of Object.keys(k)) if (kk.startsWith('arc:')) writes.push(kk);
+    return origPut(k, v);
+  };
+
+  await call('/report', { method: 'POST', body: JSON.stringify({ serverId: 1, minTs: m1 + 1, cpu: 1 }) });
+  assert.equal(writes.length, 0, '推进 <10 分钟不写水位');
+  assert.equal(Number(st.storage.map.get('arc:1')), m1, '水位保持原值');
 });
 
 test('MetricsDO: 归档超过 100 行分批 batch 落 D1', async () => {

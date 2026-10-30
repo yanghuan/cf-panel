@@ -23,6 +23,10 @@ const ARC_PERSIST_MIN = 10;
 // fullSweep 每页读取的热区行数。旧实现一次 list 全量载入（240×N 行，500 台 ≈ 12 万行），
 // 分页后峰值内存 ≈ 一页 + 当前机器的窗口。SQLite 后端的 list 支持 limit/startAfter。
 const SWEEP_PAGE_ROWS = 500;
+// 探活状态兜底对账间隔：list('probe:') 会把全部探针键连同 value 载入内存
+//（500 台 × 10 探针 ≈ 5,000 键），按 10 分钟 alarm 扫就是 72 万键读/天。
+// 改为每小时一次（且仅告警开启时），代价是「删掉探针后残留冷却」最多多留 1 小时。
+const PROBE_PRUNE_INTERVAL_MS = 60 * 60 * 1000;
 const METRICS_RETENTION_DAYS = 30; // D1 历史保留期（天），过期行每日清理
 const AUDIT_RETENTION_DAYS = 90; // 审计日志保留期（天），过期行随每日清理删除
 // 按天账保留期（天，默认 3 年 = 1095）。
@@ -66,6 +70,7 @@ export class MetricsDO {
     this.arcPersisted = new Map(); // serverId -> 已写进 storage 的水位（降频持久化用，见 ARC_PERSIST_MIN）
     this.lastSweepAt = 0; // 上次 fullSweep 时间戳（ms；持久化跨 evict，见 ensureHousekeepLoaded）
     this.lastPruneAt = 0; // 上次保留期清理时间戳（ms；同上，替代易被 evict 重置的内存计数）
+    this.lastProbePruneAt = 0; // 上次探活状态兜底对账时间戳（ms；同上，见 PROBE_PRUNE_INTERVAL_MS）
     this.housekeepLoaded = false; // 家政状态（fullSweep/prune 时间）是否已从 storage 恢复
     this.lastSeenSec = new Map(); // serverId -> 最后上报秒（内存，/latest 在线判定用；evict 后由 D1 last_seen 兜底）
     this.alarmCached = null; // 实例内已知的下一次 alarm 时间戳；避免每帧上报都 getAlarm（DO Storage 读）
@@ -104,6 +109,7 @@ export class MetricsDO {
         const h = JSON.parse(raw);
         this.lastSweepAt = Number(h.lastSweepAt) || 0;
         this.lastPruneAt = Number(h.lastPruneAt) || 0;
+        this.lastProbePruneAt = Number(h.lastProbePruneAt) || 0;
       }
     } catch { /* 恢复失败按 0 处理（首次/损坏），下次 alarm 正常判定 */ }
   }
@@ -172,6 +178,29 @@ export class MetricsDO {
     return this.data.get(serverId);
   }
 
+  // 按机补扫热区（`m:<id>:` 前缀）取最新一行，写进 out 与增量 Map。
+  // 供 /latest 冷启动给「缺 l: 快照」的机器兜底（升级首轮、该机快照写失败）。
+  // 按机读的峰值内存是一台机器的窗口，不会退化成全量热区。
+  async loadLatestFromHot(serverId, out) {
+    const prefix = `m:${serverId}:`;
+    let keys;
+    try { keys = await this.listStorage(prefix); } catch { return; }
+    let best = null;
+    for (const k of keys) {
+      const ts = Number(k.name.slice(prefix.length));
+      if (!Number.isFinite(ts) || (best && ts <= best.ts)) continue;
+      try { best = { ts, v: JSON.parse(k.value) }; } catch { /* 单行损坏跳过 */ }
+    }
+    if (!best) return;
+    const l = {
+      ts: best.ts, cpu: best.v.cpu, mem_used: best.v.mem_used, mem_total: best.v.mem_total,
+      net_in: best.v.net_in, net_out: best.v.net_out, extra: best.v.extra,
+      last_seen_s: this.lastSeenSec.get(serverId),
+    };
+    out[serverId] = l;
+    this.latestByServer.set(serverId, l);
+  }
+
   // 增量归档：把该服务器热区中「归档水位之后、归档线之前」的行落 D1。
   // 由 /report 热写路径顺带调用（水位 < 归档线时才执行，正常每 ~10 分钟一次），
   // 取代 alarm 每 10 分钟全量 list + 重复 INSERT（消除 DO Storage 读与 D1 重复写）。
@@ -184,6 +213,10 @@ export class MetricsDO {
     if (arcTs == null) {
       try { arcTs = Number(await this.state.storage.get(arcKey)) || 0; } catch { arcTs = 0; }
       this.arcCache.set(serverId, arcTs);
+      // 冷启动也要记「已落盘水位」= 刚读到的值，否则每个新实例的首次归档都会立即写一次
+      //（慢采/频繁 evict 下 1,440 写/台/天，降频白做）。期间不落盘的代价只是 evict 后重放
+      // 已归档区间，INSERT OR IGNORE 幂等。
+      this.arcPersisted.set(serverId, arcTs);
     }
     const archiveCutoff = Math.floor(Date.now() / 1000 / 60) - ARCHIVE_AFTER_MIN;
     // 数值归一化兜底：storage 历史行可能含修复前的坏数据（对象/字符串），
@@ -497,6 +530,8 @@ export class MetricsDO {
         // 用「距上次写快照 ≥5 分钟」而不是「minTs % 5 === 0」：后者依赖上报恰好落在 5 的倍数
         // 分钟上，120s 慢采若长期落在同一组分钟（如奇数分钟）就永远不会写，优化静默失效。
         // 首帧（含 evict 后）必写一次，保证冷启动快照总是新鲜的。
+        // 已知取舍：快照取该分钟的首帧（与热行同一个 v，不额外算），冷启动最多多一个分钟粒度的
+        // 偏差；要取分钟内最后一帧就得每帧都写快照（+1,440 写/台/天），不值得。
         const lastL = this.latestAt.get(b.serverId);
         const wantLatest = lastL == null || minTs - lastL >= LATEST_KEY_EVERY_MIN;
         const entries = { [this.hotKey(b.serverId, minTs)]: JSON.stringify(v) };
@@ -627,6 +662,18 @@ export class MetricsDO {
           };
           out[serverId] = l;
           this.latestByServer.set(serverId, l);
+        }
+        // 快照是「按机」的：某台缺 l:（升级首轮 / 该机快照写失败）不能因为别的机器有快照就
+        // 跳过它——否则冷启动首查会缺这台机器的指标（面板显示 '-' 直到下一帧上报）。
+        // 只为缺快照的机器按前缀补扫（峰值内存仍是一台机器的窗口），其余机器零额外读。
+        let ids = [];
+        try {
+          ids = ((await this.env.DB.prepare('SELECT id FROM servers').all()).results || [])
+            .map((s) => Number(s.id) || 0);
+        } catch { /* D1 不可用：本次只返回已有快照，下一帧上报即补齐 */ }
+        for (const sid of ids) {
+          if (!sid || out[sid]) continue;
+          await this.loadLatestFromHot(sid, out);
         }
         return json(out);
       }
@@ -1019,16 +1066,23 @@ export class MetricsDO {
       alertOn = true;
     }
     if (alertOn) await this.checkOfflineAlerts();
-    // 探活状态兜底对账：清理「配置里已不存在」的探针冷却（单帧清理信号可能丢，且覆盖不到
-    // 「只删掉其中一个探针」的场景）。与 alertOn 无关——状态残留与告警开关无关，只在被重新
-    // 启用时才伤人，所以无条件对账（无 probe 状态时只是一次空 list）。
-    try {
-      await this.pruneStaleProbeStates();
-    } catch (e) {
-      console.error('probe state prune failed:', e);
-    }
     const now = Date.now();
     let housekeepChanged = false;
+    // 探活状态兜底对账：清理「配置里已不存在」的探针冷却（单帧清理信号可能丢，且覆盖不到
+    // 「只删掉其中一个探针」）。两道门控压住读放大（一次 list('probe:') 会把全部探针键连
+    // value 载入内存，见 PROBE_PRUNE_INTERVAL_MS）：
+    //   1) 只在告警开启（= 配了 webhook，alertOn）时做——没有 webhook 时冷却状态不产生任何
+    //      通知，配置好之后的首轮 alarm 再对账即可（与探活告警自身的开关口径一致）；
+    //   2) 每小时最多一次（时间戳落 housekeep 跨 evict），而不是每个 10 分钟 alarm 都扫。
+    if (alertOn && now - this.lastProbePruneAt >= PROBE_PRUNE_INTERVAL_MS) {
+      try {
+        await this.pruneStaleProbeStates();
+        this.lastProbePruneAt = now;
+        housekeepChanged = true;
+      } catch (e) {
+        console.error('probe state prune failed:', e);
+      }
+    }
     // 按天统计结算（流量/可用率）：先补记离线机器的可用率分母，再把内存增量落 D1。
     // 独立于归档开关（ARCHIVE_TO_D1）：天账是长期账本，不应因关闭分钟归档而停摆。
     try {
@@ -1099,7 +1153,7 @@ export class MetricsDO {
     // 家政状态持久化（仅变化时写）
     if (housekeepChanged) {
       try {
-        await this.state.storage.put('housekeep', JSON.stringify({ lastSweepAt: this.lastSweepAt, lastPruneAt: this.lastPruneAt }));
+        await this.state.storage.put('housekeep', JSON.stringify({ lastSweepAt: this.lastSweepAt, lastPruneAt: this.lastPruneAt, lastProbePruneAt: this.lastProbePruneAt }));
       } catch { /* 持久化失败：下次 alarm 按当前值重新判定（可能提前执行，无害） */ }
     }
     } finally {

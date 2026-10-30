@@ -271,15 +271,15 @@
 
 > 1–4 项不改任何快采/慢采间隔，也不改界面刷新节拍，建议直接实施；第 5 项涉及新鲜度或分片迁移，需单独决策。
 
-## 九、修复验证（2026-10-30，未提交工作区）
+## 九、修复验证（2026-10-30，已提交 `6bb26ce`）
 
-修复后 `npm test` → **278/278 通过**（原 275 + 本次复核新增 3 个）。Rust 未改，E2E 未跑。
+修复后 `npm test` → **292/292 通过**；`node scripts/e2e.mjs` → **33/33**（wrangler dev + release agent，含 MCP 17 工具）。Rust 源码未改（仅为 E2E 重新构建了 release 二进制）。
 
 | 发现 | 状态 | 实现与验证 |
 |---|---|---|
 | P2-01 天账跨实例丢失 | ✅ 已修 | `do-metrics.js`：`ensureDayCursor`（Storage `daycur:<id>` → D1 `last_seen` 播种、未来时间 clamp）、`persistDayCursors`（alarm 内先持久化游标再写 D1）、`sweepOfflineDaySpans` 改 async 且遍历 D1 `servers.last_seen`、`/drop` 清 `daycur`。跨实例两帧：`{0,0,0}` → `{bytes_in:120000, online_min:2, total_min:2}` |
 | P3-01 热区查询污染 | ✅ 已修 | `loadHot` 改为合并（内存优先、storage 补缺）。同分钟 10→90 后首次 `/query` 返回 90 |
-| P3-02 过期 update 阻塞 | ✅ 已修（含复核补强） | `hasActiveAgentUpdate` 加 `deadline_at > ?` 并顺手收敛过期行；复核补：`TerminalDO.isUpdating` 以 D1 为权威清掉内存 `updating` 残留（Agent 挂住不回执时 `updating` 永不释放，仅修 D1 判据仍会被 DO 内存标记挡住），D1 不可用时保守按「更新中」 |
+| P3-02 过期 update 阻塞 | ✅ 已修（含两次补强） | `hasActiveAgentUpdate` 加 `deadline_at > ?`（**只读**：过期行收敛交给 `settleServerExpired`，避免每次开终端/exec 多一条 0 行 UPDATE）；`TerminalDO.isUpdating` 以 D1 为权威、且**始终查 D1**（evict 后本地 Map 为空也要拦），标记按 `Map<serverId, jobId>` 判定——排除「本次要下发的任务」、迟到回执只清同 jobId；3 条用例（过期清除 / 冷实例仍拦 / 旧标记不挡新任务） |
 | P3-03 收敛名额被 exec 挤占 | ✅ 已修 | `settleServerExpired` 加 `kind IN ('upload','agent_update')` + `ORDER BY deadline_at`；新增 25 条过期 exec 的用例 |
 | P3-04 更新 tooltip `{from}` | ✅ 已修 | `s.info.agent_version`；新增静态断言 |
 | P3-05 探针配置移除残留 | ✅ 已修（含复核补强） | `[]` 语义保留、`probe_json` 写 NULL、`probesCleared` 顺风车；复核补：`clearProbeState` 方法此前**只调用未定义**（被 `catch` 静默吞掉，275 个用例未覆盖），已补内存 + Storage 清理并加用例 |
@@ -287,9 +287,20 @@
 | P3-07 错误码缺翻译 | ✅ 已修 | 两语言包各补 14 个；`TOO_LARGE` 与后端真实 code 对齐；新增「以 src 为源」的覆盖测试 |
 | 文档漂移 10 处 | ✅ 已修 | architecture（120s/300s/事件驱动）、README（异步更新）、agent/README（异步拉取 + 3 个变量）、schema、e2e 17 工具、app.js 注释、设计文档 §7.5；README 保持 CRLF，diff 仅 1 行 |
 | 复核补的游标失败顺序 | ✅ 已修 | `persistDayCursors` 返回失败集合；`flushDayPending` 对本轮游标未落盘的机器**不写 D1**（否则 D1 有增量、游标更早 → 下次重复记账），增量保留到下次重试；新增用例 |
+| 探针状态兜底对账 | ✅ 已修 | alarm 内 `pruneStaleProbeStates`：以 D1 `probe_json` 为准清理残留冷却，覆盖「清理帧丢失」与「只删掉其中一个探针」；门控 = 配了 webhook + 每小时一次（原 10 分钟一次 = 72 万键读/天 → −6×） |
+| A/B 档额度优化 | ✅ 已实施 | `arc` 水位降频（1,440 → 144 写/台/天，含冷启动 `arcPersisted` 初始化）；`fullSweep` 500 行/页分页 + 单机缓冲 + 128 键批量删；`/latest` 冷启动改读 `l:` 快照（288 写/台/天，最坏 720）+ 缺快照逐机补扫；PanelDO 列表缓存 20s + 并发合并 + 失效代际 + 6 条写路径清缓存（带 1s 超时）；`/viewers` 探针 300s；前端更新后不再 2.5s 轮询；`/api/usage` 估算改按服务器数解析 |
+| 二审 P3-1 慢采 D1 写偏高 31% | ✅ 已修 | `slow_d1_writes` 3024 → 2304（慢采 `last_seen` 每帧写 720，非 60s 节流的 1,440），note 按两档写明 |
+| 二审 P3-2 `/latest` 回退是全局判断 | ✅ 已修 | 缺 `l:` 的机器按 `m:<id>:` 前缀**逐机补扫**，其余机器零额外读；用例断言只扫 `l:` 与 `m:2:` |
+| 二审 P3-3 文档 `l:` 频率口径 | ✅ 已修 | architecture 补「冷启动首帧必写、最坏 720 写/台/天」 |
+| 二审 P4-1 探针对账读放大 | ✅ 已修 | 见上（告警开启 + 每小时一次双门控） |
+| 二审 P4-2 `isUpdating` 写语句放大 | ✅ 已修 | `hasActiveAgentUpdate` 回归纯 SELECT；用例改为断言「只读判据不得改状态」，收敛由 `settleServerExpired` 覆盖 |
+| 二审 P4-3 清缓存同步 await | ✅ 已修 | `clearPanelListCache` 带 1s 超时；PanelDO 不可达时写请求照常 200（用例） |
+| 二审 P4-4 本文档过期 | ✅ 已修 | 即本节 |
+| 二审 P4-5 `l:` 存分钟内首帧 | ✅ 已知取舍 | 注释记录：要取分钟内最后一帧需每帧写快照（+1,440 写/台/天），不值 |
+| 二审 P4-6 `arcPersisted` 未从 storage 初始化 | ✅ 已修 | 冷启动读 `arc:<id>` 时同步 `arcPersisted`；用例断言「冷启动推进 <10 分钟不写水位」 |
 
-**仍存在的残余（未在本轮改）**
+**残余（本轮仍不做）**
 
-1. `probesCleared` 只挂在「有 → 无」的变更帧上：若该帧在同机 5s 批内被下一帧覆盖、或 flush 前实例被 evict，清理标记会丢（慢采必达、快采有小概率）。彻底做法是把「待清」标记保持到成功 flush，或让 `checkProbeAlerts` 顺带剪掉不在本次列表中的探针状态（同时可覆盖「只删其中一个探针」的场景——当前不清理）。
-2. `settleServerExpired` / `hasActiveAgentUpdate` 的收敛路径仍不写审计（`expired` 的 upload/update 没有终态审计行），与「审计只在终态写」的既有取舍一致，未改。
-3. §八 的额度优化项（`arc` 降频、告警状态按需读、`fullSweep` 分块、列表缓存等）本轮均未实施，仍是下一轮的额度优化清单。
+1. 「清理帧丢失 / 只删一个探针」已由 alarm 对账收口，残余降级为：**对账周期内（≤1 小时）** 同名探针重新启用可能沿用旧冷却——前提是配了 webhook，最坏造成一次通知抖动。
+2. `settleServerExpired` / `settleExpiredAll` 的收敛路径不写审计（`expired` 的 upload/update 无终态审计行），与「审计只在终态写」的既有取舍一致。
+3. §八 的 C 档（`REPORT_FWD_THROTTLE_S` 5→10、`SHARDS` 4→2、`LAST_SEEN_THROTTLE_S` 60→180、idle 10→5min）与 8.7 内存专项（`serverListCache` 上限、`data` 热区 LRU、`fetch.rs` 同步写）仍未实施。

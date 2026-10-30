@@ -549,10 +549,8 @@ async function deleteServerCascade(env, user, ip, id) {
       });
     } catch { /* 分片暂不可达；agent 重连会因 key 失效被拒 */ }
   }
-  // 5) 清 PanelDO 列表缓存（避免已删服务器最多 4.5s 内仍出现在观看者推送列表）
-  try {
-    await doPanel(env).fetch('https://do.internal/rpc/clear_list_cache', { method: 'POST' });
-  } catch { /* 清缓存失败由 listCache TTL 兜底 */ }
+  // 5) 清 PanelDO 列表缓存（避免已删服务器仍出现在观看者推送列表；带超时见 clearPanelListCache 注释）
+  await clearPanelListCache(env);
   return server.name;
 }
 
@@ -1573,10 +1571,15 @@ function serverListCacheClear() {
 // 清 PanelDO 侧列表缓存。Worker 侧 serverListCache 只影响 REST 列表；观看者的推送走
 // PanelDO 自己的缓存（TTL 20s）。改名/分组/排序若只清 Worker 侧，下一次推送会把旧值
 // 回推给前端（最多 20s 的"改名又变回去"）。失败只记日志，由 TTL 兜底。
+// 带 1s 超时：PanelDO 抖动时不能让 create/update 这类写请求跟着挂住（清失败由 TTL 兜底，
+// 不能用 fire-and-forget——Worker 返回后未完成的 I/O 会被取消，等于没清）。
 async function clearPanelListCache(env) {
   try {
-    await doPanel(env).fetch('https://do.internal/rpc/clear_list_cache', { method: 'POST' });
-  } catch { /* 清失败由 PanelDO TTL 兜底 */ }
+    await doPanel(env).fetch('https://do.internal/rpc/clear_list_cache', {
+      method: 'POST',
+      signal: AbortSignal.timeout(1000),
+    });
+  } catch { /* 清失败（含超时）由 PanelDO TTL 兜底 */ }
 }
 
 // 用量观测公共构建（REST /api/usage 与 MCP get_usage 共用，避免两处重复实现漂移）：
@@ -1602,7 +1605,7 @@ async function collectUsageView(env) {
     note: 'Worker 计数为实例级（evict/重启清零，趋势参考）；MetricsDO 计数每 10 分钟 alarm 汇总到 storage（跨 evict 保留）。'
       + '每日估算按「服务器数 × 采样档位」解析：面板三列为「24h 有人观看」上界（快采 5s），'
       + '无人观看的慢采（120s）见 slow_* 字段；DO 请求已按 WS 入站 20:1 折算并计入分片转发与推送；'
-      + 'D1 写/机/天 = metrics_min 1,440 + last_seen 1,440（60s 节流）+ metrics_day 144。',
+      + 'D1 写/机/天 = metrics_min 1,440 + metrics_day 144 + last_seen（快采 60s 节流 1,440 → 3,024；慢采每帧写 720 → 2,304）。',
     api,
     metrics_do: doUsage,
     estimates_per_day: {
@@ -1612,10 +1615,12 @@ async function collectUsageView(env) {
       // DO 请求：入站（÷20）+ 每活跃分片 5s 一次转发 + 每 5s 一次推送 + alarm 144
       do_events: Math.round((FAST_FRAMES / 20) * servers + FAST_FRAMES * (activeShards + 1) + 144),
       d1_writes: 3024 * servers,
-      // 无人观看（慢采）对照：入站（÷20）+ 逐帧转发 + 探针 pong（240/天 ÷20）+ alarm
+      // 无人观看（慢采）对照：入站（÷20）+ 逐帧转发 + 探针 pong（240/天 ÷20）+ alarm。
+      // D1 写不同档：快采 last_seen 按 60s 节流 = 1,440，慢采每帧都写（120s）= 720；
+      // metrics_min 1,440 + metrics_day 144 两档相同 → 快采 3,024 / 慢采 2,304。
       slow_report_frames: SLOW_FRAMES * servers,
       slow_do_events: Math.round((SLOW_FRAMES / 20) * servers + SLOW_FRAMES * servers + (240 / 20) * servers + 144),
-      slow_d1_writes: 3024 * servers,
+      slow_d1_writes: 2304 * servers,
     },
   };
 }

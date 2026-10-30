@@ -201,6 +201,10 @@ export async function deleteStagingObject(env, job) {
 // cron（1h）——期间没有任何路径会收敛它（settleExpiredAll 每小时第 17 分才跑）。
 // excludeJobId：排除「本次要下发的那个任务」——它自己当然是 active 的，
 // 不排除会让 DO 在下发新更新时被自己刚创建的 D1 行挡住（旧更新挂住后重试的路径）。
+// 只读：过期行的收敛交给 settleServerExpired（创建任务前按 server 收敛一次）。
+// 不在这里顺手 UPDATE：本函数是 exec/upload/终端/更新下发的热路径判据（每次调用一条 SELECT
+// 就够了），多一条 0 行 UPDATE 会在每次开终端时白付一次写语句；而占着唯一索引的过期行
+// 只在「创建 agent_update」时才挡路，那条路径本来就会先 settleServerExpired。
 export async function hasActiveAgentUpdate(env, serverId, excludeJobId = null) {
   const now = nowSec();
   const row = await env.DB.prepare(
@@ -210,20 +214,7 @@ export async function hasActiveAgentUpdate(env, serverId, excludeJobId = null) {
         AND id != ?
       LIMIT 1`
   ).bind(serverId, now, excludeJobId || '').first();
-  if (row) return true;
-  // 过期行仍占着部分唯一索引（idx_operation_jobs_active_update 不含 deadline），
-  // 会让 createAgentUpdateJob 误判 UPDATE_BUSY（最长到 cron）。此处顺手收敛：
-  // 条件 UPDATE，天然幂等；与 settleServerExpired 的语义一致（迟到回执仍可纠正，见 finishUpdateJob）。
-  try {
-    await env.DB.prepare(
-      `UPDATE operation_jobs
-          SET status = 'expired', error = COALESCE(error, 'expired before completion'), finished_at = ?,
-              duration_ms = CASE WHEN started_at IS NULL THEN NULL ELSE (? - started_at) * 1000 END
-        WHERE server_id = ? AND kind = 'agent_update'
-          AND status IN ('queued','waiting_agent','running') AND deadline_at <= ?`
-    ).bind(now, now, serverId, now).run();
-  } catch { /* 收敛失败不影响互斥判定（下次调用重试） */ }
-  return false;
+  return !!row;
 }
 
 // ---- upload 任务 ----

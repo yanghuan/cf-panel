@@ -8,17 +8,12 @@ compatibility_date = "2026-08-02"
 workers_dev = false
 
 # ---------- 兼容性开关 ----------
-# durable_object_io_tasks_do_not_prevent_eviction（Cloudflare 2026-10-01 changelog）：
-# 关闭「挂起的 I/O 阻止 Durable Object 被空闲驱逐」的新行为。
-# 新行为下，下列操作会让实例持续驻留（每次最多 15 分钟，可被后续操作续期）且 duration 照常计费：
-#   挂起的 fetch()/RPC 到其他 DO、waitUntil() 的 Promise、setTimeout()/setInterval() 定时器。
-# 本项目 DO 内没有「客户端断开后仍须继续执行」的长任务——exec/upload/agent update 已全部异步化
-# （任务状态落 D1，调用方轮询 get_operation），DO 只负责下发。而 broadcastViewers/setPush/
-# resendWaitingUploads 这类 fire-and-forget 的 fetch，以及 pendingExec/pendingUpload/pendingUpdate
-# 的 setTimeout（30s/120s/180s）都会成为 pending I/O，把实例按住不让驱逐。
-# 若线上本就处于旧行为（compatibility_date < 2026-10-01 时该行为默认关闭），本 flag 为空操作，无害；
-# 若 10-26 之后 duration 的异常增长确由该行为引起（请求数不变、单条驻留从 0.5s 涨到 5s），
-# 加上它即可回落。验证后如确认无关，可移除并改为埋点定位（见 do-terminal.js 的 logSlow）。
+# durable_object_io_tasks_do_not_prevent_eviction：opt-out「挂起的 I/O 阻止 DO 空闲驱逐」。
+# 实测（2026-10-30）：compatibility_date = 2026-08-02 早于该行为默认生效的 2026-10-01，
+# 它本就是关闭状态，此 flag 为空操作——加它前后 duration 无变化；真正的下降来自把 DO 内
+# fire-and-forget 的 fetch/存储操作改成 await（890d88c、17d413c）。
+# 保留它仅作未来护栏：若日后升级 compatibility_date，或 Cloudflare 把该行为推广到所有 Worker，
+# 这里是唯一的关闭开关。注意旧版 wrangler（< 4.156 的 workerd）不认识它，会让 wrangler dev 启动失败。
 compatibility_flags = ["durable_object_io_tasks_do_not_prevent_eviction"]
 
 # ---------- D1 数据库（面板核心数据 + 键值表 kv_json） ----------

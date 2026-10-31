@@ -488,6 +488,9 @@ curl -X POST https://<面板域名>/mcp -H "Authorization: Bearer <token>" \
 - **自定义指标**建议每机 ≤20 个（面板弹窗内亦有容量提示）。
 - **日志额度**：`wrangler.toml` 开启了 `invocation_logs`（每次调用一条日志）。快采 5s 意味着每机每天约 **17,280** 次上报帧调用，免费档日志额度约在 **10 台规模触顶**——规模化时建议关闭 `invocation_logs`（仅影响日志，不影响功能）。
 - **用量观测**：管理员访问 `GET /api/usage` 查看近 24h 上报帧 / DO 事件 / D1 写行估算。
+- **DO duration 必须按分片看**：免费档限制的是 duration（13,000 GB-s/天，UTC 0 点重置），不是请求数。
+  四个分片的单条成本可能相差 100 倍（实测 0.2 秒 vs 15 秒），看总量会被平均掉。
+  排查方法与换算口径见 [docs/do-duration-investigation.md](docs/do-duration-investigation.md)。
 
 ---
 
@@ -612,5 +615,6 @@ wrangler d1 execute cf-panel --remote --file=schema.sql    # 重建
 | 文档 | 内容 |
 | --- | --- |
 | [docs/architecture.md](docs/architecture.md) | 架构设计、技术选型、Cloudflare 能力边界 |
+| [docs/do-duration-investigation.md](docs/do-duration-investigation.md) | DO duration 暴涨排查记录：分片分化判断、`[cold]` 埋点、`immediate` 重启 |
 | [docs/reviews/](docs/reviews/) | 历次代码审查记录（含问题与修复决策） |
 | [agent/README.md](agent/README.md) | Agent 构建与交叉编译说明 |

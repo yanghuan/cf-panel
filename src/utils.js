@@ -369,6 +369,12 @@ function redactUrls(message) {
   return String(message || '').replace(/https?:\/\/[^\s]+/gi, '[redacted-url]').slice(0, 200);
 }
 
+// webhook 请求硬上限：`fetch` 默认没有超时，目标站不响应就会一直挂着。
+// 这条 await 在 MetricsDO 内部（告警链路），而 MetricsDO 又被 TerminalDO 的 /report 转发 await 着，
+// 所以一个黑洞 webhook 能把 TerminalDO 一起钉在 non-hibernateable（按 70–140s 的 evict 周期计 duration）。
+// 5s 对正常 webhook（几百毫秒）有 10 倍余量，超时后按既有路径退避重试。
+export const WEBHOOK_TIMEOUT_MS = 5000;
+
 // 发送告警 Webhook（模板化）：method/url/body/headers 均支持占位符；
 // token 仅作为 {token} 占位符变量，由用户放在 URL/header/body 任意位置。
 // 日志只记录事件与状态，不记录可能携带 token 的完整 URL。
@@ -392,7 +398,10 @@ export async function sendWebhookRaw(cfg, payload) {
   if (!headers['content-type']) headers['content-type'] = cfg.content_type || 'application/json';
   const body = method === 'GET' ? undefined : (cfg.body_template ? renderTemplate(cfg.body_template, vars) : JSON.stringify(payload));
   try {
-    const resp = await fetch(checked.url.toString(), { method, headers, body, redirect: 'error' });
+    const resp = await fetch(checked.url.toString(), {
+      method, headers, body, redirect: 'error',
+      signal: AbortSignal.timeout(WEBHOOK_TIMEOUT_MS),
+    });
     if (!resp.ok) {
       console.error(`[cf-panel] webhook failed: ${payload.event} HTTP ${resp.status}`);
       return { ok: false, status: resp.status, error: `HTTP ${resp.status}` };

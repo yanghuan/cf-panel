@@ -55,10 +55,18 @@ function mockState(store = {}) {
   return { storage };
 }
 
+// 告警 webhook 已改后台执行（bgRun → state.waitUntil），所以每次调用后等后台收敛：
+// 断言 cap.calls 的前提是 webhook 已发出，与生产的 waitUntil 语义一致（测试里就是同步等待）。
 function mkMetrics(env, state) {
   const inst = new MetricsDO(state, env);
-  const call = (path, init) => inst.fetch(new Request(`https://do.internal${path}`, init));
-  return { inst, call };
+  const call = async (path, init) => {
+    const res = await inst.fetch(new Request(`https://do.internal${path}`, init));
+    await inst.bgDrain();
+    return res;
+  };
+  const alarm = async () => { await inst.alarm();
+  await inst.bgDrain?.(); await inst.bgDrain(); };
+  return { inst, call, alarm };
 }
 
 function insertServer(env, keyId, name, extra = {}) {
@@ -164,6 +172,7 @@ test('MetricsDO: 家政状态持久化跨 evict（fullSweep/prune 不因重置�
   const nowMin = Math.floor(Date.now() / 1000 / 60);
   await call('/report', { method: 'POST', body: JSON.stringify({ serverId: 1, minTs: nowMin - 5, cpu: 1 }) });
   await inst.alarm();
+  await inst.bgDrain?.();
   const h = JSON.parse(await st.storage.get('housekeep'));
   assert.ok(h.lastSweepAt > 0, 'fullSweep 时间已持久化');
   assert.ok(h.lastPruneAt > 0, 'prune 时间已持久化');
@@ -379,6 +388,7 @@ test('MetricsDO: /usage 用量计数，alarm 汇总到 storage 跨 evict 保留'
   assert.equal(usage.counters.query, 1);
   // alarm 将本周期计数累计到 storage 并清零内存
   await inst.alarm();
+  await inst.bgDrain?.();
   const after = await (await call('/usage')).json();
   assert.equal(after.counters.report, 0, 'alarm 后内存清零');
   assert.equal(after.persisted.report, 2, '累计到 storage');
@@ -514,6 +524,7 @@ test('MetricsDO: alarm 归档超 1 小时数据到 D1；热区保留窗口内数
   await call('/report', { method: 'POST', body: JSON.stringify({ serverId: 1, minTs: recentTs, cpu: 6 }) });
 
   await inst.alarm();
+  await inst.bgDrain?.();
 
   const rows = await env.DB.prepare('SELECT * FROM metrics_min WHERE server_id = 1').all();
   assert.equal(rows.results.length, 1, '归档：仅 >60min 的行写入 D1');
@@ -526,6 +537,7 @@ test('MetricsDO: alarm 归档超 1 小时数据到 D1；热区保留窗口内数
   assert.deepEqual(q.map((x) => x.ts).sort((a, b) => a - b), [oldTs, recentTs], '热区保留归档前数据');
 
   await inst.alarm();
+  await inst.bgDrain?.();
   const rows2 = await env.DB.prepare('SELECT * FROM metrics_min WHERE server_id = 1').all();
   assert.equal(rows2.results.length, 1, '二次归档不重复写 D1（OR IGNORE）');
 });
@@ -648,6 +660,7 @@ test('MetricsDO: fullSweep/prune 失败不推进家政时间戳', async () => {
   console.error = () => {};
   try {
     await inst.alarm();
+  await inst.bgDrain?.();
     assert.equal(inst.lastSweepAt, 0, 'fullSweep 未完成时不推进时间戳');
 
     inst.lastSweepAt = Date.now();
@@ -655,6 +668,7 @@ test('MetricsDO: fullSweep/prune 失败不推进家政时间戳', async () => {
     const realBatch = env.DB.batch;
     env.DB.batch = async () => { throw new Error('prune unavailable'); };
     await inst.alarm();
+  await inst.bgDrain?.();
     env.DB.batch = realBatch;
     assert.equal(inst.lastPruneAt, 0, 'prune 失败时不推进时间戳');
   } finally {
@@ -789,6 +803,7 @@ test('MetricsDO: 高频 report 不后推已有 alarm（归档按期执行）', a
   await call('/report', { method: 'POST', body: JSON.stringify({ serverId: 1, minTs: nowMin, cpu: 2 }) });
   assert.equal(st.storage.alarmTs, t1, '再次 report 不后推 alarm');
   await inst.alarm();
+  await inst.bgDrain?.();
   assert.ok(st.storage.alarmTs >= Date.now(), 'alarm 执行后固定重排');
 });
 
@@ -800,6 +815,7 @@ test('MetricsDO: ARCHIVE_TO_D1=0 时 alarm 仍执行 D1 保留期清理（audit_
   await env.DB.prepare("INSERT INTO audit_logs (user_id, action, created_at) VALUES (1, 'recent', datetime('now', '-5 days'))").run();
 
   await inst.alarm();
+  await inst.bgDrain?.();
 
   const rows = await env.DB.prepare('SELECT action FROM audit_logs').all();
   assert.deepEqual(rows.results.map((r) => r.action), ['recent']);
@@ -813,6 +829,7 @@ test('MetricsDO: alarm 按 30 天保留期清理过期行', async () => {
   await env.DB.prepare('INSERT OR IGNORE INTO metrics_min (server_id, ts, cpu) VALUES (?,?,?)').bind(1, nowMin - 10, 2).run();
 
   await inst.alarm();
+  await inst.bgDrain?.();
 
   const rows = await env.DB.prepare('SELECT ts FROM metrics_min ORDER BY ts').all();
   assert.deepEqual(rows.results.map((r) => r.ts), [nowMin - 10]);
@@ -833,6 +850,7 @@ test('MetricsDO: alarm 按保留期分层——细粒度窗口（7 天）后只�
   await env.DB.prepare('INSERT OR IGNORE INTO metrics_min (server_id, ts, cpu) VALUES (?,?,?)').bind(1, nowMin - 3 * 1440, 99).run();
 
   await inst.alarm();
+  await inst.bgDrain?.();
 
   const rows = await env.DB.prepare('SELECT ts FROM metrics_min ORDER BY ts').all();
   assert.deepEqual(
@@ -849,6 +867,7 @@ test('MetricsDO: alarm 清理超过 90 天的审计日志，保留近期', async
   await env.DB.prepare("INSERT INTO audit_logs (user_id, action, created_at) VALUES (1, 'server.delete', datetime('now', '-5 days'))").run();
 
   await inst.alarm();
+  await inst.bgDrain?.();
 
   const rows = await env.DB.prepare('SELECT action FROM audit_logs').all();
   assert.deepEqual(rows.results.map((r) => r.action), ['server.delete']);
@@ -864,6 +883,7 @@ test('MetricsDO: alarm 离线/恢复告警（DO Storage 状态去重）', async 
   const cap = captureFetch();
   try {
     await inst.alarm();
+  await inst.bgDrain?.();
     assert.equal(cap.calls.length, 1);
     const body = JSON.parse(cap.calls[0].init.body);
     assert.equal(body.event, 'offline');
@@ -872,11 +892,13 @@ test('MetricsDO: alarm 离线/恢复告警（DO Storage 状态去重）', async 
 
     // 仍离线 → 不重复告警
     await inst.alarm();
+  await inst.bgDrain?.();
     assert.equal(cap.calls.length, 1);
 
     // 恢复在线 → recovered
     await env.DB.prepare('UPDATE servers SET last_seen = ? WHERE id = 1').bind(Math.floor(Date.now() / 1000)).run();
     await inst.alarm();
+  await inst.bgDrain?.();
     assert.equal(cap.calls.length, 2);
     assert.equal(JSON.parse(cap.calls[1].init.body).event, 'recovered');
     assert.equal(st.storage.map.get('alert:offline:1'), 'on');
@@ -897,7 +919,8 @@ test('MetricsDO: 离线告警状态跨 evict 恢复不重复告警（storage 键
   const { inst } = mkMetrics(env, st);
   const cap = captureFetch();
   try {
-    await inst.alarm(); // evict 后首个 alarm：机器仍离线但状态已持久化为 off
+    await inst.alarm();
+  await inst.bgDrain?.(); // evict 后首个 alarm：机器仍离线但状态已持久化为 off
     assert.equal(cap.calls.length, 0, '已告警过的离线机器恢复状态后不得重复告警');
     // 状态应为数字键（与 s.id 匹配），storage 持久化值不变
     assert.equal(inst.offlineState.get(1), 'off');
@@ -1251,6 +1274,7 @@ test('MetricsDO: idle 判据不受冷实例 data 为空影响（有服务器就�
   assert.equal(inst.data.size, 0, '前提：冷实例内存热区为空');
 
   await inst.alarm();
+  await inst.bgDrain?.();
   const delay = inst.alarmCached - Date.now();
   assert.ok(delay < 11 * 60 * 1000, `有服务器时不应退避 1h（实际 ${Math.round(delay / 60000)} 分钟）`);
 });
@@ -1259,6 +1283,7 @@ test('MetricsDO: 真的没有服务器时才退避 1h（省额度）', async () 
   const env = makeEnv();
   const { inst } = mkMetrics(env, mockState());
   await inst.alarm();
+  await inst.bgDrain?.();
   const delay = inst.alarmCached - Date.now();
   assert.ok(delay > 55 * 60 * 1000, `零服务器应退避约 1h（实际 ${Math.round(delay / 60000)} 分钟）`);
 });
@@ -1313,6 +1338,7 @@ test('PanelDO: alarm 回收超时未鉴权连接并续排下一截止时间', as
   state.getWebSockets = () => [expired, future, viewer];
   const inst = new PanelDO(state, makeEnv());
   await inst.alarm();
+  await inst.bgDrain?.();
   assert.equal(expired.closed, true, '超时 pending 连接关闭');
   assert.equal(future.closed, false, '未到期 pending 连接保留');
   assert.equal(viewer.closed, false, '已鉴权连接不受影响');
@@ -2101,6 +2127,7 @@ test('TerminalDO: 僵尸会话超 TTL 由 alarm 清理，未到期安排下次 a
   inst.sessions.set('0-live', { streamId: '0-live', serverId: 1, creatorUserId: 1, createdAt: now - TTL * 2, userWs: {}, agentWs: null });
 
   await inst.alarm();
+  await inst.bgDrain?.();
 
   assert.equal(inst.sessions.has('0-old'), false);
   assert.equal(inst.pendingOpen.has('0-old'), false);
@@ -2123,6 +2150,7 @@ test('TerminalDO: alarm 回收超时 user-pending 连接', async () => {
   st.getWebSockets = () => [expired, future];
   const inst = new TerminalDO(st, makeEnv());
   await inst.alarm();
+  await inst.bgDrain?.();
   assert.equal(expired.closed, true, '超时 pending 连接关闭');
   assert.equal(future.closed, false, '未到期 pending 连接保留');
   assert.equal(st.storage.alarmTs, future.attachment.authDeadline + 1000, '续排下一鉴权截止时间');
@@ -2823,13 +2851,15 @@ test('MetricsDO: 探活状态兜底对账每小时最多一次（读放大门控
   inst.listStorage = async (p, o) => { if (p === 'probe:') lists += 1; return orig(p, o); };
   await st.storage.put('probe:1:web', JSON.stringify({ ok: false, lastFail: 1 })); // 服务器 1 已删除
 
-  await inst.alarm(); // 首轮：告警开启 + 从未对账 → 扫一次并清掉孤儿键
+  await inst.alarm();
+  await inst.bgDrain?.(); // 首轮：告警开启 + 从未对账 → 扫一次并清掉孤儿键
   assert.equal(lists, 1, '本轮对账一次');
   assert.equal(st.storage.map.has('probe:1:web'), false, '服务器已删除的残留被清掉');
   assert.ok(inst.lastProbePruneAt > 0, '对账时间戳已记录');
 
   await st.storage.put('probe:1:db', JSON.stringify({ ok: false, lastFail: 1 }));
-  await inst.alarm(); // 同一小时内：跳过对账
+  await inst.alarm();
+  await inst.bgDrain?.(); // 同一小时内：跳过对账
   assert.equal(lists, 1, '一小时内不再重复对账');
   assert.equal(st.storage.map.has('probe:1:db'), true, '本轮未清理（下轮再来，不影响正确性）');
 
@@ -2841,6 +2871,7 @@ test('MetricsDO: 探活状态兜底对账每小时最多一次（读放大门控
     return orig2(p, o);
   };
   await inst.alarm();
+  await inst.bgDrain?.();
   assert.equal(inst.lastProbePruneAt, 0, '失败不推进时间戳，下轮 alarm（10 分钟）重试');
   inst.listStorage = orig2;
 });
@@ -2858,6 +2889,7 @@ test('MetricsDO: 未配置 webhook 时不对账探活状态（状态不产生通
   await st.storage.put('probe:1:web', JSON.stringify({ ok: false, lastFail: 1 }));
 
   await inst.alarm();
+  await inst.bgDrain?.();
   assert.equal(lists, 0, '未配置 webhook：不扫描探活状态');
   assert.equal(st.storage.map.has('probe:1:web'), true, '状态保留，配置 webhook 后的首轮再对账');
 });

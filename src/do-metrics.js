@@ -80,7 +80,8 @@ export class MetricsDO {
     this.latestByServer = new Map(); // serverId -> 最新指标 {ts, ..., last_seen_s}（/report 热写 O(1) 维护，/latest 直接 O(S) 返回）
     this.latestAt = new Map(); // serverId -> 上次写 `l:` 快照的分钟（降频，见 LATEST_KEY_EVERY_MIN）
     this.offlineLoaded = false; // 离线告警状态是否已从 storage 一次性加载（惰性）
-    this.offlineState = new Map(); // serverId -> 'on'|'off'（内存副本，避免每机逐个 getAlarm）
+    this.offlineState = new Map(); // serverId ->'on'|'off'（内存副本，避免每机逐个 getAlarm）
+    this.bg = new Set(); // 进行中的后台任务（告警 webhook），见 bgRun
     this.usage = { report: 0, latest: 0, query: 0 }; // 用量观测：本周期（10min）计数，周期末累计到 storage
     this.hotLoaded = new Set(); // serverId 已从 storage 完整加载热区的标记（见 ensureHot）
     this.pushOn = false; // 是否有观看者（PanelDO 0→1/1→0 通知），开启时才推送 latest
@@ -99,6 +100,24 @@ export class MetricsDO {
     this.dayAccum = new Map(); // serverId -> { lastSec, uptimeMin }
     this.dayCurLoaded = new Set(); // serverId：本实例已尝试恢复游标（Storage → D1 播种）
     this.dayCurDirty = new Set(); // serverId：游标有变化，待下次 alarm 持久化
+  }
+
+  // 告警 webhook 改后台执行：`await fetch` 在 MetricsDO 里会一直占着本次 /report，
+  // 而 TerminalDO 又 await 着这个 /report —— 一条慢 webhook 能把终端 DO 一起钉在
+  // non-hibernateable（70–140s evict 周期计 duration）。这里不 await，交给 state.waitUntil 托管，
+  // /report 立刻返回；webhook 完成后 waitUntil 释放（最长 15 分钟，且 fetch 侧另有 5s 超时）。
+  // 基线任务用于测试/诊断时等待后台收敛（见 bgDrain）。
+  bgRun(promise) {
+    const p = promise.catch(() => { /* 后台失败不冒泡，内部各自记日志 */ });
+    this.bg.add(p);
+    p.finally(() => this.bg.delete(p));
+    try { this.state.waitUntil?.(p); } catch { /* 无 waitUntil（测试/旧运行时）时仅内存跟踪 */ }
+    return p;
+  }
+
+  // 等待全部后台任务收敛（测试用；生产不调用）
+  async bgDrain() {
+    while (this.bg.size) await Promise.allSettled([...this.bg]);
   }
 
   // 家政状态（lastSweepAt/lastPruneAt）从 storage 惰性恢复（持久化跨实例 evict，
@@ -868,24 +887,28 @@ export class MetricsDO {
       if (await cooled(x.key)) alerts.push(x.text);
     }
     if (alerts.length) {
-      const ok = await sendWebhook(cfg, {
-        event: 'alert',
-        title: `[cf-panel] ${b.serverName} 指标告警`,
-        server: { id: b.serverId, name: b.serverName },
-        message: `服务器 ${b.serverName}（id=${b.serverId}）指标超阈值：\n` + alerts.join('\n'),
-        details: alerts,
-        time: new Date().toISOString(),
-      });
-      if (!ok && cooledKeys.length) {
-        // webhook 送达失败不得消耗完整冷却（否则指标持续超阈值时告警静默丢失整个冷却期）。
-        // 把冷却起点回拨到 cooldown - RETRY_BACKOFF_MS 前 → 剩余冷却恰为退避间隔（1 分钟），
-        // 之后每帧（≤5s）重新判定触发重发，直至送达。
-        const backoffTs = now - cooldown + RETRY_BACKOFF_MS;
-        for (const key of cooledKeys) {
-          this.alertLast.set(key, backoffTs);
-          try { await this.state.storage.put('alert:' + key, String(backoffTs)); } catch { /* 持久化失败仅内存 */ }
+      // webhook 后台发送（见 bgRun）：本函数的调用方是 /report 热路径，await 会连带拖住
+      // TerminalDO 的 hibernation。冷却已在上面的 cooled() 内置，这里只负责送达与失败回拨。
+      this.bgRun((async () => {
+        const ok = await sendWebhook(cfg, {
+          event: 'alert',
+          title: `[cf-panel] ${b.serverName} 指标告警`,
+          server: { id: b.serverId, name: b.serverName },
+          message: `服务器 ${b.serverName}（id=${b.serverId}）指标超阈值：\n` + alerts.join('\n'),
+          details: alerts,
+          time: new Date().toISOString(),
+        });
+        if (!ok && cooledKeys.length) {
+          // webhook 送达失败不得消耗完整冷却（否则指标持续超阈值时告警静默丢失整个冷却期）。
+          // 把冷却起点回拨到 cooldown - RETRY_BACKOFF_MS 前 → 剩余冷却恰为退避间隔（1 分钟），
+          // 之后每帧（≤5s）重新判定触发重发，直至送达。
+          const backoffTs = now - cooldown + RETRY_BACKOFF_MS;
+          for (const key of cooledKeys) {
+            this.alertLast.set(key, backoffTs);
+            try { await this.state.storage.put('alert:' + key, String(backoffTs)); } catch { /* 持久化失败仅内存 */ }
+          }
         }
-      }
+      })());
     }
   }
 
@@ -903,38 +926,43 @@ export class MetricsDO {
       if (p.ok) {
         if (!st.ok) {
           // 成功才落 up 状态；失败回滚为原 down 状态，下帧重发（恢复为瞬时事件，无冷却语义，≤5s 重试）
-          const sent = await sendWebhook(cfg, {
-            event: 'probe_recovered',
-            title: `[cf-panel] ${serverName} 服务恢复：${p.name}`,
-            server: { id: serverId, name: serverName },
-            message: `服务器 ${serverName} 的服务「${p.name}」已恢复正常。`,
-            time: new Date().toISOString(),
-          });
-          if (!sent) {
-            this.probeState.set(key, st);
-            try { await this.state.storage.put('probe:' + key, JSON.stringify(st)); } catch { /* 持久化失败仅内存 */ }
-          } else {
-            this.probeState.set(key, { ok: true, lastFail: 0 });
-            try { await this.state.storage.put('probe:' + key, JSON.stringify({ ok: true, lastFail: 0 })); } catch { /* 持久化失败仅内存 */ }
-          }
+          // webhook 后台发送（见 bgRun）：本函数在 /report 热路径上，await 会拖住 TerminalDO 的 hibernation。
+          this.bgRun((async () => {
+            const sent = await sendWebhook(cfg, {
+              event: 'probe_recovered',
+              title: `[cf-panel] ${serverName} 服务恢复：${p.name}`,
+              server: { id: serverId, name: serverName },
+              message: `服务器 ${serverName} 的服务「${p.name}」已恢复正常。`,
+              time: new Date().toISOString(),
+            });
+            if (!sent) {
+              this.probeState.set(key, st);
+              try { await this.state.storage.put('probe:' + key, JSON.stringify(st)); } catch { /* 持久化失败仅内存 */ }
+            } else {
+              this.probeState.set(key, { ok: true, lastFail: 0 });
+              try { await this.state.storage.put('probe:' + key, JSON.stringify({ ok: true, lastFail: 0 })); } catch { /* 持久化失败仅内存 */ }
+            }
+          })());
         }
       } else if (st.ok || now - st.lastFail >= cooldown) {
         this.probeState.set(key, { ok: false, lastFail: now });
         try { await this.state.storage.put('probe:' + key, JSON.stringify({ ok: false, lastFail: now })); } catch { /* 持久化失败仅内存 */ }
-        const sent = await sendWebhook(cfg, {
-          event: 'probe_down',
-          title: `[cf-panel] ${serverName} 服务异常：${p.name}`,
-          server: { id: serverId, name: serverName },
-          message: `服务器 ${serverName} 的服务「${p.name}」探测失败${p.code ? `（HTTP ${p.code}）` : ''}。`,
-          details: p,
-          time: new Date().toISOString(),
-        });
-        if (!sent) {
-          // down 通知送达失败 → lastFail 回拨到 cooldown - 退避 前，剩余冷却=1 分钟退避后重发
-          const backoff = now - cooldown + RETRY_BACKOFF_MS;
-          this.probeState.set(key, { ok: false, lastFail: backoff });
-          try { await this.state.storage.put('probe:' + key, JSON.stringify({ ok: false, lastFail: backoff })); } catch { /* 持久化失败仅内存 */ }
-        }
+        this.bgRun((async () => {
+          const sent = await sendWebhook(cfg, {
+            event: 'probe_down',
+            title: `[cf-panel] ${serverName} 服务异常：${p.name}`,
+            server: { id: serverId, name: serverName },
+            message: `服务器 ${serverName} 的服务「${p.name}」探测失败${p.code ? `（HTTP ${p.code}）` : ''}。`,
+            details: p,
+            time: new Date().toISOString(),
+          });
+          if (!sent) {
+            // down 通知送达失败 → lastFail 回拨到 cooldown - 退避 前，剩余冷却=1 分钟退避后重发
+            const backoff = now - cooldown + RETRY_BACKOFF_MS;
+            this.probeState.set(key, { ok: false, lastFail: backoff });
+            try { await this.state.storage.put('probe:' + key, JSON.stringify({ ok: false, lastFail: backoff })); } catch { /* 持久化失败仅内存 */ }
+          }
+        })());
       }
     }
   }
@@ -1036,29 +1064,35 @@ export class MetricsDO {
       const last = this.offlineState.get(s.id) || 'on';
       if (!isOnline && last !== 'off') {
         // 送达成功才落 off 状态（失败不落状态，下轮 alarm（10min）自动重发）
-        const sent = await sendWebhook(cfg, {
-          event: 'offline',
-          title: `[cf-panel] ${s.name} 离线`,
-          server: { id: s.id, name: s.name },
-          message: `服务器 ${s.name}（id=${s.id}）超过 ${offlineAfter}s 未上报，已判定离线。`,
-          time: new Date().toISOString(),
-        });
-        if (sent) {
-          this.offlineState.set(s.id, 'off');
-          await this.state.storage.put(key, 'off');
-        }
+        // webhook 后台发送（见 bgRun）：alarm 里逐机 await 多条慢 webhook 会把本次 alarm 拖到分钟级，
+        // 同样拖住实例的 hibernation。
+        this.bgRun((async () => {
+          const sent = await sendWebhook(cfg, {
+            event: 'offline',
+            title: `[cf-panel] ${s.name} 离线`,
+            server: { id: s.id, name: s.name },
+            message: `服务器 ${s.name}（id=${s.id}）超过 ${offlineAfter}s 未上报，已判定离线。`,
+            time: new Date().toISOString(),
+          });
+          if (sent) {
+            this.offlineState.set(s.id, 'off');
+            await this.state.storage.put(key, 'off');
+          }
+        })());
       } else if (isOnline && last === 'off') {
-        const sent = await sendWebhook(cfg, {
-          event: 'recovered',
-          title: `[cf-panel] ${s.name} 恢复在线`,
-          server: { id: s.id, name: s.name },
-          message: `服务器 ${s.name}（id=${s.id}）已恢复上报。`,
-          time: new Date().toISOString(),
-        });
-        if (sent) {
-          this.offlineState.set(s.id, 'on');
-          await this.state.storage.put(key, 'on');
-        }
+        this.bgRun((async () => {
+          const sent = await sendWebhook(cfg, {
+            event: 'recovered',
+            title: `[cf-panel] ${s.name} 恢复在线`,
+            server: { id: s.id, name: s.name },
+            message: `服务器 ${s.name}（id=${s.id}）已恢复上报。`,
+            time: new Date().toISOString(),
+          });
+          if (sent) {
+            this.offlineState.set(s.id, 'on');
+            await this.state.storage.put(key, 'on');
+          }
+        })());
       }
     }
   }

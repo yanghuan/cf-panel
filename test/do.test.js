@@ -2997,7 +2997,16 @@ test('MetricsDO: 同分钟多帧后首次 /query 返回最新帧（loadHot 不�
 // 取正午可留出 12 小时余量，覆盖本文件所有用例的跨度。
 function daySafeBase() {
   const now = Math.floor(Date.now() / 1000);
-  return Math.floor(now / 86400) * 86400 + 12 * 3600;
+  const dayStart = Math.floor(now / 86400) * 86400;
+  // 优先用「今天 12:00 UTC」（历史断言口径）；若当前还没到 12:00，退化为
+  // 「至少 10 分钟前、且仍在今天的 UTC 日内」的时点。
+  // 原因：ensureDayCursor 有一条「游标不得落在未来」的保护，lastSec > now 会被钳到 now。
+  // 若 base 取未来的 12:00，钳位后 dt 会变成 base+120-now（UTC 凌晨跑 CI 时约 11 小时），
+  // 两个天账用例就会以「应记 2 分钟，实际 657 分钟」失败——是测试对时间的依赖，与实现无关。
+  // 注意 base 只要 ≤ now 即可：base+120 落在未来不影响 dt（accumulateDay 直接用传入值算差值）。
+  const noon = dayStart + 12 * 3600;
+  if (noon <= now) return noon;
+  return Math.max(dayStart, now - 600);
 }
 
 test('MetricsDO: 按天统计累加在线时长与流量（速率 × 时长）', async () => {

@@ -37,23 +37,21 @@ class_name = "MetricsDO"
 name = "PANEL"
 class_name = "PanelDO"
 
-# ---------- DO 代码更新策略（默认 deferred，即部署不会立刻重启实例） ----------
+# ---------- DO 代码更新策略：immediate（部署即重启实例） ----------
 # Cloudflare 自 2026-10-30 起把默认改成 deferred：部署后活跃对象可继续跑旧代码最多
-# max_delay（默认 300s），等它 hibernate 才切新版；到点仍未休眠则强制 reset。
-# 后果：实例一旦陷入 non-hibernateable（本项目的 duration 异常即此症状），
-# 每次部署都要等满 5 分钟才真正换代码，无法靠"部署一下"把它重启掉。
-#
-# 需要硬重启（清空实例内存态、重跑 constructor）时，用 CLI 参数单次指定，不要写进本文件：
-#   npx wrangler deploy --durable-objects-code-update-mode immediate
-#   npx wrangler versions deploy <VERSION_ID>@100% --durable-objects-code-update-mode immediate
-# immediate 语义是 resets and adopts the new code immediately：中断在途请求、终止 WS 连接。
-# 本项目对此是安全的——内存状态可从连接附件 + D1 重建（异步化改造的验收点），
-# agent 会在 3~5s 内退避重连，DO 持久化只有 sess:*（终端会话）。
-#
-# 不固化为配置的原因：日常改动不值得付这个代价，按需在命令行加参数即可。
-# 若确需固化，取消下面两行的注释：
-# [durable_objects.code_update_strategy]
-# mode = "immediate"
+# max_delay（默认 300s），等它 hibernate 才切新版；到点仍未休眠才强制 reset。
+# 本项目选 immediate，原因：
+#   1) 实例一旦陷入 non-hibernateable（本项目的 duration 异常即此症状），deferred 下
+#      每次部署都要等满 5 分钟才真正换代码，靠"部署一下"重启不掉它；
+#   2) 面板不对外服务、无常驻业务流量，中断在途请求与 WS 的代价可忽略；
+#   3) 硬重启会清空实例内存态并重跑 constructor，是当前唯一可自助做的"重启"手段。
+# 代价（已知且接受）：immediate 语义为 resets and adopts the new code immediately ——
+# 中断在途请求、终止 WS 连接。本项目对此安全：内存状态可从连接附件 + D1 重建
+#（异步化改造的验收点），agent 会在 3~5s 内退避重连，DO 持久化只有 sess:*（终端会话）。
+# 若某次部署不希望打断（例如灰度中），临时用 CLI 覆盖：
+#   npx wrangler deploy --durable-objects-code-update-mode deferred
+[durable_objects.code_update_strategy]
+mode = "immediate"
 
 [[migrations]]
 tag = "v1"

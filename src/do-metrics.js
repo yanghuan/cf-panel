@@ -80,7 +80,7 @@ export class MetricsDO {
     this.latestByServer = new Map(); // serverId -> 最新指标 {ts, ..., last_seen_s}（/report 热写 O(1) 维护，/latest 直接 O(S) 返回）
     this.latestAt = new Map(); // serverId -> 上次写 `l:` 快照的分钟（降频，见 LATEST_KEY_EVERY_MIN）
     this.offlineLoaded = false; // 离线告警状态是否已从 storage 一次性加载（惰性）
-    this.offlineState = new Map(); // serverId ->'on'|'off'（内存副本，避免每机逐个 getAlarm）
+    this.offlineState = new Map(); // serverId -> 'on'|'off'（内存副本，避免每机逐个 getAlarm）
     this.bg = new Set(); // 进行中的后台任务（告警 webhook），见 bgRun
     this.usage = { report: 0, latest: 0, query: 0 }; // 用量观测：本周期（10min）计数，周期末累计到 storage
     this.hotLoaded = new Set(); // serverId 已从 storage 完整加载热区的标记（见 ensureHot）

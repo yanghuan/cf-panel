@@ -31,6 +31,11 @@ async function getServerRow(env, serverId) {
 // 告警/探活判定搭 /report 顺风车，随之 ~5s 一次（冷却 30min 不受影响，探活判定延迟 ≤5s）；
 // 卡片新鲜度 ≤5s，last_seen_s 最旧 ~6s 远低于 15s 快宽限（余量充足）
 export const REPORT_FWD_THROTTLE_S = 5;
+// 转发到 MetricsDO 的硬上限（毫秒）。这条 await 位于 TerminalDO 的 webSocketMessage 内，
+// 一旦 MetricsDO 挂住（冷启动、被 evict、或它内部同步发告警 webhook —— sendWebhook 本身没有超时），
+// TerminalDO 的处理函数就不返回，对象停在 non-hibernateable 状态按 70–140s 的 evict 周期计 duration。
+// 取 2s：正常转发实测 50–60ms，余量足够；超时后本批 frames 丢弃，下一帧（≤5s 后）会重新聚合。
+export const FWD_TIMEOUT_MS = 2000;
 export const reportBatch = new Map(); // serverId -> 待批量转发的帧（跨实例 evict 丢失后仅偶发丢一帧，无害）
 export let reportFlushAt = 0; // 上次 flush 时刻（ms；隔离实例内共享，上报驱动触发）
 export function setReportFlushAt(v) { reportFlushAt = v; } // let 原始值无法经属性赋值，测试用 setter 操纵 flush 时刻
@@ -260,6 +265,7 @@ export async function handleReport(env, payload, timing) {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ frames }),
+      signal: AbortSignal.timeout(FWD_TIMEOUT_MS), // 挂起会拖住 TerminalDO 的 hibernation，见常量注释
     });
     if (timing) { timing.fwd = Date.now() - tFwd; timing.flushed = 1; }
   }

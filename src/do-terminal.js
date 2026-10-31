@@ -40,6 +40,10 @@ const SLOW_LOG_BUDGET_PER_HOUR = 20; // 每实例每小时上限。实例包含 
 // setTimeout 会让 DO 在窗口内失去 hibernation 资格并持续计 duration，故缩短窗口；
 // 控制通道重连间隙通常 3~6s，3s 间隔仍能覆盖，3 次后放弃（前端另有自愈兜底）。
 const OPEN_ACK_RETRY_MS = 3 * 1000;
+// 查观看者数的硬上限（毫秒）。这条 await 位于 webSocketMessage / 控制通道握手内，
+// 而 PanelDO /viewers 只是读内存计数器（实测 1–3ms），一旦它挂住就会拖住本实例的
+// hibernation → 按 70–140s 的 evict 周期计 duration。1s 已是 300 倍余量。
+const VIEWERS_TIMEOUT_MS = 1000;
 
 export class TerminalDO {
   constructor(state, env) {
@@ -471,7 +475,9 @@ export class TerminalDO {
       // 连接建立即下发当前上报间隔（省配额：有观看者快采 / 无观看者慢采）
       const tSetup = Date.now();
       try {
-        const vResp = await doPanel(this.env).fetch('https://do.internal/viewers');
+        const vResp = await doPanel(this.env).fetch('https://do.internal/viewers', {
+          signal: AbortSignal.timeout(VIEWERS_TIMEOUT_MS), // 挂起会拖住握手与本实例的 hibernation
+        });
         const v = await vResp.json();
         const iv = (v.count || 0) > 0 ? REPORT_FAST_INTERVAL_S : REPORT_SLOW_INTERVAL_S;
         this.applyAgentInterval(pair[1], server.id, iv);
@@ -1155,7 +1161,9 @@ export class TerminalDO {
     const tViewers = Date.now();
     let want = REPORT_SLOW_INTERVAL_S;
     try {
-      const resp = await doPanel(this.env).fetch('https://do.internal/viewers');
+      const resp = await doPanel(this.env).fetch('https://do.internal/viewers', {
+        signal: AbortSignal.timeout(VIEWERS_TIMEOUT_MS), // 挂起会拖住本条上报，进而拖住 hibernation
+      });
       const v = await resp.json();
       want = (v.count || 0) > 0 ? REPORT_FAST_INTERVAL_S : REPORT_SLOW_INTERVAL_S;
     } catch { /* 兜底慢采 */ }

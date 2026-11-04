@@ -88,6 +88,10 @@ export class TerminalDO {
     this.statFwdMs = 0; // 转发 MetricsDO 的总耗时（ms）
     this.statFwdTimeout = 0; // 其中因 2s 超时被 abort 的次数
     this.statRefire = 0; // alarm 触发时发现「下一次 alarm 已过期」的次数（空转直接证据）
+    this.statSend = 0; // 窗口内向 agent 主动发送的帧数（ping/probe）
+    this.statSendFail = 0; // 其中 send 抛错的次数（对端已死/半开的直接信号）
+    this.statWsOpen = 0; // 上次快照统计到的 OPEN socket 数
+    this.statWsOther = 0; // 上次快照统计到的非 OPEN socket 数（>0 且不减 = 连接泄漏）
   }
 
   // 每小时第一次被唤起时，把上个小时的统计打出来并归零。
@@ -128,6 +132,10 @@ export class TerminalDO {
       intv: this.agentInterval.size,
       pend: this.pendingOpen.size,
       inflight: this.inflight, // 未 settle 的出站 I/O 数：长期非零 = 卡在某个 fetch/D1 上
+      send: this.statSend, // 窗口内主动发送帧数
+      send_fail: this.statSendFail, // 其中 send 失败数（半开连接信号）
+      ws_open: this.statWsOpen, // 窗口内最后一次统计到的 readyState===1 的 socket 数
+      ws_other: this.statWsOther, // 其余状态（CLOSING/CLOSED，若长期 >0 说明连接泄漏）
     };
     this.statAt = now;
     this.statMsg = 0;
@@ -138,12 +146,16 @@ export class TerminalDO {
     this.statFwdMs = 0;
     this.statFwdTimeout = 0;
     this.statRefire = 0;
+    this.statSend = 0;
+    this.statSendFail = 0;
     if (snap.msg === 0) return; // 窗口内没有消息（纯 alarm 唤醒等）不输出
     // 连接快照：僵尸连接会持续产生唤醒源，是「看不见的事件」候选之一
     let socks = 0; let ctrl = 0; let user = 0; let other = 0;
+    let wsOpen = 0; let wsOther = 0;
     try {
       for (const w of this.state.getWebSockets?.() || []) {
         socks += 1;
+        if (w.readyState === 1) wsOpen += 1; else wsOther += 1;
         let a = null;
         try { a = w.deserializeAttachment?.(); } catch { /* ignore */ }
         const role = a && typeof a === 'object' ? a.role : (a ? 'legacy' : 'none');
@@ -151,6 +163,8 @@ export class TerminalDO {
         else if (role === 'user' || role === 'agent' || role === 'user-pending') user += 1;
         else other += 1;
       }
+      this.statWsOpen = wsOpen;
+      this.statWsOther = wsOther;
     } catch { /* ignore */ }
     let alarmS = null;
     try {
@@ -1062,14 +1076,16 @@ export class TerminalDO {
               const lastP = this.lastPingAt.get(serverId) || 0;
               if (nowP - lastP > 30000) {
                 this.lastPingAt.set(serverId, nowP);
-                try { ws.send(JSON.stringify({ type: 'ping' })); } catch { /* ignore */ }
+                this.statSend += 1;
+                try { ws.send(JSON.stringify({ type: 'ping' })); } catch { this.statSendFail += 1; }
               }
               // 顺风车探活：report 本身只证明上行通，这里补一个下行探测帧（出站不计费），
               // agent 回 pong 后刷新 lastRoundTripAt —— exec 判据因此始终新鲜，无需当场等待回执。
               // 没有等待方，所以不需要 pending 表，也不产生 setTimeout。
               if (this.probeCapable.has(serverId) && nowP - (this.lastProbeAt.get(serverId) || 0) > PROBE_REFRESH_MS) {
                 this.lastProbeAt.set(serverId, nowP);
-                try { ws.send(JSON.stringify({ type: 'probe', id: `p-${crypto.randomUUID()}` })); } catch { /* ignore */ }
+                this.statSend += 1;
+                try { ws.send(JSON.stringify({ type: 'probe', id: `p-${crypto.randomUUID()}` })); } catch { this.statSendFail += 1; }
               }
             }
             try {

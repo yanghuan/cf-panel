@@ -75,6 +75,7 @@ export class TerminalDO {
     // 健康实例每条消息都是冷启动（cold ≈ req）；从未被回收的实例 cold = 0 ——
     // 这是区分「代码执行慢」与「平台不回收实例」最直接的一条证据，也是开工单的关键数据。
     this.bornAt = Date.now(); // 实例创建时刻：age_s 用来判断它活了多久（non-hibernateable 的直接证据）
+    this.inflight = 0; // 未 settle 的出站 I/O 数量（fetch / D1 / 跨 DO 调用），见 tracked()
     this.statAt = this.bornAt; // 上次快照时刻（满 STAT_WINDOW_MS 才输出，见 maybeFlushStat）
     this.statReq = 0; // 本窗口收到的 report 帧数
     this.statCold = 0; // 其中处于冷启动（本实例首次处理）的帧数
@@ -91,6 +92,15 @@ export class TerminalDO {
 
   // 每小时第一次被唤起时，把上个小时的统计打出来并归零。
   // 只在跨小时时触发，日志量 = 每实例每小时 1 条（4 分片 ≈ 96 条/天），可忽略。
+  // 出站 I/O 计数包装：官方 hibernation 判据之一是「没有未完成的 I/O」。
+  // 这里把每处跨 DO fetch / D1 调用都过一遍，[stat] 里带上 inflight ——
+  // 若异常实例长期停在非零值（且不随窗口变化），就是「挂在某个 I/O 上」的直接证据；
+  // 若 inflight 在快照时总是 0，则可排除本类原因，转向运行时自身判定。
+  async tracked(fn) {
+    this.inflight += 1;
+    try { return await fn(); } finally { this.inflight -= 1; }
+  }
+
   // 状态快照：每存活满 STAT_WINDOW_MS 输出一行 [stat] 并归零计数。
   // 为什么不用「跨整点」触发：实例被回收后新实例的 statHour 为空，几乎不可能跨过整点——
   // 实测 14:00 整点后一条都没有，正是因为实例寿命远短于 1 小时。改成按存活时长触发后，
@@ -117,6 +127,7 @@ export class TerminalDO {
       sess: this.sessions.size,
       intv: this.agentInterval.size,
       pend: this.pendingOpen.size,
+      inflight: this.inflight, // 未 settle 的出站 I/O 数：长期非零 = 卡在某个 fetch/D1 上
     };
     this.statAt = now;
     this.statMsg = 0;
@@ -511,7 +522,7 @@ export class TerminalDO {
         // await：不留下未完成的 promise（未完成 I/O 会让对象失去 hibernation 资格、持续计 duration）。
         // 代价：101 会晚于原 fire-and-forget 返回——常态 waiting 为空时是 4 次带索引 D1（几十毫秒）；
         // 队列非空时每条 job 再加一次 markUploadRunning，重连握手最坏慢到几百毫秒。可接受。
-        try { await this.resendWaitingUploads(server.id, pair[1], panelOrigin); } catch { /* 失败不阻塞连接 */ }
+        try { await this.tracked(() => this.resendWaitingUploads(server.id, pair[1], panelOrigin)); } catch { /* 失败不阻塞连接 */ }
       }
       // T1 能力来源：不在此处探活——建连时能力未知，探活失败无法安全处理（分不清旧 agent 与真断链）。
       // 改为由 agent 在上报里自声明（info.probe_proto，见 report 分支）；声明后 exec 前探活失败
@@ -531,9 +542,9 @@ export class TerminalDO {
       // 连接建立即下发当前上报间隔（省配额：有观看者快采 / 无观看者慢采）
       const tSetup = Date.now();
       try {
-        const vResp = await doPanel(this.env).fetch('https://do.internal/viewers', {
+        const vResp = await this.tracked(() => doPanel(this.env).fetch('https://do.internal/viewers', {
           signal: AbortSignal.timeout(VIEWERS_TIMEOUT_MS), // 挂起会拖住握手与本实例的 hibernation
-        });
+        }));
         const v = await vResp.json();
         const iv = (v.count || 0) > 0 ? REPORT_FAST_INTERVAL_S : REPORT_SLOW_INTERVAL_S;
         this.applyAgentInterval(pair[1], server.id, iv);
@@ -1063,7 +1074,7 @@ export class TerminalDO {
             }
             try {
               if (serverId) {
-                await handleReport(this.env, {
+                await this.tracked(() => handleReport(this.env, {
                   serverId,
                   cpu: j.cpu,
                   mem_used: j.mem_used,
@@ -1074,7 +1085,7 @@ export class TerminalDO {
                   info: j.info,
                   probes: j.probes,
                   custom: j.custom,
-                }, timing);
+                }, timing));
                 await this.syncAgentInterval(ws, serverId, timing);
               }
             } catch (e) { console.error('handleReport failed:', e); }
@@ -1274,9 +1285,9 @@ export class TerminalDO {
     const tViewers = Date.now();
     let want = REPORT_SLOW_INTERVAL_S;
     try {
-      const resp = await doPanel(this.env).fetch('https://do.internal/viewers', {
+      const resp = await this.tracked(() => doPanel(this.env).fetch('https://do.internal/viewers', {
         signal: AbortSignal.timeout(VIEWERS_TIMEOUT_MS), // 挂起会拖住本条上报，进而拖住 hibernation
-      });
+      }));
       const v = await resp.json();
       want = (v.count || 0) > 0 ? REPORT_FAST_INTERVAL_S : REPORT_SLOW_INTERVAL_S;
     } catch { /* 兜底慢采 */ }

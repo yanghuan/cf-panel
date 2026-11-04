@@ -74,28 +74,87 @@ export class TerminalDO {
     this.statHour = ''; // 计数器所属小时（UTC，YYYYMMDDHH）
     this.statReq = 0; // 本小时收到的 report 帧数
     this.statCold = 0; // 其中处于冷启动（本实例首次处理）的帧数
+    // 每小时快照的其余计数（用来证伪「平台不给休眠」）：若某小时计费驻留远大于
+    // 所有事件耗时之和，就必须有一个我们看不见的事件源——alarm 空转是头号嫌疑，
+    // 所以单独计 alarm 次数与「下一次 alarm 是否已经过期」。
+    this.statMsg = 0; // 本小时处理的 WS 消息总数（含 pong/exec_result 等）
+    this.statInMs = 0; // 上述消息的 handler 内部耗时之和（ms）
+    this.statAlarm = 0; // 本小时 alarm() 被调用次数
+    this.statFwdMs = 0; // 转发 MetricsDO 的总耗时（ms）
+    this.statFwdTimeout = 0; // 其中因 2s 超时被 abort 的次数
+    this.statRefire = 0; // alarm 触发时发现「下一次 alarm 已过期」的次数（空转直接证据）
   }
 
   // 每小时第一次被唤起时，把上个小时的统计打出来并归零。
   // 只在跨小时时触发，日志量 = 每实例每小时 1 条（4 分片 ≈ 96 条/天），可忽略。
-  rollHourStat(now) {
+  // 小时键（UTC，YYYYMMDDHH）
+  hourKey(now) {
     const d = new Date(now);
-    const hour = `${d.getUTCFullYear()}${String(d.getUTCMonth() + 1).padStart(2, '0')}`
+    return `${d.getUTCFullYear()}${String(d.getUTCMonth() + 1).padStart(2, '0')}`
       + `${String(d.getUTCDate()).padStart(2, '0')}${String(d.getUTCHours()).padStart(2, '0')}`;
-    if (hour === this.statHour) return;
-    if (this.statHour && this.statReq > 0) {
-      try {
-        console.error(`[cold] ${JSON.stringify({
-          hour: this.statHour, // 统计所属小时（UTC）
-          req: this.statReq, // 该小时收到的 report 帧数
-          cold: this.statCold, // 其中冷启动帧数；≈req = 每条都要重建，0 = 从未被回收
-          rebuilt: this.rebuilt ? 1 : 0, // 打点时本实例是否已重建索引
-        })}`);
-      } catch { /* ignore */ }
-    }
+  }
+
+  // 同小时直接返回 null（零成本：只有一次字符串比较，不新建 Promise、不 await）；
+  // 跨小时才返回待结算的 Promise，由调用方 await，保证计数重置发生在本次累加之前。
+  maybeRollHour(now) {
+    if (this.hourKey(now) === this.statHour) return null;
+    return this.emitHourStat(now);
+  }
+
+  // 每小时快照：跨小时时输出上一小时一行 [hour] 并归零。
+  // 目的：把「计费驻留 ≫ 事件耗时」变成可证伪的——若 in_ms 只有几十秒而该小时计费是
+  // 几千秒，差额必然来自某个我们看不见的事件（alarm 空转 / 僵尸连接唤醒）。
+  // 因此同时记录 alrm（alarm 次数）、refire（alarm 触发时下一次已过期 → 空转证据）、
+  // alarm_s（下一次 alarm 距现在秒数，负数=已过期）与 socks/ctrl/user 连接快照。
+  async emitHourStat(now) {
+    const prev = this.statHour;
+    const hour = this.hourKey(now);
+    // 先快照并归零（在任何 await 之前，避免统计被并发消息污染），再异步取 alarm/连接
+    const snap = {
+      hour: prev, // 统计所属小时（UTC）
+      msg: this.statMsg, // 该小时处理的 WS 消息总数
+      req: this.statReq, // 其中 report 帧数
+      cold: this.statCold, // 冷启动帧数；≈req = 每条都要重建，0 = 从未被回收
+      in_ms: this.statInMs, // 所有消息的 handler 内部耗时之和
+      fwd_ms: this.statFwdMs, // 转发 MetricsDO 总耗时
+      fwd_to: this.statFwdTimeout, // 转发超时次数（MetricsDO 排队指标）
+      alrm: this.statAlarm, // alarm() 调用次数（正常应为个位数）
+      refire: this.statRefire, // alarm 空转直接证据
+      sess: this.sessions.size,
+      intv: this.agentInterval.size,
+      pend: this.pendingOpen.size,
+    };
     this.statHour = hour;
+    this.statMsg = 0;
     this.statReq = 0;
     this.statCold = 0;
+    this.statInMs = 0;
+    this.statAlarm = 0;
+    this.statFwdMs = 0;
+    this.statFwdTimeout = 0;
+    this.statRefire = 0;
+    if (!prev || (snap.msg === 0 && snap.req === 0)) return; // 上一小时无流量不输出
+    // 连接快照：僵尸连接会持续产生唤醒源，是「看不见的事件」候选之一
+    let socks = 0; let ctrl = 0; let user = 0; let other = 0;
+    try {
+      for (const w of this.state.getWebSockets?.() || []) {
+        socks += 1;
+        let a = null;
+        try { a = w.deserializeAttachment?.(); } catch { /* ignore */ }
+        const role = a && typeof a === 'object' ? a.role : (a ? 'legacy' : 'none');
+        if (role === 'control') ctrl += 1;
+        else if (role === 'user' || role === 'agent' || role === 'user-pending') user += 1;
+        else other += 1;
+      }
+    } catch { /* ignore */ }
+    let alarmS = null;
+    try {
+      const at = await this.state.storage.getAlarm();
+      alarmS = at == null ? null : Math.round((at - now) / 1000);
+    } catch { /* ignore */ }
+    try {
+      console.error(`[hour] ${JSON.stringify({ ...snap, socks, ctrl, user, other, alarm_s: alarmS })}`);
+    } catch { /* ignore */ }
   }
 
   // 内存互斥可能因 Agent 挂住（不回执、连接仍在）而永不释放——D1 的 deadline 才是权威。
@@ -605,6 +664,13 @@ export class TerminalDO {
 
   // Hibernation alarm：零流量时也被唤醒执行清理；无僵尸会话则无需设定 alarm，保持休眠
   async alarm() {
+    this.statAlarm += 1; // 计数：正常应是个位数/小时，若上千即 alarm 空转
+    // 空转探针：alarm 刚触发时若「下一次 alarm」已经过期，说明有人在把它不断设到过去，
+    // 会形成「触发→扫描→再设到过去→立即再触发」的自我维持循环（这会持续计 duration）。
+    try {
+      const at = await this.state.storage.getAlarm();
+      if (at != null && at < Date.now() - 1000) this.statRefire += 1;
+    } catch { /* ignore */ }
     this.rebuildIndex();
     await this.maybeSweep();
   }
@@ -813,10 +879,14 @@ export class TerminalDO {
   async webSocketMessage(ws, message) {
     const t0 = Date.now();
     const coldStart = !this.rebuilt; // 本条消息是否触发实例冷重建（evict 后首条，成本最高）
+    const roll = this.maybeRollHour(t0); // 同小时返回 null；跨小时返回待结算 Promise
+    if (roll) await roll;
     try {
       return await this.onWsMessage(ws, message, coldStart);
     } finally {
       const ms = Date.now() - t0;
+      this.statMsg += 1; // 计入小时快照（in_ms 与 msg 用来和平台计费做对照）
+      this.statInMs += ms;
       if (ms >= SLOW_MSG_MS) {
         // 类型/角色只在慢路径解析，正常消息零开销
         let type = 'binary';
@@ -958,10 +1028,11 @@ export class TerminalDO {
             const tReport = Date.now(); // 埋点：整条上报耗时（消息到达 → 落库 + 转发完成）
             const timing = {};
             // 冷启动统计：coldStart 在函数顶部已取（rebuildIndex 之前），这里只累加计数。
-            // 每小时跨点时输出上一小时的 [cold] 行（见 rollHourStat）。
-            this.rollHourStat(tReport);
+            // 跨小时结算在 webSocketMessage 的包装层统一做（见 rollHourStat），此处不再重复调用。
             this.statReq += 1;
             if (coldStart) this.statCold += 1;
+            this.statFwdMs += timing.fwd || 0; // 转发 MetricsDO 的耗时（计时在 report.js 里）
+            if (timing.fwdTimeout) this.statFwdTimeout += 1;
             // ② 能力门控：agent 自声明支持探活（info.probe_proto，随上报免费到达）才启用 exec 前探活。
             // 旧 agent 不报该字段 → 永不探活、永不误关；声明后探活失败必为真断链 → 可安全 close(4002)。
             // 已登记则跳过（避免每帧都序列化附件）；evict 后由附件恢复，故仅在丢失时重写。

@@ -1812,7 +1812,7 @@ test('TerminalDO: 被顶替的旧连接 close 不清新连接的探活能力与�
   assert.equal(inst.lastRoundTripAt.has(1), false, '真正断开时才清往返记录');
 });
 
-test('TerminalDO: 跨小时输出 [cold] 统计（区分冷启动与常驻）', async () => {
+test('TerminalDO: 跨小时输出 [hour] 快照（冷启动/耗时/alarm/连接数）', async () => {
   const env = makeEnv();
   const ws = {
     deserializeAttachment: () => ({ role: 'control', serverId: 1 }),
@@ -1835,16 +1835,35 @@ test('TerminalDO: 跨小时输出 [cold] 统计（区分冷启动与常驻）', 
     // 模拟跨小时：把 statHour 改成上个小时，再触发一次
     inst.statHour = '2026010100';
     await inst.webSocketMessage(ws, JSON.stringify({ type: 'report', cpu: 3 }));
-    const cold = lines.filter((l) => l.startsWith('[cold]'));
+    const cold = lines.filter((l) => l.startsWith('[hour]'));
     assert.equal(cold.length, 1, '跨小时输出恰好一行');
-    const stat = JSON.parse(cold[0].replace('[cold] ', ''));
+    const stat = JSON.parse(cold[0].replace('[hour] ', ''));
     assert.equal(stat.hour, '2026010100', '记录的是上一小时');
     assert.equal(stat.req, 2, '上一小时共 2 帧');
     assert.equal(stat.cold, 1, '其中 1 帧是冷启动');
+    assert.equal(stat.msg, 2, '该小时处理 2 条消息（用于与平台计费做对照）');
+    assert.ok(stat.in_ms >= 0, '记录 handler 内部耗时之和');
+    assert.equal(stat.alrm, 0, '未触发 alarm');
     assert.equal(inst.statReq, 1, '新小时重新计数');
+    assert.equal(inst.statMsg, 1, '消息计数同样归零后累加');
   } finally {
     console.error = origError;
   }
+});
+
+test('TerminalDO: alarm 计数与空转探针（下一次 alarm 已过期 → refire）', async () => {
+  const env = makeEnv();
+  const st = mockState();
+  // 塞一个已过期的 alarm：这是「触发 → 扫描 → 又设到过去 → 立即再触发」空转的形态
+  await st.storage.setAlarm(Date.now() - 60_000);
+  const inst = new TerminalDO(st, env);
+  await inst.alarm();
+  assert.equal(inst.statAlarm, 1, 'alarm 次数计入小时快照');
+  assert.equal(inst.statRefire, 1, '下一次 alarm 已过期 → 记为 refire（空转直接证据）');
+  // 正常情况（未设置 alarm）不误报
+  const inst2 = new TerminalDO(mockState(), env);
+  await inst2.alarm();
+  assert.equal(inst2.statRefire, 0, '没有 alarm 时不算空转');
 });
 
 test('TerminalDO: 任意类型的慢消息都输出 [slow-msg]（不只 report）', async () => {

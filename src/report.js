@@ -261,12 +261,18 @@ export async function handleReport(env, payload, timing) {
     reportBatch.clear();
     const mdo = doMetrics(env);
     const tFwd = Date.now();
-    await mdo.fetch('https://do.internal/report', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ frames }),
-      signal: AbortSignal.timeout(FWD_TIMEOUT_MS), // 挂起会拖住 TerminalDO 的 hibernation，见常量注释
-    });
+    try {
+      await mdo.fetch('https://do.internal/report', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ frames }),
+        signal: AbortSignal.timeout(FWD_TIMEOUT_MS), // 挂起会拖住 TerminalDO 的 hibernation，见常量注释
+      });
+    } catch (e) {
+      // 超时/失败都记下来（调用方会照旧向上抛，语义不变）：超时次数是「MetricsDO 排队」的直接指标
+      if (timing) { timing.fwd = Date.now() - tFwd; timing.fwdTimeout = 1; }
+      throw e;
+    }
     if (timing) { timing.fwd = Date.now() - tFwd; timing.flushed = 1; }
   }
 }

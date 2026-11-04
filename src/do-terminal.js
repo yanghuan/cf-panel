@@ -32,10 +32,13 @@ const PROBE_REFRESH_MS = 300 * 1000; // 上报顺带 probe 的最小间隔。
 // config.js 的 UPDATE_JOB_TIMEOUT_S/GRACE_S）。本类只负责下发指令与接收回执，不再转发字节。
 // 慢路径埋点（定位「DO 唤醒后单条消息为什么贵」）：正常单条处理后端各段都是毫秒级，
 // 超过阈值才输出一行 JSON；每实例每小时限量，避免埋点自己吃掉可观测性额度。
+const SLOW_MSG_MS = 1000; // 任意 WS 消息（消息到达 → 处理返回）阈值，见 webSocketMessage 的计时包装
 const SLOW_REPORT_MS = 1000; // 单条上报（消息到达 → D1 + 转发 MetricsDO 完成）阈值
 const SLOW_CONN_MS = 1000; // agent 控制通道握手（D1 反查 → 101）阈值
-const SLOW_LOG_BUDGET_PER_HOUR = 20; // 每实例每小时上限。实例包含 TerminalDO/PanelDO/MetricsDO，
-// 且 evict 会清零计数，冷启动频繁时全局上限高于 20×实例数；埋点日志仍只在千条/天量级，可接受。
+const SLOW_LOG_BUDGET_PER_HOUR = 200; // 每实例每小时上限。定为 200 而非 20：
+// 坏时段（duration 折算 15 秒+）里几乎每条消息都超过 1 秒，20 条预算在头几分钟就耗尽，
+// 之后完全静默——这正是上一轮「看到 2.3 秒的消息却没有日志」的原因。实例数 ≤ 7、evict 还会清零，
+// 200 的最坏量级仍只是万条/天，但足够覆盖一整段异常期。
 // open_terminal/open_file 未确认的重发间隔（3 次 → 9s 窗口，原为 5s×3 = 15s）。
 // setTimeout 会让 DO 在窗口内失去 hibernation 资格并持续计 duration，故缩短窗口；
 // 控制通道重连间隙通常 3~6s，3s 间隔仍能覆盖，3 次后放弃（前端另有自愈兜底）。
@@ -804,8 +807,43 @@ export class TerminalDO {
   }
 
   // Hibernation：消息转发（双向对拷 + resize 走控制通道）
+  // 所有入站 WS 消息的唯一入口：只做「计时 + 超阈值记录」，业务全部转给 onWsMessage。
+  // 为什么需要这一层：原先只给 report 帧打点，实测出现过 2 秒以上的 ws-message 却没有任何日志，
+  // 无法判断慢在哪一类消息上（pong / exec_result / 二进制帧 / 附件异常的 report）。
   async webSocketMessage(ws, message) {
+    const t0 = Date.now();
     const coldStart = !this.rebuilt; // 本条消息是否触发实例冷重建（evict 后首条，成本最高）
+    try {
+      return await this.onWsMessage(ws, message, coldStart);
+    } finally {
+      const ms = Date.now() - t0;
+      if (ms >= SLOW_MSG_MS) {
+        // 类型/角色只在慢路径解析，正常消息零开销
+        let type = 'binary';
+        if (typeof message === 'string') {
+          type = 'unparsed';
+          try {
+            const j = JSON.parse(message);
+            type = (j && j.type) || 'json-no-type';
+          } catch { /* 保持 unparsed */ }
+        }
+        let role = '';
+        try {
+          const a = ws.deserializeAttachment?.();
+          role = (a && typeof a === 'object' && a.role) || '';
+        } catch { /* ignore */ }
+        this.logSlow('msg', {
+          type, // report / pong / exec_result / json-no-type / unparsed / binary
+          role, // control / user / agent / user-pending（空 = 附件缺失或字符串格式）
+          ms,
+          cold: coldStart ? 1 : 0,
+          len: typeof message === 'string' ? message.length : ((message && message.byteLength) || 0),
+        });
+      }
+    }
+  }
+
+  async onWsMessage(ws, message, coldStart) {
     this.rebuildIndex(); // 休眠唤醒后索引可能已丢，先按附件重建
     // 浏览器侧待鉴权连接（role: user-pending）：首帧必须是 {type:'auth', token}
     const att = ws.deserializeAttachment?.();

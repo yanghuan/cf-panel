@@ -1847,6 +1847,31 @@ test('TerminalDO: 跨小时输出 [cold] 统计（区分冷启动与常驻）', 
   }
 });
 
+test('TerminalDO: 任意类型的慢消息都输出 [slow-msg]（不只 report）', async () => {
+  const env = makeEnv();
+  const inst = new TerminalDO(mockState(), env);
+  const lines = [];
+  const orig = console.error;
+  console.error = (...a) => lines.push(a.map(String).join(' '));
+  try {
+    // 用耗时 1.05s 的假处理函数模拟跨 DO 等待（真实场景是 MetricsDO /report 或 D1）
+    inst.onWsMessage = async () => { await new Promise((r) => setTimeout(r, 1050)); };
+    const ws = {
+      deserializeAttachment: () => ({ role: 'control', serverId: 1 }),
+      send() {}, readyState: 1,
+    };
+    await inst.webSocketMessage(ws, JSON.stringify({ type: 'pong', id: 'p-1' }));
+    const line = lines.find((l) => l.startsWith('[slow-msg]'));
+    assert.ok(line, '非 report 的慢消息必须打点（原实现只给 report 打点，导致 2 秒以上的消息无日志）');
+    const s = JSON.parse(line.replace('[slow-msg] ', ''));
+    assert.equal(s.type, 'pong', '记录消息类型');
+    assert.equal(s.role, 'control', '记录连接角色');
+    assert.ok(s.ms >= 1000, '记录总耗时');
+  } finally {
+    console.error = orig;
+  }
+});
+
 test('TerminalDO: 能力撤销同时清附件 rtt（不会在 evict 后被复活）', async () => {
   const env = makeEnv();
   let att = { role: 'control', serverId: 1, probe: true, rtt: 12345 };

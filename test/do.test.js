@@ -1812,40 +1812,45 @@ test('TerminalDO: 被顶替的旧连接 close 不清新连接的探活能力与�
   assert.equal(inst.lastRoundTripAt.has(1), false, '真正断开时才清往返记录');
 });
 
-test('TerminalDO: 跨小时输出 [hour] 快照（冷启动/耗时/alarm/连接数）', async () => {
+test('TerminalDO: 满 60 秒窗口输出 [stat] 快照（含 age_s / cold / alarm / 连接数）', async () => {
   const env = makeEnv();
   const ws = {
     deserializeAttachment: () => ({ role: 'control', serverId: 1 }),
     send() {}, readyState: 1,
   };
-  const inst = new TerminalDO(mockState(), env);
+  const st = mockState();
+  st.getWebSockets = () => [ws]; // 让快照里的连接统计有数据（生产由 state 提供）
+  const inst = new TerminalDO(st, env);
   inst.agents.set(1, ws);
   const lines = [];
   const origError = console.error;
   console.error = (...a) => lines.push(a.map(String).join(' '));
   try {
-    // 第一条：冷启动（rebuilt=false）
+    // 第一条：冷启动（rebuilt=false）。窗口未满 → 不输出
     await inst.webSocketMessage(ws, JSON.stringify({ type: 'report', cpu: 1 }));
-    assert.equal(inst.statReq, 1, '本小时累计 1 帧');
+    assert.equal(inst.statReq, 1, '本窗口累计 1 帧');
     assert.equal(inst.statCold, 1, '首帧算冷启动');
-    // 同小时再来一条：不再是冷启动
+    assert.equal(lines.filter((l) => l.startsWith('[stat]')).length, 0, '未满窗口不输出');
+    // 同实例再来一条：不再是冷启动
     await inst.webSocketMessage(ws, JSON.stringify({ type: 'report', cpu: 2 }));
     assert.equal(inst.statReq, 2);
     assert.equal(inst.statCold, 1, '同一实例后续帧不是冷启动');
-    // 模拟跨小时：把 statHour 改成上个小时，再触发一次
-    inst.statHour = '2026010100';
+    // 把窗口起点拨回 61 秒前，模拟「活过 60 秒」→ 本次消息先结算再处理
+    inst.statAt = Date.now() - 61_000;
     await inst.webSocketMessage(ws, JSON.stringify({ type: 'report', cpu: 3 }));
-    const cold = lines.filter((l) => l.startsWith('[hour]'));
-    assert.equal(cold.length, 1, '跨小时输出恰好一行');
-    const stat = JSON.parse(cold[0].replace('[hour] ', ''));
-    assert.equal(stat.hour, '2026010100', '记录的是上一小时');
-    assert.equal(stat.req, 2, '上一小时共 2 帧');
-    assert.equal(stat.cold, 1, '其中 1 帧是冷启动');
-    assert.equal(stat.msg, 2, '该小时处理 2 条消息（用于与平台计费做对照）');
-    assert.ok(stat.in_ms >= 0, '记录 handler 内部耗时之和');
-    assert.equal(stat.alrm, 0, '未触发 alarm');
-    assert.equal(inst.statReq, 1, '新小时重新计数');
-    assert.equal(inst.statMsg, 1, '消息计数同样归零后累加');
+    const st = lines.filter((l) => l.startsWith('[stat]'));
+    assert.equal(st.length, 1, '满窗口输出恰好一行');
+    const snap = JSON.parse(st[0].replace('[stat] ', ''));
+    assert.equal(snap.msg, 2, '结算的是窗口内的 2 条消息');
+    assert.equal(snap.req, 2, '其中 2 条是 report');
+    assert.equal(snap.cold, 1, '其中 1 条是冷启动');
+    assert.ok(snap.age_s >= 0, 'age_s = 本实例已存活秒数（判断 non-hibernateable 的关键）');
+    assert.ok(snap.win_s >= 60, 'win_s = 本窗口秒数');
+    assert.ok(snap.in_ms >= 0, 'handler 内部耗时之和');
+    assert.equal(snap.alrm, 0, '未触发 alarm');
+    assert.equal(snap.ctrl, 1, '连接快照统计到 1 条控制通道');
+    assert.equal(inst.statReq, 1, '新窗口重新计数（本次消息已累加）');
+    assert.equal(inst.statMsg, 1);
   } finally {
     console.error = origError;
   }

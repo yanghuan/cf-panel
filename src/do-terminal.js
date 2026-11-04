@@ -33,6 +33,9 @@ const PROBE_REFRESH_MS = 300 * 1000; // 上报顺带 probe 的最小间隔。
 // 慢路径埋点（定位「DO 唤醒后单条消息为什么贵」）：正常单条处理后端各段都是毫秒级，
 // 超过阈值才输出一行 JSON；每实例每小时限量，避免埋点自己吃掉可观测性额度。
 const SLOW_MSG_MS = 1000; // 任意 WS 消息（消息到达 → 处理返回）阈值，见 webSocketMessage 的计时包装
+const STAT_WINDOW_MS = 60 * 1000; // [stat] 快照的输出窗口：任何活过 60 秒的实例都会输出一行。
+// 不用「跨整点」触发：实例被回收后新实例不会跨整点，实测 14:00 整点后一条都没有；
+// 按存活时长触发才能覆盖到短命实例，并直接给出 age_s（本实例已存活多久）。
 const SLOW_REPORT_MS = 1000; // 单条上报（消息到达 → D1 + 转发 MetricsDO 完成）阈值
 const SLOW_CONN_MS = 1000; // agent 控制通道握手（D1 反查 → 101）阈值
 const SLOW_LOG_BUDGET_PER_HOUR = 200; // 每实例每小时上限。定为 200 而非 20：
@@ -71,8 +74,9 @@ export class TerminalDO {
     // 冷启动计数器：每小时汇总一行 [cold]，用来判断「对象是否被 evict 过」。
     // 健康实例每条消息都是冷启动（cold ≈ req）；从未被回收的实例 cold = 0 ——
     // 这是区分「代码执行慢」与「平台不回收实例」最直接的一条证据，也是开工单的关键数据。
-    this.statHour = ''; // 计数器所属小时（UTC，YYYYMMDDHH）
-    this.statReq = 0; // 本小时收到的 report 帧数
+    this.bornAt = Date.now(); // 实例创建时刻：age_s 用来判断它活了多久（non-hibernateable 的直接证据）
+    this.statAt = this.bornAt; // 上次快照时刻（满 STAT_WINDOW_MS 才输出，见 maybeFlushStat）
+    this.statReq = 0; // 本窗口收到的 report 帧数
     this.statCold = 0; // 其中处于冷启动（本实例首次处理）的帧数
     // 每小时快照的其余计数（用来证伪「平台不给休眠」）：若某小时计费驻留远大于
     // 所有事件耗时之和，就必须有一个我们看不见的事件源——alarm 空转是头号嫌疑，
@@ -87,34 +91,24 @@ export class TerminalDO {
 
   // 每小时第一次被唤起时，把上个小时的统计打出来并归零。
   // 只在跨小时时触发，日志量 = 每实例每小时 1 条（4 分片 ≈ 96 条/天），可忽略。
-  // 小时键（UTC，YYYYMMDDHH）
-  hourKey(now) {
-    const d = new Date(now);
-    return `${d.getUTCFullYear()}${String(d.getUTCMonth() + 1).padStart(2, '0')}`
-      + `${String(d.getUTCDate()).padStart(2, '0')}${String(d.getUTCHours()).padStart(2, '0')}`;
+  // 状态快照：每存活满 STAT_WINDOW_MS 输出一行 [stat] 并归零计数。
+  // 为什么不用「跨整点」触发：实例被回收后新实例的 statHour 为空，几乎不可能跨过整点——
+  // 实测 14:00 整点后一条都没有，正是因为实例寿命远短于 1 小时。改成按存活时长触发后，
+  // 任何活过 60 秒的实例都会输出；而 age_s 直接给出「本实例已存活多久」，
+  // 这正是判断 non-hibernateable 的关键数字（计费驻留 ≫ age_s 的累积才是问题）。
+  maybeFlushStat(now) {
+    if (now - this.statAt < STAT_WINDOW_MS) return null; // 常态零成本：一次减法比较
+    return this.emitStat(now);
   }
 
-  // 同小时直接返回 null（零成本：只有一次字符串比较，不新建 Promise、不 await）；
-  // 跨小时才返回待结算的 Promise，由调用方 await，保证计数重置发生在本次累加之前。
-  maybeRollHour(now) {
-    if (this.hourKey(now) === this.statHour) return null;
-    return this.emitHourStat(now);
-  }
-
-  // 每小时快照：跨小时时输出上一小时一行 [hour] 并归零。
-  // 目的：把「计费驻留 ≫ 事件耗时」变成可证伪的——若 in_ms 只有几十秒而该小时计费是
-  // 几千秒，差额必然来自某个我们看不见的事件（alarm 空转 / 僵尸连接唤醒）。
-  // 因此同时记录 alrm（alarm 次数）、refire（alarm 触发时下一次已过期 → 空转证据）、
-  // alarm_s（下一次 alarm 距现在秒数，负数=已过期）与 socks/ctrl/user 连接快照。
-  async emitHourStat(now) {
-    const prev = this.statHour;
-    const hour = this.hourKey(now);
+  async emitStat(now) {
     // 先快照并归零（在任何 await 之前，避免统计被并发消息污染），再异步取 alarm/连接
     const snap = {
-      hour: prev, // 统计所属小时（UTC）
-      msg: this.statMsg, // 该小时处理的 WS 消息总数
+      age_s: Math.max(0, Math.round((now - this.bornAt) / 1000)), // 本实例已存活秒数
+      win_s: Math.max(1, Math.round((now - this.statAt) / 1000)), // 本窗口秒数
+      msg: this.statMsg, // 窗口内处理的 WS 消息总数
       req: this.statReq, // 其中 report 帧数
-      cold: this.statCold, // 冷启动帧数；≈req = 每条都要重建，0 = 从未被回收
+      cold: this.statCold, // 冷启动帧数；≈msg = 每条都要重建（正常回收），0 = 从未被回收
       in_ms: this.statInMs, // 所有消息的 handler 内部耗时之和
       fwd_ms: this.statFwdMs, // 转发 MetricsDO 总耗时
       fwd_to: this.statFwdTimeout, // 转发超时次数（MetricsDO 排队指标）
@@ -124,7 +118,7 @@ export class TerminalDO {
       intv: this.agentInterval.size,
       pend: this.pendingOpen.size,
     };
-    this.statHour = hour;
+    this.statAt = now;
     this.statMsg = 0;
     this.statReq = 0;
     this.statCold = 0;
@@ -133,7 +127,7 @@ export class TerminalDO {
     this.statFwdMs = 0;
     this.statFwdTimeout = 0;
     this.statRefire = 0;
-    if (!prev || (snap.msg === 0 && snap.req === 0)) return; // 上一小时无流量不输出
+    if (snap.msg === 0) return; // 窗口内没有消息（纯 alarm 唤醒等）不输出
     // 连接快照：僵尸连接会持续产生唤醒源，是「看不见的事件」候选之一
     let socks = 0; let ctrl = 0; let user = 0; let other = 0;
     try {
@@ -153,7 +147,7 @@ export class TerminalDO {
       alarmS = at == null ? null : Math.round((at - now) / 1000);
     } catch { /* ignore */ }
     try {
-      console.error(`[hour] ${JSON.stringify({ ...snap, socks, ctrl, user, other, alarm_s: alarmS })}`);
+      console.error(`[stat] ${JSON.stringify({ ...snap, socks, ctrl, user, other, alarm_s: alarmS })}`);
     } catch { /* ignore */ }
   }
 
@@ -879,7 +873,7 @@ export class TerminalDO {
   async webSocketMessage(ws, message) {
     const t0 = Date.now();
     const coldStart = !this.rebuilt; // 本条消息是否触发实例冷重建（evict 后首条，成本最高）
-    const roll = this.maybeRollHour(t0); // 同小时返回 null；跨小时返回待结算 Promise
+    const roll = this.maybeFlushStat(t0); // 未满窗口返回 null；满窗口返回待结算 Promise
     if (roll) await roll;
     try {
       return await this.onWsMessage(ws, message, coldStart);
@@ -1221,6 +1215,16 @@ export class TerminalDO {
     // 更新期间不下发上传：Agent 正在 self-replace，此时发 upload_fetch 会与升级竞争。
     // 首次下发路径查了同样的互斥（/rpc/upload/submit），重发路径必须一致。
     // 任务留在 waiting_agent，更新结束后的下一次重连会再试。
+    // 廉价预检：绝大多数重连没有任何 upload 在途（常态 waiting = 0）。一次带索引的
+    // SELECT 就能判定后面三步（requeue / settle / list）是否全部为空操作，省掉 4 次 D1 往返。
+    // 实测意义：握手 setup 段 p50 = 978ms，其中主要是这里与 last_seen 写入（[slow-agent-conn]）；
+    // 每次 agent 重连都要走一遍，而全量 D1 查询在 99% 的情况下什么也找不到。
+    try {
+      const any = await this.env.DB.prepare(
+        "SELECT 1 AS x FROM operation_jobs WHERE server_id = ? AND kind = 'upload' AND status IN ('running','waiting_agent') LIMIT 1",
+      ).bind(serverId).first();
+      if (!any) return;
+    } catch { /* 预检失败走原路径：宁可多查，不可漏发 */ }
     if (await this.isUpdating(serverId)) return;
     // 先收敛：断开期间处于 running 的 upload 不可能再收到回执
     await requeueOrphanUploads(this.env, serverId);

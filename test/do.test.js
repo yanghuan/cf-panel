@@ -3148,6 +3148,82 @@ test('TerminalDO: cleanup 按归属清理 pendingOpen，跨服务器/会话隔�
   assert.equal(inst.pendingOpen.size, 0, 'server2 断开后 pendingOpen 清空');
 });
 
+test('TerminalDO: patToken 迁移成功后紧接撤销，原始 PAT 不得被写回附件', async () => {
+  const env = makeEnv();
+  // 用 JWT 冒充附件里的旧 patToken：authIdentityByToken 走 verifyJwt，无需 D1 造 PAT 行
+  const legacyToken = await I.signJwt({ uid: 1, username: 'admin' }, env);
+  let cur = { role: 'user', sid: 's1', serverId: 1, patToken: legacyToken };
+  const ws = {
+    deserializeAttachment: () => cur,
+    serializeAttachment: (a) => { cur = a; },
+    send() {}, readyState: 1, close() {},
+  };
+  const inst = new TerminalDO(mockState(), env);
+  const sess = {
+    streamId: 's1', serverId: 1, type: 'terminal',
+    userWs: ws, agentWs: null, creatorUserId: 1, creatorUser: 'admin',
+    createdAt: Date.now(), clientIp: '', auth: null,
+  };
+  inst.sessions.set('s1', sess);
+
+  const revoked = await inst.revalidateOrRevoke(sess, ws);
+  assert.equal(revoked, false, '管理员身份迁移后不应被撤销');
+  assert.equal('patToken' in cur, false, '迁移必须剥离原始 PAT');
+  assert.equal(cur.auth && cur.auth.kind, 'jwt', '迁移后写入解析出的身份');
+
+  // 组合路径：迁移成功后紧接着撤销。若迁移绕过 setAtt，缓存里仍是含 patToken 的旧附件，
+  // closeWs → stampClose 会用 {...cachedOld, cx} 重写，把刚剥离的 PAT 写回来。
+  inst.revokeSession(sess, ws, 'test revoke');
+  assert.equal('patToken' in cur, false, '撤销不得把原始 PAT 写回附件');
+  assert.equal(cur.auth && cur.auth.kind, 'jwt', '撤销不得丢掉迁移后的身份');
+  assert.equal(cur.cx, 'auth', '来源标记仍写入');
+});
+
+test('TerminalDO: rebuildIndex 遇到抛错的 socket 仍完成其余索引', () => {
+  const env = makeEnv();
+  const bad = {
+    deserializeAttachment() { throw new Error('boom'); },
+    send() {}, readyState: 1, close() {},
+  };
+  const good = { deserializeAttachment: () => ({ role: 'control', serverId: 7, ts: 5 }), send() {}, readyState: 1 };
+  const inst = new TerminalDO({ getWebSockets: () => [bad, good] }, env);
+  inst.rebuildIndex();
+  assert.equal(inst.agents.get(7), good, '坏连接不能让整次重建中断');
+  assert.equal(inst.rebuilt, true, '遍历完整走完才置位');
+});
+
+test('TerminalDO: closeWs 按 tag 归入对应计数', () => {
+  const env = makeEnv();
+  const inst = new TerminalDO(mockState(), env);
+  const mk = () => ({ deserializeAttachment: () => ({ role: 'control', serverId: 1, ts: 1 }), serializeAttachment() {}, send() {}, readyState: 1, close() {} });
+  inst.closeWs(mk(), 'sess');
+  inst.closeWs(null, 'sess'); // 空值不计
+  inst.closeWs(mk(), 'auth', 1008, 'unauthorized');
+  inst.closeWs(mk(), 'super', 4001, 'superseded');
+  assert.equal(inst.statCloseSess, 1);
+  assert.equal(inst.statCloseAuth, 1);
+  assert.equal(inst.statCloseSuper, 1);
+});
+
+test('TerminalDO: 删除两端皆空的会话时一并清 pendingOpen 定时器', async () => {
+  const env = makeEnv();
+  const inst = new TerminalDO(mockState(), env);
+  const ws = { deserializeAttachment: () => ({ role: 'user', sid: 'sess-p', serverId: 1 }), serializeAttachment() {}, send() {}, readyState: 1, close() {} };
+  inst.sessions.set('sess-p', {
+    streamId: 'sess-p', serverId: 1, type: 'terminal',
+    userWs: ws, agentWs: null, creatorUserId: 1, creatorUser: 'admin',
+    createdAt: Date.now(), clientIp: '', auth: null,
+  });
+  let fired = false;
+  const timer = setTimeout(() => { fired = true; }, 50);
+  inst.pendingOpen.set('sess-p', { tries: 0, timer, serverId: 1, agentWs: null, type: 'terminal' });
+  await inst.cleanup(ws);
+  assert.equal(inst.sessions.has('sess-p'), false, '会话被回收');
+  assert.equal(inst.pendingOpen.has('sess-p'), false, '待确认记录一并清掉');
+  await new Promise((r) => setTimeout(r, 80));
+  assert.equal(fired, false, '定时器必须被 clearTimeout（否则会空跑并阻止 hibernation）');
+});
+
 test('TerminalDO: [stat] 的 fwd_ms 记录转发耗时（不再恒为 0）', async () => {
   const env = makeEnv();
   await insertServer(env, 'k1', 'srv1');

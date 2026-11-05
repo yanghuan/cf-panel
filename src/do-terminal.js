@@ -284,6 +284,7 @@ export class TerminalDO {
   }
 
   async fetch(request) {
+    this.attCache = null; // 事件入口先清：上一个事件若非正常结束，缓存可能残留
     // await：maybeSweep 内部有 storage 删除/arm，不等它结束就会留下未完成 I/O，
     // 阻止对象回到 hibernateable 状态（空闲期持续计 duration）。
     await this.maybeSweep();
@@ -986,6 +987,7 @@ export class TerminalDO {
   // 为什么需要这一层：原先只给 report 帧打点，实测出现过 2 秒以上的 ws-message 却没有任何日志，
   // 无法判断慢在哪一类消息上（pong / exec_result / 二进制帧 / 附件异常的 report）。
   async webSocketMessage(ws, message) {
+    this.attCache = null; // 事件入口先清（finally 里还会清一次，双保险）
     const t0 = Date.now();
     const coldStart = !this.rebuilt; // 本条消息是否触发实例冷重建（evict 后首条，成本最高）
     const roll = this.maybeFlushStat(t0); // 未满窗口返回 null；满窗口返回待结算 Promise
@@ -1161,7 +1163,7 @@ export class TerminalDO {
             const tReport = Date.now(); // 埋点：整条上报耗时（消息到达 → 落库 + 转发完成）
             const timing = {};
             // 冷启动统计：coldStart 在函数顶部已取（rebuildIndex 之前），这里只累加计数。
-            // 跨小时结算在 webSocketMessage 的包装层统一做（见 rollHourStat），此处不再重复调用。
+            // 跨窗口结算在 webSocketMessage 的包装层统一做（见 maybeFlushStat/emitStat），此处不再重复。
             this.statReq += 1;
             if (coldStart) this.statCold += 1;
             // ② 能力门控：agent 自声明支持探活（info.probe_proto，随上报免费到达）才启用 exec 前探活。
@@ -1611,7 +1613,7 @@ export class TerminalDO {
   // 判据与建连同源（routes 的 /api/terminal、/api/file/open 都用 canExec）；管理员不查库。
   async revalidateOrRevoke(sess, ws) {
     if (sess.revoked) return true;
-    let att = ws.deserializeAttachment?.();
+    const att = this.attOf(ws); // 走事件内缓存：与后续 setAtt/stampClose 保持同一份
     let identity = att && att.auth;
     // 旧版本 patToken 附件：首次活动时校验并原地迁移，避免在线升级强制中断会话
     if (!identity && att && att.patToken) {
@@ -1619,7 +1621,10 @@ export class TerminalDO {
       if (!migrated) return this.revokeSession(sess, ws, 'unauthorized');
       const { patToken: _discard, ...safe } = att;
       safe.auth = migrated.identity;
-      ws.serializeAttachment(safe);
+      // 必须走 setAtt：直接 serializeAttachment 会让 attCache 仍持有含 patToken 的旧附件，
+      // 紧随其后的撤销路径（closeWs → stampClose 用 {...cachedOld, cx} 重写）会把刚剥离的
+      // 原始 PAT 写回附件，同时丢掉迁移后的 auth —— 正是本次迁移要消除的东西。
+      this.setAtt(ws, safe);
       identity = safe.auth;
     }
     if (!identity) return false; // 无身份信息（升级前的旧会话）：沿用既有行为
@@ -1646,10 +1651,12 @@ export class TerminalDO {
   }
 
   async webSocketClose(ws) {
+    this.attCache = null; // 事件入口清缓存（cleanup 会给对端盖戳并可能跨 ws 读附件）
     this.rebuildIndex(); // 确保索引完整后再清理，否则休眠唤醒后的断连无法正确解除
     await this.cleanup(ws);
   }
   async webSocketError(ws) {
+    this.attCache = null;
     this.rebuildIndex();
     await this.cleanup(ws);
   }

@@ -1812,6 +1812,36 @@ test('TerminalDO: 被顶替的旧连接 close 不清新连接的探活能力与�
   assert.equal(inst.lastRoundTripAt.has(1), false, '真正断开时才清往返记录');
 });
 
+test('TerminalDO: 重建时旧格式（纯字符串）附件不得覆盖新格式胜出连接', () => {
+  const env = makeEnv();
+  const legacy = { deserializeAttachment: () => '1', send() {}, readyState: 1 }; // 旧格式：无 ts
+  const modern = { deserializeAttachment: () => ({ role: 'control', serverId: 1, ts: 100 }), send() {}, readyState: 1 };
+  // 先遍历到旧格式，再遍历到新格式：最终必须仍是新格式
+  const a = new TerminalDO({ getWebSockets: () => [legacy, modern] }, env);
+  a.rebuildIndex();
+  assert.equal(a.agents.get(1), modern, '新格式胜出连接不被旧格式覆盖');
+
+  // 反序：旧格式后遍历，仍不得顶掉已登记的 ts>0 连接
+  const b = new TerminalDO({ getWebSockets: () => [modern, legacy] }, env);
+  b.rebuildIndex();
+  assert.equal(b.agents.get(1), modern, '旧格式即使后遍历也不得覆盖 ts>0 的连接');
+});
+
+test('TerminalDO: ts 相等时允许接管（避免死连接永不让位）', async () => {
+  const env = makeEnv();
+  await insertServer(env, 'k1', 'srv1');
+  const mk = (ts, rs) => ({
+    deserializeAttachment: () => ({ role: 'control', serverId: 1, ts }),
+    send() {}, readyState: rs,
+  });
+  const cur = mk(100, 1);
+  const same = mk(100, 1); // ts 相同、但它在发消息，说明是活的
+  const inst = new TerminalDO(mockState(), env);
+  inst.agents.set(1, cur);
+  await inst.webSocketMessage(same, JSON.stringify({ type: 'report', cpu: 1 }));
+  assert.equal(inst.agents.get(1), same, '守卫用的是 >= 而非 >：等 ts 时来消息者可接管');
+});
+
 test('TerminalDO: 双活连接时 ts 较小的旧连接不得抢回 agents 索引', async () => {
   const env = makeEnv();
   await insertServer(env, 'k1', 'srv1');
@@ -3115,6 +3145,25 @@ test('TerminalDO: cleanup 按归属清理 pendingOpen，跨服务器/会话隔�
   await inst.cleanup(ctl2);
   assert.equal(inst.agents.size, 0);
   assert.equal(inst.pendingOpen.size, 0, 'server2 断开后 pendingOpen 清空');
+});
+
+test('TerminalDO: cleanup 不得误删与本次 ws 无关、尚未挂接的会话', async () => {
+  const env = makeEnv();
+  const inst = new TerminalDO(mockState(), env);
+  // 模拟 /rpc create 之后、浏览器/agent 尚未挂接：两端均空的合法会话
+  inst.sessions.set('1-new', {
+    streamId: '1-new', serverId: 1, creatorUserId: 1, createdAt: Date.now(),
+    userWs: null, agentWs: null, userBuf: [], agentBuf: [],
+  });
+  // 一条完全无关的连接关闭（user-pending 鉴权失败 / 旧控制连接被 4001 顶替 / 其他会话流断开）
+  const unrelated = { send() {}, readyState: 1, deserializeAttachment: () => ({ role: 'control', serverId: 7 }) };
+  await inst.cleanup(unrelated);
+  assert.equal(inst.sessions.has('1-new'), true, '无关 ws 关闭不得回收未挂接的新会话');
+  // 当该会话自己挂接的 agent 流断开时，仍要正常回收
+  const agentFlow = { send() {}, readyState: 1 };
+  inst.sessions.get('1-new').agentWs = agentFlow;
+  await inst.cleanup(agentFlow);
+  assert.equal(inst.sessions.has('1-new'), false, '本会话 ws 断开后正常回收');
 });
 
 test('MetricsDO: 同分钟多帧后首次 /query 返回最新帧（loadHot 不得回退到 storage 首帧）', async () => {

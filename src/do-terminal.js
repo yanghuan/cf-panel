@@ -779,7 +779,15 @@ export class TerminalDO {
         // 兼容旧格式：控制通道附件为 String(server.id)
         const serverId = Number(att);
         if (Number.isInteger(serverId) && serverId > 0) {
-          this.agents.set(serverId, ws);
+          // 旧格式没有 ts（wsAttTs 视为 0），若已登记的是新格式连接（ts>0）则让位——
+          // 否则新旧版本混跑时会按 getWebSockets 的遍历顺序短暂指向旧连接（exec 发错对象），
+          // 要等下一次 report 才被入站守卫纠正。这里与入站刷新（A）用同一判据：
+          // 当前登记者不可写、或旧格式的 0 不低于它的 ts 时才登记。
+          const cur = this.agents.get(serverId);
+          const curDead = !cur || cur.readyState !== 1;
+          if (curDead || this.wsAttTs(cur) === 0) {
+            this.agents.set(serverId, ws);
+          }
         }
         continue;
       }
@@ -1617,8 +1625,10 @@ export class TerminalDO {
   // 让对象在断连后失去 hibernation 资格、持续计 duration。
   async cleanup(ws) {
     for (const [sid, sess] of this.sessions) {
+      let touched = false;
       if (sess.userWs === ws) {
         sess.userWs = null;
+        touched = true;
         if (sess.agentWs) {
           this.statCloseSess += 1;
           this.stampClose(sess.agentWs, 'sess');
@@ -1627,6 +1637,7 @@ export class TerminalDO {
       }
       if (sess.agentWs === ws) {
         sess.agentWs = null;
+        touched = true;
         if (sess.userWs) {
           this.statCloseSess += 1;
           this.stampClose(sess.userWs, 'sess');
@@ -1637,7 +1648,11 @@ export class TerminalDO {
         if (r && r.timer) clearTimeout(r.timer);
         this.pendingOpen.delete(sid);
       }
-      if (!sess.userWs && !sess.agentWs) {
+      // 只回收本次 ws 触及、且两端都已空的会话；与本 ws 无关的空会话（如 /rpc 刚创建、
+      // 浏览器/agent 尚未挂接）不在此删除，交给 maybeSweep 按 TTL 回收。否则任意 socket
+      // 关闭（user-pending 刷新、旧控制连接被 4001 顶替、其他会话的流断开）都会把这条新
+      // 会话连同 storage 一起删掉，随后鉴权 hydrateSession 返回 null → 1008，会话凭空消失。
+      if (touched && !sess.userWs && !sess.agentWs) {
         this.sessions.delete(sid);
         await this.state.storage.delete('sess:' + sid).catch(() => {}); // 清理持久化会话（await：不留未完成 I/O）
       }

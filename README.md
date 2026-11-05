@@ -615,6 +615,6 @@ wrangler d1 execute cf-panel --remote --file=schema.sql    # 重建
 | 文档 | 内容 |
 | --- | --- |
 | [docs/architecture.md](docs/architecture.md) | 架构设计、技术选型、Cloudflare 能力边界 |
-| [docs/do-duration-investigation.md](docs/do-duration-investigation.md) | DO duration 暴涨排查记录：分片分化判断、`[cold]` 埋点、`immediate` 重启 |
+| [docs/do-duration-investigation.md](docs/do-duration-investigation.md) | DO duration 暴涨排查记录：`[stat]` 快照判读、CLOSING socket 根因、两处被推翻的结论 |
 | [docs/reviews/](docs/reviews/) | 历次代码审查记录（含问题与修复决策） |
 | [agent/README.md](agent/README.md) | Agent 构建与交叉编译说明 |

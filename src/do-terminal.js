@@ -282,9 +282,9 @@ export class TerminalDO {
       for (const [sid, sess] of this.sessions) {
         if (sess.serverId !== serverId) continue;
         sids.push(sid);
-        this.statCloseSess += 1;
-        if (sess.userWs) this.stampClose(sess.userWs, 'sess');
-        if (sess.agentWs) this.stampClose(sess.agentWs, 'sess');
+        // 按实际关闭的 socket 计数（会话可能只有一端，也可能两端都在），口径与其他路径一致
+        if (sess.userWs) { this.statCloseSess += 1; this.stampClose(sess.userWs, 'sess'); }
+        if (sess.agentWs) { this.statCloseSess += 1; this.stampClose(sess.agentWs, 'sess'); }
         try { sess.userWs && sess.userWs.close(); } catch { /* ignore */ }
         try { sess.agentWs && sess.agentWs.close(); } catch { /* ignore */ }
         this.sessions.delete(sid);
@@ -679,9 +679,9 @@ export class TerminalDO {
     for (const [sid, sess] of this.sessions) {
       // 绝对最长会话时长——即使两端有连接，到期也强制回收（防活跃会话长期占用 PTY/FD/WS）
       if (now - sess.createdAt > SESSION_ABS_MS) {
-        this.statCloseSess += 1;
-        if (sess.userWs) { this.stampClose(sess.userWs, 'sess'); try { sess.userWs.close(); } catch { /* ignore */ } }
-        if (sess.agentWs) { this.stampClose(sess.agentWs, 'sess'); try { sess.agentWs.close(); } catch { /* ignore */ } }
+        // 按实际关闭的 socket 计数；两端都为 null 时不计数（否则统计会虚高）
+        if (sess.userWs) { this.statCloseSess += 1; this.stampClose(sess.userWs, 'sess'); try { sess.userWs.close(); } catch { /* ignore */ } }
+        if (sess.agentWs) { this.statCloseSess += 1; this.stampClose(sess.agentWs, 'sess'); try { sess.agentWs.close(); } catch { /* ignore */ } }
         this.sessions.delete(sid);
         await this.state.storage.delete('sess:' + sid).catch(() => {}); // 清理持久化会话（await：不留未完成 I/O）
         continue;
@@ -764,7 +764,10 @@ export class TerminalDO {
   // 本实例只在唤醒后重建一次（this.rebuilt）：既避免每次消息 O(N) 遍历，也不会因
   // 「某个 Map 恰好为空」而反复重建——后者会把已 close（半开残留）的会话/控制连接从
   // 附件里复活（如 drop_server 后 sessions 已清、socket 仍在 getWebSockets 的窗口）。
-  // 运行期索引由各 handler 维护；死连接由入站消息（A）覆盖、同 serverId 多余连接在此关闭。
+  // 运行期索引由各 handler 维护；死连接由入站消息（A，带身份守卫）覆盖。
+  // 同 serverId 的多余连接**不在此关闭**：重建发生在刚唤醒的瞬间，落选连接的对端往往已消失，
+  // close(4001) 的握手等不到回执会让 socket 永久停在 CLOSING，进而使对象拿不到 hibernation
+  // 资格（详见下方 control 分支注释）。
   rebuildIndex() {
     if (this.rebuilt) return;
     this.rebuilt = true;
@@ -786,8 +789,9 @@ export class TerminalDO {
         if (sid > 0) {
           // caps 随连接附件恢复：supportsFetch 读的就是它，漏恢复会让 evict 后的异步任务被判
           // "不支持异步"而永久失败（agent 明明支持）。
-          // 同 serverId 多条控制连接（冻结唤醒后旧半开连接与新连接并存）：保留最新（ts 最大）
-          // 者、关闭其余，收敛到「一服务器一活连接」，避免 exec/更新发往死连接。
+          // 同 serverId 多条控制连接（冻结唤醒后旧半开连接与新连接并存）：只登记 ts 最大者，
+          // 但**不关闭**其余（关闭会留下永久 CLOSING 的 socket，见下）。少数仍活着的落选连接
+          // 由入站刷新（A）的身份守卫挡住，不会抢回索引。
           // 重建阶段**不 close 落选连接**。原因：重建发生在实例刚被唤醒时，落选的那条
           // 往往对端已经消失，close(4001) 的关闭握手永远等不到回执，socket 会永久停在
           // CLOSING（readyState=2）挂在对象上（[stat] 的 ws_states 实测为 control:2）。
@@ -796,9 +800,9 @@ export class TerminalDO {
           // 收敛仍然成立：agents 只登记 ts 最大的那条，落选连接即使继续上报也是幂等写入，
           // 断连时 cleanup 会因 isCurrent=false 而不动 agents。
           const prev = this.agents.get(sid);
-          if (prev && prev !== ws && this.wsAttTs(prev) > (Number(att.ts) || 0)) {
-            // 让位：仅跳过登记
-          } else {
+          // 已被 ts 更大的连接占位则让位（仅跳过登记，不 close）；否则由本连接登记
+          const outranked = prev && prev !== ws && this.wsAttTs(prev) > (Number(att.ts) || 0);
+          if (!outranked) {
             this.agents.set(sid, ws);
             // 上报间隔随附件恢复，且只跟随胜出的连接：旧半开连接的旧值不能覆盖新连接，
             // 否则 evict 后会按错误间隔上报（快慢采错档直接放大或浪费配额）。
@@ -1053,9 +1057,24 @@ export class TerminalDO {
           // A：入站即存活。控制通道来消息说明该连接仍活，用它刷新 agents 索引，天然淘汰
           // 「唤醒后可能被 rebuildIndex 选中的半开死连接」（0 额外消息/请求）。
           // 仅认控制附件，避免会话流失配时把数据流 WS 误登记为控制通道。
+          //
+          // 但有守卫：rebuildIndex 已按 ts 选出胜者且**不再 close 落选连接**，若无条件覆盖，
+          // 一条仍然活着的旧连接只要发一帧就会把索引抢回去（之后 exec/更新发往旧连接，而它
+          // 即将被对端关闭）。三种情况允许接管：
+          //   1) 当前没有登记（首次上报）；
+          //   2) 来消息的就是已登记的那条（幂等）；
+          //   3) 来消息的 ts >= 已登记者的 ts（双活并存时只认更新的一条，避免互踢）。
+          // 另外当前登记者若非 OPEN（半开/正在关闭），允许活连接直接接管——这正是 A 原本
+          // 要解决的场景，否则守卫会把「活连接」挡在外面、索引继续指向死连接。
           if (att && (typeof att === 'string' || att.role === 'control')) {
             const cid = this.wsServerId(ws);
-            if (cid) this.agents.set(cid, ws);
+            if (cid) {
+              const cur = this.agents.get(cid);
+              const curDead = !cur || cur.readyState !== 1;
+              if (curDead || cur === ws || this.wsAttTs(ws) >= this.wsAttTs(cur)) {
+                this.agents.set(cid, ws);
+              }
+            }
           }
           // 探活回执：证明该控制连接双向可用（与 exec_result 同等效力）。
           // 不再按 id 关联 Promise（已无等待方）——无条件按连接归属刷新，供 exec 判据使用。

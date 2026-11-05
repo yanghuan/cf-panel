@@ -1812,6 +1812,36 @@ test('TerminalDO: 被顶替的旧连接 close 不清新连接的探活能力与�
   assert.equal(inst.lastRoundTripAt.has(1), false, '真正断开时才清往返记录');
 });
 
+test('TerminalDO: 双活连接时 ts 较小的旧连接不得抢回 agents 索引', async () => {
+  const env = makeEnv();
+  await insertServer(env, 'k1', 'srv1');
+  const mk = (ts, rs) => ({
+    deserializeAttachment: () => ({ role: 'control', serverId: 1, ts }),
+    send() {}, readyState: rs,
+  });
+  const newer = mk(200, 1);
+  const older = mk(100, 1); // 仍然活着、仍在发消息的旧连接
+  const inst = new TerminalDO(mockState(), env);
+  inst.agents.set(1, newer); // rebuildIndex 已按 ts 选中新连接
+  await inst.webSocketMessage(older, JSON.stringify({ type: 'report', cpu: 1 }));
+  assert.equal(inst.agents.get(1), newer, 'ts 更小的旧连接即使来消息也不能抢回索引（否则 exec 发往即将关闭的连接）');
+});
+
+test('TerminalDO: 当前登记者非 OPEN 时，活连接可以接管索引', async () => {
+  const env = makeEnv();
+  await insertServer(env, 'k1', 'srv1');
+  const mk = (ts, rs) => ({
+    deserializeAttachment: () => ({ role: 'control', serverId: 1, ts }),
+    send() {}, readyState: rs,
+  });
+  const dead = mk(200, 2); // ts 更大，但已处于 CLOSING（半开死连接）
+  const alive = mk(100, 1);
+  const inst = new TerminalDO(mockState(), env);
+  inst.agents.set(1, dead);
+  await inst.webSocketMessage(alive, JSON.stringify({ type: 'report', cpu: 1 }));
+  assert.equal(inst.agents.get(1), alive, '登记者不可写时必须允许活连接接管（保留「入站即存活」的原意）');
+});
+
 test('TerminalDO: close 前把来源盖进附件，[stat] 的 ws_states 能追溯「谁关的、多久前」', async () => {
   const env = makeEnv();
   let att = { role: 'control', serverId: 1, ts: 1 };

@@ -9,6 +9,7 @@ import { MetricsDO, PanelDO, TerminalDO, __internals as I } from '../src/index.j
 import { EXEC_CMD_MAX_BYTES } from '../src/config.js';
 import { listServersWithState } from '../src/auth.js';
 import { makeEnv, makePanelStub, captureFetch } from './helpers.js';
+import { setReportFlushAt } from '../src/report.js';
 
 function mockState(store = {}) {
   const map = new Map(Object.entries(store));
@@ -3145,6 +3146,46 @@ test('TerminalDO: cleanup 按归属清理 pendingOpen，跨服务器/会话隔�
   await inst.cleanup(ctl2);
   assert.equal(inst.agents.size, 0);
   assert.equal(inst.pendingOpen.size, 0, 'server2 断开后 pendingOpen 清空');
+});
+
+test('TerminalDO: [stat] 的 fwd_ms 记录转发耗时（不再恒为 0）', async () => {
+  const env = makeEnv();
+  await insertServer(env, 'k1', 'srv1');
+  // MetricsDO 转发注入 40ms 延迟：旧实现把累加放在 handleReport 之前，读到 undefined，
+  // statFwdMs 恒为 0；本用例因此能真正区分「累加在写入前」与「累加在写入后」。
+  env.METRICS = {
+    idFromName: () => 'metrics-main',
+    get: () => ({
+      async fetch() { await new Promise((r) => setTimeout(r, 40)); return new Response('{}', { status: 200 }); },
+    }),
+  };
+  setReportFlushAt(0); // 强制本条上报触发批量转发（5s 节流窗口归零）
+  const ws = {
+    deserializeAttachment: () => ({ role: 'control', serverId: 1, ts: 1 }),
+    send() {}, readyState: 1,
+  };
+  const inst = new TerminalDO(mockState(), env);
+  inst.agents.set(1, ws);
+  await inst.webSocketMessage(ws, JSON.stringify({ type: 'report', cpu: 1 }));
+  assert.ok(inst.statFwdMs >= 30, `fwd_ms 应记录转发耗时，实际 ${inst.statFwdMs}`);
+});
+
+test('TerminalDO: drop_server 一并清理 updating / lastPingAt（与 cleanup 清单对齐）', async () => {
+  const env = makeEnv();
+  await insertServer(env, 'k1', 'srv1');
+  const inst = new TerminalDO(mockState(), env);
+  inst.updating.set(1, 'job-1');
+  inst.lastPingAt.set(1, Date.now());
+  inst.agentInterval.set(1, 120);
+  const res = await inst.fetch(new Request('https://do.internal/rpc/drop_server', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ serverId: 1 }),
+  }));
+  assert.equal(res.status, 200);
+  assert.equal(inst.updating.has(1), false, '更新互斥标记必须随服务器删除清掉');
+  assert.equal(inst.lastPingAt.has(1), false, '心跳时间戳必须随服务器删除清掉');
+  assert.equal(inst.agentInterval.has(1), false, '既有的间隔清理不受影响');
 });
 
 test('TerminalDO: cleanup 不得误删与本次 ws 无关、尚未挂接的会话', async () => {

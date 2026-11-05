@@ -296,6 +296,10 @@ export class TerminalDO {
       this.lastRoundTripAt.delete(serverId);
       this.lastProbeAt.delete(serverId);
       this.probeCapable.delete(serverId);
+      // 与 cleanup 的清理清单对齐：这两个 Map 原先只在 cleanup 里删，删除服务器时不动，
+      // 会随「建了又删」的机器累积条目（id 不复用，不会被误命中，但属于纯粹的内存滞留）。
+      this.updating.delete(serverId);
+      this.lastPingAt.delete(serverId);
       // 清理该服务器的 open_terminal/open_file 待确认（定时器停止）
       for (const sid of sids) {
         const r = this.pendingOpen.get(sid);
@@ -1131,8 +1135,6 @@ export class TerminalDO {
             // 跨小时结算在 webSocketMessage 的包装层统一做（见 rollHourStat），此处不再重复调用。
             this.statReq += 1;
             if (coldStart) this.statCold += 1;
-            this.statFwdMs += timing.fwd || 0; // 转发 MetricsDO 的耗时（计时在 report.js 里）
-            if (timing.fwdTimeout) this.statFwdTimeout += 1;
             // ② 能力门控：agent 自声明支持探活（info.probe_proto，随上报免费到达）才启用 exec 前探活。
             // 旧 agent 不报该字段 → 永不探活、永不误关；声明后探活失败必为真断链 → 可安全 close(4002)。
             // 已登记则跳过（避免每帧都序列化附件）；evict 后由附件恢复，故仅在丢失时重写。
@@ -1186,6 +1188,10 @@ export class TerminalDO {
                 await this.syncAgentInterval(ws, serverId, timing);
               }
             } catch (e) { console.error('handleReport failed:', e); }
+            // 转发耗时必须在这里累加：timing.fwd 是 handleReport 内部写的，
+            // 放在它之前（原实现）读到的永远是 undefined，[stat] 的 fwd_ms/fwd_to 恒为 0。
+            this.statFwdMs += timing.fwd || 0;
+            if (timing.fwdTimeout) this.statFwdTimeout += 1;
             // 慢上报埋点：把总耗时拆成 D1 行读 / D1 写 / DO 间转发 / 兜底查观看者数，
             // 用来区分「D1 慢」「MetricsDO 慢」「实例冷启动」三种完全不同的根因。
             const reportMs = Date.now() - tReport;

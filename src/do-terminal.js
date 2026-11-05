@@ -734,8 +734,6 @@ export class TerminalDO {
         // 兼容旧格式：控制通道附件为 String(server.id)
         const serverId = Number(att);
         if (Number.isInteger(serverId) && serverId > 0) {
-          const prev = this.agents.get(serverId);
-          if (prev && prev !== ws) { try { prev.close(4001, 'superseded on rebuild'); } catch { /* ignore */ } }
           this.agents.set(serverId, ws);
         }
         continue;
@@ -748,11 +746,17 @@ export class TerminalDO {
           // "不支持异步"而永久失败（agent 明明支持）。
           // 同 serverId 多条控制连接（冻结唤醒后旧半开连接与新连接并存）：保留最新（ts 最大）
           // 者、关闭其余，收敛到「一服务器一活连接」，避免 exec/更新发往死连接。
+          // 重建阶段**不 close 落选连接**。原因：重建发生在实例刚被唤醒时，落选的那条
+          // 往往对端已经消失，close(4001) 的关闭握手永远等不到回执，socket 会永久停在
+          // CLOSING（readyState=2）挂在对象上（[stat] 的 ws_states 实测为 control:2）。
+          // 一条 CLOSING 连接会让对象一直拿不到 hibernation 资格，只能撑满 15 分钟后被驱逐，
+          // 期间持续计 duration；而驱逐后新实例重建时又会重复这一步，于是永久自锁。
+          // 收敛仍然成立：agents 只登记 ts 最大的那条，落选连接即使继续上报也是幂等写入，
+          // 断连时 cleanup 会因 isCurrent=false 而不动 agents。
           const prev = this.agents.get(sid);
           if (prev && prev !== ws && this.wsAttTs(prev) > (Number(att.ts) || 0)) {
-            try { ws.close(4001, 'superseded on rebuild'); } catch { /* ignore */ }
+            // 让位：仅跳过登记
           } else {
-            if (prev && prev !== ws) { try { prev.close(4001, 'superseded on rebuild'); } catch { /* ignore */ } }
             this.agents.set(sid, ws);
             // 上报间隔随附件恢复，且只跟随胜出的连接：旧半开连接的旧值不能覆盖新连接，
             // 否则 evict 后会按错误间隔上报（快慢采错档直接放大或浪费配额）。

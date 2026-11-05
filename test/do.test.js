@@ -1769,7 +1769,7 @@ test('TerminalDO: 唤醒重建只沿胜出连接恢复 probeCapable（旧半开�
   inst.rebuildIndex();
   assert.equal(inst.agents.get(1), newWs, '胜出的是 ts 更大的新连接');
   assert.equal(inst.probeCapable.has(1), false, '旧连接的 probe 标记不得复活能力（否则对旧 agent 持续探测→误 503）');
-  assert.ok(closed.includes(4001), '旧连接被关闭');
+  assert.equal(closed.length, 0, '重建阶段不 close（避免留下永久 CLOSING 的 socket）');
 });
 
 test('TerminalDO: 唤醒重建只沿胜出连接恢复上报间隔与 rtt（旧半开连接的值不残留）', () => {
@@ -2484,7 +2484,7 @@ test('TerminalDO: 上报入站即刷新 agents 索引（活连接覆盖死连接
   assert.equal(inst.agents.get(1), liveWs, '上报入站把索引刷成能收到消息的活连接');
 });
 
-test('TerminalDO: 唤醒重建索引时同 serverId 保留最新控制连接、关闭旧连接', () => {
+test('TerminalDO: 唤醒重建索引时同 serverId 保留最新控制连接（不 close 落选连接）', () => {
   const env = makeEnv();
   const mk = (ts) => ({
     closed: false, code: 0,
@@ -2496,8 +2496,9 @@ test('TerminalDO: 唤醒重建索引时同 serverId 保留最新控制连接、�
   const inst = new TerminalDO({ getWebSockets: () => [newWs, oldWs] }, env);
   inst.rebuildIndex();
   assert.equal(inst.agents.get(1), newWs, '保留 ts 最新的控制连接');
-  assert.equal(oldWs.closed, true, '旧连接被关闭');
-  assert.equal(oldWs.code, 4001, '旧连接以 4001 superseded 关闭（agent 长退避，不互踢）');
+  // 重建阶段不 close：落选连接的对端往往已消失，close(4001) 的握手永远等不到回执，
+  // socket 会永久停在 CLOSING（ws_states 实测 control:2），让对象拿不到 hibernation 资格。
+  assert.equal(oldWs.closed, false, '重建阶段不得 close 落选连接');
   assert.equal(newWs.closed, false, '最新连接保留');
 });
 

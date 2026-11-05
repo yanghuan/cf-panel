@@ -76,6 +76,7 @@ export class TerminalDO {
     // 这是区分「代码执行慢」与「平台不回收实例」最直接的一条证据，也是开工单的关键数据。
     this.bornAt = Date.now(); // 实例创建时刻：age_s 用来判断它活了多久（non-hibernateable 的直接证据）
     this.inflight = 0; // 未 settle 的出站 I/O 数量（fetch / D1 / 跨 DO 调用），见 tracked()
+    this.attCache = null; // 单次事件内的连接附件缓存 {ws, att}，见 attOf/setAtt
     this.statAt = this.bornAt; // 上次快照时刻（满 STAT_WINDOW_MS 才输出，见 maybeFlushStat）
     this.statReq = 0; // 本窗口收到的 report 帧数
     this.statCold = 0; // 其中处于冷启动（本实例首次处理）的帧数
@@ -98,16 +99,49 @@ export class TerminalDO {
 
   // 每小时第一次被唤起时，把上个小时的统计打出来并归零。
   // 只在跨小时时触发，日志量 = 每实例每小时 1 条（4 分片 ≈ 96 条/天），可忽略。
+  // ---- 单次事件内的附件缓存 ----
+  // serialize/deserializeAttachment 是本地结构化克隆，单次虽只微秒级，但一条 report 帧会在
+  // wsServerId / stampClose / markRoundTrip / markProbeCapable / clearProbeCapable /
+  // markFetchCapable / applyAgentInterval 里反复读写同一份附件（实测 5~7 次）。
+  // DO 事件严格串行，同一 ws 的附件在一次事件内不会被外部改动，因此可以安全缓存；
+  // 所有写入都走 setAtt 并同步更新缓存，保证后续读到的是一致值。
+  attOf(ws) {
+    const c = this.attCache;
+    if (c && c.ws === ws) return c.att;
+    let att = null;
+    try { att = ws.deserializeAttachment?.(); } catch { /* ignore */ }
+    this.attCache = { ws, att };
+    return att;
+  }
+
+  setAtt(ws, att) {
+    try { ws.serializeAttachment(att); } catch { /* 写失败退化为纯内存，冷启动走兜底分支 */ }
+    this.attCache = { ws, att };
+  }
+
   // 关闭前把「谁关的 + 何时」盖进连接附件。
   // 为什么需要：CLOSING 的 socket 会挂着几小时，制造它的那次 close 早已不在当前统计窗口内，
   // 窗口计数器（close_super 等）此时必然为 0，无法归因。附件跟着 socket 走，
   // 所以 [stat] 里能直接读出「这条非 OPEN 连接是被哪条路径、多少秒前关掉的」。
   // 只对对象形式的附件盖戳（旧格式是纯字符串，改格式会破坏 rebuildIndex 的兼容分支）。
   stampClose(ws, tag) {
+    const a = this.attOf(ws);
+    if (a && typeof a === 'object') this.setAtt(ws, { ...a, cx: tag, cxAt: Date.now() });
+  }
+
+  // 统一的关闭入口：计数 + 盖来源 + 关闭三件事绑定，避免各调用点漏掉其中一步
+  //（漏计数 → [stat] 归因失真；漏盖戳 → 事后无法追溯是哪条路径关的）。
+  // tag: 'sess' | 'auth' | 'super'；code 省略等价于无关闭码的 ws.close()。
+  closeWs(ws, tag, code, reason) {
+    if (!ws) return;
+    if (tag === 'auth') this.statCloseAuth += 1;
+    else if (tag === 'super') this.statCloseSuper += 1;
+    else this.statCloseSess += 1;
+    this.stampClose(ws, tag);
     try {
-      const a = ws.deserializeAttachment?.();
-      if (a && typeof a === 'object') ws.serializeAttachment({ ...a, cx: tag, cxAt: Date.now() });
-    } catch { /* 盖戳失败不影响关闭本身 */ }
+      if (code == null) ws.close();
+      else ws.close(code, reason);
+    } catch { /* 已关闭 / 对端已消失，忽略 */ }
   }
 
   // 出站 I/O 计数包装：官方 hibernation 判据之一是「没有未完成的 I/O」。
@@ -273,9 +307,7 @@ export class TerminalDO {
       const serverId = Number(body.serverId) || 0;
       const w = this.agents.get(serverId);
       if (w) {
-        this.statCloseSess += 1;
-        this.stampClose(w, 'sess');
-        try { w.close(); } catch { /* ignore */ }
+        this.closeWs(w, 'sess');
         this.agents.delete(serverId);
       }
       const sids = [];
@@ -283,10 +315,8 @@ export class TerminalDO {
         if (sess.serverId !== serverId) continue;
         sids.push(sid);
         // 按实际关闭的 socket 计数（会话可能只有一端，也可能两端都在），口径与其他路径一致
-        if (sess.userWs) { this.statCloseSess += 1; this.stampClose(sess.userWs, 'sess'); }
-        if (sess.agentWs) { this.statCloseSess += 1; this.stampClose(sess.agentWs, 'sess'); }
-        try { sess.userWs && sess.userWs.close(); } catch { /* ignore */ }
-        try { sess.agentWs && sess.agentWs.close(); } catch { /* ignore */ }
+        this.closeWs(sess.userWs, 'sess');
+        this.closeWs(sess.agentWs, 'sess');
         this.sessions.delete(sid);
         await this.state.storage.delete('sess:' + sid).catch(() => {}); // 清理持久化会话（await：不留未完成 I/O）
       }
@@ -525,7 +555,7 @@ export class TerminalDO {
       const pair = new WebSocketPair();
       this.state.acceptWebSocket(pair[1]);
       const authDeadline = Date.now() + WS_AUTH_TIMEOUT_MS;
-      pair[1].serializeAttachment({
+      this.setAtt(pair[1], {
         role: 'user-pending', sid: streamId, serverId: sess.serverId,
         creatorUserId: sess.creatorUserId, creatorUser: sess.creatorUser || '',
         clientIp: sess.clientIp || '', type: sess.type, createdAt: sess.createdAt, authDeadline,
@@ -563,13 +593,12 @@ export class TerminalDO {
       // 连接互踢形成 ping-pong 循环。
       const prevAgent = this.agents.get(server.id);
       if (prevAgent && prevAgent !== pair[1]) {
-        this.statCloseSuper += 1;
-        this.stampClose(prevAgent, 'super'); // 顶替：附件记录来源，便于事后归因
-        try { prevAgent.close(4001, 'superseded by new connection'); } catch { /* ignore */ }
+        // 顶替：附件记录来源，便于事后归因
+        this.closeWs(prevAgent, 'super', 4001, 'superseded by new connection');
       }
       this.agents.set(server.id, pair[1]);
       // 附件随连接持久化：休眠唤醒后靠它重建 agents index（role 区分控制通道与会话流）
-      pair[1].serializeAttachment({ role: 'control', serverId: server.id, ts: Date.now() });
+      this.setAtt(pair[1], { role: 'control', serverId: server.id, ts: Date.now() });
       // Agent 重连 → 重发停在 waiting_agent 的 upload（文档 §9）。不等待，避免拖慢握手：
       // 先把断开期间中断的 running 退回 waiting_agent，再逐条重新签发短期 URL 下发。
       // 公网 origin 只能来自 Worker 注入的 query：这里的 url 已被 handleWs 改写成
@@ -636,7 +665,7 @@ export class TerminalDO {
       // 挂接 agent 数据流并按序补发缓冲的浏览器输入
       this.attachAgentFlow(sess, pair[1]);
       // 附件随连接持久化：休眠唤醒后靠它重建会话索引
-      pair[1].serializeAttachment({
+      this.setAtt(pair[1], {
         role: 'agent', sid, serverId: sess.serverId,
         creatorUserId: sess.creatorUserId, creatorUser: sess.creatorUser || '',
         clientIp: sess.clientIp || '', type: sess.type, createdAt: sess.createdAt,
@@ -652,11 +681,7 @@ export class TerminalDO {
   dropAgentSessions(serverId) {
     for (const [, sess] of this.sessions) {
       if (sess.serverId !== serverId) continue;
-      if (sess.agentWs) {
-        this.statCloseSess += 1;
-        this.stampClose(sess.agentWs, 'sess');
-        try { sess.agentWs.close(); } catch { /* ignore */ }
-      }
+      if (sess.agentWs) this.closeWs(sess.agentWs, 'sess');
     }
   }
 
@@ -683,9 +708,9 @@ export class TerminalDO {
     for (const [sid, sess] of this.sessions) {
       // 绝对最长会话时长——即使两端有连接，到期也强制回收（防活跃会话长期占用 PTY/FD/WS）
       if (now - sess.createdAt > SESSION_ABS_MS) {
-        // 按实际关闭的 socket 计数；两端都为 null 时不计数（否则统计会虚高）
-        if (sess.userWs) { this.statCloseSess += 1; this.stampClose(sess.userWs, 'sess'); try { sess.userWs.close(); } catch { /* ignore */ } }
-        if (sess.agentWs) { this.statCloseSess += 1; this.stampClose(sess.agentWs, 'sess'); try { sess.agentWs.close(); } catch { /* ignore */ } }
+        // 按实际关闭的 socket 计数；两端都为 null 时不计数（closeWs 对 null 直接返回）
+        this.closeWs(sess.userWs, 'sess');
+        this.closeWs(sess.agentWs, 'sess');
         this.sessions.delete(sid);
         await this.state.storage.delete('sess:' + sid).catch(() => {}); // 清理持久化会话（await：不留未完成 I/O）
         continue;
@@ -717,9 +742,7 @@ export class TerminalDO {
       if (!att || att.role !== 'user-pending') continue;
       const deadline = Number(att.authDeadline) || 0;
       if (deadline <= now) {
-        this.statCloseAuth += 1;
-        this.stampClose(ws, 'auth');
-        try { ws.close(1008, 'authentication timeout'); } catch { /* ignore */ }
+        this.closeWs(ws, 'auth', 1008, 'authentication timeout');
       } else {
         next = Math.min(next, deadline);
       }
@@ -774,10 +797,12 @@ export class TerminalDO {
   // 资格（详见下方 control 分支注释）。
   rebuildIndex() {
     if (this.rebuilt) return;
-    this.rebuilt = true;
+    // rebuilt 在遍历**之后**才置位：任一 socket 抛错时保持 false，下次事件可重试。
+    // 若先置位再遍历，一次异常就会让索引永久残缺（表现为 agent offline / 会话 404）。
     const socks = this.state.getWebSockets?.() || [];
     for (const ws of socks) {
-      const att = ws.deserializeAttachment();
+      let att = null;
+      try { att = this.attOf(ws); } catch { continue; } // 单条坏连接不拖垮整次重建
       if (att === null || att === undefined) continue;
       if (typeof att === 'string') {
         // 兼容旧格式：控制通道附件为 String(server.id)
@@ -864,6 +889,7 @@ export class TerminalDO {
         else sess.agentWs = ws;
       }
     }
+    this.rebuilt = true; // 遍历完整走完才算重建成功；中途抛错时保持 false 允许下次重试
   }
 
   // 挂接 agent 数据流：赋值 agentWs + 按序补发挂接前缓冲的浏览器输入（防静默丢弃）
@@ -879,7 +905,7 @@ export class TerminalDO {
 
   // 从连接附件解析 serverId（兼容旧字符串格式与新对象格式）
   wsServerId(ws) {
-    const att = ws.deserializeAttachment?.();
+    const att = this.attOf(ws);
     if (att === null || att === undefined) return 0;
     if (typeof att === 'string') return Number(att) || 0;
     if (typeof att === 'object') return Number(att.serverId) || 0;
@@ -889,7 +915,7 @@ export class TerminalDO {
   // 控制连接附件的建立时间戳：唤醒重建时同 serverId 多条连接取最新者（旧格式无 ts 记 0）
   wsAttTs(ws) {
     try {
-      const att = ws.deserializeAttachment?.();
+      const att = this.attOf(ws);
       if (att && typeof att === 'object') return Number(att.ts) || 0;
     } catch { /* ignore */ }
     return 0;
@@ -902,9 +928,9 @@ export class TerminalDO {
     const now = Date.now();
     this.lastRoundTripAt.set(serverId, now);
     try {
-      const a = ws.deserializeAttachment?.();
+      const a = this.attOf(ws);
       if (a && typeof a === 'object' && a.role === 'control') {
-        ws.serializeAttachment({ ...a, rtt: now });
+        this.setAtt(ws, { ...a, rtt: now });
       }
     } catch { /* 附件写失败退化为纯内存，冷启动走乐观放行 */ }
   }
@@ -915,11 +941,11 @@ export class TerminalDO {
   markProbeCapable(ws, serverId) {
     this.probeCapable.add(serverId);
     try {
-      const a = ws.deserializeAttachment?.();
+      const a = this.attOf(ws);
       // 已标过就跳过：pong 路径紧邻 markRoundTrip（附件刚写过一次），
       // 常态下只需一次序列化，仅首次 pong 走两次。
       if (a && typeof a === 'object' && a.role === 'control' && a.probe !== true) {
-        ws.serializeAttachment({ ...a, probe: true });
+        this.setAtt(ws, { ...a, probe: true });
       }
     } catch { /* ignore */ }
   }
@@ -931,13 +957,13 @@ export class TerminalDO {
     this.lastRoundTripAt.delete(serverId);
     this.lastProbeAt.delete(serverId);
     try {
-      const a = ws.deserializeAttachment?.();
+      const a = this.attOf(ws);
       if (a && typeof a === 'object' && a.role === 'control' && (a.probe || a.rtt)) {
         const next = { ...a };
         delete next.probe;
         // 与内存一致：能力撤销即作废往返记录，否则 evict 后 rebuildIndex 会把陈旧 rtt 复活
         delete next.rtt;
-        ws.serializeAttachment(next);
+        this.setAtt(ws, next);
       }
     } catch { /* ignore */ }
   }
@@ -946,12 +972,12 @@ export class TerminalDO {
   // 只在值变化时写，避免每帧上报都 serializeAttachment。
   markFetchCapable(ws, caps) {
     try {
-      const a = ws.deserializeAttachment?.();
+      const a = this.attOf(ws);
       if (!a || typeof a !== 'object' || a.role !== 'control') return;
       const cur = a.caps || {};
       if (Number(cur.upload_fetch_proto) === caps.upload_fetch_proto
         && Number(cur.update_fetch_proto) === caps.update_fetch_proto) return;
-      ws.serializeAttachment({ ...a, caps });
+      this.setAtt(ws, { ...a, caps });
     } catch { /* ignore */ }
   }
 
@@ -967,6 +993,7 @@ export class TerminalDO {
     try {
       return await this.onWsMessage(ws, message, coldStart);
     } finally {
+      this.attCache = null; // 事件结束即释放，避免跨事件持有 ws 引用或读到过期附件
       const ms = Date.now() - t0;
       this.statMsg += 1; // 计入小时快照（in_ms 与 msg 用来和平台计费做对照）
       this.statInMs += ms;
@@ -982,7 +1009,7 @@ export class TerminalDO {
         }
         let role = '';
         try {
-          const a = ws.deserializeAttachment?.();
+          const a = this.attOf(ws);
           role = (a && typeof a === 'object' && a.role) || '';
         } catch { /* ignore */ }
         this.logSlow('msg', {
@@ -999,12 +1026,10 @@ export class TerminalDO {
   async onWsMessage(ws, message, coldStart) {
     this.rebuildIndex(); // 休眠唤醒后索引可能已丢，先按附件重建
     // 浏览器侧待鉴权连接（role: user-pending）：首帧必须是 {type:'auth', token}
-    const att = ws.deserializeAttachment?.();
+    const att = this.attOf(ws);
     if (att && att.role === 'user-pending') {
       if (att.authDeadline && Date.now() > att.authDeadline) {
-        this.statCloseAuth += 1;
-        this.stampClose(ws, 'auth');
-        try { ws.close(1008, 'authentication timeout'); } catch { /* ignore */ }
+        this.closeWs(ws, 'auth', 1008, 'authentication timeout');
         return;
       }
       let j = null;
@@ -1015,9 +1040,7 @@ export class TerminalDO {
       const user = authenticated && authenticated.user;
       const sess = await this.hydrateSession(att.sid);
       if (!user || !sess) {
-        this.statCloseAuth += 1;
-        this.stampClose(ws, 'auth');
-        try { ws.close(1008, 'unauthorized'); } catch { /* ignore */ }
+        this.closeWs(ws, 'auth', 1008, 'unauthorized');
         return;
       }
       let allowed = isAdmin(user);
@@ -1032,9 +1055,7 @@ export class TerminalDO {
         }
       }
       if (!allowed) {
-        this.statCloseAuth += 1;
-        this.stampClose(ws, 'auth');
-        try { ws.close(1008, 'unauthorized'); } catch { /* ignore */ }
+        this.closeWs(ws, 'auth', 1008, 'unauthorized');
         return;
       }
       // 鉴权通过 → 挂接为会话用户端；附件只保存不可逆 PAT HMAC 或已验证 JWT claims。
@@ -1043,7 +1064,7 @@ export class TerminalDO {
       if (!sess.clientIp && att.clientIp) sess.clientIp = att.clientIp;
       sess.userWs = ws;
       sess.lastAuthCheck = Date.now();
-      ws.serializeAttachment({
+      this.setAtt(ws, {
         role: 'user', sid: att.sid, serverId: sess.serverId,
         creatorUserId: sess.creatorUserId, creatorUser: sess.creatorUser || '',
         clientIp: sess.clientIp || '', type: sess.type, createdAt: sess.createdAt,
@@ -1060,8 +1081,16 @@ export class TerminalDO {
     }
     // agent 控制通道（不在任何 session）：处理监控上报 {type:"report"} 与终端确认 {type:"terminal_ready"}
     // 附件已含 sid → O(1) 定位（原来每条消息 O(N) 扫 sessions，终端按键高频路径）
-    const sess = (att && att.sid && this.sessions.get(att.sid)) ||
-      [...this.sessions.values()].find((s) => s.userWs === ws || s.agentWs === ws);
+    // 附件含 sid 时 O(1) 直达；只有会话流（user/agent/user-pending）在缺 sid 的兼容路径上
+    // 才需要按值兜底扫描。控制通道附件没有 sid —— 不短路的话每条 report/pong 都会白跑一次
+    // [...sessions.values()] 的数组分配与查找（热路径开销）。
+    let sess = att && att.sid ? this.sessions.get(att.sid) : null;
+    if (!sess && (!att || (typeof att === 'object'
+      && (att.role === 'user' || att.role === 'agent' || att.role === 'user-pending')))) {
+      for (const s of this.sessions.values()) {
+        if (s.userWs === ws || s.agentWs === ws) { sess = s; break; }
+      }
+    }
     if (!sess) {
       if (typeof message === 'string') {
         try {
@@ -1378,7 +1407,7 @@ export class TerminalDO {
   // 读它零请求；只有附件也没有（升级前的老连接）才查 /viewers 兜底。
   async syncAgentInterval(ws, serverId, timing) {
     if (this.agentInterval.has(serverId)) return; // 事件驱动已维护
-    const att = ws.deserializeAttachment?.();
+    const att = this.attOf(ws);
     const cached = Number(att && typeof att === 'object' ? att.interval : 0);
     if (cached === REPORT_FAST_INTERVAL_S || cached === REPORT_SLOW_INTERVAL_S) {
       // 附件命中：agent 侧本来就知道这个间隔，无需重发，也不产生任何 DO 调用
@@ -1405,9 +1434,9 @@ export class TerminalDO {
     this.agentInterval.set(serverId, interval);
     try { ws.send(JSON.stringify({ type: 'set_report_interval', interval })); } catch { /* ignore */ }
     try {
-      const a = ws.deserializeAttachment?.();
+      const a = this.attOf(ws);
       if (a && typeof a === 'object' && a.role === 'control' && a.interval !== interval) {
-        ws.serializeAttachment({ ...a, interval });
+        this.setAtt(ws, { ...a, interval });
       }
     } catch { /* 附件写失败只影响 evict 后省下的那次查询 */ }
   }
@@ -1416,7 +1445,7 @@ export class TerminalDO {
   // 与 probe_proto 同样的"能力随上报免费到达"范式。旧 Agent 不声明 → 明确拒绝而不是静默降级，
   // 否则会下发它不认识的帧，最终只能在 deadline 上超时。
   supportsFetch(ws, kind) {
-    const att = ws.deserializeAttachment?.() || {};
+    const att = this.attOf(ws) || {};
     const cap = att.caps || {};
     if (kind === 'upload') return Number(cap.upload_fetch_proto) >= 1;
     if (kind === 'update') return Number(cap.update_fetch_proto) >= 1;
@@ -1612,9 +1641,7 @@ export class TerminalDO {
   // 标记会话失效并关闭浏览器端连接：revoked 让后续双向流量立即短路（等 cleanup 收尾）
   revokeSession(sess, ws, reason) {
     sess.revoked = true;
-    this.statCloseAuth += 1;
-    this.stampClose(ws, 'auth');
-    try { ws.close(1008, reason); } catch { /* ignore */ }
+    this.closeWs(ws, 'auth', 1008, reason);
     return true;
   }
 
@@ -1635,20 +1662,12 @@ export class TerminalDO {
       if (sess.userWs === ws) {
         sess.userWs = null;
         touched = true;
-        if (sess.agentWs) {
-          this.statCloseSess += 1;
-          this.stampClose(sess.agentWs, 'sess');
-          try { sess.agentWs.close(); } catch { /* ignore */ }
-        }
+        if (sess.agentWs) this.closeWs(sess.agentWs, 'sess');
       }
       if (sess.agentWs === ws) {
         sess.agentWs = null;
         touched = true;
-        if (sess.userWs) {
-          this.statCloseSess += 1;
-          this.stampClose(sess.userWs, 'sess');
-          try { sess.userWs.close(); } catch { /* ignore */ }
-        }
+        if (sess.userWs) this.closeWs(sess.userWs, 'sess');
         // 会话数据流断开 → 仅清理该会话的 open_terminal/open_file 待确认（数据流已不可用）
         const r = this.pendingOpen.get(sid);
         if (r && r.timer) clearTimeout(r.timer);
@@ -1659,6 +1678,11 @@ export class TerminalDO {
       // 关闭（user-pending 刷新、旧控制连接被 4001 顶替、其他会话的流断开）都会把这条新
       // 会话连同 storage 一起删掉，随后鉴权 hydrateSession 返回 null → 1008，会话凭空消失。
       if (touched && !sess.userWs && !sess.agentWs) {
+        // 该会话的 *_ready 待确认也要清：否则重发定时器继续空跑（每个 3s，最多 2 次），
+        // 期间定时器让对象拿不到 hibernation 资格。
+        const pending = this.pendingOpen.get(sid);
+        if (pending && pending.timer) clearTimeout(pending.timer);
+        this.pendingOpen.delete(sid);
         this.sessions.delete(sid);
         await this.state.storage.delete('sess:' + sid).catch(() => {}); // 清理持久化会话（await：不留未完成 I/O）
       }
@@ -1673,7 +1697,7 @@ export class TerminalDO {
     // 终端页时误清该机的 updating/probeCapable——实测后果是"更新期间能新建终端会话"，
     // 等于把 f81635d 修的互斥又开了一个口子。
     // typeof att === 'string' 那支要保留：rebuildIndex 兼容旧格式（附件直接存 serverId）。
-    const att = ws.deserializeAttachment?.();
+    const att = this.attOf(ws);
     const isControlAttachment = typeof att === 'string' || (att && att.role === 'control');
     const attServerId = isControlAttachment ? this.wsServerId(ws) : 0;
     const matched = [];
@@ -1706,8 +1730,12 @@ export class TerminalDO {
         this.lastProbeAt.delete(serverId);
         this.probeCapable.delete(serverId);
       }
-      // 更新互斥与连接无关：被顶替的旧连接也要释放，否则该机器在本实例存活期内一直 409
-      //（更新进程已随连接丢失，D1 侧已终态，纯内存泄漏）
+      // 更新互斥**故意**在 isCurrent 之外释放，这是有代价权衡后的选择，不是遗漏：
+      // - 若只在 isCurrent 时删：被顶替的旧连接遗留的 jobId 会留到实例 evict；
+      // - 无条件删：被顶替的旧连接晚到时，会抹掉新连接刚登记的 jobId（本地快路径失效）。
+      // 两种残留都只影响「本地快路径」，因为 isUpdating 无论本地有没有标记都会问 D1
+      //（hasActiveAgentUpdate），D1 的 deadline 才是权威判据（见 isUpdating 注释）。
+      // 选无条件删：多一次 D1 查询，优于让过期标记一直挡着 exec/upload。
       this.updating.delete(serverId);
       // D1 收敛只对"真正的断开"做：被顶替的旧连接说明 Agent 已重连、任务还在新连接上跑，
       // 此时判 failed 会误杀正在进行的命令。upload 一律交给重连时的 requeueOrphanUploads。

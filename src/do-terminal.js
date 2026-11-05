@@ -90,8 +90,6 @@ export class TerminalDO {
     this.statRefire = 0; // alarm 触发时发现「下一次 alarm 已过期」的次数（空转直接证据）
     this.statSend = 0; // 窗口内向 agent 主动发送的帧数（ping/probe）
     this.statSendFail = 0; // 其中 send 抛错的次数（对端已死/半开的直接信号）
-    this.statWsOpen = 0; // 上次快照统计到的 OPEN socket 数
-    this.statWsOther = 0; // 上次快照统计到的非 OPEN socket 数（>0 且不减 = 连接泄漏）
   }
 
   // 每小时第一次被唤起时，把上个小时的统计打出来并归零。
@@ -116,7 +114,26 @@ export class TerminalDO {
   }
 
   async emitStat(now) {
-    // 先快照并归零（在任何 await 之前，避免统计被并发消息污染），再异步取 alarm/连接
+    // 连接状态先同步采集（无 await，不会与并发消息交错），再快照计数并归零。
+    // 上一版把这段放在快照之后，导致 ws_open/ws_other 落后一个窗口，已于本次修正。
+    let socks = 0; let ctrl = 0; let user = 0; let other = 0;
+    let wsOpen = 0; let wsOther = 0;
+    const states = [];
+    try {
+      for (const w of this.state.getWebSockets?.() || []) {
+        socks += 1;
+        const rs = w.readyState;
+        if (rs === 1) wsOpen += 1; else wsOther += 1;
+        let a = null;
+        try { a = w.deserializeAttachment?.(); } catch { /* ignore */ }
+        const role = a && typeof a === 'object' ? a.role : (a ? 'legacy' : 'none');
+        if (role === 'control') ctrl += 1;
+        else if (role === 'user' || role === 'agent' || role === 'user-pending') user += 1;
+        else other += 1;
+        // 前 8 条逐个带上 role/readyState，非 OPEN 的那条能直接认出来
+        if (states.length < 8) states.push(`${role || '-'}:${rs}`);
+      }
+    } catch { /* ignore */ }
     const snap = {
       age_s: Math.max(0, Math.round((now - this.bornAt) / 1000)), // 本实例已存活秒数
       win_s: Math.max(1, Math.round((now - this.statAt) / 1000)), // 本窗口秒数
@@ -128,14 +145,16 @@ export class TerminalDO {
       fwd_to: this.statFwdTimeout, // 转发超时次数（MetricsDO 排队指标）
       alrm: this.statAlarm, // alarm() 调用次数（正常应为个位数）
       refire: this.statRefire, // alarm 空转直接证据
+      send: this.statSend, // 窗口内主动发送帧数（ping/probe）
+      send_fail: this.statSendFail, // 其中 send 抛错数（半开连接信号）
+      inflight: this.inflight, // 未 settle 的出站 I/O 数：长期非零 = 卡在某个 fetch/D1 上
       sess: this.sessions.size,
       intv: this.agentInterval.size,
       pend: this.pendingOpen.size,
-      inflight: this.inflight, // 未 settle 的出站 I/O 数：长期非零 = 卡在某个 fetch/D1 上
-      send: this.statSend, // 窗口内主动发送帧数
-      send_fail: this.statSendFail, // 其中 send 失败数（半开连接信号）
-      ws_open: this.statWsOpen, // 窗口内最后一次统计到的 readyState===1 的 socket 数
-      ws_other: this.statWsOther, // 其余状态（CLOSING/CLOSED，若长期 >0 说明连接泄漏）
+      socks, ctrl, user, other, // 连接数快照（socks 应 ≈ intv；多出来的是陈旧连接）
+      ws_open: wsOpen, // readyState===1
+      ws_other: wsOther, // 非 OPEN：长期 >0 即连接泄漏
+      ws_states: states.join(','), // 逐个 socket 的 role:readyState
     };
     this.statAt = now;
     this.statMsg = 0;
@@ -149,30 +168,13 @@ export class TerminalDO {
     this.statSend = 0;
     this.statSendFail = 0;
     if (snap.msg === 0) return; // 窗口内没有消息（纯 alarm 唤醒等）不输出
-    // 连接快照：僵尸连接会持续产生唤醒源，是「看不见的事件」候选之一
-    let socks = 0; let ctrl = 0; let user = 0; let other = 0;
-    let wsOpen = 0; let wsOther = 0;
-    try {
-      for (const w of this.state.getWebSockets?.() || []) {
-        socks += 1;
-        if (w.readyState === 1) wsOpen += 1; else wsOther += 1;
-        let a = null;
-        try { a = w.deserializeAttachment?.(); } catch { /* ignore */ }
-        const role = a && typeof a === 'object' ? a.role : (a ? 'legacy' : 'none');
-        if (role === 'control') ctrl += 1;
-        else if (role === 'user' || role === 'agent' || role === 'user-pending') user += 1;
-        else other += 1;
-      }
-      this.statWsOpen = wsOpen;
-      this.statWsOther = wsOther;
-    } catch { /* ignore */ }
     let alarmS = null;
     try {
       const at = await this.state.storage.getAlarm();
       alarmS = at == null ? null : Math.round((at - now) / 1000);
     } catch { /* ignore */ }
     try {
-      console.error(`[stat] ${JSON.stringify({ ...snap, socks, ctrl, user, other, alarm_s: alarmS })}`);
+      console.error(`[stat] ${JSON.stringify({ ...snap, alarm_s: alarmS })}`);
     } catch { /* ignore */ }
   }
 

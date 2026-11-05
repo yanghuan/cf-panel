@@ -1812,6 +1812,39 @@ test('TerminalDO: 被顶替的旧连接 close 不清新连接的探活能力与�
   assert.equal(inst.lastRoundTripAt.has(1), false, '真正断开时才清往返记录');
 });
 
+test('TerminalDO: [stat] 输出 close 来源计数，并用 * 标出胜出连接', async () => {
+  const env = makeEnv();
+  const winner = { deserializeAttachment: () => ({ role: 'control', serverId: 1, ts: 2 }), send() {}, readyState: 1 };
+  const stuck = { deserializeAttachment: () => ({ role: 'control', serverId: 1, ts: 1 }), send() {}, readyState: 2 };
+  const st = mockState();
+  st.getWebSockets = () => [winner, stuck];
+  const inst = new TerminalDO(st, env);
+  inst.agents.set(1, winner); // 胜出的是 OPEN 那条
+  inst.statMsg = 1;
+  inst.statReq = 1;
+  inst.statCloseSuper = 2;
+  inst.statCloseSess = 1;
+  const lines = [];
+  const orig = console.error;
+  console.error = (...a) => lines.push(a.map(String).join(' '));
+  try {
+    await inst.emitStat(Date.now());
+    const line = lines.find((l) => l.startsWith('[stat]'));
+    assert.ok(line, '应输出一条 [stat]');
+    const p = JSON.parse(line.replace('[stat] ', ''));
+    assert.equal(p.close_super, 2, '握手顶替次数');
+    assert.equal(p.close_sess, 1, '会话/agent 连接清理次数');
+    assert.equal(p.close_auth, 0);
+    assert.equal(p.ws_open, 1, '1 条 OPEN');
+    assert.equal(p.ws_other, 1, '1 条非 OPEN（CLOSING）');
+    assert.ok(p.ws_states.includes('control:1*'), '胜出连接带 * 标记');
+    assert.ok(p.ws_states.includes('control:2'), 'CLOSING 那条不在 * 标记里');
+    assert.equal(inst.statCloseSuper, 0, '快照后计数归零');
+  } finally {
+    console.error = orig;
+  }
+});
+
 test('TerminalDO: 满 60 秒窗口输出 [stat] 快照（含 age_s / cold / alarm / 连接数）', async () => {
   const env = makeEnv();
   const ws = {

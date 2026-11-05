@@ -90,6 +90,10 @@ export class TerminalDO {
     this.statRefire = 0; // alarm 触发时发现「下一次 alarm 已过期」的次数（空转直接证据）
     this.statSend = 0; // 窗口内向 agent 主动发送的帧数（ping/probe）
     this.statSendFail = 0; // 其中 send 抛错的次数（对端已死/半开的直接信号）
+    // close 计数按来源分开：用于判断「长期 CLOSING 的 socket」是哪条路径制造的
+    this.statCloseSuper = 0; // 握手顶替（prevAgent.close(4001)）
+    this.statCloseAuth = 0; // 鉴权失败/超时（1008）
+    this.statCloseSess = 0; // 会话或 agent 连接清理（drop_server / sweep / 会话摘除）
   }
 
   // 每小时第一次被唤起时，把上个小时的统计打出来并归零。
@@ -130,8 +134,11 @@ export class TerminalDO {
         if (role === 'control') ctrl += 1;
         else if (role === 'user' || role === 'agent' || role === 'user-pending') user += 1;
         else other += 1;
-        // 前 8 条逐个带上 role/readyState，非 OPEN 的那条能直接认出来
-        if (states.length < 8) states.push(`${role || '-'}:${rs}`);
+        // 前 8 条逐个带上 role/readyState；`*` 表示它就是 agents.get(sid) 当前登记的那条
+        // （即 exec/更新会发往它）。非 OPEN 且带 * → 最严重：指令会发往正在关闭的连接。
+        const sid = a && typeof a === 'object' ? (Number(a.serverId) || 0) : (a ? (Number(a) || 0) : 0);
+        const isWinner = sid > 0 && this.agents.get(sid) === w;
+        if (states.length < 8) states.push(`${role || '-'}:${rs}${isWinner ? '*' : ''}`);
       }
     } catch { /* ignore */ }
     const snap = {
@@ -147,6 +154,9 @@ export class TerminalDO {
       refire: this.statRefire, // alarm 空转直接证据
       send: this.statSend, // 窗口内主动发送帧数（ping/probe）
       send_fail: this.statSendFail, // 其中 send 抛错数（半开连接信号）
+      close_super: this.statCloseSuper, // close 来源：握手顶替
+      close_auth: this.statCloseAuth, // close 来源：鉴权失败/超时
+      close_sess: this.statCloseSess, // close 来源：会话/agent 连接清理
       inflight: this.inflight, // 未 settle 的出站 I/O 数：长期非零 = 卡在某个 fetch/D1 上
       sess: this.sessions.size,
       intv: this.agentInterval.size,
@@ -167,6 +177,9 @@ export class TerminalDO {
     this.statRefire = 0;
     this.statSend = 0;
     this.statSendFail = 0;
+    this.statCloseSuper = 0;
+    this.statCloseAuth = 0;
+    this.statCloseSess = 0;
     if (snap.msg === 0) return; // 窗口内没有消息（纯 alarm 唤醒等）不输出
     let alarmS = null;
     try {
@@ -243,6 +256,7 @@ export class TerminalDO {
       const serverId = Number(body.serverId) || 0;
       const w = this.agents.get(serverId);
       if (w) {
+        this.statCloseSess += 1;
         try { w.close(); } catch { /* ignore */ }
         this.agents.delete(serverId);
       }
@@ -250,6 +264,7 @@ export class TerminalDO {
       for (const [sid, sess] of this.sessions) {
         if (sess.serverId !== serverId) continue;
         sids.push(sid);
+        this.statCloseSess += 1;
         try { sess.userWs && sess.userWs.close(); } catch { /* ignore */ }
         try { sess.agentWs && sess.agentWs.close(); } catch { /* ignore */ }
         this.sessions.delete(sid);
@@ -524,6 +539,7 @@ export class TerminalDO {
       // 连接互踢形成 ping-pong 循环。
       const prevAgent = this.agents.get(server.id);
       if (prevAgent && prevAgent !== pair[1]) {
+        this.statCloseSuper += 1;
         try { prevAgent.close(4001, 'superseded by new connection'); } catch { /* ignore */ }
       }
       this.agents.set(server.id, pair[1]);
@@ -612,6 +628,7 @@ export class TerminalDO {
     for (const [, sess] of this.sessions) {
       if (sess.serverId !== serverId) continue;
       if (sess.agentWs) {
+        this.statCloseSess += 1;
         try { sess.agentWs.close(); } catch { /* ignore */ }
       }
     }
@@ -640,6 +657,7 @@ export class TerminalDO {
     for (const [sid, sess] of this.sessions) {
       // 绝对最长会话时长——即使两端有连接，到期也强制回收（防活跃会话长期占用 PTY/FD/WS）
       if (now - sess.createdAt > SESSION_ABS_MS) {
+        this.statCloseSess += 1;
         if (sess.userWs) { try { sess.userWs.close(); } catch { /* ignore */ } }
         if (sess.agentWs) { try { sess.agentWs.close(); } catch { /* ignore */ } }
         this.sessions.delete(sid);
@@ -673,6 +691,7 @@ export class TerminalDO {
       if (!att || att.role !== 'user-pending') continue;
       const deadline = Number(att.authDeadline) || 0;
       if (deadline <= now) {
+        this.statCloseAuth += 1;
         try { ws.close(1008, 'authentication timeout'); } catch { /* ignore */ }
       } else {
         next = Math.min(next, deadline);
@@ -944,6 +963,7 @@ export class TerminalDO {
     const att = ws.deserializeAttachment?.();
     if (att && att.role === 'user-pending') {
       if (att.authDeadline && Date.now() > att.authDeadline) {
+        this.statCloseAuth += 1;
         try { ws.close(1008, 'authentication timeout'); } catch { /* ignore */ }
         return;
       }
@@ -955,6 +975,7 @@ export class TerminalDO {
       const user = authenticated && authenticated.user;
       const sess = await this.hydrateSession(att.sid);
       if (!user || !sess) {
+        this.statCloseAuth += 1;
         try { ws.close(1008, 'unauthorized'); } catch { /* ignore */ }
         return;
       }
@@ -970,6 +991,7 @@ export class TerminalDO {
         }
       }
       if (!allowed) {
+        this.statCloseAuth += 1;
         try { ws.close(1008, 'unauthorized'); } catch { /* ignore */ }
         return;
       }
@@ -1531,6 +1553,7 @@ export class TerminalDO {
   // 标记会话失效并关闭浏览器端连接：revoked 让后续双向流量立即短路（等 cleanup 收尾）
   revokeSession(sess, ws, reason) {
     sess.revoked = true;
+    this.statCloseAuth += 1;
     try { ws.close(1008, reason); } catch { /* ignore */ }
     return true;
   }
@@ -1551,12 +1574,14 @@ export class TerminalDO {
       if (sess.userWs === ws) {
         sess.userWs = null;
         if (sess.agentWs) {
+          this.statCloseSess += 1;
           try { sess.agentWs.close(); } catch { /* ignore */ }
         }
       }
       if (sess.agentWs === ws) {
         sess.agentWs = null;
         if (sess.userWs) {
+          this.statCloseSess += 1;
           try { sess.userWs.close(); } catch { /* ignore */ }
         }
         // 会话数据流断开 → 仅清理该会话的 open_terminal/open_file 待确认（数据流已不可用）

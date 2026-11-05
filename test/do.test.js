@@ -1812,6 +1812,38 @@ test('TerminalDO: 被顶替的旧连接 close 不清新连接的探活能力与�
   assert.equal(inst.lastRoundTripAt.has(1), false, '真正断开时才清往返记录');
 });
 
+test('TerminalDO: close 前把来源盖进附件，[stat] 的 ws_states 能追溯「谁关的、多久前」', async () => {
+  const env = makeEnv();
+  let att = { role: 'control', serverId: 1, ts: 1 };
+  const ws = {
+    deserializeAttachment: () => att,
+    serializeAttachment: (a) => { att = a; },
+    send() {}, readyState: 2, // 模拟关闭握手未完成 → 停在 CLOSING
+  };
+  const st = mockState();
+  st.getWebSockets = () => [ws];
+  const inst = new TerminalDO(st, env);
+  // 100 秒前由会话清理路径关闭
+  inst.stampClose(ws, 'sess');
+  att = { ...att, cxAt: Date.now() - 100_000 };
+  inst.statMsg = 1;
+  const lines = [];
+  const orig = console.error;
+  console.error = (...a) => lines.push(a.map(String).join(' '));
+  try {
+    await inst.emitStat(Date.now());
+    const p = JSON.parse(lines.find((l) => l.startsWith('[stat]')).replace('[stat] ', ''));
+    // 关键：窗口计数器此时为 0（close 发生在很久以前），但附件仍能给出归因
+    assert.equal(p.close_super, 0);
+    assert.equal(p.close_sess, 0);
+    assert.equal(p.ws_other, 1, '这条连接仍是非 OPEN');
+    assert.match(p.ws_states, /control:2:sess@\d+/, 'ws_states 带出来源与距今秒数');
+    assert.ok(Number(p.ws_states.split('@')[1]) >= 100, '距今秒数正确');
+  } finally {
+    console.error = orig;
+  }
+});
+
 test('TerminalDO: [stat] 输出 close 来源计数，并用 * 标出胜出连接', async () => {
   const env = makeEnv();
   const winner = { deserializeAttachment: () => ({ role: 'control', serverId: 1, ts: 2 }), send() {}, readyState: 1 };

@@ -4,6 +4,11 @@
 > 基线提交：`832dff7`  
 > 日期：2026-10-28  
 > 目标读者：实现 Agent、Review/验收人员
+>
+> **历史草案说明**：本文保留各阶段的设计与决策记录，正文中出现的 `/rpc/upload`、
+> `/mcp/file_upload`、`/rpc/agent_update`、`LEGACY_SYNC_UPDATE`、同步路径的随机 `exec_id`
+> 等均为当时方案；阶段 E 之后这些入口与字段已全部删除。当前实现以
+> `docs/architecture.md`、`src/` 与 `agent/rust/src/` 为准。
 
 **实现进度**
 

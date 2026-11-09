@@ -24,6 +24,10 @@ const EXEC_ROUNDTRIP_TTL_MS = 900 * 1000; // exec 判据：窗口内有过成功
 // 窗口取 900s 才能容忍丢一次 pong（720s）仍不误判。超过窗口视为链路不可信 → 立即 503 让调用方重试
 //（命令尚未下发，重试绝对安全）。若日后把 REPORT_SLOW_INTERVAL_S 调大，需同步放大本窗口。
 const PROBE_REFRESH_MS = 300 * 1000; // 上报顺带 probe 的最小间隔。
+// 控制通道身份复核：附件里的 key 指纹与 D1 当前 agent_key_id 的比对结果缓存 30s。
+// 轮换/删除会通过 drop_server 主动清缓存（下一帧立即复核），这里的 TTL 只是常态开销上限：
+// 每条 report 一次 Map 命中，17 台机约每 30s 一次主键查询，可忽略。
+const AGENT_KEY_CHECK_TTL_MS = 30 * 1000;
 // 注意：每条 probe 都会让 agent 回一个 pong，而 pong 是入站 WS 消息 = 一次 DO 请求。
 // 60s 会让每台机每小时多 60 次请求（约等于上报量翻倍），所以按 5 分钟一次足够维持 exec 判据。
 // 上传/更新的体积与超时上限不在这里定义：同步上传路径已删除，上传走 upload_jobs
@@ -58,6 +62,8 @@ export class TerminalDO {
     this.sessions = new Map(); // streamId -> {streamId, serverId, creatorUserId, createdAt, userWs, agentWs}
     this.agents = new Map(); // serverId -> 控制 WS
     this.agentInterval = new Map(); // serverId -> 当前下发的上报间隔（秒），避免重复下发
+    this.agentKeyCache = new Map(); // serverId -> { keyId, exp }：控制通道身份复核的短 TTL 缓存
+    this.agentKeyEpoch = 0; // 每次 drop_server 清缓存时递增：作废进行中的批量预热
     this.pendingOpen = new Map(); // streamId -> {tries, timer, type} open_terminal/open_file 确认重发
     this.lastProbeAt = new Map(); // serverId -> 上次发出 probe 帧的时间（上报顺风车节流，防每帧都发）
     // serverId -> 进行中更新的 jobId（与上传/更新互斥，防 Binary 帧交错）。
@@ -97,8 +103,9 @@ export class TerminalDO {
     this.statCloseSess = 0; // 会话或 agent 连接清理（drop_server / sweep / 会话摘除）
   }
 
-  // 每小时第一次被唤起时，把上个小时的统计打出来并归零。
-  // 只在跨小时时触发，日志量 = 每实例每小时 1 条（4 分片 ≈ 96 条/天），可忽略。
+  // 每存活满 STAT_WINDOW_MS（60s）输出一行统计并归零。
+  // 不再按「跨整点」触发：实例寿命常短于 1 小时，跨整点实测常常一条都没有；
+  // 日志量 = 每实例每 60s 最多 1 条（4 分片，实际由实例寿命决定），可忽略。
   // ---- 单次事件内的附件缓存 ----
   // serialize/deserializeAttachment 是本地结构化克隆，单次虽只微秒级，但一条 report 帧会在
   // wsServerId / stampClose / markRoundTrip / markProbeCapable / clearProbeCapable /
@@ -296,21 +303,79 @@ export class TerminalDO {
     if (path === '/rpc/set_viewers' && request.method === 'POST') {
       const body = await request.json();
       const want = (Number(body.count) || 0) > 0 ? REPORT_FAST_INTERVAL_S : REPORT_SLOW_INTERVAL_S;
-      for (const [serverId, w] of this.agents) {
-        if (this.agentInterval.get(serverId) !== want) this.applyAgentInterval(w, serverId, want);
+      // 用副本遍历：liveAgent 可能删除索引项。与其它下发路径同口径——身份已撤销的旧连接
+      // 不再收下行帧（本路径只调上报间隔，风险低，但保持"所有下行都经 liveAgent"一致）。
+      // 串行而非并行：并行 await 下 attCache 会交错、setAtt 也会竞争同一条连接。
+      // 串行的代价是每台一次身份复核，故先批量预热：把「缓存缺失 **或已过期**」的机器
+      // 用一条整表查询一次性取回（servers 几百行；不用 IN 是为了避开 D1 参数上限），
+      // 把 D1 读从 O(机器数) 收敛为 1 次；缓存全部新鲜时是纯 Map 命中、零 D1。
+      // 判据必须看 exp 而不是 has()：TTL 到期后条目仍留在 Map 里，只看 has() 会退化成
+      // 「每台各查一次 D1」（观看者切换通常远超 30s，正好命中这种退化）。
+      // 调用方 broadcastViewers 给每个分片 1s 上限：只有 D1 明显变慢才可能超时，
+      // 表现为部分机器未切档，下一次 0→1/1→0 会重试（不值得为此加并行复杂度）。
+      const ids = [...this.agents.keys()];
+      const now = Date.now();
+      const need = new Set(ids.filter((id) => {
+        const c = this.agentKeyCache.get(id);
+        return !c || c.exp <= now;
+      }));
+      const epoch = this.agentKeyEpoch;
+      if (need.size > 0) {
+        try {
+          const rows = await this.env.DB.prepare('SELECT id, agent_key_id FROM servers').all();
+          // 预热期间若 drop_server 清过缓存（轮换/删除），本次读到的 keyId 可能已是旧值：
+          // 放弃填充，交给 liveAgent 单查（它必然读到最新值）。
+          if (this.agentKeyEpoch === epoch) {
+            const t = Date.now();
+            for (const r of rows.results || []) {
+              const id = Number(r.id);
+              if (!need.has(id)) continue;
+              this.agentKeyCache.set(id, {
+                keyId: String(r.agent_key_id || ''),
+                exp: t + AGENT_KEY_CHECK_TTL_MS,
+              });
+            }
+          }
+        } catch { /* D1 不可用：liveAgent 内 fail-open，保持已建立连接 */ }
+      }
+      for (const serverId of ids) {
+        const live = await this.liveAgent(serverId);
+        if (!live) continue;
+        if (this.agentInterval.get(serverId) !== want) this.applyAgentInterval(live, serverId, want);
       }
       return json({ ok: true });
     }
 
-    // 内部 RPC：删除服务器时断开该 agent 的常驻控制通道与相关会话（key 已删，重连会被 401 拒绝）
+    // 内部 RPC：删除服务器 / 轮换 key 时断开该 agent 的常驻控制通道与相关会话
+    //（key 已换/已删，重连会被 401 拒绝）。
+    // 必须关闭**所有**匹配的控制连接，不能只关 agents 里的胜出者：轮换后 agents 被删，
+    // 任何残留连接都能经「当前无登记者」分支重新占回索引，继续 report / 接收 exec。
     if (path === '/rpc/drop_server' && request.method === 'POST') {
       const body = await request.json();
       const serverId = Number(body.serverId) || 0;
-      const w = this.agents.get(serverId);
-      if (w) {
-        this.closeWs(w, 'sess');
-        this.agents.delete(serverId);
+      // 先清身份缓存：让该分片立刻按 D1 最新的 agent_key_id 复核，不必等 TTL。
+      this.agentKeyCache.delete(serverId);
+      this.agentKeyEpoch += 1; // 作废进行中的批量预热，防把刚读到的旧 keyId 写回
+      let closed = 0;
+      let pending = 0;
+      for (const ws of this.state.getWebSockets?.() || []) {
+        const a = this.attOf(ws);
+        if (!a) continue;
+        const sid = typeof a === 'string'
+          ? (Number(a) || 0)
+          : (a.role === 'control' ? (Number(a.serverId) || 0) : 0);
+        if (sid !== serverId) continue;
+        // 只对 OPEN 的连接发起关闭。对已经消失的对端调 close() 会留下永久 CLOSING 的
+        // socket，让对象拿不到 hibernation 资格（11-05 duration 根因）；这类连接只从
+        // 索引摘除，靠 per-message 身份复核拦住它后续的消息。
+        if (ws.readyState === 1) {
+          this.closeWs(ws, 'sess');
+          closed += 1;
+        } else {
+          pending += 1;
+        }
       }
+      this.agents.delete(serverId);
       const sids = [];
       for (const [sid, sess] of this.sessions) {
         if (sess.serverId !== serverId) continue;
@@ -337,7 +402,9 @@ export class TerminalDO {
         if (r && r.timer) clearTimeout(r.timer);
         this.pendingOpen.delete(sid);
       }
-      return json({ ok: true });
+      // closed/pending 让调用方（REST/MCP/删除）能判断是否真的收口：全为 0 且原本在线，
+      // 说明本分片没有该机器连接（正常），而不是静默失败。
+      return json({ ok: true, closed, pending });
     }
 
     // 内部 RPC：worker 创建终端/文件会话时调用
@@ -346,8 +413,9 @@ export class TerminalDO {
       if (body.op === 'create' || body.op === 'open_file') {
         const isFile = body.op === 'open_file';
         if (await this.isUpdating(body.serverId)) return json({ error: 'agent update in progress' }, 409);
-        // 先确认 agent 在线，离线时不创建/不落盘（避免失败会话残留）
-        const agentWs = this.agents.get(body.serverId);
+        // 先确认 agent 在线且身份仍有效，离线/已撤销时不创建/不落盘（避免失败会话残留）。
+        // 必须走 liveAgent：轮换 key 后残留的旧连接不得再收到 open_terminal（P1-01）。
+        const agentWs = await this.liveAgent(body.serverId);
         if (!agentWs) return json({ error: 'agent offline', code: 'AGENT_OFFLINE' }, 502);
         // 每服务器并发会话上限（防批量创建耗尽 PTY/bash/FD/WebSocket）
         let active = 0;
@@ -418,7 +486,7 @@ export class TerminalDO {
         await this.failExecJobWithAudit(this.env, jobId, 'agent update in progress');
         return json({ error: 'agent update in progress' }, 409);
       }
-      const agentWs = this.agents.get(serverId);
+      const agentWs = await this.liveAgent(serverId);
       if (!agentWs) {
         await this.failExecJobWithAudit(this.env, jobId, 'agent offline');
         return json({ error: 'agent offline', code: 'AGENT_OFFLINE' }, 503);
@@ -468,7 +536,9 @@ export class TerminalDO {
         await failJob(this.env, jobId, 'agent update in progress');
         return json({ error: 'agent update in progress' }, 409);
       }
-      const agentWs = this.agents.get(serverId);
+      // liveAgent：身份已撤销的旧连接视同离线，不得把 upload_fetch 发给它（P1-01）。
+      // 任务置 waiting_agent 等新 key 重连后重发，语义比直接失败更稳。
+      const agentWs = await this.liveAgent(serverId);
       if (!agentWs) {
         // 离线不停在失败态（文档 §9）：置 waiting_agent，Agent 重连时自动重发。
         // 这里不需要生成 download URL——重连重发时会重新签发（短期 URL 会过期）。
@@ -514,7 +584,7 @@ export class TerminalDO {
         await failJob(this.env, jobId, 'agent update already in progress');
         return json({ error: 'agent update in progress' }, 409);
       }
-      const agentWs = this.agents.get(serverId);
+      const agentWs = await this.liveAgent(serverId);
       if (!agentWs) {
         await failJob(this.env, jobId, 'agent offline');
         return json({ error: 'agent offline', code: 'AGENT_OFFLINE' }, 503);
@@ -598,8 +668,13 @@ export class TerminalDO {
         this.closeWs(prevAgent, 'super', 4001, 'superseded by new connection');
       }
       this.agents.set(server.id, pair[1]);
-      // 附件随连接持久化：休眠唤醒后靠它重建 agents index（role 区分控制通道与会话流）
-      this.setAtt(pair[1], { role: 'control', serverId: server.id, ts: Date.now() });
+      // 附件随连接持久化：休眠唤醒后靠它重建 agents index（role 区分控制通道与会话流）。
+      // keyId 是握手时使用的 key 指纹，后续每条控制消息都用它与 D1 当前 agent_key_id 比对，
+      // 使轮换/删除能真正撤销已建立的长连接（P1-01），而不是只依赖"重连会 401"。
+      this.setAtt(pair[1], {
+        role: 'control', serverId: server.id, ts: Date.now(),
+        keyId: String(server.agent_key_id || keyId || ''),
+      });
       // Agent 重连 → 重发停在 waiting_agent 的 upload（文档 §9）。不等待，避免拖慢握手：
       // 先把断开期间中断的 running 退回 waiting_agent，再逐条重新签发短期 URL 下发。
       // 公网 origin 只能来自 Worker 注入的 query：这里的 url 已被 handleWs 改写成
@@ -913,6 +988,48 @@ export class TerminalDO {
     return 0;
   }
 
+  // 控制连接的身份复核：附件里的 keyId 必须等于 D1 当前 agent_key_id。
+  // - 附件无 keyId（升级前建立的老连接 / 旧字符串格式）：放行。发布瞬间不能把所有
+  //   已连接 agent 判失效；它们重连时会写入指纹，且 drop_server 已按 serverId 关闭。
+  // - D1 查询失败：放行（fail-open）。宁可短暂保留一条待撤销的连接，也不能因 D1 抖动
+  //   把全站 agent 判成失效；轮换/删除路径会清缓存，下一次消息立即重新复核。
+  async agentKeyStillValid(ws, serverId) {
+    const a = this.attOf(ws);
+    const bound = a && typeof a === 'object' ? String(a.keyId || '') : '';
+    if (!bound) return true;
+    const now = Date.now();
+    const c = this.agentKeyCache.get(serverId);
+    let current;
+    if (c && c.exp > now) {
+      current = c.keyId;
+    } else {
+      try {
+        const row = await this.env.DB
+          .prepare('SELECT agent_key_id FROM servers WHERE id = ?')
+          .bind(serverId)
+          .first();
+        current = row ? String(row.agent_key_id || '') : '';
+        this.agentKeyCache.set(serverId, { keyId: current, exp: now + AGENT_KEY_CHECK_TTL_MS });
+      } catch {
+        return true;
+      }
+    }
+    return current === bound;
+  }
+
+  // 取「当前可用」的控制连接：在线 + 身份仍有效。会话创建、exec、upload、update 四条
+  // 下发路径都必须经过这里——否则轮换后残留的旧连接仍能收到指令（P1-01）。
+  async liveAgent(serverId) {
+    const ws = this.agents.get(serverId);
+    if (!ws) return null;
+    if (await this.agentKeyStillValid(ws, serverId)) return ws;
+    if (this.agents.get(serverId) === ws) this.agents.delete(serverId);
+    // 只对 OPEN 发起关闭：对已消失对端 close() 会留下永久 CLOSING 的 socket
+    //（11-05 duration 根因），与 drop_server / webSocketMessage 的守卫保持一致。
+    if (ws.readyState === 1) this.closeWs(ws, 'auth', 1008, 'agent key revoked');
+    return null;
+  }
+
   // 控制连接附件的建立时间戳：唤醒重建时同 serverId 多条连接取最新者（旧格式无 ts 记 0）
   wsAttTs(ws) {
     try {
@@ -1097,6 +1214,18 @@ export class TerminalDO {
       if (typeof message === 'string') {
         try {
           const j = JSON.parse(message);
+          // 控制通道身份复核（P1-01）：key 轮换/删除后，残留连接仍可能继续上报或收结果。
+          // 必须放在刷新 agents 索引之前——否则旧连接会先抢回索引，exec 随后被发往它。
+          // 常态成本：一次内存 Map 命中（TTL 30s）；轮换路径会清缓存，下一帧立即失效。
+          if (att && (typeof att === 'string' || att.role === 'control')) {
+            const cid = this.wsServerId(ws);
+            if (cid && !(await this.agentKeyStillValid(ws, cid))) {
+              if (this.agents.get(cid) === ws) this.agents.delete(cid);
+              // 只对 OPEN 发起关闭：已 CLOSING 的连接再 close 会延长 CLOSING 寿命。
+              if (ws.readyState === 1) this.closeWs(ws, 'auth', 1008, 'agent key revoked');
+              return;
+            }
+          }
           // A：入站即存活。控制通道来消息说明该连接仍活，用它刷新 agents 索引，天然淘汰
           // 「唤醒后可能被 rebuildIndex 选中的半开死连接」（0 额外消息/请求）。
           // 仅认控制附件，避免会话流失配时把数据流 WS 误登记为控制通道。
@@ -1142,20 +1271,24 @@ export class TerminalDO {
             if (esid) this.markRoundTrip(ws, esid);
             // 异步路径：终态落 D1 + 写审计。本条消息可能唤醒的是一台刚 evict 的 DO，
             // 状态全部来自 D1/job 行，不依赖内存 Map——这正是异步化的核心验收点。
-            if (String(j.exec_id || '').startsWith('job_')) await this.settleExecJob(j.exec_id, j);
+            if (String(j.exec_id || '').startsWith('job_')) {
+              await this.settleExecJob(j.exec_id, j, this.wsServerId(ws));
+            }
             return;
           }
           if (j && j.type === 'upload_result') {
             // 异步路径：job_ 前缀的 upload_id。只有 commit 回执才是"文件已落地"，
             // 非 commit 帧的 ok:true 只表示"该块已写入临时文件"，不能当终态。
             if (String(j.upload_id || '').startsWith('job_') && (j.commit === true || !j.ok)) {
-              await this.settleUploadJob(j.upload_id, j);
+              await this.settleUploadJob(j.upload_id, j, this.wsServerId(ws));
             }
             return;
           }
           if (j && j.type === 'agent_update_result') {
             // 异步路径：job_ 前缀。回执到达即终态（成功=self-replace 完成）。
-            if (String(j.update_id || '').startsWith('job_')) await this.settleUpdateJob(j.update_id, j);
+            if (String(j.update_id || '').startsWith('job_')) {
+              await this.settleUpdateJob(j.update_id, j, this.wsServerId(ws));
+            }
             return;
           }
           if (j && j.type === 'report') {
@@ -1266,9 +1399,12 @@ export class TerminalDO {
         try {
           const j = JSON.parse(message);
           if (j && j.type === 'resize') {
-            const agentWs = this.agents.get(sess.serverId);
+            // resize 也走 liveAgent：身份已撤销的旧连接不得再收到任何下行帧
+            const agentWs = await this.liveAgent(sess.serverId);
             if (agentWs) {
-              agentWs.send(JSON.stringify({ type: 'resize', stream_id: sess.streamId, rows: Number(j.rows) || 24, cols: Number(j.cols) || 80 }));
+              try {
+                agentWs.send(JSON.stringify({ type: 'resize', stream_id: sess.streamId, rows: Number(j.rows) || 24, cols: Number(j.cols) || 80 }));
+              } catch { /* 对端已断开：等重连后 resize 由前端重发 */ }
             }
             return;
           }
@@ -1480,14 +1616,24 @@ export class TerminalDO {
     return job;
   }
 
+  // 回执归属校验（P3-1）：持有 A 机 key 且知道 B 机 job_id 的连接不能结算 B 机的任务。
+  // 返回 true = 通过。row 为空（任务已清理/伪造 id）交给原有条件更新兜底。
+  receiptFromServer(row, fromServerId) {
+    if (!row || !fromServerId) return true;
+    if (Number(row.server_id) === Number(fromServerId)) return true;
+    console.error(`reject job receipt: ${row.id} belongs to server ${row.server_id}, receipt from ${fromServerId}`);
+    return false;
+  }
+
   // upload_result → D1 终态 + 审计（异步路径）。
   // 成功即删 R2 staging 对象：任务已落地，暂存件没有保留价值（也避免占满 10GB 额度）。
-  async settleUploadJob(jobId, j) {
+  async settleUploadJob(jobId, j, fromServerId = 0) {
     let ok = !!j.ok;
     let errMsg = j.error || null;
     // 回执 size 必须与 staged 时的实际字节一致：下载被截断（网络中断）时 Agent 侧
     // 若没拦住，会在目标位置留下短文件却报 ok。两道校验（Agent 侧 fetch + 这里）。
     const row = await getJob(this.env, jobId);
+    if (!this.receiptFromServer(row, fromServerId)) return;
     if (ok && row && typeof j.size === 'number' && Number(row.size_bytes) > 0
         && j.size !== Number(row.size_bytes)) {
       ok = false;
@@ -1522,12 +1668,16 @@ export class TerminalDO {
   }
 
   // agent_update_result → D1 终态 + 审计（异步路径）
-  async settleUpdateJob(jobId, j) {
+  async settleUpdateJob(jobId, j, fromServerId) {
     let ok = !!j.ok;
     let errMsg = j.error || null;
     // 回执校验（文档 §8.6.3）：乱序或伪造回执可能把错误资产标成成功。
     // build_id 必须与任务记录的 to_version 一致；声明了 size 时也必须一致。
     const row = await getJob(this.env, jobId);
+    // 归属校验（P3-1）：持有 A 机 key 的连接不得结算 B 机的更新任务。
+    // 与 settleExecJob / settleUploadJob 同口径；row 为空时交给后续条件更新兜底。
+    // 日志由 receiptFromServer 统一输出（含 job id 与两侧 server id），此处不再重复打。
+    if (!this.receiptFromServer(row, fromServerId)) return;
     if (ok && row) {
       if (j.build_id && row.build_id && String(j.build_id) !== String(row.build_id)) {
         ok = false;
@@ -1565,8 +1715,9 @@ export class TerminalDO {
 
   // exec_result → D1 终态 + 审计（异步路径）。
   // 条件更新未命中说明是重复回执或任务已判过期：只记日志，不覆盖终态、不重复审计。
-  async settleExecJob(jobId, j) {
+  async settleExecJob(jobId, j, fromServerId = 0) {
     const row = await getJob(this.env, jobId);
+    if (!this.receiptFromServer(row, fromServerId)) return;
     // 迟到回执尤其重要：命令可能真的执行了（systemctl restart 之类），报 expired 会
     // 让调用方误判为"没执行"而重试 → 重复执行。纠正状态，但用 [late] 留下曾判过期的痕迹，
     // 否则事后复理会以为首次就成功。

@@ -262,6 +262,40 @@ export function shardFromStreamId(streamId) {
 export function doForShard(env, n) {
   return env.TERMINAL.get(env.TERMINAL.idFromName(`shard-${n}`));
 }
+
+// 广播「断开该服务器的所有控制连接」到全部分片（删除服务器 / 轮换 key 共用）。
+// 不吞失败：返回 { ok, failed, closed, pending }，调用方必须把 failed 暴露给用户或日志。
+// 静默失败会让「旧 key 已失效并已断连」的对外承诺不成立（review P1-01）。
+export async function dropServerConnections(env, serverId) {
+  const results = await Promise.all(Array.from({ length: SHARDS }, async (_, i) => {
+    try {
+      const resp = await doForShard(env, i).fetch('https://do.internal/rpc/drop_server', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ serverId }),
+        // 删除/轮换是管理动作：单分片挂起不得拖住整个请求，失败会进 failed[] 显式上报
+        signal: AbortSignal.timeout(3000),
+      });
+      if (!resp.ok) return { shard: i, ok: false, status: resp.status, closed: 0, pending: 0 };
+      const body = await resp.json().catch(() => ({}));
+      return {
+        shard: i, ok: true,
+        closed: Number(body.closed) || 0,
+        pending: Number(body.pending) || 0,
+      };
+    } catch (e) {
+      return { shard: i, ok: false, status: 0, closed: 0, pending: 0, error: String((e && e.message) || e) };
+    }
+  }));
+  const failed = results.filter((r) => !r.ok).map((r) => r.shard);
+  return {
+    ok: failed.length === 0,
+    failed,
+    closed: results.reduce((n, r) => n + r.closed, 0),
+    pending: results.reduce((n, r) => n + r.pending, 0),
+    shards: results,
+  };
+}
 export function doMetrics(env) {
   return env.METRICS.get(env.METRICS.idFromName('main'));
 }

@@ -353,18 +353,32 @@ fn parse_url(url: &str) -> Result<ParsedUrl, Box<dyn Error + Send + Sync>> {
 /// 当前 url 只来自 Worker/DO，风险可控；但若 DO 被攻破、`panel_origin` 被污染，
 /// 或不慎支持多面板，Agent 会带着有效 token 去请求任意地址。要求：
 ///   - host 必须等于 `AGENT_WSS_URL` 的 host（面板自身域名）
-///   - path 必须以 `/mcp/` 开头（只允许我们自己的两个下载端点）
+///   - port 必须与 `AGENT_WSS_URL` 一致（否则可借同主机其他端口绕过边界）
+///   - scheme 必须与 `AGENT_WSS_URL` 的 tls 语义一致（wss ↔ https，ws ↔ http）
+///   - path 必须以 `/mcp/` 开头（只允许我们自己的下载端点）
+///
+/// 仅主机名一致的旧判据会放行 `https://panel:8443/...` 或明文 `http://panel/...`（P3-8）。
 pub fn validate_panel_url(url: &str, panel_wss: &str) -> Result<(), String> {
     let target = parse_url(url).map_err(|e| format!("invalid download url: {e}"))?;
-    // AGENT_WSS_URL 形如 wss://panel.example/ws/agent：取 authority 里的 host 作为唯一合法目标
-    let panel_host = panel_wss_host(panel_wss);
-    if panel_host.is_empty() {
-        return Err("AGENT_WSS_URL missing host, cannot validate download url".into());
-    }
+    let (panel_host, panel_port, panel_tls) = panel_wss_target(panel_wss)
+        .ok_or_else(|| "AGENT_WSS_URL invalid, cannot validate download url".to_string())?;
     if !target.host.eq_ignore_ascii_case(&panel_host) {
         return Err(format!(
             "download url host mismatch: {} != {panel_host}",
             target.host
+        ));
+    }
+    if target.port != panel_port {
+        return Err(format!(
+            "download url port mismatch: {} != {panel_port}",
+            target.port
+        ));
+    }
+    if target.tls != panel_tls {
+        return Err(format!(
+            "download url scheme mismatch: {} != {}",
+            if target.tls { "https" } else { "http" },
+            if panel_tls { "https" } else { "http" }
         ));
     }
     if !target.path_and_query.starts_with("/mcp/") {
@@ -376,14 +390,31 @@ pub fn validate_panel_url(url: &str, panel_wss: &str) -> Result<(), String> {
     Ok(())
 }
 
-// 从 ws(s)://host[:port]/path 里取 host（含 IPv6 字面量处理）
-fn panel_wss_host(wss: &str) -> String {
-    let rest = wss.split("://").nth(1).unwrap_or("");
+// 从 ws(s)://host[:port]/path 解析 (host, port, tls)；IPv6 字面量按 [::1]:port 处理
+fn panel_wss_target(wss: &str) -> Option<(String, u16, bool)> {
+    let (tls, rest) = match wss.strip_prefix("wss://") {
+        Some(r) => (true, r),
+        None => (false, wss.strip_prefix("ws://")?),
+    };
     let authority = rest.split('/').next().unwrap_or("");
-    if let Some(stripped) = authority.strip_prefix('[') {
-        return stripped.split(']').next().unwrap_or("").to_string();
+    if authority.is_empty() {
+        return None;
     }
-    authority.split(':').next().unwrap_or("").to_string()
+    let default_port = if tls { 443 } else { 80 };
+    if let Some(stripped) = authority.strip_prefix('[') {
+        let (host, tail) = stripped.split_once(']')?;
+        let port = tail
+            .strip_prefix(':')
+            .and_then(|p| p.parse::<u16>().ok())
+            .unwrap_or(default_port);
+        return Some((host.to_string(), port, tls));
+    }
+    match authority.rsplit_once(':') {
+        Some((h, p)) if !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()) => {
+            Some((h.to_string(), p.parse::<u16>().ok()?, tls))
+        }
+        _ => Some((authority.to_string(), default_port, tls)),
+    }
 }
 
 async fn resolve_addr(u: &ParsedUrl) -> Result<std::net::SocketAddr, Box<dyn Error + Send + Sync>> {
@@ -586,13 +617,28 @@ mod tests {
             validate_panel_url("https://panel.example/mcp/upload-jobs/download?id=1", panel)
                 .is_ok()
         );
-        // 端口不同的面板地址也应通过（AGENT_WSS_URL 可能带端口）
+        // 端口必须与 AGENT_WSS_URL 一致：同主机不同端口是另一个服务，不属于面板边界
         assert!(
             validate_panel_url(
                 "https://panel.example/mcp/x",
                 "wss://panel.example:8787/ws/agent"
             )
+            .is_err(),
+            "443 与 8787 不一致必须拒绝"
+        );
+        // 本地开发：ws + 显式端口与 URL 完全一致时放行
+        assert!(
+            validate_panel_url(
+                "http://localhost:8787/mcp/x",
+                "ws://localhost:8787/ws/agent"
+            )
             .is_ok()
+        );
+        // 生产 wss 下不得接受明文 http
+        assert!(
+            validate_panel_url("http://panel.example/mcp/x", "wss://panel.example/ws/agent")
+                .is_err(),
+            "wss 面板不得被明文 http 请求绕过"
         );
 
         // 异源必须拒绝

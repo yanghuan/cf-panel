@@ -271,7 +271,9 @@ export class PanelDO {
       latest = this.latestCache.data;
     } else {
       try {
-        const lResp = await doMetrics(this.env).fetch('https://do.internal/latest');
+        const lResp = await doMetrics(this.env).fetch('https://do.internal/latest', {
+          signal: AbortSignal.timeout(1500), // 对端挂起不得拖住本 DO（hibernation/计时）
+        });
         latest = await lResp.json();
         this.latestCache = { data: latest, ts: lcNow };
       } catch { /* 无最新指标 */ }

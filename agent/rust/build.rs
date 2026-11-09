@@ -15,7 +15,8 @@ fn main() {
         );
     }
 
-    // 收集 src/ 下所有 .rs（新增文件自动纳入）
+    // 收集 src/ **顶层** 的 .rs（子目录如 src/metrics/ 不在此列；那部分由 CI 的
+    // `cargo fmt --check` 兜底）。rerun-if-changed=src/ 本身是递归的，只有本收集不是。
     let files: Vec<String> = std::fs::read_dir("src")
         .map(|rd| {
             rd.filter_map(|e| e.ok())

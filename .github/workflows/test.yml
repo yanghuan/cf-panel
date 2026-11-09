@@ -3,6 +3,12 @@
 # 2) E2E 真实环境联调（wrangler dev --local + Rust agent，纯 Node 零外部二进制依赖）
 name: CI
 
+# 供应链：所有第三方 Action 固定到 commit SHA（标签/分支可被移动，@v4 不是安全边界）。
+# 升级时必须同时核对 SHA 与版本注释：
+#   actions/checkout@v4.2.2
+#   actions/setup-node@v4.2.0
+#   dtolnay/rust-toolchain@stable（分支引用，固定于 2026-11-06）
+
 on:
   push:
   pull_request:
@@ -17,9 +23,9 @@ jobs:
         # node:sqlite 内置模块需 Node >= 22；24 为稳定版
         node-version: [22, 24]
     steps:
-      - uses: actions/checkout@v4.2.2 # 固定具体版本（防 supply chain 变更）
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # 固定具体版本（防 supply chain 变更）
 
-      - uses: actions/setup-node@v4.2.0
+      - uses: actions/setup-node@1d0ff469b7ec7b3cb9d8673fde0c81c44821de2a
         with:
           node-version: ${{ matrix.node-version }}
 
@@ -31,9 +37,9 @@ jobs:
       contents: read # 最小权限
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4.2.2 # 固定具体版本
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # 固定具体版本
 
-      - uses: actions/setup-node@v4.2.0
+      - uses: actions/setup-node@1d0ff469b7ec7b3cb9d8673fde0c81c44821de2a
         with:
           node-version: 24
 
@@ -48,7 +54,7 @@ jobs:
           echo "PANEL_PASSWORD=e2e-pass-$(openssl rand -hex 8)" >> .dev.vars
 
       - name: 构建 Rust agent（E2E 默认使用；Shell 版已废弃）
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
       - run: cargo build --release --manifest-path agent/rust/Cargo.toml
 
       - name: 运行 E2E（wrangler dev + Rust agent 真实联调）

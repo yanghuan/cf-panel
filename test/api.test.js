@@ -1971,6 +1971,43 @@ test('轮换 Agent Key：旧 key 指纹失效，监控历史与审计保留', as
   assert.equal(logs.results.length, 1, '轮换是安全处置动作，必须留痕');
 });
 
+test('轮换 Agent Key：分片断连失败不掩盖成功，失败分片对调用方可见', async () => {
+  const env = makeEnv();
+  const token = await login(env);
+  const added = await addServer(env, token, { name: 'rot-fail' });
+  const list = await (await call(env, { path: '/api/servers', token })).json();
+  const id = list[0].id;
+  const badShard = `shard-${id % 4}`;
+  const stub = env.TERMINAL;
+  const origGet = stub.get.bind(stub);
+  stub.get = (name) => (name === badShard
+    ? { fetch: async () => { throw new Error('shard down'); } }
+    : origGet(name));
+
+  const res = await call(env, { method: 'POST', path: `/api/servers/${id}/rotate-key`, token });
+  assert.equal(res.status, 200, 'key 已换（事务已提交），不能因断连失败返回 5xx');
+  const rot = await res.json();
+  assert.ok(rot.agent_key, '仍须返回新 key');
+  assert.equal(rot.dropped.ok, false);
+  assert.deepEqual(rot.dropped.failed, [id % 4], '失败分片必须暴露，不能静默吞掉');
+  assert.equal(rot.dropped.closed, 0);
+
+  // MCP 入口同源：note 必须条件化，不能无条件声称"已断开"
+  const byId = await (await mcp(env, {
+    token,
+    body: {
+      jsonrpc: '2.0', id: 21, method: 'tools/call',
+      params: { name: 'rotate_agent_key', arguments: { server_id: id } },
+    },
+  })).json();
+  assert.equal(byId.result.isError, false);
+  const mcpRes = JSON.parse(byId.result.content[0].text);
+  assert.equal(mcpRes.disconnected.ok, false);
+  assert.deepEqual(mcpRes.disconnected.failed, [id % 4]);
+  assert.match(mcpRes.note, /连接断开调用失败/, 'MCP note 不得再无条件承诺已断开');
+  assert.ok(mcpRes.agent_key, 'MCP 同样返回新 key');
+});
+
 test('轮换 Agent Key：仅管理员，不存在的服务器 404', async () => {
   const env = makeEnv();
   const token = await login(env);
@@ -2317,6 +2354,34 @@ test('upload job：创建 → 上传字节 → R2 staging → 下发 → 终态�
   assert.equal(audit.results.length, 1, 'file.upload 在 Agent commit 后才写');
 });
 
+test('upload 响应返回 dispatch 之后的状态（不是下发前快照）', async () => {
+  const env = makeEnv();
+  const token = await login(env);
+  await addServer(env, token, { name: 'up-status' });
+  // 模拟真实 DO：收到 /rpc/upload/submit 时把任务从 staged 推进到 waiting_agent
+  env.TERMINAL = {
+    idFromName: (n) => n,
+    get: () => ({
+      fetch: async (url, init = {}) => {
+        if (new URL(url).pathname === '/rpc/upload/submit') {
+          const b = JSON.parse(init.body);
+          await env.DB.prepare("UPDATE operation_jobs SET status = 'waiting_agent' WHERE id = ?").bind(b.jobId).run();
+        }
+        return new Response(JSON.stringify({ ok: true }), { status: 200 });
+      },
+    }),
+  };
+
+  const job = await (await call(env, { method: 'POST', path: '/api/upload-jobs', token, body: { server_id: 1, path: '/opt/s.bin' } })).json();
+  const payload = 'y'.repeat(16);
+  const up = await worker.fetch(new Request(job.upload_url, {
+    method: 'POST', headers: { 'content-length': String(payload.length) }, body: payload,
+  }), env);
+  assert.equal(up.status, 202);
+  const resp = await up.json();
+  assert.equal(resp.status, 'waiting_agent', '必须读 dispatch 后的任务行，否则客户端会看到过期的 staged');
+});
+
 test('upload job：超长字节被拒且不留半截对象；下载 URL 绑定 job/状态', async () => {
   const env = makeEnv({ UPLOAD_MAX_MB: '1' }); // 1MB 上限，便于构造超限
   const token = await login(env);
@@ -2627,6 +2692,14 @@ test('exec 幂等键：跨服务器/跨命令复用必须 409（不得静默返�
     body: { ...body, command: 'echo two' },
   });
   assert.equal(otherCmd.status, 409);
+  // 同 key + 另一个 timeout → 409（否则调用方以为新窗口生效，实际执行仍按旧值）
+  const otherTimeout = await call(env, {
+    method: 'POST', path: '/api/exec-jobs', token,
+    body: { ...body, timeout: 10 },
+  });
+  assert.equal(otherTimeout.status, 409);
+  assert.equal((await otherTimeout.json()).code, 'IDEMPOTENCY_CONFLICT');
+
   // 且不得产生新任务
   const cnt = await env.DB.prepare("SELECT COUNT(*) AS n FROM operation_jobs WHERE kind = 'exec'").first();
   assert.equal(cnt.n, 1, '冲突时不得插入新任务');

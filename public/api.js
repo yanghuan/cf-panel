@@ -44,7 +44,8 @@
       this.serverId = 0;
       this.cwd = '/';
       this._generation = 0;      // open/close 代际：丢弃乱序 API 响应与旧 WebSocket 事件
-      this.uploadState = null;   // { file, size, sent, acked, uploadId, path, reader }
+      this._reqSeq = 0;          // read 请求代际：回执必须匹配 state.reqId（防取消后重开串帧）
+      this.uploadState = null;   // { file, size, sent, acked, uploadId, path, reader, inflightOffset }
       this.downloadState = null; // { path, size, parts, received }
       this.editState = null;     // { path, size, offset, total, parts, received }（editText / 尾部预览）
       this.prependState = null;  // { path, offset, want, parts, received }（只读预览向上追加）
@@ -91,14 +92,35 @@
     close() {
       this._generation += 1; // 取消尚未返回的 open() 及旧 WebSocket 的迟到事件
       if (this.uploadState) {
-        this.send({ type: 'abort', path: this.uploadState.path, upload_id: this.uploadState.uploadId });
+        const u = this.uploadState;
+        this.send({ type: 'abort', path: u.path, upload_id: u.uploadId });
+        // 挂起 reader 必须中止：它持有旧 FileReader，复用时旧 onload 会在新 state 上触发
+        try { u.reader.abort?.(); } catch { /* ignore */ }
         this.uploadState = null;
       }
       this.downloadState = null;
       this.editState = null;
+      // 必须一并清：残留会让重开会话后的 prependMore() 被永久挡住（prependState 非空即 return）
+      this.prependState = null;
       if (this.ws) { try { this.ws.close(); } catch { /* ignore */ } this.ws = null; }
     }
     send(obj) { if (this.connected) this.ws.send(JSON.stringify(obj)); }
+
+    // 发起一次 read 并登记代际 + 期望 offset：取消后立即重开同一路径时，旧回执可能晚于
+    // 新 state 到达；回执必须同时匹配 reqId 与 offset，否则丢弃（P2-02）。
+    // agent 旧版本不回 req_id（undefined）→ 退化为只校验 offset，功能不中断。
+    _read(state, path, offset) {
+      state.reqId = `r${++this._reqSeq}`;
+      state.expectOffset = offset;
+      this.send({ type: 'read', path, offset, limit: FILE_CHUNK, req_id: state.reqId });
+    }
+    _readMatches(state, j) {
+      if (!state) return false;
+      if (state.reqId && j.req_id != null && j.req_id !== state.reqId) return false;
+      if (typeof state.expectOffset === 'number' && typeof j.offset === 'number'
+          && j.offset !== state.expectOffset) return false;
+      return true;
+    }
 
     // 列表（Everything 风格：无通配符纯文本按子串匹配 *文本*）
     list(path, pattern) {
@@ -185,7 +207,10 @@
       if (!u || u.sent >= u.size) return;
       const chunk = u.file.slice(u.sent, Math.min(u.sent + FILE_CHUNK, u.size));
       u.reader.onload = () => {
-        if (!this.uploadState) return; // 已取消（reader 异步完成）
+        // 必须确认仍是同一次上传：取消后立刻重开同一路径时，旧 reader 的异步回调
+        // 会把旧块发进新任务（P2-02）
+        if (this.uploadState !== u) return;
+        u.inflightOffset = u.sent;
         const commit = u.sent + chunk.size >= u.size;
         // 混合帧：JSON 头 + '\n' + 原始字节（Binary 帧，无 base64 膨胀）
         const head = new TextEncoder().encode(JSON.stringify({ type: 'write', path: u.path, offset: u.sent, commit, upload_id: u.uploadId, overwrite: u.overwrite }) + '\n');
@@ -200,13 +225,20 @@
     }
     cancelUpload() {
       if (!this.uploadState) return;
-      this.send({ type: 'abort', path: this.uploadState.path, upload_id: this.uploadState.uploadId });
+      const u = this.uploadState;
+      this.send({ type: 'abort', path: u.path, upload_id: u.uploadId });
+      try { u.reader.abort?.(); } catch { /* ignore */ }
       this.uploadState = null;
       if (this.h.onUploadCanceled) this.h.onUploadCanceled();
     }
     _onWriteResult(j) {
       const u = this.uploadState;
       if (!u) return;
+      // 回执必须属于当前这次上传：upload_id / offset 任一不符即为迟到或串台的回执
+      //（取消后立刻重开同一路径时最常见），直接丢弃，不得推进 acked（P2-02）。
+      // 旧版 agent 不回 upload_id（undefined）→ 仅按 offset 校验，功能不中断。
+      if (j.upload_id != null && j.upload_id !== u.uploadId) return;
+      if (typeof j.offset === 'number' && j.offset !== u.inflightOffset) return;
       u.acked += j.written || 0;
       if (u.acked >= u.size) {
         const path = u.path;
@@ -225,7 +257,7 @@
       if (size <= 0) { if (this.h.onError) this.h.onError(t('file.errEmpty')); return; }
       this.downloadState = { path, size, parts: [], received: 0 };
       if (this.h.onDownloadProgress) this.h.onDownloadProgress(0);
-      this.send({ type: 'read', path, offset: 0, limit: FILE_CHUNK });
+      this._read(this.downloadState, path, 0);
     }
     cancelDownload() {
       if (!this.downloadState) return;
@@ -243,7 +275,7 @@
       if (size <= 0) { if (this.h.onError) this.h.onError(t('file.errZipEmpty')); return; }
       this.downloadState = { path: zipPath, size, parts: [], received: 0, isZip: true, dlName: this._zipBaseName };
       if (this.h.onDownloadProgress) this.h.onDownloadProgress(0);
-      this.send({ type: 'read', path: zipPath, offset: 0, limit: FILE_CHUNK });
+      this._read(this.downloadState, zipPath, 0);
     }
     // 重命名（仅改名，不支持跨目录；newName 不含 /）
     rename(path, newName) { this.send({ type: 'rename', path, new_name: newName }); }
@@ -274,7 +306,7 @@
       const offset = tailBytes > 0 ? Math.max(0, size - tailBytes) : 0;
       // size 语义是"本次要读取的字节数"（= 文件大小 − 起点偏移），完成判定 received >= size 依赖它
       this.editState = { path, size: size - offset, offset, total: size, parts: [], received: 0 };
-      this.send({ type: 'read', path, offset, limit: FILE_CHUNK });
+      this._read(this.editState, path, offset);
     }
     cancelEditText() { this.editState = null; }
 
@@ -286,7 +318,7 @@
       if (this.prependState || from <= 0) return; // 在途去重 + 已到开头不再请求
       const offset = Math.max(0, from - FILE_CHUNK);
       this.prependState = { path, offset, want: from - offset, parts: [], received: 0 };
-      this.send({ type: 'read', path, offset, limit: FILE_CHUNK });
+      this._read(this.prependState, path, offset);
     }
     cancelPrepend() { this.prependState = null; }
 
@@ -294,6 +326,7 @@
       // 编辑器全文读取（优先于下载状态机：editState 独立，完成即回调文本）
       const ed = this.editState;
       if (ed && j.path === ed.path) {
+        if (!this._readMatches(ed, j)) return; // 迟到的旧请求回执：丢弃，不推进当前 state
         // 空文件（size=0，agent 首读即 got=0）直接当空文本打开，不算失败
         if (j.got === 0 && ed.size === 0) {
           this.editState = null;
@@ -337,13 +370,14 @@
           if (this.h.onEditLoaded) this.h.onEditLoaded(ed.path, text, info);
         } else {
           // 续传偏移 = 起点 + 已收字节（尾部预览起点非 0；原实现固定用 received，仅在 offset=0 时正确）
-          this.send({ type: 'read', path: ed.path, offset: ed.offset + ed.received, limit: FILE_CHUNK });
+          this._read(ed, ed.path, ed.offset + ed.received);
         }
         return;
       }
       // 只读预览向上追加（与 editState 互斥：预览首次读已完成，此处是后续翻页）
       const pp = this.prependState;
       if (pp && j.path === pp.path) {
+        if (!this._readMatches(pp, j)) return;
         if (j.got === 0 || !data) {
           this.prependState = null;
           if (this.h.onError) this.h.onError(t('file.errReadFail'));
@@ -370,12 +404,13 @@
           this.prependState = null;
           if (this.h.onPrepended) this.h.onPrepended(pp.path, text, startByte);
         } else {
-          this.send({ type: 'read', path: pp.path, offset: pp.offset + pp.received, limit: FILE_CHUNK });
+          this._read(pp, pp.path, pp.offset + pp.received);
         }
         return;
       }
       const d = this.downloadState;
-      if (!d || j.path !== d.path) return; // 取消后的迟到响应：静默丢弃
+      // 取消后的迟到响应静默丢弃；path 相同但 reqId/offset 不符（取消后立即重开）同样丢弃
+      if (!d || j.path !== d.path || !this._readMatches(d, j)) return;
       if (j.got === 0) {
         // EOF 未达预期 size → 文件已缩短/被替换，中止（zip 临时文件同步清理）
         if (d.isZip) { this._zipCleanup = true; this.send({ type: 'delete', path: d.path }); }
@@ -396,7 +431,7 @@
         if (this.h.onDownloadDone) this.h.onDownloadDone(path, parts, dlName);
       } else {
         if (this.h.onDownloadProgress) this.h.onDownloadProgress(Math.min(100, Math.round((d.received / d.size) * 100)));
-        this.send({ type: 'read', path: j.path, offset: d.received, limit: FILE_CHUNK });
+        this._read(d, j.path, d.received);
       }
     }
   }
@@ -524,12 +559,14 @@
       this.ws = null;
       this.closed = true;
       this.retries = 0;
+      this._retryTimer = null; // 重连定时器：close() 后必须取消，否则会与再次 open() 生成双 WS
     }
     get connected() { return this.ws && this.ws.readyState === 1; }
 
     open() {
       this.closed = false;
       this.retries = 0;
+      if (this._retryTimer) { clearTimeout(this._retryTimer); this._retryTimer = null; }
       if (this.ws && (this.ws.readyState === WebSocket.CONNECTING || this.ws.readyState === WebSocket.OPEN)) return;
       this._connect();
     }
@@ -563,11 +600,12 @@
         }
         if (this.retries < 5) {
           this.retries += 1;
-          setTimeout(() => this._connect(), 3000);
+          // 定时器必须可取消：close() 后残留的定时器会在再次 open() 时补建第二条 WS
+          this._retryTimer = setTimeout(() => { this._retryTimer = null; this._connect(); }, 3000);
         } else {
           // 重连耗尽后 30s 兜底重试（服务恢复后自动连回，无需手动刷新）
           if (this.h.onLongRetry) this.h.onLongRetry();
-          setTimeout(() => this._connect(), 30000);
+          this._retryTimer = setTimeout(() => { this._retryTimer = null; this._connect(); }, 30000);
         }
       };
       ws.onerror = () => { try { ws.close(); } catch { /* ignore */ } };
@@ -575,6 +613,9 @@
     // 主动关闭（idle 暂停/后台隐藏/登出），不再重连
     close() {
       this.closed = true;
+      // 取消待执行的重连：否则 close() 后立即 open() 会同时建立两条 WS
+      //（重复观看者计数 → 维持快采 → 请求/DO duration 放大）
+      if (this._retryTimer) { clearTimeout(this._retryTimer); this._retryTimer = null; }
       if (this.ws) { const w = this.ws; this.ws = null; try { w.close(); } catch { /* ignore */ } }
     }
     sync() { if (this.connected) this.ws.send('sync'); } // 拉最新列表

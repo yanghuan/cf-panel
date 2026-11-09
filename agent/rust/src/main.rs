@@ -903,6 +903,29 @@ async fn control_conn(
     result
 }
 
+// 异步上传的临时文件路径：同目录（跨文件系统 rename 会退化）+ upload_id 白名单。
+// 校验与拼接必须绑在同一个构造函数里——只校验不拼接、或只拼接不校验，都会让
+// 路径注入面回归（单测据此覆盖接线，而不只是白名单函数本身）。
+fn staged_tmp_path(path: &str, upload_id: &str) -> Option<std::path::PathBuf> {
+    if !session::is_valid_upload_id(upload_id) {
+        return None;
+    }
+    Some(std::path::PathBuf::from(format!(
+        "{path}.cfp-upload-{upload_id}"
+    )))
+}
+
+// 临时文件清理也必须走 file_blocking：NFS/FUSE 上 remove_file 同样可能长时间阻塞，
+// 直接在 async worker 上跑会让任务卡住并绕过本地超时约束（P1-02 的同类面）。
+async fn remove_tmp_async(p: std::path::PathBuf) {
+    let p = p.to_string_lossy().into_owned();
+    let _ = crate::blocking::file_blocking(5, move || {
+        let _ = std::fs::remove_file(&p);
+        true
+    })
+    .await;
+}
+
 // 阶段 B：异步上传。字节由本机从 Worker 拉取后原子落盘。
 // 与旧推送路径的区别只在"字节怎么来"：旧的是 DO 切 48KB 帧推过来（DO 全程活跃），
 // 这里是自己发一次 HTTPS GET（DO 完全不参与），落盘仍走"临时文件 + fsync + rename"。
@@ -936,6 +959,16 @@ async fn handle_fetch_upload(
     if upload_id.is_empty() || path.is_empty() || url.is_empty() {
         return;
     }
+    // upload_id 会被拼进临时文件名：白名单与拼接收口到同一个函数（staged_tmp_path），
+    // 单测才能覆盖「校验是否真的接在路径构造上」而不只是白名单本身（P1-02）。
+    let Some(tmp) = staged_tmp_path(&path, &upload_id) else {
+        ctrl_enqueue(
+            &tx,
+            upload_reply(&upload_id, false, Some("invalid upload_id".into()), 0),
+            "upload_result",
+        );
+        return;
+    };
     // 下载 URL 必须与面板同源（文档 §10.5）：即便 DO 已被攻破/panel_origin 被污染，
     // 也不能带着有效 token 去请求任意地址。
     if let Err(e) = fetch::validate_panel_url(&url, &cfg.wss) {
@@ -949,6 +982,23 @@ async fn handle_fetch_upload(
     // 系统路径保护：与旧同步路径、文件会话保持同一判据（/etc /usr /var /proc 等一律拒绝）。
     // 少了这一层，拥有 server:exec 的凭据就能把文件写到 /etc/cron.d/ 这类位置。
     if session::is_system_path(&path) {
+        ctrl_enqueue(
+            &tx,
+            upload_reply(
+                &upload_id,
+                false,
+                Some(session::SYSTEM_PATH_ERR.to_string()),
+                0,
+            ),
+            "upload_result",
+        );
+        return;
+    }
+    // 真实路径预检：上面的词法判定看不穿符号链接（/home/u/link -> /etc）。
+    // 必须在下载前解析父目录再判一次，否则拥有 server:exec 的凭据能把文件写进 /etc，
+    // 而文件管理协议明确宣称系统目录受保护（review P1-02）。
+    // 下载完成后的 commit 还会再判一次（缩小下载期间的 TOCTOU 窗口）。
+    if session::system_path_blocked(&path).await {
         ctrl_enqueue(
             &tx,
             upload_reply(
@@ -979,8 +1029,7 @@ async fn handle_fetch_upload(
             }
             Message::Text(j.to_string().into())
         };
-        // 下载到目标同目录的临时文件：跨文件系统时 rename 会退化，同目录才是原子替换
-        let tmp = std::path::PathBuf::from(format!("{path}.cfp-upload-{upload_id}"));
+        // tmp 在进入 spawn 前已由 staged_tmp_path 生成（同目录，跨文件系统 rename 会退化）
         // 登记到连接级清理表：若下载中途进程重启/控制连接断开，连接退出时会删除，
         // 不在 /opt 这类业务目录留下半截文件（旧同步路径同样登记）。
         if let Ok(mut tmps) = created.lock() {
@@ -991,45 +1040,25 @@ async fn handle_fetch_upload(
         let expect = if size > 0 { Some(size) } else { None };
         match fetch::download_to_file(&url, &tmp, expect, None, max_bytes).await {
             Ok(res) => {
-                // overwrite=false 且目标已存在 → 拒绝（防误覆盖），与旧同步路径同语义。
-                // exists() 是同步 stat，放在 rename 前一次性判断即可（此处已在 spawn 里）。
-                if !overwrite && std::path::Path::new(&path).exists() {
-                    let _ = std::fs::remove_file(&tmp);
-                    ctrl_enqueue(
-                        &tx,
-                        reply(
-                            false,
-                            Some("target already exists (use overwrite=1)".into()),
-                            0,
-                        ),
-                        "upload_result",
-                    );
-                    return;
-                }
-                let commit = (|| -> std::io::Result<()> {
-                    // fsync 后 rename：断电时不会留下半截目标文件
-                    if let Ok(f) = std::fs::File::open(&tmp) {
-                        let _ = f.sync_all();
+                // 提交阶段（exists/fsync/create_dir_all/rename）全部收口到 commit_staged_upload：
+                // 走 file_blocking 的超时 + 信号量 + 熔断，而不是直接在 tokio::spawn 的
+                // async worker 上做同步 IO——挂死 NFS 会永久占住 worker，也绕过本地超时约束。
+                // 该函数内部会再做一次真实路径复核（下载可能耗时数分钟，缩小 TOCTOU 窗口），
+                // overwrite=false 且目标存在时返回与旧同步路径一致的错误文案。
+                let tmp_str = tmp.to_string_lossy();
+                match session::commit_staged_upload(&path, tmp_str.as_ref(), overwrite).await {
+                    Ok(()) => {
+                        log(format!("upload {upload_id}: {} bytes -> {path}", res.bytes));
+                        ctrl_enqueue(&tx, reply(true, None, res.bytes), "upload_result");
                     }
-                    if let Some(p) = std::path::Path::new(&path).parent() {
-                        std::fs::create_dir_all(p)?;
+                    Err(e) => {
+                        remove_tmp_async(tmp).await;
+                        ctrl_enqueue(&tx, reply(false, Some(e), 0), "upload_result");
                     }
-                    std::fs::rename(&tmp, &path)
-                })();
-                if let Err(e) = commit {
-                    let _ = std::fs::remove_file(&tmp);
-                    ctrl_enqueue(
-                        &tx,
-                        reply(false, Some(format!("commit failed: {e}")), 0),
-                        "upload_result",
-                    );
-                    return;
                 }
-                log(format!("upload {upload_id}: {} bytes -> {path}", res.bytes));
-                ctrl_enqueue(&tx, reply(true, None, res.bytes), "upload_result");
             }
             Err(e) => {
-                let _ = std::fs::remove_file(&tmp);
+                remove_tmp_async(tmp).await;
                 ctrl_enqueue(&tx, reply(false, Some(e.to_string()), 0), "upload_result");
             }
         }
@@ -1725,9 +1754,9 @@ async fn dispatch(
                     return;
                 }
                 log(format!("exec {exec_id}: {command}"));
-                // agent 用原始 timeout_s 执行；DO 兜底定时器比这晚 5s（EXEC_TIMEOUT_GRACE_MS），
-                // 正常路径 agent 先回执（超时=无输出：output() 超时分支的缓冲区随 future drop
-                // 丢弃，不存在"部分输出"），DO 定时器仅防悬挂。
+                // agent 用原始 timeout_s 执行；任务 deadline 在 D1 侧另加宽限（EXEC_JOB_GRACE_S），
+                // 正常路径 agent 先回执（超时=无输出：timeout 分支的缓冲区随 future drop
+                // 丢弃，不存在"部分输出"），D1 deadline 仅防悬挂。
                 // 防孤儿：process_group(0) 让子进程成为新进程组组长，超时后 kill(-pid) 连同
                 // 孙进程一并清理（与终端会话 cleanup 的进程组语义一致，见 session.rs）。
                 // 跨平台：Unix 进程组（setsid + kill(-pgid)）/ Windows Job Object（terminate 整树）
@@ -1744,7 +1773,9 @@ async fn dispatch(
                 let mut child = match cmd.spawn() {
                     Ok(c) => c,
                     Err(e) => {
-                        // spawn 失败（如 fork 资源不足）：立即回执，无需等待
+                        // spawn 失败（如 fork 资源不足）：立即回执，无需等待。
+                        // 必须带 error：DO 的 settleExecJob 只把 j.error 映射为 failed，
+                        // 只有 exit_code=-1 会被记成 succeeded（P3-4）。
                         let msg = serde_json::json!({
                             "type": "exec_result",
                             "exec_id": exec_id,
@@ -1752,6 +1783,7 @@ async fn dispatch(
                             "stderr": format!("spawn failed: {e}"),
                             "exit_code": -1,
                             "timed_out": false,
+                            "error": format!("spawn failed: {e}"),
                         });
                         ctrl_enqueue(&tx, Message::Text(msg.to_string().into()), "exec_result");
                         return;
@@ -1783,7 +1815,9 @@ async fn dispatch(
                     (o, e, status)
                 })
                 .await;
-                let (stdout, stderr, exit_code, timed_out) = match out {
+                // error：仅基础设施失败（spawn/wait 异常）携带。真超时由 timed_out 表达，
+                // 命令自身的非零退出码仍算 succeeded（exit_code 才是结果）。
+                let (stdout, stderr, exit_code, timed_out, error) = match out {
                     Ok((o, e, Ok(status))) => {
                         platform::detach_job(pid); // 正常退出：释放 Job 表项与句柄（Windows）
                         (
@@ -1791,17 +1825,20 @@ async fn dispatch(
                             String::from_utf8_lossy(&e).into_owned(),
                             status.code().unwrap_or(-1),
                             false,
+                            None,
                         )
                     }
                     Ok((o, _e, Err(w))) => {
                         // wait 返回错误时子进程句柄已无法继续正常回收；Windows 仍须移除
                         // JOBS 表项并关闭 Job handle，避免每次失败泄漏到 1024 上限。
                         platform::detach_job(pid);
+                        let reason = format!("wait failed: {w}");
                         (
                             String::from_utf8_lossy(&o).into_owned(),
-                            format!("wait failed: {w}"),
+                            reason.clone(),
                             -1,
                             false,
+                            Some(reason),
                         )
                     }
                     Err(_) => {
@@ -1815,6 +1852,7 @@ async fn dispatch(
                             format!("timed out after {timeout_s}s"),
                             -1,
                             true,
+                            None,
                         )
                     }
                 };
@@ -1828,6 +1866,7 @@ async fn dispatch(
                     "stderr": stderr,
                     "exit_code": exit_code,
                     "timed_out": timed_out,
+                    "error": error,
                 });
                 ctrl_enqueue(&tx, Message::Text(msg.to_string().into()), "exec_result");
             });
@@ -2092,6 +2131,42 @@ mod tests {
     #[test]
     fn validate_wss_accepts_wss() {
         assert!(validate_wss("wss://panel.example.com/ws/agent").is_ok());
+    }
+
+    // 接线测试：非法 upload_id 必须在构造临时路径时被拒（不只是白名单函数本身）。
+    #[test]
+    fn staged_tmp_path_rejects_path_injection() {
+        let ok = staged_tmp_path("/opt/a.bin", "job_ABC-123_0").expect("合法 id 应通过");
+        assert_eq!(
+            ok.to_string_lossy(),
+            "/opt/a.bin.cfp-upload-job_ABC-123_0",
+            "临时文件必须与目标同目录（跨文件系统 rename 会退化）"
+        );
+        for bad in ["", "../x", "..", "a/b", "a\\b", "job\n1", "job 1", "job..1"] {
+            assert!(
+                staged_tmp_path("/opt/a.bin", bad).is_none(),
+                "必须拒绝 {bad:?}（拼进文件名的 id 只允许字母数字/-/_）"
+            );
+        }
+    }
+
+    // 清理路径必须真的删掉文件（remove_tmp_async 走 file_blocking 后仍要保证语义不变）。
+    #[tokio::test]
+    async fn remove_tmp_async_deletes_file() {
+        let p = std::env::temp_dir().join(format!(
+            "cfp-remove-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::write(&p, b"x").expect("准备临时文件");
+        assert!(p.exists());
+        remove_tmp_async(p.clone()).await;
+        assert!(!p.exists(), "清理后文件必须消失");
+        // 文件不存在时也不得 panic/报错（失败路径会重复调用）
+        remove_tmp_async(p).await;
     }
 
     #[test]

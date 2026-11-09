@@ -112,7 +112,7 @@ Try again`），再叠加断线退避就成了"半天连不上"。glibc 的解�
 1. **推荐**：systemd/launchd/Windows 服务包装器托管，保持 `AGENT_SELF_RESTART=0`，由 supervisor 拉起；
 2. 手工/计划任务运行且无 supervisor：设置 `AGENT_SELF_RESTART=1`，旧进程清理会话后主动启动新版本。
 
-安全边界：更新接口仅 JWT 管理员可调用（PAT 即使有 `server:exec` 也拒绝）；Release 仓库默认固定为 `yanghuan/cf-panel`，Worker 按 manifest SHA-256、Agent 再独立校验。SHA-256 提供完整性，不等于离线发布签名；仓库/Release 凭证仍是供应链信任根。
+安全边界：更新接口仅管理员可调用——JWT 管理员，或带 `agent:update` scope 且命中 `server_ids` 白名单的 PAT（仅有 `server:exec` 的 PAT 仍拒绝）；Release 仓库默认固定为 `yanghuan/cf-panel`，Worker 按 manifest SHA-256、Agent 再独立校验。SHA-256 提供完整性，不等于离线发布签名；仓库/Release 凭证仍是供应链信任根。
 
 更新失败时正式文件不会替换；已完成替换但新版本无法上线时，可停止服务后把同目录 `<agent文件名>.bak` 复制回正式文件并重启。当前版本保留人工回滚备份，尚未实现独立 watchdog 自动健康回滚。
 

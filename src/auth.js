@@ -174,7 +174,9 @@ export async function panelGraceSeconds(env) {
   if (graceCache && now - graceCache.ts < GRACE_CACHE_TTL_MS) return graceCache.value;
   let value = ONLINE_GRACE_SLOW_S;
   try {
-    const resp = await doPanel(env).fetch('https://do.internal/viewers');
+    const resp = await doPanel(env).fetch('https://do.internal/viewers', {
+      signal: AbortSignal.timeout(1500), // Worker 侧等待也要有上限，避免单个请求挂住
+    });
     const v = await resp.json();
     const count = Number(v.count || 0);
     const fastSince = Number(v.fastSince || 0);
@@ -206,7 +208,9 @@ export async function listServersWithState(env, user) {
   const rows = await queryServersForUser(env, user);
   let latest = {};
   try {
-    const lResp = await doMetrics(env).fetch('https://do.internal/latest');
+    const lResp = await doMetrics(env).fetch('https://do.internal/latest', {
+      signal: AbortSignal.timeout(1500),
+    });
     latest = await lResp.json();
   } catch { /* 无最新指标 */ }
   const nowSec = Math.floor(now / 1000);

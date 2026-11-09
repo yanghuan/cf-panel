@@ -310,7 +310,7 @@ Webhook 出站安全：仅允许 HTTP(S)，拒绝 URL 内嵌凭据、本地域�
 - **搜索**：**过滤**只看当前目录（`*`/`?` 通配符，agent 端先过滤再截断）；**递归搜索**下钻子目录（如 `*.log`，带深度 / 结果数 / 扫描条目三重上限）。递归搜索按**文件名**匹配，不支持内容搜索。
 - **行操作（⋯ 菜单）**：下载 / 重命名（仅改名）/ 移动 / 复制（目录递归拷贝，拒绝复制到自身子目录）/ 权限 / 编辑 / 删除（目录递归）。
 - **权限**：Unix 支持 POSIX 九宫格与八进制双向联动；**Windows 无 POSIX mode**，填八进制会被拒绝，只能用「只读」开关。
-- **在线编辑**：Monaco 懒加载（失败回退 textarea），30+ 语言高亮、`Ctrl/Cmd+S` 保存、全屏、Markdown 预览（marked + DOMPurify，本地 vendor）。上限 1MB，二进制文件双重检测拒绝打开。
+- **在线编辑**：Monaco 懒加载（失败回退 textarea），30+ 语言高亮、`Ctrl/Cmd+S` 保存、全屏、Markdown 预览（marked + DOMPurify，本地 vendor）。上限 2MB（`EDIT_MAX_BYTES`），二进制文件双重检测拒绝打开。
 
 > 系统目录（`/proc`、`/sys`、`/etc`、`/usr`、`/var`、`/root` 等；Windows 为 `Windows`、`Program Files` 等）拒绝写操作，ZIP 属只读下载。
 
@@ -318,7 +318,7 @@ Webhook 出站安全：仅允许 HTTP(S)，拒绝 URL 内嵌凭据、本地域�
 
 管理员登录时读取 GitHub Release 的 `agent-manifest.json`（5 分钟缓存）。节点上报 `update_protocol=1` 且配置 `ALLOW_SELF_UPDATE=1` 时，卡片菜单出现「更新 Agent」：
 
-二进制经 Worker → TerminalDO → 控制 WS 流式中转，Agent 校验大小 / SHA-256 / 候选 `--version`，保留 `.bak` 后用 `self-replace` 原子替换，由 supervisor 或 `AGENT_SELF_RESTART=1` 拉起。
+面板只创建 `agent_update` 任务并下发任务元数据与短期签名 URL（资产字节不经过 Worker/DO）；Agent 自行经资产代理拉取、校验大小 / SHA-256 / 候选 `--version`，保留 `.bak` 后用 `self-replace` 原子替换，由 supervisor 或 `AGENT_SELF_RESTART=1` 拉起。接口是**异步**的：返回 `job_id`，需轮询 `get_operation` 获取终态。
 
 - 更新需 `agent:update` 权限（管理员，或带该 scope 且命中白名单的 PAT），操作写审计日志。
 - Fork 部署请设 `AGENT_RELEASE_REPO=owner/repo`。
@@ -326,7 +326,7 @@ Webhook 出站安全：仅允许 HTTP(S)，拒绝 URL 内嵌凭据、本地域�
 
 ### 轮换 Agent Key
 
-卡片菜单「轮换 Key」：旧 key 立即失效并断开现有连接，**监控历史（含按天账）与审计记录全部保留**——这是 key 泄露或误发后的正确处置路径（此前只能删服务器重建，会清空全部历史）。
+卡片菜单「轮换 Key」：旧 key 对新连接立即失效（一律 401），处于打开状态的控制连接会被主动关闭（已进入关闭中的只摘索引，不再重复 close）；仍在发消息的连接还会用附件里的 key 指纹与 D1 复核，不符即 1008 断开（复核结果缓存 30s，故最迟 30s 生效；D1 暂不可用时该次复核放行，恢复后重新生效）。升级前建立、附件无指纹的老连接只能依赖主动关闭。**监控历史（含按天账）与审计记录全部保留**——这是 key 泄露或误发后的正确处置路径（此前只能删服务器重建，会清空全部历史）。
 
 轮换后需人工到目标机更新 `AGENT_KEY` 并重启 agent（key 是 agent 侧静态凭据，服务端无法推送给未连接的 agent）。
 
@@ -386,7 +386,7 @@ Webhook 出站安全：仅允许 HTTP(S)，拒绝 URL 内嵌凭据、本地域�
 | GET | `/api/servers` | 服务器列表（含分组、序号，按权限过滤） |
 | POST | `/api/servers` | 添加服务器（`name` 必填，`group`/`sort_order`/`description` 可选），返回一次性 agent 配置 |
 | PATCH | `/api/servers/:id` | 改名称 / 分组 / 描述 / 序号 / 告警阈值覆盖（`description` 传空串清除、`alert_override` 传 `null` 清除） |
-| POST | `/api/servers/:id/rotate-key` | 轮换 agent key（旧 key 立即失效并断连，历史保留） |
+| POST | `/api/servers/:id/rotate-key` | 轮换 agent key（新连接立即 401；OPEN 连接主动关闭 + 指纹复核 ≤30s，D1 抖动时放行；历史保留） |
 | POST | `/api/servers/:id/agent-update` | 异步更新 Agent：创建任务并下发元数据，Agent 经资产代理自行拉取（需节点 `ALLOW_SELF_UPDATE=1`） |
 | POST | `/api/servers/batch` | 批量操作：`op=update-group`（单事务）或 `delete`（逐台级联），`ids` 上限 100 |
 | DELETE | `/api/servers/:id` | 删除服务器（含历史清理与断连） |

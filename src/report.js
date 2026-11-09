@@ -34,7 +34,8 @@ export const REPORT_FWD_THROTTLE_S = 5;
 // 转发到 MetricsDO 的硬上限（毫秒）。这条 await 位于 TerminalDO 的 webSocketMessage 内，
 // 一旦 MetricsDO 挂住（冷启动、被 evict、或它内部同步发告警 webhook —— sendWebhook 本身没有超时），
 // TerminalDO 的处理函数就不返回，对象停在 non-hibernateable 状态按 70–140s 的 evict 周期计 duration。
-// 取 2s：正常转发实测 50–60ms，余量足够；超时后本批 frames 丢弃，下一帧（≤5s 后）会重新聚合。
+// 取 2s：正常转发实测 50–60ms，余量足够；失败/超时/非 2xx 的批次会放回 reportBatch，
+// 由下一帧（≤5s 后）重新聚合，不静默丢帧（P3-6）。
 export const FWD_TIMEOUT_MS = 2000;
 export const reportBatch = new Map(); // serverId -> 待批量转发的帧（跨实例 evict 丢失后仅偶发丢一帧，无害）
 export let reportFlushAt = 0; // 上次 flush 时刻（ms；隔离实例内共享，上报驱动触发）
@@ -257,21 +258,35 @@ export async function handleReport(env, payload, timing) {
   const flushNow = Date.now();
   if (flushNow - reportFlushAt >= REPORT_FWD_THROTTLE_S * 1000) {
     reportFlushAt = flushNow;
-    const frames = [...reportBatch.values()];
+    const batch = [...reportBatch.entries()]; // [serverId, frame]：失败时按机放回
     reportBatch.clear();
     const mdo = doMetrics(env);
     const tFwd = Date.now();
+    // 失败（网络 reject 或非 2xx）必须把批次放回，否则这批帧被静默丢弃——
+    // fetch() 对 5xx 是 resolve，只靠 catch 抓不到（P3-6）。
+    const restore = () => {
+      for (const [sid, f] of batch) {
+        if (!reportBatch.has(sid)) reportBatch.set(sid, f); // 期间新帧优先，旧帧只补缺
+      }
+    };
+    let resp;
     try {
-      await mdo.fetch('https://do.internal/report', {
+      resp = await mdo.fetch('https://do.internal/report', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ frames }),
+        body: JSON.stringify({ frames: batch.map(([, f]) => f) }),
         signal: AbortSignal.timeout(FWD_TIMEOUT_MS), // 挂起会拖住 TerminalDO 的 hibernation，见常量注释
       });
     } catch (e) {
       // 超时/失败都记下来（调用方会照旧向上抛，语义不变）：超时次数是「MetricsDO 排队」的直接指标
+      restore();
       if (timing) { timing.fwd = Date.now() - tFwd; timing.fwdTimeout = 1; }
       throw e;
+    }
+    if (!resp.ok) {
+      restore();
+      if (timing) { timing.fwd = Date.now() - tFwd; timing.fwdFailed = 1; }
+      throw new Error(`metrics forward failed: HTTP ${resp.status}`);
     }
     if (timing) { timing.fwd = Date.now() - tFwd; timing.flushed = 1; }
   }

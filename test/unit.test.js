@@ -373,11 +373,17 @@ test('编辑读取：大文件尾部只读预览（1 次往返、丢弃半截首
   const loaded = [];
   sess.h.onEditLoaded = (path, text, info) => loaded.push({ path, text, info });
   const enc = new TextEncoder();
+  // 请求带代际 id（P2-02）：断言协议其余字段时剥离 req_id，只校验其格式
+  const reqOf = (f) => {
+    const { req_id, ...rest } = f;
+    assert.match(req_id, /^r\d+$/);
+    return rest;
+  };
 
   // 1) 普通全量读取（多块续传）：续传偏移 = 起点(0) + 已收字节。
   //    仅靠这条无法区分新老实现，故紧接着用非 0 起点的尾部预览覆盖真正的回归面。
   sess.editText('/home/u/a.log', 1024 * 1024);
-  assert.deepEqual(frames[0], { type: 'read', path: '/home/u/a.log', offset: 0, limit: 512 * 1024 });
+  assert.deepEqual(reqOf(frames[0]), { type: 'read', path: '/home/u/a.log', offset: 0, limit: 512 * 1024 });
 
   // 2) 尾部预览：10MB 文件只请求末尾 PREVIEW_TAIL_BYTES，起点 = 大小 − 尾部长度
   const size = 10 * 1024 * 1024;
@@ -435,6 +441,11 @@ test('只读预览向上追加：已在开头不发请求、在途去重、半�
   sess.h.onPrepended = (path, text, nextFrom) => got.push({ path, text, nextFrom });
   const enc = new TextEncoder();
   const blk = CfApi.FILE_CHUNK;
+  const reqOf = (f) => {
+    const { req_id, ...rest } = f;
+    assert.match(req_id, /^r\d+$/);
+    return rest;
+  };
 
   // 已在文件开头（from = 0）→ 一个字节都不该请求（UI 的 previewFrom 归 0 后即停在此）
   sess.prependMore('/var/log/big.log', 0);
@@ -442,7 +453,7 @@ test('只读预览向上追加：已在开头不发请求、在途去重、半�
 
   // 从第 3 块处往前取一块：offset = 3 块 − 1 块
   sess.prependMore('/var/log/big.log', 3 * blk);
-  assert.deepEqual(frames[0], { type: 'read', path: '/var/log/big.log', offset: 2 * blk, limit: blk });
+  assert.deepEqual(reqOf(frames[0]), { type: 'read', path: '/var/log/big.log', offset: 2 * blk, limit: blk });
 
   // 在途期间重复触发直接忽略：滚动事件极密集，每次都是一趟 WS 往返
   sess.prependMore('/var/log/big.log', 2 * blk);
@@ -481,6 +492,49 @@ test('只读预览向上追加：已在开头不发请求、在途去重、半�
   assert.ok(sess.prependState, '在途');
   sess._onMessage({ data: JSON.stringify({ type: 'error', message: 'boom' }) });
   assert.equal(sess.prependState, null, 'error 后状态复位，可重试');
+});
+
+test('文件传输串帧防护：取消后重开同一路径，旧回执/旧 reader 不得推进新任务', () => {
+  const sess = new CfApi.FileSession({});
+  const frames = [];
+  sess.send = (o) => frames.push(o);
+  const done = [];
+  sess.h.onDownloadDone = (p) => done.push(p);
+
+  // ---- 读取：取消后立即重开同一路径 ----
+  sess.download('/home/u/a.bin', 4);
+  const oldReq = frames[frames.length - 1];
+  sess.cancelDownload();
+  sess.download('/home/u/a.bin', 4);
+  const newReq = frames[frames.length - 1];
+  assert.notEqual(oldReq.req_id, newReq.req_id, '每次 read 请求都有独立代际');
+
+  sess._onReadResult({ path: '/home/u/a.bin', offset: 0, got: 4, req_id: oldReq.req_id }, new Uint8Array(4));
+  assert.equal(sess.downloadState.received, 0, '旧代际回执不得推进当前下载');
+  sess._onReadResult({ path: '/home/u/a.bin', offset: 0, got: 4, req_id: newReq.req_id }, new Uint8Array(4));
+  assert.equal(done.length, 1, '当前代际回执照常完成');
+
+  // ---- 上传：旧 upload_id / offset 的回执必须丢弃 ----
+  const mkUpload = (id) => ({
+    file: { size: 10 }, size: 10, sent: 0, acked: 0, uploadId: id, path: '/home/u/a.bin',
+    reader: { abort() {} }, inflightOffset: 0,
+  });
+  sess.uploadState = mkUpload('u-new');
+  sess._onWriteResult({ type: 'write_result', upload_id: 'u-old', offset: 0, written: 10 });
+  assert.equal(sess.uploadState.acked, 0, '旧 upload_id 回执不得推进新任务');
+  sess._onWriteResult({ type: 'write_result', upload_id: 'u-new', offset: 5, written: 10 });
+  assert.equal(sess.uploadState.acked, 0, 'offset 不符同样丢弃');
+  sess._onWriteResult({ type: 'write_result', upload_id: 'u-new', offset: 0, written: 10 });
+  assert.equal(sess.uploadState, null, '匹配的回执照常完成');
+
+  // ---- close(): prependState 必须清空，且挂起的 reader 被中止 ----
+  let aborted = false;
+  sess.uploadState = { ...mkUpload('u-x'), reader: { abort() { aborted = true; } } };
+  sess.prependState = { path: '/home/u/a.bin', offset: 5, want: 5, parts: [], received: 0 };
+  sess.close();
+  assert.equal(sess.uploadState, null);
+  assert.equal(aborted, true, '挂起的 FileReader 必须 abort');
+  assert.equal(sess.prependState, null, '不清会让重开会话后的 prependMore 永久静默');
 });
 
 // app.js 无 DOM/Monaco 测试环境，这部分只能做源码级锁定。锁的是几处"删掉就会静默出错"的约束：

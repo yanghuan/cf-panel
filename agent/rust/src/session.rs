@@ -1425,7 +1425,12 @@ async fn handle_file_cmd(line: &str, sid: &str, tmp_dir: &str) -> FileReply {
         "read" => {
             let offset = v.get("offset").and_then(|x| x.as_u64()).unwrap_or(0);
             let limit = v.get("limit").and_then(|x| x.as_u64()).unwrap_or(0);
-            match file_read(path, offset, limit).await {
+            let req_id = v
+                .get("req_id")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string();
+            match file_read(path, offset, limit, req_id).await {
                 Ok(frame) => FileReply::Binary(frame),
                 Err(e) => FileReply::Text(err_json(&e)),
             }
@@ -1641,7 +1646,12 @@ async fn file_list(path: String, pattern: Option<String>) -> String {
 
 // 读取返回混合帧（JSON 头 + '\n' + 原始字节，无 base64 膨胀）。
 // 块上限仍由 READ_BLOCK 约束（与前端 512KB 分块一致），错误返回 Err(描述)
-async fn file_read(path: String, offset: u64, limit: u64) -> Result<Vec<u8>, String> {
+async fn file_read(
+    path: String,
+    offset: u64,
+    limit: u64,
+    req_id: String,
+) -> Result<Vec<u8>, String> {
     match crate::blocking::file_blocking(30, move || {
         use std::io::{Read, Seek, SeekFrom};
         let meta = match std::fs::metadata(&path) {
@@ -1682,10 +1692,12 @@ async fn file_read(path: String, offset: u64, limit: u64) -> Result<Vec<u8>, Str
                 Err(_) => break,
             }
         }
-        // 混合帧：JSON 头 + '\n' + 原始字节
+        // 混合帧：JSON 头 + '\n' + 原始字节。
+        // req_id 由前端透传（旧前端不发 → 空串）：回执原样带回，前端据此丢弃
+        // 「取消后重开同一路径」时迟到的旧块（P2-02）。空串对旧前端无影响。
         let head = serde_json::json!({
             "type": "read_result", "ok": true, "path": path,
-            "offset": offset, "got": got, "size": size,
+            "offset": offset, "got": got, "size": size, "req_id": req_id,
         })
         .to_string();
         let mut frame = head.into_bytes();
@@ -1697,6 +1709,57 @@ async fn file_read(path: String, offset: u64, limit: u64) -> Result<Vec<u8>, Str
     {
         Some(v) => v,
         None => Err("read timeout".to_string()),
+    }
+}
+
+// upload_id 字符白名单（WS 分块上传与异步上传共用）：
+// upload_id 会被拼进临时文件名，异常字符（`../`、路径分隔符）等于任意路径注入。
+pub fn is_valid_upload_id(upload_id: &str) -> bool {
+    !upload_id.is_empty()
+        && upload_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+// 异步上传前的真实路径预检（供 main.rs 的 upload_fetch 调用）。
+// 词法判定看不到符号链接（link -> /etc），必须在下载前把父目录解析后再判一次。
+// canonicalize 属阻塞调用，必须走 file_blocking；超时/熔断开启时无法判定 → fail closed。
+pub async fn system_path_blocked(path: &str) -> bool {
+    let p = path.to_string();
+    crate::blocking::file_blocking(10, move || is_system_path_resolved(&p))
+        .await
+        .unwrap_or(true)
+}
+
+// 异步上传的原子提交（下载完成 → 目标落地），供 main.rs 的 upload_fetch 调用。
+// 与 write_bytes 同一安全语义：真实路径复核（下载可能耗时数分钟，下载前的检查覆盖不了
+// 这期间被替换的父目录链接）、overwrite 判据、fsync 后 rename；
+// 所有同步 IO 都在 file_blocking 内执行（超时 + 信号量 + 熔断），不再裸跑在 async worker 上。
+pub async fn commit_staged_upload(path: &str, tmp: &str, overwrite: bool) -> Result<(), String> {
+    let path = path.to_string();
+    let tmp = tmp.to_string();
+    let r = crate::blocking::file_blocking(30, move || -> Result<(), String> {
+        if is_system_path_resolved(&path) {
+            return Err(SYSTEM_PATH_ERR.to_string());
+        }
+        if !overwrite && std::path::Path::new(&path).exists() {
+            return Err("target already exists (use overwrite=1)".into());
+        }
+        // fsync 后 rename：断电时不会留下半截目标文件（写权限打开，Windows 的
+        // FlushFileBuffers 要求句柄可写）
+        if let Ok(f) = std::fs::OpenOptions::new().write(true).open(&tmp) {
+            let _ = f.sync_all();
+        }
+        if let Some(p) = std::path::Path::new(&path).parent() {
+            std::fs::create_dir_all(p).map_err(|e| format!("commit failed: {e}"))?;
+        }
+        std::fs::rename(&tmp, &path).map_err(|e| format!("commit failed: {e}"))
+    })
+    .await;
+    match r {
+        Some(Ok(())) => Ok(()),
+        Some(Err(e)) => Err(e),
+        None => Err("commit timeout".into()),
     }
 }
 
@@ -1714,14 +1777,12 @@ pub fn write_bytes(
 ) -> String {
     use std::io::{Seek, SeekFrom, Write};
     // upload_id 字符白名单（深度防御，path 已任意，防异常 upload_id 注入临时文件名）
-    if !upload_id
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-    {
+    if !is_valid_upload_id(upload_id) {
         return err_json("bad upload_id");
     }
-    // 系统路径最终防线（真实路径解析，防符号链接写穿）：WS write 与 REST 上传（main.rs）
-    // 两条写入路径都汇聚到 write_bytes，在此统一拦截；调用方各自还有词法层快速预检。
+    // 系统路径最终防线（真实路径解析，防符号链接写穿）：WS 分块写与异步上传的提交阶段
+    // （commit_staged_upload）都在此判据上收口；旧注释「两条路径都汇聚到 write_bytes」
+    // 已过时——upload_fetch 不走本函数，它复用 is_system_path_resolved 同一判据。
     // 本函数在 blocking 闭包内执行，canonicalize 阻塞由外层超时兜底
     if is_system_path_resolved(path) {
         return err_json(SYSTEM_PATH_ERR);
@@ -1783,8 +1844,10 @@ pub fn write_bytes(
         cleanup(&tmp);
         return err_json("write failed");
     }
+    // upload_id 原样回传：前端用它把回执绑定到「当前这次上传」，
+    // 避免取消后立即重开同一路径时旧回执把新任务的进度提前推满（P2-02）。
     serde_json::json!({
-        "type": "write_result", "ok": true, "path": path,
+        "type": "write_result", "ok": true, "path": path, "upload_id": upload_id,
         "offset": offset, "written": written, "commit": commit,
     })
     .to_string()
@@ -1997,6 +2060,79 @@ mod tests {
     }
 
     #[test]
+    fn upload_id_whitelist_rejects_path_injection() {
+        for ok in ["job_abc123", "job-abc_123", "a"] {
+            assert!(is_valid_upload_id(ok), "{ok} 应通过");
+        }
+        for bad in ["", "../etc", "a/b", "a\\b", "a.b", "a b", "%2e%2e"] {
+            assert!(!is_valid_upload_id(bad), "{bad} 应拒绝");
+        }
+    }
+
+    // 异步上传的提交阶段必须与 write_bytes 同一判据：父目录是符号链接（lnk -> /etc）时，
+    // 词法判定放行、真实路径判定拦下。预检与提交各验证一次（后者缩小 TOCTOU 窗口）。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn async_upload_commit_rejects_symlinked_parent() {
+        let base = std::env::temp_dir().join(format!("cfp-commit-lnk-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let link = base.join("lnk");
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink("/etc", &link).unwrap();
+        let staged = base.join("staged.bin");
+        std::fs::write(&staged, b"payload").unwrap();
+        let target = link.join("cfp-upload-should-not-exist");
+
+        assert!(
+            system_path_blocked(target.to_str().unwrap()).await,
+            "下载前的真实路径预检必须拦住符号链接父目录"
+        );
+        assert!(
+            !is_system_path(target.to_str().unwrap()),
+            "词法层看不穿符号链接——这正是 P1-02 的绕过面"
+        );
+        let err = commit_staged_upload(target.to_str().unwrap(), staged.to_str().unwrap(), true)
+            .await
+            .expect_err("提交阶段必须再拦一次（下载期间链接可能被替换）");
+        assert!(err.contains("system path is protected"), "{err}");
+        assert!(!std::path::Path::new("/etc/cfp-upload-should-not-exist").exists());
+        let _ = std::fs::remove_file(&link);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn async_upload_commit_writes_and_honors_overwrite() {
+        let base = std::env::temp_dir().join(format!("cfp-commit-ok-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let staged = base.join("staged.bin");
+        std::fs::write(&staged, b"hello").unwrap();
+        let target = base.join("sub/dir/out.bin");
+
+        commit_staged_upload(target.to_str().unwrap(), staged.to_str().unwrap(), false)
+            .await
+            .expect("普通路径应能创建父目录并原子落地");
+        assert_eq!(std::fs::read(&target).unwrap(), b"hello");
+        assert!(!staged.exists(), "staged 已 rename，不留临时文件");
+
+        // overwrite=false 且目标存在 → 拒绝且不覆盖（与旧同步路径同文案）
+        let staged2 = base.join("staged2.bin");
+        std::fs::write(&staged2, b"new").unwrap();
+        let err = commit_staged_upload(target.to_str().unwrap(), staged2.to_str().unwrap(), false)
+            .await
+            .expect_err("overwrite=false 必须拒绝已存在的目标");
+        assert!(err.contains("target already exists"), "{err}");
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            b"hello",
+            "旧内容不得被覆盖"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
     fn crc32_known_vector() {
         // 标准测试向量：CRC32("123456789") = 0xCBF43926
         assert_eq!(crc32(b"123456789"), 0xCBF43926);
@@ -2029,6 +2165,7 @@ mod tests {
             path.to_string_lossy().into_owned(),
             offset,
             READ_BLOCK as u64,
+            "r-test".to_string(),
         )
         .await
         .expect("大文件必须能按 offset 读取（尾部预览依赖它）");

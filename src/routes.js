@@ -48,7 +48,7 @@ const MCP_TOOLS = [
   },
   {
     name: 'update_agent',
-    description: '触发指定服务器的 Agent 自更新：从官方 Release 下载最新构建（SHA-256 校验）经控制通道流式中转，Agent 原子替换并重启。需要 agent:update 权限（管理员或带 agent:update scope 的 PAT，且命中 server_ids 白名单），且目标 Agent 已配置 ALLOW_SELF_UPDATE=1。单机语义：多台请串行逐台调用（与前端批量更新同策略），每次调用可看到该台的失败原因与审计。已是最新版本时返回 already_latest。',
+    description: '触发指定服务器的 Agent 自更新：面板创建 agent_update 任务并只下发指令，Agent 自行从官方 Release 拉取构建（SHA-256 校验）、原子替换并重启（资产字节不经过 Worker/DO）。**异步**：返回 job_id 与 accepted，必须用 get_operation 轮询终态（installed / failed）才能拿到结果与失败原因。需要 agent:update 权限（管理员或带 agent:update scope 的 PAT，且命中 server_ids 白名单），且目标 Agent 已配置 ALLOW_SELF_UPDATE=1。单机语义：多台请串行逐台调用（与前端批量更新同策略）。已是最新版本时返回 already_latest。',
     inputSchema: {
       type: 'object',
       properties: {
@@ -60,7 +60,7 @@ const MCP_TOOLS = [
   },
   {
     name: 'create_upload',
-    description: '创建一次性的文件上传签名 URL（大文件/二进制上传通道，不经过 LLM 上下文）。返回可直接 curl 使用的 POST URL，签名绑定目标服务器、路径与覆盖标志，10 分钟过期。AI 自身无法直接传大文件——把返回的 upload_url 转给用户/程序执行（或指导客户端用 fetch/curl POST 该 URL，body 为原始文件字节；默认上限 100MB，UPLOAD_MAX_MB 可调但受 500MB 硬上限约束，且实际还受 Cloudflare 单请求体上限限制——免费版 100MB，调高也不会生效）。需 exec 权限。**异步**：返回 job_id，必须用 get_operation 轮询终态。',
+    description: '创建一次性的文件上传签名 URL（大文件/二进制上传通道，不经过 LLM 上下文）。返回可直接 curl 使用的 POST URL；签名绑定用途/任务 id/服务器 id/额外参数/过期时间（目标路径与 overwrite 由服务端从任务记录读取，不参与签名），10 分钟过期。AI 自身无法直接传大文件——把返回的 upload_url 转给用户/程序执行（或指导客户端用 fetch/curl POST 该 URL，body 为原始文件字节；默认上限 100MB，UPLOAD_MAX_MB 可调但受 500MB 硬上限约束，且实际还受 Cloudflare 单请求体上限限制——免费版 100MB，调高也不会生效）。需 exec 权限。**异步**：返回 job_id，必须用 get_operation 轮询终态。',
     inputSchema: {
       type: 'object',
       properties: {
@@ -120,7 +120,7 @@ const MCP_TOOLS = [
   },
   {
     name: 'rotate_agent_key',
-    description: '轮换某台服务器的 agent key（仅管理员）：旧 key 立即失效并断开其现有连接，监控历史与审计记录全部保留——用于 key 泄露或误发后的处置（此前只能删除服务器重建，会清空历史）。返回新 agent_key（明文只返回一次）与 wss_base 部署地址。注意：key 是 agent 侧配置的静态凭据，服务端无法推送，须人工到目标机更新 AGENT_KEY 并重启 agent 后才会重新上线。提供 server_id 或 server_name 之一（重名时须用 server_id）。',
+    description: '轮换某台服务器的 agent key（仅管理员）：旧 key 对新连接立即失效（一律 401）；处于打开状态的控制连接会被主动关闭（已进入关闭中的只摘索引），带指纹的连接还会在每条控制消息上按附件指纹与 D1 当前值复核（不匹配即 1008，结果缓存 30s，故最迟 30s 生效；D1 暂不可用时该次复核放行）。附件无指纹的升级前老连接仅依赖主动关闭。监控历史与审计记录全部保留——用于 key 泄露或误发后的处置（此前只能删除服务器重建，会清空历史）。返回新 agent_key（明文只返回一次）与 wss_base 部署地址。注意：key 是 agent 侧配置的静态凭据，服务端无法推送，须人工到目标机更新 AGENT_KEY 并重启 agent 后才会重新上线。提供 server_id 或 server_name 之一（重名时须用 server_id）。',
     inputSchema: {
       type: 'object',
       properties: {
@@ -222,6 +222,7 @@ import {
   json, err, requireJwtSecret, signJwt, randomHex, sha256Hex, hashSecret, safeJson,
   kvGet, kvPut, sanitizeAlerts, sanitizeAlertOverride, parseRangeHours, sendWebhookRaw,
   doMetrics, doForShard, doPanel, shardForServerId, makeStreamId, shardFromStreamId,
+  dropServerConnections,
   signJobToken, verifyJobToken,
 } from './utils.js';
 import { queryMonitorRows, queryCustomMetrics, queryDayStats, kvClearCache } from './db.js';
@@ -443,6 +444,7 @@ async function dispatchExecJob(env, user, { server, command, timeoutS, ip, idemp
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ jobId: job.id, serverId: server.id, command, timeoutMs: timeoutS * 1000 }),
+      signal: AbortSignal.timeout(5000), // 短请求；对端挂起不得拖住 Worker 请求与任务收敛（P3-11）
     });
     const out = await resp.json().catch(() => ({}));
     if (!resp.ok) {
@@ -547,18 +549,14 @@ async function deleteServerCascade(env, user, ip, id) {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ server_id: id }),
+      signal: AbortSignal.timeout(3000),
     });
   } catch { /* 热区清理失败不影响删除 */ }
-  // 4) 通知各分片 DO 断开该 agent 的常驻控制通道与活跃会话
-  for (let i = 0; i < SHARDS; i++) {
-    try {
-      await doForShard(env, i).fetch('https://do.internal/rpc/drop_server', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ serverId: id }),
-      });
-    } catch { /* 分片暂不可达；agent 重连会因 key 失效被拒 */ }
-  }
+  // 4) 通知各分片 DO 断开该 agent 的常驻控制通道与活跃会话。
+  // 删除路径已无 admin 可返回，但失败必须留痕：否则「服务器已删但旧连接仍能上报」
+  // 会在无人知晓的情况下发生（P1-01）。drops.failed 同时用于线上排查。
+  const drops = await dropServerConnections(env, id);
+  if (!drops.ok) console.error(`delete server ${id}: drop_server failed on shards ${drops.failed.join(',')}`);
   // 5) 清 PanelDO 列表缓存（避免已删服务器仍出现在观看者推送列表；带超时见 clearPanelListCache 注释）
   await clearPanelListCache(env);
   return server.name;
@@ -735,7 +733,8 @@ async function handleApiInner(request, env) {
   // POST /api/servers/:id/agent-update —— 触发专用更新协议（与 MCP update_agent 共用 agentUpdateCore）。
   // 权限：管理员或带 agent:update scope 的 PAT（canUpdateAgent，含 server_ids 白名单）；
   // PAT 即使有 server:exec 也不行——更新是独立 scope 的高危供应链操作。
-  // Worker 流式中转 Release 资产，不物化整个二进制；Agent 做大小/SHA/版本复核后 self-replace。
+  // 面板只创建任务并下发元数据 + 短期签名 URL（资产字节不经过 Worker/DO）；
+  // Agent 自行经资产代理拉取，做大小/SHA/版本复核后 self-replace。
   const updateMatch = path.match(/^\/api\/servers\/(\d+)\/agent-update$/);
   if (method === 'POST' && updateMatch) {
     return agentUpdateCore(env, user, Number(updateMatch[1]) || 0, clientIp(request), url);
@@ -826,8 +825,14 @@ async function handleApiInner(request, env) {
   // 用途：key 泄露/误发后的处置路径。此前唯一手段是删服务器重建，会连带清空
   // metrics_min / metrics_custom 全部监控历史与在线账；轮换只替换身份凭证，
   // 历史数据、分组、序号、审计记录全部保留。
-  // 旧 key 立即失效：agent_key_id（key 指纹）变更 → 反查不到服务器 → 401；
-  // 已建立的旧控制通道由 drop_server 主动断开（与删除路径同一机制，但不删任何数据）。
+  // 旧 key 对新连接立即失效：agent_key_id（key 指纹）变更 → 反查不到服务器 → 401；
+  // 已建立的长连接由两重机制撤销：
+  //   1) drop_server 对所有 OPEN 的控制连接发起关闭；已处于 CLOSING 的只摘索引，避免
+  //      再 close 一次制造永久 CLOSING（11-05 duration 根因）；
+  //   2) 带指纹的连接在每条控制消息上复核附件指纹与 D1 当前值（不匹配即 1008，结果缓存
+  //      30s，故最迟 30s 生效）。D1 查询失败时该次复核 fail-open——宁可短暂保留一条待撤销
+  //      连接，也不能因 D1 抖动把全站 agent 判失效。
+  // 边界：升级前建立、附件无 keyId 的老连接没有可复核的指纹，只能依赖 drop_server。
   // 注意：轮换后须人工到目标机更新 AGENT_KEY 并重启 agent——key 是 agent 侧配置的静态凭据，
   // 服务端无法推送新 key 给未连接的 agent。
   const rotateMatch = path.match(/^\/api\/servers\/(\d+)\/rotate-key$/);
@@ -849,16 +854,17 @@ async function handleApiInner(request, env) {
     ]);
     serverListCacheClear();
     serverRowCache.delete(id); // 行缓存不含 key，但节点身份已变，避免陈旧行影响上报路径
-    for (let i = 0; i < SHARDS; i++) {
-      try {
-        await doForShard(env, i).fetch('https://do.internal/rpc/drop_server', {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ serverId: id }),
-        });
-      } catch { /* 分片暂不可达；旧 key 重连会因指纹不存在被 401 拒绝 */ }
+    const drops = await dropServerConnections(env, id);
+    if (!drops.ok) {
+      // key 已换（事务已提交），不能返回 500 让用户以为没换成功；但必须显式告知：
+      // 这些分片的残留连接会在下一帧被身份复核拒绝（最长 30s 缓存窗口）。
+      console.error(`rotate key ${id}: drop_server failed on shards ${drops.failed.join(',')}`);
     }
-    return json({ agent_key: key, wss_base: agentWssBase(url) });
+    return json({
+      agent_key: key,
+      wss_base: agentWssBase(url),
+      dropped: { ok: drops.ok, closed: drops.closed, pending: drops.pending, failed: drops.failed },
+    });
   }
 
   // PATCH /api/servers/:id —— 仅管理员；修改名称/分组/序号/告警覆盖（不动 agent key，在线状态不受影响）
@@ -1004,6 +1010,7 @@ async function handleApiInner(request, env) {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ op: 'create', streamId, serverId: server.id, creatorUserId: user.id, creatorUser: user.username, clientIp: clientIp(request) }),
+      signal: AbortSignal.timeout(5000),
     });
     if (!resp.ok) return err(`agent not reachable: ${await resp.text()}`, 502);
     await auditSessionOpen(env, user, request, 'terminal.open', server.id);
@@ -1022,6 +1029,7 @@ async function handleApiInner(request, env) {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ op: 'open_file', streamId, serverId: server.id, creatorUserId: user.id, creatorUser: user.username, clientIp: clientIp(request) }),
+      signal: AbortSignal.timeout(5000),
     });
     if (!resp.ok) return err(`agent not reachable: ${await resp.text()}`, 502);
     await auditSessionOpen(env, user, request, 'file.open', server.id);
@@ -1139,7 +1147,7 @@ async function handleApiInner(request, env) {
     if (!res.meta.changes) return err(`token not found (id=${id})`, 404);
     // PAT 撤销即时生效：清 PanelDO 鉴权缓存，已建观看者连接下个推送（≤5s）内关闭
     try {
-      await doPanel(env).fetch('https://do.internal/rpc/clear_auth_cache', { method: 'POST' });
+      await doPanel(env).fetch('https://do.internal/rpc/clear_auth_cache', { method: 'POST', signal: AbortSignal.timeout(1500) });
     } catch { /* 清缓存失败由 authCache 30s TTL 兜底 */ }
     return json({ ok: true });
   }
@@ -1209,7 +1217,7 @@ async function handleApiInner(request, env) {
     });
     // 已建 WS 连接持有 30s 缓存的身份（含旧 scopes）：清缓存让降权立即生效，不等 TTL
     try {
-      await doPanel(env).fetch('https://do.internal/rpc/clear_auth_cache', { method: 'POST' });
+      await doPanel(env).fetch('https://do.internal/rpc/clear_auth_cache', { method: 'POST', signal: AbortSignal.timeout(1500) });
     } catch { /* 清失败由 authCache 30s TTL 兜底 */ }
     return json({ ok: true, id, scopes, server_ids: serverIDs, expires_at: expiresAt });
   }
@@ -1354,7 +1362,7 @@ async function handleApiInner(request, env) {
     kvClearCache('settings'); // 告警配置立即生效（Worker 侧）
     // MetricsDO 是独立隔离实例，其 SETTINGS_CACHE 需 RPC 清除（否则告警/探活判定最长滞后 300s）
     try {
-      await doMetrics(env).fetch('https://do.internal/rpc/clear_settings_cache', { method: 'POST' });
+      await doMetrics(env).fetch('https://do.internal/rpc/clear_settings_cache', { method: 'POST', signal: AbortSignal.timeout(1500) });
     } catch { /* 清缓存失败：MetricsDO 侧按 300s TTL 自然过期 */ }
     await auditSettingsUpdate(env, user, clientIp(request), body, next);
     return json(next);
@@ -1483,7 +1491,7 @@ async function handleJobContentUpload(request, env, u) {
     try { await env.UPLOADS.delete(job.r2_key); } catch { /* ignore */ }
     return err('job state changed during upload', 409);
   }
-  const staged = await getJob(env, job.id);
+  const staged = await getJob(env, job.id); // staged 快照：仅用于下方 token/dispatch 参数
   // 通知 DO 下发 upload_fetch（短请求，不读文件、不等 Agent 落盘）
   try {
     const dlToken = await signJobToken('download', job.id, job.server_id, String(res.sizeBytes), env, JOB_URL_TTL_S);
@@ -1495,6 +1503,7 @@ async function handleJobContentUpload(request, env, u) {
         jobId: job.id, serverId: job.server_id, path: job.target_path,
         overwrite: !!job.overwrite, size: res.sizeBytes, downloadUrl: dlUrl,
       }),
+      signal: AbortSignal.timeout(5000), // 短请求；对端挂起不得拖住 Worker 请求（P3-11）
     });
     if (!resp.ok) {
       const out = await resp.json().catch(() => ({}));
@@ -1507,7 +1516,10 @@ async function handleJobContentUpload(request, env, u) {
     try { await env.UPLOADS.delete(job.r2_key); } catch { /* ignore */ }
     return json({ error: 'upload dispatch failed', job_id: job.id, status: 'failed' }, 502);
   }
-  return json(uploadJobResponse(staged, null, JOB_POLL_AFTER_MS, { withSize: true }), 202);
+  // 必须读 dispatch 之后的状态：DO 已把 staged 改成 waiting_agent/running，
+  // 用下发前的快照会让客户端看到「staged」再轮询一次（P3-2）。
+  const dispatched = (await getJob(env, job.id)) || staged;
+  return json(uploadJobResponse(dispatched, null, JOB_POLL_AFTER_MS, { withSize: true }), 202);
 }
 
 // GET /mcp/upload-jobs/download?id=&server_id=&size=&token= —— Agent 从 R2 拉取 staging 文件。
@@ -1607,7 +1619,9 @@ async function clearPanelListCache(env) {
 async function collectUsageView(env) {
   let doUsage = {};
   try {
-    doUsage = await (await doMetrics(env).fetch('https://do.internal/usage')).json();
+    doUsage = await (await doMetrics(env).fetch('https://do.internal/usage', {
+      signal: AbortSignal.timeout(3000),
+    })).json();
   } catch { /* 用量读取失败不影响 */ }
   const api = {};
   for (const [k, v] of apiCounts) api[k] = v;
@@ -1783,6 +1797,7 @@ async function agentUpdateCore(env, user, id, ip, requestUrl) {
         jobId: job.id, serverId: id, buildId: manifest.build_id, platform,
         size: asset.size, sha256: asset.sha256, downloadUrl: assetProxyUrl,
       }),
+      signal: AbortSignal.timeout(5000),
     });
     out = await resp.json().catch(() => ({}));
     if (!resp.ok) {
@@ -1888,7 +1903,8 @@ async function mcpGetOperation(user, env, args) {
 }
 
 // 工具：创建一次性上传签名 URL（大文件上传通道，不经过 LLM 上下文）。
-// HMAC 签名无状态自验证（绑定 server_id/path/overwrite/exp，10 分钟过期）；
+// HMAC 无状态自验证：token 绑定 purpose|jobId|serverId|extra|exp（10 分钟过期），
+// path/overwrite 不参与签名，校验时从任务行读取（见 utils.js 的 signJobToken）。
 // AI 把 upload_url 转给用户/程序执行（curl POST body 为原始字节），服务端自动分片写 agent。
 async function mcpCreateUpload(user, env, args, url, ip) {
   const serverId = Number(args.server_id) || 0;
@@ -2106,21 +2122,18 @@ async function mcpRotateAgentKey(user, env, args, ip, url) {
   ]);
   serverListCacheClear();
   serverRowCache.delete(server.id);
-  for (let i = 0; i < SHARDS; i++) {
-    try {
-      await doForShard(env, i).fetch('https://do.internal/rpc/drop_server', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ serverId: server.id }),
-      });
-    } catch { /* 分片暂不可达；旧 key 重连会因指纹不存在被 401 拒绝 */ }
-  }
+  const drops = await dropServerConnections(env, server.id);
+  const note = drops.ok
+    ? `旧 key 对新连接已失效，OPEN 的控制连接已请求断开（closed=${drops.closed}；已进入关闭中的只摘索引）；带指纹的残留连接最迟 30s 内被逐消息复核拒绝（D1 暂不可用时该次复核放行）；附件无指纹的升级前老连接仅依赖主动关闭。监控历史保留，须人工到目标机更新 AGENT_KEY 并重启 agent 后才会重新上线`
+    : `旧 key 对新连接已失效，但分片 ${drops.failed.join(',')} 的连接断开调用失败（closed=${drops.closed}）；这些分片上带指纹的旧连接会在下一帧被身份复核拒绝（最长 30s，D1 暂不可用时放行），无需重试；无指纹的老连接只能靠重连淘汰。监控历史保留，须人工到目标机更新 AGENT_KEY 并重启 agent 后才会重新上线`;
+  if (!drops.ok) console.error(`mcp rotate key ${server.id}: drop_server failed on shards ${drops.failed.join(',')}`);
   return {
     server_id: server.id,
     server_name: server.name,
     agent_key: key, // 明文只返回一次
     wss_base: agentWssBase(url),
-    note: '旧 key 已失效并已断开现有连接；监控历史保留，须人工到目标机更新 AGENT_KEY 并重启 agent 后才会重新上线',
+    disconnected: { ok: drops.ok, closed: drops.closed, pending: drops.pending, failed: drops.failed },
+    note,
   };
 }
 
@@ -2180,7 +2193,7 @@ async function mcpRevokeToken(user, env, args) {
   if (!res.meta.changes) throw new Error(`token not found (id=${id})`);
   // PAT 撤销即时生效：清 PanelDO 鉴权缓存
   try {
-    await doPanel(env).fetch('https://do.internal/rpc/clear_auth_cache', { method: 'POST' });
+    await doPanel(env).fetch('https://do.internal/rpc/clear_auth_cache', { method: 'POST', signal: AbortSignal.timeout(1500) });
   } catch { /* 清缓存失败由 authCache 30s TTL 兜底 */ }
   return { ok: true, token_id: id };
 }
@@ -2242,7 +2255,7 @@ async function mcpUpdateSettings(user, env, args, ip) {
   await kvPut(env, 'settings', next);
   kvClearCache('settings');
   try {
-    await doMetrics(env).fetch('https://do.internal/rpc/clear_settings_cache', { method: 'POST' });
+    await doMetrics(env).fetch('https://do.internal/rpc/clear_settings_cache', { method: 'POST', signal: AbortSignal.timeout(1500) });
   } catch { /* 清缓存失败：MetricsDO 侧按 300s TTL 自然过期 */ }
   await auditSettingsUpdate(env, user, ip, args, next);
   return next;

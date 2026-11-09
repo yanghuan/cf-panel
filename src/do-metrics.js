@@ -45,6 +45,9 @@ const LATEST_KEY_EVERY_MIN = 5;
 // /latest 冷启动为「缺 l: 快照」的机器补扫时的单轮上限：升级首轮可能 500 台全缺，
 // 串行补扫会让面板首连多等数秒；缺的部分由下一轮冷启动或该机首帧上报补齐。
 const LATEST_BACKFILL_MAX = 100;
+// /latest「内存增量 Map 已覆盖全部服务器」判据的有效期（ms）：新增/删除服务器后计数最多
+// 60s 后重新校准。没有这个 TTL，size 与真实机器数一旦错位，快路径会永久跳过补扫。
+const LATEST_COUNT_TTL_MS = 60 * 1000;
 const LATEST_PUSH_INTERVAL_MS = 5000; // 上报驱动聚合推送间隔（有观看者时 ≥5s 推一次全部 latest 给 PanelDO；
 // 单机时被 REPORT_FWD_THROTTLE_S=5s 钳制（MetricsDO 每 5s 收帧），多机时聚合多台上报防推送风暴）
 // pushOn 自愈反查 /viewers 的间隔（MetricsDO evict 丢失 pushOn 时）。
@@ -79,6 +82,10 @@ export class MetricsDO {
     this.alarmCached = null; // 实例内已知的下一次 alarm 时间戳；避免每帧上报都 getAlarm（DO Storage 读）
     this.latestByServer = new Map(); // serverId -> 最新指标 {ts, ..., last_seen_s}（/report 热写 O(1) 维护，/latest 直接 O(S) 返回）
     this.latestAt = new Map(); // serverId -> 上次写 `l:` 快照的分钟（降频，见 LATEST_KEY_EVERY_MIN）
+    // /latest 能否直接返回增量 Map 的判据：D1 当前服务器总数 + 该计数的刷新时刻。
+    // 0 表示尚未校准，必须走一次完整的快照 + 补扫路径（冷启动时 Map 可能只有子集）。
+    this.latestServerCount = 0;
+    this.latestServerCountAt = 0;
     this.offlineLoaded = false; // 离线告警状态是否已从 storage 一次性加载（惰性）
     this.offlineState = new Map(); // serverId -> 'on'|'off'（内存副本，避免每机逐个 getAlarm）
     this.bg = new Set(); // 进行中的后台任务（告警 webhook），见 bgRun
@@ -225,6 +232,13 @@ export class MetricsDO {
       net_in: best.v.net_in, net_out: best.v.net_out, extra: best.v.extra,
       last_seen_s: this.lastSeenSec.get(serverId),
     };
+    // 与快照恢复同一条守卫：热区最新行可能比内存值旧（本实例刚收到更新的一帧），
+    // 补扫只用于补齐缺失的机器，不得回退已有值。
+    const prev = this.latestByServer.get(serverId);
+    if (prev && (Number(prev.ts) || 0) >= (Number(l.ts) || 0)) {
+      out[serverId] = prev;
+      return;
+    }
     out[serverId] = l;
     this.latestByServer.set(serverId, l);
   }
@@ -615,6 +629,8 @@ export class MetricsDO {
             method: 'POST',
             headers: { 'content-type': 'application/json' },
             body: JSON.stringify({ latest: Object.fromEntries(this.latestByServer) }),
+            // 未设超时的跨 DO fetch 在对端挂起时会钉住本实例、持续计 duration（P3-11）
+            signal: AbortSignal.timeout(1500),
           });
         } catch { /* 推送失败下个周期重试 */ }
       }
@@ -623,7 +639,9 @@ export class MetricsDO {
       // 新实例不知道有人观看 → 面板数据冻结。低频（PUSH_PROBE_INTERVAL_MS=300s）反查 /viewers，有人看则恢复推送
       this.lastPushProbeAt = Date.now();
       try {
-        const vResp = await doPanel(this.env).fetch('https://do.internal/viewers');
+        const vResp = await doPanel(this.env).fetch('https://do.internal/viewers', {
+          signal: AbortSignal.timeout(1500),
+        });
         const v = await vResp.json();
         if ((v.count || 0) > 0) this.pushOn = true;
       } catch { /* 反查失败下次再试 */ }
@@ -669,8 +687,19 @@ export class MetricsDO {
     if (url.pathname === '/latest' && request.method === 'GET') {
       this.usage.latest += 1; // 用量观测
       const out = {};
-      // 增量 latest Map：/report 热写 O(1) 维护，此处 O(S) 直接返回（避免对分钟 Map 扫描）
-      if (this.latestByServer.size > 0) {
+      // 增量 latest Map：/report 热写 O(1) 维护，此处 O(S) 直接返回（避免对分钟 Map 扫描）。
+      // 但只有确认「已覆盖 D1 全部服务器」时才允许走快路径：冷启动/evict 后 Map 可能只收到
+      // 少数几台的上报（实测 4/17、2/17），此时提前返回会让面板长期缺少其余机器的实时指标（P2-01）。
+      // size < count、或计数过期（新增/删除服务器）→ 落到下面的 `l:` 快照 + 逐机补扫。
+      // 已知取舍：判据是「数量」而非集合覆盖（零成本判据，拿不到 id 清单）。若存在从未上报的
+      // 机器（无 `l:` 快照、无热区），size 永远小于 count → 每次 /latest 都走慢路径
+      //（一次 list('l:') + 一次 D1 查询 + 最多 LATEST_BACKFILL_MAX 次前缀扫描）。
+      // 功能正确；这类机器本就不产生指标，面板只缺它一行实时数据。
+      const countFresh = Date.now() - this.latestServerCountAt < LATEST_COUNT_TTL_MS;
+      if (this.latestByServer.size > 0
+          && this.latestServerCount > 0
+          && countFresh
+          && this.latestByServer.size >= this.latestServerCount) {
         for (const [serverId, l] of this.latestByServer) {
           if (l) out[serverId] = l;
         }
@@ -691,6 +720,13 @@ export class MetricsDO {
         if (!serverId) continue;
         let v;
         try { v = JSON.parse(k.value); } catch { continue; } // 单行损坏不得拖垮整个 /latest
+        // 内存增量 Map 可能比 `l:` 快照更新（同分钟内多次上报只写一次快照）：
+        // 恢复路径只能用「更新的快照」覆盖内存，否则 /latest 会把刚上报的值回退成旧值。
+        const prev = this.latestByServer.get(serverId);
+        if (prev && (Number(prev.ts) || 0) >= (Number(v.ts) || 0)) {
+          out[serverId] = prev;
+          continue;
+        }
         const l = {
           ts: v.ts, cpu: v.cpu, mem_used: v.mem_used, mem_total: v.mem_total,
           net_in: v.net_in, net_out: v.net_out, extra: v.extra,
@@ -717,6 +753,9 @@ export class MetricsDO {
         // D1 不可用：本次只返回已有快照（升级首轮则为空），下一帧上报即补齐
         return json(out);
       }
+      // 校准「全部服务器」判据：下一轮请求若 size 已覆盖该数量且计数新鲜，可回到 O(S) 快路径
+      this.latestServerCount = ids.length;
+      this.latestServerCountAt = Date.now();
       let filled = 0;
       for (const sid of ids) {
         if (!sid || out[sid]) continue;
@@ -739,6 +778,7 @@ export class MetricsDO {
       this.putMin.delete(serverId);
       this.hotLoaded.delete(serverId);
       this.latestByServer.delete(serverId);
+      this.latestServerCount = 0; // 服务器清单已变：下一轮 /latest 重新校准，避免快路径永久跳过补扫
       this.latestAt.delete(serverId);
       this.lastSeenSec.delete(serverId);
       this.pendingArcRetry.delete(serverId);

@@ -42,12 +42,15 @@ export async function purgeExpired(env) {
 // 创建 exec 任务。返回 { job, reused }：reused=true 表示命中 idempotency_key，返回已有任务。
 //
 // 命中幂等键时必须校验「是不是同一件事」：同一用户在同一 TTL（24h）内复用同一个 key 去
-// 跑**另一台机器/另一条命令**时，直接返回旧任务会让调用方拿到完全不相干的结果（甚至以为
-// 命令已执行）。server 或 command 不一致 → 拒绝（409），让调用方换 key，而不是静默串台。
-function assertSameIdempotentJob(dup, { serverId, command }) {
-  if (Number(dup.server_id) === Number(serverId) && String(dup.command || '') === String(command)) return;
+// 跑**另一台机器/另一条命令/另一个超时**时，直接返回旧任务会让调用方拿到与自己请求不符的
+// 结果（甚至以为新命令已执行）。任一不一致 → 拒绝（409），让调用方换 key，而不是静默串台。
+// timeout_s 也纳入比较：同 key 改 timeout 却复用旧任务，实际执行窗口仍是旧值（P3-3）。
+function assertSameIdempotentJob(dup, { serverId, command, timeoutS }) {
+  if (Number(dup.server_id) === Number(serverId)
+      && String(dup.command || '') === String(command)
+      && Number(dup.timeout_s) === Number(timeoutS)) return;
   const e = new Error(
-    'idempotency_key already used for a different exec request (server/command mismatch); use a new key'
+    'idempotency_key already used for a different exec request (server/command/timeout mismatch); use a new key'
   );
   e.code = 'IDEMPOTENCY_CONFLICT';
   throw e;
@@ -65,7 +68,7 @@ export async function createExecJob(env, {
       .bind(user.id, idempotencyKey, now)
       .first();
     if (dup) {
-      assertSameIdempotentJob(dup, { serverId, command });
+      assertSameIdempotentJob(dup, { serverId, command, timeoutS });
       return { job: dup, reused: true };
     }
   }
@@ -106,7 +109,7 @@ export async function createExecJob(env, {
         .bind(user.id, idempotencyKey, now)
         .first();
       if (dup) {
-        assertSameIdempotentJob(dup, { serverId, command });
+        assertSameIdempotentJob(dup, { serverId, command, timeoutS });
         return { job: dup, reused: true };
       }
     }

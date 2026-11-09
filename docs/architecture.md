@@ -317,23 +317,23 @@ Rust 版以 `#[cfg(unix)]` / `#[cfg(windows)]` 条件编译实现三平台（平
 
 > 未采纳项：TCP keepalive / `set_nodelay` 需要自建 `TcpStream`（`connect_async` 不暴露 socket），且 keepalive 需显式设 `keepidle/keepintvl/keepcnt`（内核默认 2h 无意义）；`disable_nagle` 对指令往返的几十毫秒延迟不敏感，保持默认。
 
-#### 3.5.3 Agent 自更新（Worker 中转 + self-replace）
+#### 3.5.3 Agent 自更新（异步资产拉取 + self-replace）
 
-设计目标：被控机只需访问面板、不要求能直连 GitHub；保持 Agent 无通用 HTTP 客户端的小体积；更新操作与普通文件上传完全隔离。
+设计目标：被控机只需访问面板、不要求能直连 GitHub；**资产字节不经过 Worker/DO**（DO 只下发一帧元数据），避免长驻 DO、大帧中转与 hibernation 被破坏；更新操作与普通文件上传完全隔离。
 
 ```text
 管理员点击更新
   → Worker GET 最新 agent-manifest.json（模块/边缘缓存）
   → 校验平台/size/SHA/Release URL，审计 agent.update.request
-  → GitHub Release Response.body 流式传给对应 TerminalDO
-  → TerminalDO 切为 ≤48KB agent_update Binary 帧
+  → 建 agent_update 任务（D1），下发一帧元数据 + 短期签名 URL
+  → Agent 经 /mcp/agent-update-asset 自行 HTTPS 拉取（Worker 流式回源 GitHub）
   → Agent 同目录 staging（严格 offset/总大小）
   → fsync + SHA-256 + 候选 --version/build_id 复核
   → 备份当前二进制为 .bak
   → self-replace 跨平台替换
   → agent_update_result → Agent 优雅清 PTY 后退出
   → systemd/launchd/supervisor 或 AGENT_SELF_RESTART 拉起
-  → 新 Agent 首次 report 上报目标 build_id，前端确认成功
+  → 新 Agent 首次 report 上报目标 build_id，前端/轮询 get_operation 确认成功
 ```
 
 **Release 清单**：CI `prepare` job 从触发 commit 时间 + 8 位短 SHA 生成全平台统一 build id（`YYYY.MM.DD-HHMM-xxxxxxxx`），防独立 job 跨分钟版本不一致与同分钟 tag 碰撞；`agent-manifest.json` 包含 schema/Cargo 版本/build id/tag/commit/update protocol，以及四个平台资产的 name/size/SHA-256/固定 GitHub Release URL。
@@ -346,9 +346,10 @@ Rust 版以 `#[cfg(unix)]` / `#[cfg(windows)]` 条件编译实现三平台（平
 
 **安全/资源边界**：
 - Worker 将仓库固定为 `AGENT_RELEASE_REPO`（默认官方仓库），manifest 内 asset URL 必须精确匹配该仓库/tag/name；清单与资产分别 5 分钟/24 小时缓存。
-- Worker 不整包缓冲；DO 直接切 fetch chunk；Agent 端 32MB 硬上限、平台匹配、逐帧元数据一致、offset/size/SHA/候选版本四层校验。
+- Worker 不整包缓冲，按流回源；Agent 端 32MB 硬上限、平台匹配、元数据一致、size/SHA/候选版本多层校验。
+- 签名 URL 绑定用途/任务 id/服务器 id/额外参数/过期时间（path 等业务字段从任务行读取）；下载 URL 另经同源校验（host + port + scheme + `/mcp/` 路径前缀）。
 - SHA-256 解决完整性，不等价于离线发布签名；GitHub 仓库/Release 发布权限仍是供应链信任根。后续若引入离线签名，可在 manifest 增 Ed25519 signature 并把公钥编入 Agent。
-- 约 2MB 更新包 ≈43 个出站 WS 帧（DO 出站免费）+ 1 个最终入站回执；人工低频更新对 Worker/DO 额度影响可忽略。
+- 更新只产生 1 帧下发 + 1 个回执；资产流量走 HTTPS，不占 DO 出站；人工低频更新对 Worker/DO 额度影响可忽略。
 - `self-replace` 负责 Unix 原子 rename 与 Windows 运行中 exe 的辅助替换；项目额外保留一个 `.bak` 供人工回滚。自动健康回滚未实现——前端 90s 未见目标 build id 时明确提示检查 supervisor/手工恢复。
 
 ### 3.6 PTY（伪终端）
@@ -364,8 +365,8 @@ Rust 版以 `#[cfg(unix)]` / `#[cfg(windows)]` 条件编译实现三平台（平
 
 > **实际实现（2026-08，Rust 版）**：采用下述简化协议，以下"magic 帧/多路复用"为初版设计参考（对齐哪吒），当前未使用。
 > - **鉴权**：agent 数据流（`/ws/agent/terminal|file`）用 `X-Agent-Key` 请求头（key 指纹 + 哈希校验）；浏览器流（`/ws/terminal|file`）用**首帧** `{type:"auth", token}`（token 不进 URL，防日志/历史泄露）。
-> - **控制通道**（agent 常驻 WS）：JSON 文本帧 `open_terminal` / `open_file` / `resize {stream_id,rows,cols}` / `set_report_interval {interval}` / `ping`（心跳）/ `exec {exec_id, command, timeout_s}`（一次性命令）/ `probe {id}`（下行探活，仅对声明 `probe_proto` 的 agent；回执 `pong` 只用于刷新 exec 判据的「最近往返时间」，DO 不等待）；agent 回执 `terminal_ready` / `file_ready` / `pong {id}` / `exec_result {exec_id, exit_code, stdout, stderr, timed_out}`。自更新使用 Binary 混合帧（`agent_update` JSON 头 + `\n` + ≤48KB 原始字节），最终回 `agent_update_result`。
->   - 异步 exec 的 `exec_id` **就是 `operation_jobs.id`**（`job_` 前缀），DO 收到 `exec_result` 后据此把终态写回 D1。同步旧路径的 `exec_id` 为随机串，两者靠前缀区分，过渡期共存。
+> - **控制通道**（agent 常驻 WS）：JSON 文本帧 `open_terminal` / `open_file` / `resize {stream_id,rows,cols}` / `set_report_interval {interval}` / `ping`（心跳）/ `exec {exec_id, command, timeout_s}`（一次性命令）/ `probe {id}`（下行探活，仅对声明 `probe_proto` 的 agent；回执 `pong` 只用于刷新 exec 判据的「最近往返时间」，DO 不等待）；agent 回执 `terminal_ready` / `file_ready` / `pong {id}` / `exec_result {exec_id, exit_code, stdout, stderr, timed_out, error}`。自更新只下发一帧 JSON 元数据（`agent_update` + 资产签名 URL），Agent 自行拉取后回 `agent_update_result`，不再使用 Binary 帧中转字节。
+>   - exec 的 `exec_id` **就是 `operation_jobs.id`**（`job_` 前缀），DO 收到 `exec_result` 后据此把终态写回 D1；同步旧路径已删除，不存在随机串 `exec_id`。
 > - **终端数据流**：纯字节透传（输入/输出无帧头，单向直转）；resize 走控制通道（非数据流帧）。
 > - **心跳保活**：控制通道 `ping` + DO 侧 30s 限频心跳下行，防健康连接被误判半开。
 

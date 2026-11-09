@@ -142,6 +142,34 @@ test('MetricsDO: storage.put 按分钟去重，put 失败下帧重试（降额�
   assert.equal(st.storage.map.has(`m:1:${nowMin + 2}`), true, 'put 失败下帧重试写入');
 });
 
+test('MetricsDO: /latest 冷启动只有部分上报时仍返回全部快照机器', async () => {
+  const env = makeEnv({ ARCHIVE_TO_D1: '0' });
+  await insertServerWithId(env, 1);
+  await insertServerWithId(env, 2);
+  await insertServerWithId(env, 3);
+  const nowMin = Math.floor(Date.now() / 1000 / 60);
+  const st = mockState({
+    'l:2': JSON.stringify({ ts: nowMin, cpu: 20 }),
+    'l:3': JSON.stringify({ ts: nowMin, cpu: 30 }),
+  });
+  const { call } = mkMetrics(env, st);
+  // 冷实例：只有 1 号机发过 report，内存增量 Map 只有它
+  await call('/report', { method: 'POST', body: JSON.stringify({ serverId: 1, minTs: nowMin, cpu: 10 }) });
+
+  const latest = await (await call('/latest')).json();
+  assert.equal(latest[1].cpu, 10, '内存中的机器保留');
+  assert.equal(latest[2].cpu, 20, '缺 l: 的机器必须从快照补齐（不得因 Map 非空就提前返回）');
+  assert.equal(latest[3].cpu, 30);
+
+  // 覆盖完整后回到 O(S) 快路径：不再扫 storage / 查 D1
+  let lists = 0;
+  const origList = st.storage.list.bind(st.storage);
+  st.storage.list = async (opts = {}) => { lists += 1; return origList(opts); };
+  const latest2 = await (await call('/latest')).json();
+  assert.equal(Object.keys(latest2).length, 3);
+  assert.equal(lists, 0, `覆盖完整时应走快路径（实际扫了 ${lists} 次 storage）`);
+});
+
 test('MetricsDO: 兜底 listStorage 仅本实例首帧执行（降额）', async () => {
   const env = makeEnv();
   const nowMin = Math.floor(Date.now() / 1000 / 60);
@@ -1694,6 +1722,78 @@ test('TerminalDO: /rpc/set_viewers 按观看者数切换快/慢采', async () =>
     JSON.stringify({ type: 'set_report_interval', interval: 120 }),
     JSON.stringify({ type: 'set_report_interval', interval: 120 }),
   ]);
+});
+
+test('TerminalDO: /rpc/set_viewers 不给身份失效的旧连接发 interval', async () => {
+  const env = makeEnv();
+  await env.DB.prepare('INSERT INTO servers (agent_key_id, name, user_id, agent_key_hash) VALUES (?,?,?,?)')
+    .bind('new-key', 's1', 1, 'h1').run();
+  const sent = [];
+  const closed = [];
+  const inst = new TerminalDO(mockState(), env);
+  const ws = {
+    attachment: { role: 'control', serverId: 1, keyId: 'old-key' },
+    deserializeAttachment() { return this.attachment; },
+    serializeAttachment(a) { this.attachment = a; },
+    send: (m) => sent.push(m),
+    readyState: 1,
+    close(code) { closed.push(code); this.readyState = 3; },
+  };
+  inst.agents.set(1, ws);
+
+  const res = await inst.fetch(new Request('https://do.internal/rpc/set_viewers', {
+    method: 'POST', body: JSON.stringify({ count: 1 }),
+  }));
+  assert.equal(res.status, 200);
+  assert.deepEqual(sent, [], '失效连接不得收到 set_report_interval');
+  assert.deepEqual(closed, [1008], '身份不符必须关闭');
+  assert.equal(inst.agents.has(1), false, '索引必须清空');
+});
+
+test('TerminalDO: /rpc/set_viewers 预热在缓存过期后仍只查一次 D1', async () => {
+  const env = makeEnv();
+  await env.DB.prepare('INSERT INTO servers (agent_key_id, name, user_id, agent_key_hash) VALUES (?,?,?,?)')
+    .bind('k1', 's1', 1, 'h1').run();
+  // 统计两类查询：批量预热（整表）与 liveAgent 的逐台单查
+  let bulk = 0;
+  let single = 0;
+  const origPrepare = env.DB.prepare.bind(env.DB);
+  env.DB.prepare = (sql) => {
+    const s = String(sql);
+    if (s.includes('SELECT id, agent_key_id FROM servers')) bulk += 1;
+    else if (s.includes('SELECT agent_key_id FROM servers WHERE id')) single += 1;
+    return origPrepare(sql);
+  };
+
+  const inst = new TerminalDO(mockState(), env);
+  const ws = {
+    attachment: { role: 'control', serverId: 1, keyId: 'k1' },
+    deserializeAttachment() { return this.attachment; },
+    serializeAttachment(a) { this.attachment = a; },
+    send() {}, readyState: 1, close() {},
+  };
+  inst.agents.set(1, ws);
+
+  await inst.fetch(new Request('https://do.internal/rpc/set_viewers', { method: 'POST', body: JSON.stringify({ count: 1 }) }));
+  assert.equal(bulk, 1, '冷实例应整表预热一次');
+  assert.equal(single, 0, '不得逐台单查');
+
+  // TTL 到期：条目仍在 Map 里但 exp 已过——必须重新批量预热，而不是退化成 N 次单查
+  for (const c of inst.agentKeyCache.values()) c.exp = 0;
+  await inst.fetch(new Request('https://do.internal/rpc/set_viewers', { method: 'POST', body: JSON.stringify({ count: 0 }) }));
+  assert.equal(bulk, 2, '过期后必须重新整表预热');
+  assert.equal(single, 0, '过期后仍不得逐台单查');
+
+  // 预热期间发生 drop_server（epoch 变化）：本次整表结果可能已被轮换，不得写回缓存，
+  // 必须交给 liveAgent 单查最新值（否则会把旧 keyId 放回，最长 30s 放行旧连接）。
+  for (const c of inst.agentKeyCache.values()) c.exp = 0;
+  const patched = env.DB.prepare;
+  env.DB.prepare = (sql) => {
+    if (String(sql).includes('SELECT id, agent_key_id FROM servers')) inst.agentKeyEpoch += 1;
+    return patched(sql);
+  };
+  await inst.fetch(new Request('https://do.internal/rpc/set_viewers', { method: 'POST', body: JSON.stringify({ count: 1 }) }));
+  assert.equal(single, 1, '预热作废后必须由 liveAgent 单查最新值');
 });
 
 test('TerminalDO: 上报间隔从连接附件恢复（evict 后不再打 PanelDO /viewers）', async () => {
@@ -3264,6 +3364,123 @@ test('TerminalDO: drop_server 一并清理 updating / lastPingAt（与 cleanup �
   assert.equal(inst.agentInterval.has(1), false, '既有的间隔清理不受影响');
 });
 
+test('TerminalDO: drop_server 关闭所有匹配控制连接（含落选者），跳过已 CLOSING 的连接', async () => {
+  const env = makeEnv();
+  await insertServer(env, 'k1', 'srv1');
+  const closed = [];
+  const mk = (serverId, rs) => ({
+    deserializeAttachment: () => ({ role: 'control', serverId, ts: 1 }),
+    serializeAttachment() {},
+    send() {},
+    readyState: rs,
+    close(code, reason) { closed.push({ serverId, code, reason }); this.readyState = 3; },
+  });
+  const winner = mk(1, 1); // agents 登记的那条
+  const loser = mk(1, 1); // 同机双开的落选连接：同样必须被关闭，否则能抢回索引
+  const stuck = mk(1, 2); // 已 CLOSING：再 close 会延长 CLOSING 寿命、破坏 hibernation
+  const other = mk(2, 1); // 其他服务器：不得误伤
+  const st = mockState();
+  st.getWebSockets = () => [winner, loser, stuck, other];
+  const inst = new TerminalDO(st, env);
+  inst.agents.set(1, winner);
+
+  const res = await inst.fetch(new Request('https://do.internal/rpc/drop_server', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ serverId: 1 }),
+  }));
+  const body = await res.json();
+  assert.deepEqual(closed.map((c) => c.serverId), [1, 1], '只关闭 OPEN 且 serverId 匹配的两条控制连接');
+  assert.ok(closed.every((c) => c.code === undefined), '保持原有"无关闭码"语义（agent 会重连并被 401 拒绝）');
+  assert.equal(body.closed, 2);
+  assert.equal(body.pending, 1);
+  assert.equal(inst.agents.has(1), false, '索引必须清空，否则残留连接可重新占位');
+  assert.equal(other.readyState, 1, '其他服务器的连接不受影响');
+});
+
+test('TerminalDO: key 轮换后旧控制连接的 report 被拒并关闭，不发往 D1/MetricsDO', async () => {
+  const env = makeEnv();
+  await insertServer(env, 'new-key', 'srv1'); // D1 当前指纹已轮换
+  const att = { role: 'control', serverId: 1, ts: 1, keyId: 'old-key' };
+  const closed = [];
+  const ws = {
+    deserializeAttachment: () => att,
+    serializeAttachment: (a) => { Object.assign(att, a); },
+    send() {},
+    readyState: 1,
+    close(code) { closed.push(code); this.readyState = 3; },
+  };
+  const inst = new TerminalDO(mockState(), env);
+  inst.agents.set(1, ws);
+  await inst.webSocketMessage(ws, JSON.stringify({ type: 'report', cpu: 42 }));
+
+  assert.deepEqual(closed, [1008], '指纹不匹配 → 1008 关闭');
+  assert.equal(inst.agents.has(1), false, '旧连接不得继续占据索引');
+  const mins = await env.DB.prepare('SELECT COUNT(*) AS n FROM metrics_min').first();
+  assert.equal(mins.n, 0, '被拒连接的 report 不得落库');
+
+  // 指纹一致的连接照常处理（缓存/查询命中都走同一判据）
+  const att2 = { role: 'control', serverId: 1, ts: 2, keyId: 'new-key' };
+  const okClosed = [];
+  const ws2 = {
+    deserializeAttachment: () => att2,
+    serializeAttachment: (a) => { Object.assign(att2, a); },
+    send() {},
+    readyState: 1,
+    close(code) { okClosed.push(code); this.readyState = 3; },
+  };
+  const inst2 = new TerminalDO(mockState(), env);
+  await inst2.webSocketMessage(ws2, JSON.stringify({ type: 'report', cpu: 7 }));
+  assert.deepEqual(okClosed, [], '指纹一致不得被关闭');
+  assert.equal(inst2.agents.get(1), ws2, '指纹一致时正常登记索引');
+});
+
+test('TerminalDO: 轮换后残留的旧控制连接不得接收 exec 指令', async () => {
+  const env = makeEnv();
+  await insertServer(env, 'new-key', 'srv1');
+  const att = { role: 'control', serverId: 1, ts: 1, keyId: 'old-key' };
+  const closed = [];
+  const sent = [];
+  const ws = {
+    deserializeAttachment: () => att,
+    serializeAttachment() {},
+    send(m) { sent.push(m); },
+    readyState: 1,
+    close(code) { closed.push(code); this.readyState = 3; },
+  };
+  const inst = new TerminalDO(mockState(), env);
+  inst.agents.set(1, ws);
+  const res = await inst.fetch(new Request('https://do.internal/rpc/exec/submit', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ jobId: 'job_old', serverId: 1, command: 'uptime', timeoutMs: 5000 }),
+  }));
+
+  assert.equal(res.status, 503, '身份不符视同离线，不得下发');
+  assert.deepEqual(closed, [1008], '旧连接必须被关闭');
+  assert.equal(sent.length, 0, '旧连接不得收到 exec 帧');
+  assert.equal(inst.agents.has(1), false, '索引必须清空');
+});
+
+test('TerminalDO: 跨服务器回执不得结算他人任务', async () => {
+  const env = makeEnv();
+  const now = Math.floor(Date.now() / 1000);
+  await env.DB.prepare(
+    `INSERT INTO operation_jobs (id, kind, status, user_id, username, server_id, command, created_at, deadline_at, expires_at)
+     VALUES ('job_cross', 'exec', 'running', 1, 'admin', 2, 'uptime', ?, ?, ?)`
+  ).bind(now, now + 60, now + 86400).run();
+  const inst = new TerminalDO(mockState(), env);
+
+  await inst.settleExecJob('job_cross', { exit_code: 0, stdout: 'pwned' }, 1); // A 机回执结算 B 机任务
+  const afterForge = await env.DB.prepare('SELECT status, stdout FROM operation_jobs WHERE id = ?').bind('job_cross').first();
+  assert.equal(afterForge.status, 'running', '归属不符的回执必须被丢弃');
+  assert.equal(afterForge.stdout, null, '伪造的 stdout 不得写入');
+
+  await inst.settleExecJob('job_cross', { exit_code: 0, stdout: 'ok' }, 2); // 正确归属
+  const afterOk = await env.DB.prepare('SELECT status FROM operation_jobs WHERE id = ?').bind('job_cross').first();
+  assert.equal(afterOk.status, 'succeeded');
+});
+
 test('TerminalDO: cleanup 不得误删与本次 ws 无关、尚未挂接的会话', async () => {
   const env = makeEnv();
   const inst = new TerminalDO(mockState(), env);
@@ -3652,6 +3869,44 @@ test('TerminalDO /rpc/upload/submit：只下发 upload_fetch 元数据，不推�
   assert.equal(row.status, 'running');
 });
 
+test('TerminalDO /rpc/upload/submit：身份已撤销的旧连接不得收到 upload_fetch', async () => {
+  const env = makeEnv();
+  await env.DB.prepare('INSERT INTO servers (agent_key_id, name, user_id, agent_key_hash) VALUES (?,?,?,?)')
+    .bind('new-key', 's1', 1, 'h1').run();
+  const now = Math.floor(Date.now() / 1000);
+  await env.DB.prepare(`INSERT INTO operation_jobs (id, kind, status, user_id, username, server_id, target_path, overwrite, size_bytes, r2_key, created_at, deadline_at, expires_at)
+    VALUES ('job_up_old','upload','staged',1,'admin',1,'/opt/a.bin',0,100,'upload-jobs/job_up_old',?,?,?)`)
+    .bind(now, now + 600, now + 86400).run();
+
+  const inst = new TerminalDO(mockState(), env);
+  const sent = [];
+  const closed = [];
+  const ws = {
+    attachment: { role: 'control', serverId: 1, keyId: 'old-key', caps: { upload_fetch_proto: 1 } },
+    deserializeAttachment() { return this.attachment; },
+    serializeAttachment(a) { this.attachment = a; },
+    send: (m) => sent.push(m),
+    readyState: 1,
+    close(code) { closed.push(code); this.readyState = 3; },
+  };
+  inst.agents.set(1, ws);
+
+  const res = await inst.fetch(new Request('https://do.internal/rpc/upload/submit', {
+    method: 'POST',
+    body: JSON.stringify({
+      jobId: 'job_up_old', serverId: 1, path: '/opt/a.bin', overwrite: false,
+      size: 100, downloadUrl: 'https://panel.local/mcp/upload-jobs/download?id=job_up_old',
+    }),
+  }));
+  assert.equal(res.status, 202);
+  assert.equal((await res.json()).status, 'waiting_agent', '视同离线：等新 key 重连后重发');
+  assert.equal(sent.length, 0, '旧连接不得收到 upload_fetch（文件落盘指令不能被已撤销的 key 拿到）');
+  assert.deepEqual(closed, [1008], '身份不符的旧连接必须被关闭');
+  assert.equal(inst.agents.has(1), false, '索引必须清空');
+  const row = await env.DB.prepare('SELECT status FROM operation_jobs WHERE id = ?').bind('job_up_old').first();
+  assert.equal(row.status, 'waiting_agent');
+});
+
 test('TerminalDO /rpc/upload/submit：Agent 无 upload_fetch_proto → 明确要求升级', async () => {
   const env = makeEnv();
   await env.DB.prepare('INSERT INTO servers (agent_key_id, name, user_id, agent_key_hash) VALUES (?,?,?,?)')
@@ -3747,6 +4002,25 @@ test('TerminalDO /rpc/agent_update/submit：回执后释放 updating，同机 ex
     method: 'POST', body: JSON.stringify({ jobId: 'job_e1', serverId: 1, command: 'echo hi', timeoutMs: 5000 }),
   }));
   assert.equal(execRes.status, 200, '更新结束后同机 exec 必须恢复正常');
+});
+
+test('agent_update_result：跨服务器回执不得结算他人任务', async () => {
+  const env = makeEnv();
+  const now = Math.floor(Date.now() / 1000);
+  await env.DB.prepare(`INSERT INTO operation_jobs (id, kind, status, user_id, username, server_id, build_id, from_version, to_version, platform, size_bytes, sha256, asset_url, created_at, deadline_at, expires_at)
+    VALUES ('job_au_cross','agent_update','running',1,'admin',2,'b1','v0','b1','linux-x86_64',4,'aa','https://p/x',?,?,?)`)
+    .bind(now - 2, now + 200, now + 86400).run();
+  const inst = new TerminalDO(mockState(), env);
+
+  // A 机（server 1）伪造 B 机（server 2）的回执
+  await inst.settleUpdateJob('job_au_cross', { ok: true, build_id: 'b1', size: 4 }, 1);
+  const forged = await env.DB.prepare('SELECT status FROM operation_jobs WHERE id = ?').bind('job_au_cross').first();
+  assert.equal(forged.status, 'running', '归属不符的回执必须被丢弃');
+
+  // 正确归属照常结算
+  await inst.settleUpdateJob('job_au_cross', { ok: true, build_id: 'b1', size: 4 }, 2);
+  const ok = await env.DB.prepare('SELECT status FROM operation_jobs WHERE id = ?').bind('job_au_cross').first();
+  assert.equal(ok.status, 'succeeded');
 });
 
 test('TerminalDO /rpc/agent_update/submit：回执 build 不符不判成功', async () => {

@@ -105,7 +105,7 @@ Try again`），再叠加断线退避就成了"半天连不上"。glibc 的解�
 
 旧版 Agent 不会上报 `update_protocol`，需先手动替换一次为包含本功能的版本；此后的发布才会出现自动更新按钮。
 
-更新包不再经 Worker 中转：面板只下发任务元数据与短期签名 URL，Agent 自己经资产代理（`/mcp/agent-update-asset`）拉取并流式落盘到当前可执行文件同目录的 staging，严格校验总大小/SHA-256，并执行候选文件 `--version` 复核 build id；通过后保留 `<当前文件>.bak`，再由 `self-replace` 跨平台替换。更新会关闭现有终端/文件会话。
+更新包不再经 DO 中转（由 Worker 流式代理回源 GitHub Release）：面板只下发任务元数据与短期签名 URL，Agent 自己经资产代理（`/mcp/agent-update-asset`）拉取并流式落盘到当前可执行文件同目录的 staging，严格校验总大小/SHA-256，并执行候选文件 `--version` 复核 build id；通过后保留 `<当前文件>.bak`，再由 `self-replace` 跨平台替换。更新会关闭现有终端/文件会话。
 
 更新成功后必须有重启方式（二选一）：
 

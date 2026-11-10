@@ -3,12 +3,15 @@
 // cf-panel E2E 测试（Node >= 22，零外部依赖：fetch + WebSocket 内置）
 // 验证链路：wrangler dev → D1 建表 → 登录 → 注册服务器 →
 //           agent 控制通道上线 → 监控上报落库 → 终端双向透传 →
-//           文件上传/下载 → MCP 全量工具（17 个，含 get_operation）
+//           文件上传/下载 → MCP 全量工具（17 个，含 get_operation）→
+//           Agent 更新资产代理（无条件 Content-Length / 长度一致性）
 // 用法：node scripts/e2e.mjs
 // 环境变量：E2E_PORT（默认 8787）、E2E_PASSWORD（默认读 .dev.vars）
 //           AGENT_CMD（默认 agent/rust/target/release/cf-panel-agent）
 // ============================================================
 import { spawn, spawnSync, execSync } from 'node:child_process';
+import { createServer } from 'node:http';
+import { signJobToken } from '../src/utils.js';
 import {
   readFileSync, writeFileSync, existsSync,
   createWriteStream, mkdtempSync, rmSync, unlinkSync,
@@ -47,10 +50,15 @@ function bad(msg) { fail++; console.error(`  ✖ ${msg}`); }
 
 function readPassword() {
   if (process.env.E2E_PASSWORD) return process.env.E2E_PASSWORD;
+  return readDevVar('PANEL_PASSWORD');
+}
+
+// 读取 .dev.vars 中的本地密钥（签名 URL 验签用的是同一个 HASH_SECRET/JWT_SECRET）
+function readDevVar(key) {
   const devVars = join(ROOT, '.dev.vars');
   if (!existsSync(devVars)) return '';
-  const m = readFileSync(devVars, 'utf8').match(/^PANEL_PASSWORD=(.+)$/m);
-  return m ? m[1] : '';
+  const m = readFileSync(devVars, 'utf8').match(new RegExp(`^${key}=(.+)$`, 'm'));
+  return m ? m[1].trim() : '';
 }
 
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
@@ -108,7 +116,7 @@ function registerCleanup() {
 
 // ---- 节标题 ----
 let stepIdx = 0;
-function section(desc) { stepIdx++; console.log(`\n[${stepIdx}/9] ${desc}...`); }
+function section(desc) { stepIdx++; console.log(`\n[${stepIdx}/10] ${desc}...`); }
 
 // ============================================================
 // 第 1 步：D1 migrations
@@ -620,9 +628,83 @@ async function step8_mcp() {
 }
 
 // ============================================================
-// 第 9 步：清理本测试注册的服务器（随机名 + 结束后删除，防残留）
+// 第 9 步：Agent 更新资产代理（针对 /mcp/agent-update-asset 的端到端覆盖）
+// 构造一条 running 的 agent_update 任务 + 签名 token，实际 GET 资产代理。
+// 上游故意用 chunked（无 Content-Length），验证 Worker 仍按 job.size_bytes 回传 CL；
+// 再让上游少发字节，验证固定长度流让响应流报错，不静默留下截断文件。
+// 不触发真实 Agent 更新：D1 里插的是一次性任务，Agent 不参与、不会替换自身二进制。
+// 用 wrangler d1 execute --local --persist-to STATE 往运行中的 workerd 写行是可行的：
+// 它与 step1 migrations / step2 dev 共享同一份本地 SQLite（WAL 允许多进程写），
+// 写的只是一条一次性任务，本地状态随 TMP 一起删除，不影响线上数据。
 // ============================================================
-async function step9_removeServer() {
+async function step9_assetProxy() {
+  section('Agent 更新资产代理（Content-Length / 长度一致性）');
+  if (!serverId) return;
+  const asset = Buffer.from('cf-panel-e2e-asset');
+  const buildId = '2026.11.11-0000-e2easset';
+  const platform = 'linux-x86_64';
+  const jobId = `job_e2e_asset_${randomBytes(4).toString('hex')}`;
+  let shortMode = false;
+  const upstream = createServer((_req, res) => {
+    const payload = shortMode ? asset.subarray(0, 3) : asset;
+    // 不给 Content-Length：模拟上游 chunked / 边缘改写成无长度响应
+    res.writeHead(200, { 'transfer-encoding': 'chunked', 'content-type': 'application/octet-stream' });
+    res.end(payload);
+  });
+  await new Promise((resolve) => upstream.listen(0, '127.0.0.1', resolve));
+  const assetUrl = `http://127.0.0.1:${upstream.address().port}/asset`;
+  const now = Math.floor(Date.now() / 1000);
+  const sql = `INSERT INTO operation_jobs (id, kind, status, user_id, username, server_id, build_id, platform, size_bytes, asset_url, created_at, deadline_at, expires_at) VALUES ('${jobId}', 'agent_update', 'running', 1, 'admin', ${serverId}, '${buildId}', '${platform}', ${asset.length}, '${assetUrl}', ${now}, ${now + 200}, ${now + 86400})`;
+  try {
+    const r = spawnSync(process.execPath, [
+      '--no-warnings', WRANGLER_CLI, 'd1', 'execute', 'cf-panel',
+      '--local', '--persist-to', STATE, '--command', sql,
+    ], { cwd: ROOT, stdio: 'pipe', timeout: 60_000, encoding: 'utf8' });
+    if (r.status !== 0) {
+      bad(`插入测试更新任务失败：${String(r.stderr || r.stdout || '').slice(0, 300)}`);
+      return;
+    }
+    const secrets = {
+      JWT_SECRET: readDevVar('JWT_SECRET'),
+      HASH_SECRET: readDevVar('HASH_SECRET'),
+    };
+    const assetToken = await signJobToken(
+      'asset', jobId, serverId, `${buildId}|${platform}|${asset.length}`, secrets, 600
+    );
+    const url = `${BASE}/mcp/agent-update-asset?id=${jobId}&server_id=${serverId}&token=${encodeURIComponent(assetToken)}`;
+
+    // 1) 上游无 CL：仍按 job.size_bytes 回传，且 body 完整
+    const res = await fetch(url);
+    const buf = Buffer.from(await res.arrayBuffer());
+    if (res.status === 200
+      && res.headers.get('content-length') === String(asset.length)
+      && buf.equals(asset)) {
+      ok('资产代理：上游无 Content-Length 时仍回传 job.size_bytes，且 body 完整');
+    } else {
+      bad(`资产代理异常：HTTP ${res.status} CL=${res.headers.get('content-length')} body=${buf.length}`);
+    }
+
+    // 2) 上游实际字节比声明短：同一 token / 同一任务，响应流必须报错
+    shortMode = true;
+    let rejected = false;
+    try {
+      const shortRes = await fetch(url);
+      await shortRes.arrayBuffer();
+    } catch { rejected = true; }
+    if (rejected) ok('资产代理：上游短流时响应流报错，不静默留下截断文件');
+    else bad('资产代理：上游短流未被拦截');
+  } catch (e) {
+    bad(`资产代理测试异常：${e.message || e}`);
+  } finally {
+    upstream.close();
+    // 本地临时状态随 TMP 一起删除，无需回删任务行
+  }
+}
+
+// ============================================================
+// 第 10 步：清理本测试注册的服务器（随机名 + 结束后删除，防残留）
+// ============================================================
+async function step10_removeServer() {
   section('清理测试服务器');
   if (!serverId) return;
   const res = await fetch(`${BASE}/api/servers/${serverId}`, {
@@ -656,7 +738,8 @@ async function main() {
     await step6_terminal();
     await step7_file();
     await step8_mcp();
-    await step9_removeServer(); // 测试结束删除本测试服务器（wrangler 退出前执行）
+    await step9_assetProxy();
+    await step10_removeServer(); // 测试结束删除本测试服务器（wrangler 退出前执行）
   } catch (e) {
     console.error(`\n致命错误：${e.message || e}`);
     console.error(e.stack);

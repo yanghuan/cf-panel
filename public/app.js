@@ -2555,7 +2555,10 @@
     document.querySelectorAll('#servers .card.selected').forEach((c) => c.classList.remove('selected'));
   }
 
-  // 批量更新 Agent：串行执行，逐台反馈；全部结束后汇总成功/失败
+  // 批量更新 Agent：串行执行，逐台反馈；全部结束后汇总成功/失败。
+  // 更新接口是异步的：POST 返回 202 {job_id} 只代表任务已下发，不代表安装成功。
+  // 每台都轮询 GET /api/jobs/:id 到终态，只有 succeeded 才计入成功；失败/超时/过期、
+  // 轮询窗口用尽或异常响应一律计入失败并带上原因，避免「报成功但机器没更新」。
   async function batchUpdateAgent() {
     const ids = [...selectedServers];
     if (!ids.length) return;
@@ -2566,21 +2569,32 @@
         let ok = 0;
         const failed = [];
         // 与单台更新一致的逐台过程提示：开始（长驻，被下一条覆盖）→ 已安装（等待上线）→ 失败。
-        // 不做单台那样 90s 等待上线的轮询——批量串行等待会让总时长线性膨胀，
-        // 上线确认交给推送刷新与收尾汇总
+        // 不做单台那样 90s 等待版本号上线的轮询——批量串行叠加会让总时长线性膨胀，
+        // 上线确认交给推送刷新与收尾汇总；但任务终态必须等，它是成败判据。
         for (let i = 0; i < ids.length; i++) {
           const id = ids[i];
           const s = serversCache.find((x) => x.id === id);
           const name = s ? s.name : `#${id}`;
           updatingAgents.add(id);
           renderServers(); // 该卡按钮置「更新中...」
-          toast(t('server.batchUpdatingOne', { i: i + 1, n: ids.length, name }), 30000);
+          // 长驻到任务终态：覆盖 waitJob 的最长等待窗口，随后被结果提示覆盖
+          toast(t('server.batchUpdatingOne', { i: i + 1, n: ids.length, name }), 240000);
           try {
             const result = await api(`/api/servers/${id}/agent-update`, { method: 'POST' });
-            ok += 1;
             if (result.already_latest) {
+              ok += 1;
               toast(t('server.updateLatest'), 6000);
             } else {
+              let error = null;
+              if (!result.job_id) {
+                error = t('server.updateNoJob');
+              } else {
+                const job = await waitJob(result.job_id);
+                if (!job) error = t('server.updateJobTimeout');
+                else if (job.status !== 'succeeded') error = (job.result && job.result.error) || job.status;
+              }
+              if (error) throw new Error(error);
+              ok += 1;
               toast(t('server.installedWaiting', { build: result.build_id || target || '' }), 8000);
             }
           } catch (e) {
@@ -2588,8 +2602,8 @@
             toast(t('server.updateFailed', { err: e.message }), 6000);
           } finally {
             updatingAgents.delete(id);
+            renderServers();
           }
-          renderServers();
         }
         renderServers();
         infoDialog(t('server.batchUpdateDone'), t('server.batchUpdateSummary', {

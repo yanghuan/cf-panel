@@ -318,7 +318,7 @@ Webhook 出站安全：仅允许 HTTP(S)，拒绝 URL 内嵌凭据、本地域�
 
 管理员登录时读取 GitHub Release 的 `agent-manifest.json`（5 分钟缓存）。节点上报 `update_protocol=1` 且配置 `ALLOW_SELF_UPDATE=1` 时，卡片菜单出现「更新 Agent」：
 
-面板只创建 `agent_update` 任务并下发任务元数据与短期签名 URL（资产字节不经过 Worker/DO）；Agent 自行经资产代理拉取、校验大小 / SHA-256 / 候选 `--version`，保留 `.bak` 后用 `self-replace` 原子替换，由 supervisor 或 `AGENT_SELF_RESTART=1` 拉起。接口是**异步**的：返回 `job_id`，需轮询 `get_operation` 获取终态。
+面板只创建 `agent_update` 任务并下发任务元数据与短期签名 URL（指向面板同源的 `/mcp/agent-update-asset`，由 Worker 流式代理回源 GitHub Release，资产字节不经过 DO）；Agent 自行经该资产代理拉取、校验大小 / SHA-256 / 候选 `--version`，保留 `.bak` 后用 `self-replace` 原子替换，由 supervisor 或 `AGENT_SELF_RESTART=1` 拉起。节点只需访问面板、不要求能直连 GitHub。接口是**异步**的：返回 `job_id`，需轮询 `get_operation` 获取终态。
 
 - 更新需 `agent:update` 权限（管理员，或带该 scope 且命中白名单的 PAT），操作写审计日志。
 - Fork 部署请设 `AGENT_RELEASE_REPO=owner/repo`。

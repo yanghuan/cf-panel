@@ -133,6 +133,8 @@
     'server.installedWaiting': 'Agent {build} installed, waiting for it to come back online...',
     'server.updatedTo': '"{name}" Agent updated to {target}',
     'server.updateFailed': 'Agent update failed: {err}',
+    'server.updateNoJob': 'The update endpoint returned no job ID; unable to confirm the result',
+    'server.updateJobTimeout': 'The update job did not reach a final state in time; check the server list or audit log later',
     'server.updateAgent': 'Update Agent',
     'server.updating': 'Updating...',
     'server.updatable': '↻ Update available',

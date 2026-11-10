@@ -48,7 +48,7 @@ const MCP_TOOLS = [
   },
   {
     name: 'update_agent',
-    description: '触发指定服务器的 Agent 自更新：面板创建 agent_update 任务并只下发指令，Agent 自行从官方 Release 拉取构建（SHA-256 校验）、原子替换并重启（资产字节不经过 Worker/DO）。**异步**：返回 job_id 与 accepted，必须用 get_operation 轮询终态（installed / failed）才能拿到结果与失败原因。需要 agent:update 权限（管理员或带 agent:update scope 的 PAT，且命中 server_ids 白名单），且目标 Agent 已配置 ALLOW_SELF_UPDATE=1。单机语义：多台请串行逐台调用（与前端批量更新同策略）。已是最新版本时返回 already_latest。',
+    description: '触发指定服务器的 Agent 自更新：面板创建 agent_update 任务并只下发指令，Agent 从面板同源的 /mcp/agent-update-asset 拉取构建（由 Worker 流式代理回源 GitHub Release，资产字节不经过 DO），SHA-256 校验、原子替换并重启；节点只需访问面板，不直连 GitHub。**异步**：返回 job_id 与 accepted，必须用 get_operation 轮询终态（succeeded / failed / timed_out / expired）才能拿到结果与失败原因。需要 agent:update 权限（管理员或带 agent:update scope 的 PAT，且命中 server_ids 白名单），且目标 Agent 已配置 ALLOW_SELF_UPDATE=1。单机语义：多台请串行逐台调用（与前端批量更新同策略）。已是最新版本时返回 already_latest。',
     inputSchema: {
       type: 'object',
       properties: {
@@ -733,8 +733,9 @@ async function handleApiInner(request, env) {
   // POST /api/servers/:id/agent-update —— 触发专用更新协议（与 MCP update_agent 共用 agentUpdateCore）。
   // 权限：管理员或带 agent:update scope 的 PAT（canUpdateAgent，含 server_ids 白名单）；
   // PAT 即使有 server:exec 也不行——更新是独立 scope 的高危供应链操作。
-  // 面板只创建任务并下发元数据 + 短期签名 URL（资产字节不经过 Worker/DO）；
-  // Agent 自行经资产代理拉取，做大小/SHA/版本复核后 self-replace。
+  // 面板只创建任务并下发元数据 + 短期签名面板 URL（资产字节经 Worker 流式代理、不经过 DO）；
+  // Agent 自行经该资产代理拉取（Worker 回源 GitHub Release，节点不直连 GitHub），
+  // 做大小/SHA/版本复核后 self-replace。
   const updateMatch = path.match(/^\/api\/servers\/(\d+)\/agent-update$/);
   if (method === 'POST' && updateMatch) {
     return agentUpdateCore(env, user, Number(updateMatch[1]) || 0, clientIp(request), url);
@@ -1568,6 +1569,12 @@ async function handleAgentAssetProxy(request, env, u) {
   if (Number(job.server_id) !== serverId) return err('forbidden', 403);
   if (job.status !== 'running') return err(`job is not running (status=${job.status})`, 409);
   if (!job.asset_url) return err('no asset url', 404);
+  // 大小来自 manifest 校验过的 job 记录，与上游无关：先判，避免无效任务也回源一次
+  // 并留下一个没人读的 upstream.body。
+  const expected = Number(job.size_bytes);
+  if (!Number.isSafeInteger(expected) || expected <= 0) {
+    return err('asset job has no valid size', 500);
+  }
   let upstream;
   try {
     upstream = await fetch(job.asset_url, {
@@ -1581,17 +1588,29 @@ async function handleAgentAssetProxy(request, env, u) {
     return err('asset fetch failed', 502);
   }
   if (!upstream.ok || !upstream.body) return err(`asset fetch failed (${upstream.status})`, 502);
-  const len = Number(upstream.headers.get('content-length'));
+  const upstreamLen = Number(upstream.headers.get('content-length'));
   // 与 job 记录比对：manifest 里的大小是权威值，防止代理到异常大的对象
-  if (Number.isFinite(len) && len > 0 && job.size_bytes && len !== Number(job.size_bytes)) {
-    return err(`asset size mismatch (${len} != ${job.size_bytes})`, 502);
+  if (Number.isFinite(upstreamLen) && upstreamLen > 0 && upstreamLen !== expected) {
+    try { await upstream.body.cancel(); } catch { /* ignore */ }
+    return err(`asset size mismatch (${upstreamLen} != ${expected})`, 502);
   }
-  const headers = {
-    'content-type': 'application/octet-stream',
-    'cache-control': 'no-store',
-  };
-  if (Number.isFinite(len) && len > 0) headers['content-length'] = String(len);
-  return new Response(upstream.body, { status: 200, headers });
+  // 无条件回传 Content-Length：Agent 的手写 HTTP/1.1 靠它判定 body 结束。上游可能
+  // 不给 CL（chunked / 边缘缓存改写），此时客户端只能读到 EOF；经不发 TLS
+  // close_notify 的代理时 rustls 会抛 UnexpectedEof（Muse 组更新失败即此形态）。
+  // 必须用 FixedLengthStream 给流一个「已知长度」：Workers 对「显式 CL + 未知长度
+  // 流」会改写成 chunked 并丢掉 CL（e2e 实测），那样 CL 根本送不到 Agent。
+  // 它同时承担长度校验：短了/长了都让 readable error，不静默留下截断文件；
+  // 全程流式，不把资产攒进 Worker 内存（与 streamToR2 同一套 API）。
+  const { readable, writable } = new FixedLengthStream(expected);
+  upstream.body.pipeTo(writable).catch(() => { /* 错误由 readable 传给客户端 */ });
+  return new Response(readable, {
+    status: 200,
+    headers: {
+      'content-type': 'application/octet-stream',
+      'content-length': String(expected),
+      'cache-control': 'no-store',
+    },
+  });
 }
 
 // 服务器增删改后清列表缓存（serverListCache 在 auth.js）

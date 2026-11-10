@@ -319,7 +319,7 @@ Rust 版以 `#[cfg(unix)]` / `#[cfg(windows)]` 条件编译实现三平台（平
 
 #### 3.5.3 Agent 自更新（异步资产拉取 + self-replace）
 
-设计目标：被控机只需访问面板、不要求能直连 GitHub；**资产字节不经过 Worker/DO**（DO 只下发一帧元数据），避免长驻 DO、大帧中转与 hibernation 被破坏；更新操作与普通文件上传完全隔离。
+设计目标：被控机只需访问面板、不要求能直连 GitHub；**资产字节不经过 DO**（DO 只下发一帧元数据），由 Worker 的 `/mcp/agent-update-asset` 流式代理回源 GitHub Release（不落盘、不整体缓冲），避免长驻 DO、大帧中转与 hibernation 被破坏；更新操作与普通文件上传完全隔离。
 
 ```text
 管理员点击更新

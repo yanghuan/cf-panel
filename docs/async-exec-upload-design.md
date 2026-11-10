@@ -848,7 +848,9 @@ expires_at=now+24h
 - token 绑定 `job_id + server_id + build_id + platform + size + sha256 + exp`；建议 10 分钟有效。
 - 读取 job，要求 kind=`agent_update`、status=`running`、`asset_url` 与 manifest 校验结果一致，避免任意 URL 代理。
 - Worker 从已校验的 `asset.url` 获取 Release 资产，沿用当前的 `accept: application/octet-stream`、`user-agent: cf-panel-agent-updater`、`redirect: follow` 和 `cf: { cacheTtl: 86400, cacheEverything: true }`；流式返回 body，不经过 DO。
-- 校验 GitHub 返回的 `Content-Length` 与 job `size_bytes`（如果提供）；不匹配则拒绝，Agent 仍会做最终 SHA/大小校验。
+- 上游若提供 `Content-Length`，先与 job `size_bytes` 比对，不符返回 502 并 cancel 上游 body；Agent 仍会做最终 SHA/大小校验。
+- **响应无条件带 `Content-Length: job.size_bytes`**：Agent 的手写 HTTP/1.1 靠它判定 body 结束；上游不给 CL 时客户端只能读到 EOF，经不发 TLS `close_notify` 的代理会触发 rustls `UnexpectedEof`（Muse 组更新失败即此形态）。
+- 必须用 `FixedLengthStream(job.size_bytes)` 给流一个「已知长度」并承担长度校验（短了/长了都让 readable error，不静默留下截断文件）；Workers 对「显式 CL + 未知长度流」会改写成 chunked 并丢掉 CL，`scripts/e2e.mjs` step9 已实证。这是 `/mcp/agent-update-asset` 的契约，不能把 CL 当成可选优化删掉。
 - 不能把 `asset_url` 放在 query 里由调用方指定，必须从 D1 job 读取；否则会形成开放代理。
 - 该请求会占用 Worker 请求时间，但不再占用 DO duration。
 - 这里选择 Worker 资产代理而不是 R2 staging：Release 资产只有几 MB，GitHub/Worker 边缘缓存已存在，避免给更新再增加一套对象生命周期；如果未来需要跨网络缓存，再迁移到 R2，不影响任务模型。

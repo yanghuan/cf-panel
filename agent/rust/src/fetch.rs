@@ -136,9 +136,13 @@ async fn download_to_file_inner(
         if buf.len() > HEADER_MAX {
             return Err("response header too large".into());
         }
-        let n = stream.read(&mut tmp).await?;
+        let n = read_or_eof(&mut stream, &mut tmp).await?;
         if n == 0 {
-            return Err("connection closed before response header".into());
+            return Err(format!(
+                "connection closed before response header (written=0, expected={})",
+                expected_desc(expect_size)
+            )
+            .into());
         }
         buf.extend_from_slice(&tmp[..n]);
     };
@@ -178,6 +182,17 @@ async fn download_to_file_inner(
             return Err(format!("file too large: {cl} > {max_bytes}").into());
         }
     }
+    // body 结束判据：优先 Content-Length，缺失时用任务里的期望大小兜底。
+    // 能确定长度就绝不靠 EOF 收尾：对端不发 TLS close_notify 时（xray 等 MITM
+    // 代理），读 EOF 会被 rustls 判成 UnexpectedEof，body 已收全也会被误判失败。
+    let body_len = content_length.or(expect_size);
+    // 非 chunked 没有长度判据时，「读到 EOF」无法区分正常结束与截断——本模块已把
+    // rustls 的 unexpected EOF 归一成 Ok(0)，更不能靠它兜底。宁可拒绝，也不能让
+    // 短文件被判成功（历史缺陷：expect_size=None 时截断响应覆盖目标文件）。
+    // chunked 自带 0-size 终止块作为边界，不受此限。
+    if !chunked && body_len.is_none() {
+        return Err("download length unknown: no Content-Length and no expected size".into());
+    }
 
     // ---- 写文件（流式）----
     if let Some(parent) = dest.parent() {
@@ -205,6 +220,8 @@ async fn download_to_file_inner(
 
     if chunked {
         // chunked：按 size 行逐块读，最后 0-size 块结束。pending 里可能已含有若干块数据。
+        // 终止块已在缓冲里就直接结束，不读 trailer、更不等对端关连接：不发 close_notify
+        // 的代理会让「多读一次」变成 UnexpectedEof。
         let mut raw = std::mem::take(&mut pending);
         loop {
             let (size, consumed) = match parse_chunk_size(&raw) {
@@ -214,9 +231,13 @@ async fn download_to_file_inner(
                     if raw.len() > 32 {
                         return Err("bad chunk size line".into());
                     }
-                    let n = stream.read(&mut tmp).await?;
+                    let n = read_or_eof(&mut stream, &mut tmp).await?;
                     if n == 0 {
-                        return Err("connection closed in chunked body".into());
+                        return Err(format!(
+                            "connection closed in chunked body (written={written}, expected={})",
+                            expected_desc(expect_size)
+                        )
+                        .into());
                     }
                     raw.extend_from_slice(&tmp[..n]);
                     continue;
@@ -226,9 +247,13 @@ async fn download_to_file_inner(
                 break;
             }
             if raw.len() < consumed + size + 2 {
-                let n = stream.read(&mut tmp).await?;
+                let n = read_or_eof(&mut stream, &mut tmp).await?;
                 if n == 0 {
-                    return Err("connection closed mid-chunk".into());
+                    return Err(format!(
+                        "connection closed mid-chunk (written={written}, expected={})",
+                        expected_desc(expect_size)
+                    )
+                    .into());
                 }
                 raw.extend_from_slice(&tmp[..n]);
                 continue;
@@ -242,35 +267,42 @@ async fn download_to_file_inner(
             raw.drain(..consumed + size + 2); // 末尾 CRLF
         }
     } else {
-        // 非 chunked：Content-Length 已知时只读到该长度就停，不要读到 EOF。
-        // 旧代码读到 EOF 才停：对端以 TLS 关闭且不发 close_notify 时（Cloudflare
-        // Worker 回 R2  body 后直接关连接即如此），rustls 读会报
-        // "peer closed connection without sending TLS close_notify"，明明 body
-        // 已收全却判失败。163 上传失败即此形态；本地经 MITM 代理时对端会发
-        // close_notify，读回 Ok(0) 才没暴露。
-        let mut to_write: &[u8] = &pending;
-        if let Some(cl) = content_length {
-            if (to_write.len() as u64) > cl {
-                to_write = &to_write[..cl as usize];
+        // 非 chunked：body_len（Content-Length，缺失时 expect_size）读满即停，不靠 EOF。
+        // 历史：旧代码读到 EOF 才停，Cloudflare / MITM 代理不发 close_notify 时 rustls
+        // 报 UnexpectedEof，body 已收全也判失败（Muse-163 上传、Muse 组更新）。
+        let to_write: &[u8] = &pending;
+        if let Some(len) = body_len {
+            if (to_write.len() as u64) > len {
+                return Err(format!(
+                    "download exceeds declared length: got at least {} bytes, expected={len}",
+                    to_write.len()
+                )
+                .into());
             }
         }
         write_chunk(to_write, &mut file, &mut hasher, &mut written)?;
         pending.clear();
         loop {
-            if let Some(cl) = content_length {
-                if written >= cl {
+            if let Some(len) = body_len {
+                if written >= len {
                     break;
                 }
             }
-            let n = stream.read(&mut tmp).await?;
+            let n = read_or_eof(&mut stream, &mut tmp).await?;
             if n == 0 {
                 break;
             }
-            let mut chunk: &[u8] = &tmp[..n];
-            if let Some(cl) = content_length {
-                let rem = cl - written;
+            let chunk: &[u8] = &tmp[..n];
+            if let Some(len) = body_len {
+                let rem = len - written;
+                // 短了由末尾校验拦，长了必须在这里拦：静默裁剪会把协议异常
+                // 伪装成「written == len 成功」（review P3）。
                 if (chunk.len() as u64) > rem {
-                    chunk = &chunk[..rem as usize];
+                    return Err(format!(
+                        "download exceeds declared length: got at least {} bytes, expected={len}",
+                        written + chunk.len() as u64
+                    )
+                    .into());
                 }
             }
             write_chunk(chunk, &mut file, &mut hasher, &mut written)?;
@@ -280,10 +312,12 @@ async fn download_to_file_inner(
     file.flush()?;
     drop(file);
 
-    if let Some(exp) = expect_size {
-        if written != exp {
+    // 按 body_len 校验，而不是只看 expect_size：Content-Length 存在而 expect_size
+    // 为 None 时截断同样必须失败（EOF 已归一成 Ok(0)，不再有 TLS 错误兜底）。
+    if let Some(len) = body_len {
+        if written != len {
             let _ = std::fs::remove_file(dest);
-            return Err(format!("size mismatch after download: {written} != {exp}").into());
+            return Err(format!("download incomplete: written={written}, expected={len}").into());
         }
     }
     if let Some(exp) = expect_sha256 {
@@ -300,6 +334,38 @@ async fn download_to_file_inner(
 
 trait AsyncReadWrite: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
 impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> AsyncReadWrite for T {}
+
+// rustls 0.23 把「对端未发 TLS close_notify 就关 TCP」映射成
+// std::io::ErrorKind::UnexpectedEof（见 rustls manual 的 unexpected-eof 一节）。
+// 对 HTTP 下载来说这只是连接结束：归一成 Ok(0)，由 Content-Length / expect_size /
+// SHA-256 决定 body 是否完整。经 xray 等 TUN/MITM 代理时这是常态（Muse 组更新失败），
+// 不能把「已收全的 body」误判为失败，也不能把真实截断吞掉。
+//
+// 注意：控制通道的 `main.rs::is_tls_unexpected_eof` 刻意只按错误文本判定，不复用
+// 本函数的 ErrorKind 判据——tokio-rustls 的 TLS 握手 EOF 也是 UnexpectedEof，那里
+// 必须保留真实错误日志与退避。两处语义不同是刻意的，不要「统一」（review P1-01）。
+pub(crate) fn is_unexpected_eof_io(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::UnexpectedEof
+        || e.to_string().contains("without sending TLS close_notify")
+        || e.to_string().contains("unexpected-eof")
+}
+
+// 只吞 unexpected EOF；其它 IO 错误（reset / timeout / broken pipe）照常冒泡。
+async fn read_or_eof(
+    stream: &mut Box<dyn AsyncReadWrite>,
+    buf: &mut [u8],
+) -> Result<usize, Box<dyn Error + Send + Sync>> {
+    match stream.read(buf).await {
+        Ok(n) => Ok(n),
+        Err(e) if is_unexpected_eof_io(&e) => Ok(0),
+        Err(e) => Err(e.into()),
+    }
+}
+
+fn expected_desc(v: Option<u64>) -> String {
+    v.map(|n| n.to_string())
+        .unwrap_or_else(|| "unknown".to_string())
+}
 
 struct ParsedUrl {
     host: String,
@@ -608,6 +674,293 @@ mod tests {
         assert_eq!(std::fs::read(&dest).unwrap(), b"hello");
         let _ = std::fs::remove_file(&dest);
         server.abort();
+    }
+
+    #[test]
+    fn only_unexpected_tls_eof_is_treated_as_clean_close() {
+        use std::io::{Error as IoError, ErrorKind};
+        let eof = IoError::new(
+            ErrorKind::UnexpectedEof,
+            "peer closed connection without sending TLS close_notify: https://docs.rs/rustls/latest/rustls/manual/_03_howto/index.html#unexpected-eof",
+        );
+        assert!(is_unexpected_eof_io(&eof));
+        // 不同 rustls/tokio-rustls 版本可能把 kind 映射成 Other，文本兜底仍要认得
+        let by_text =
+            IoError::other("IO error: peer closed connection without sending TLS close_notify");
+        assert!(is_unexpected_eof_io(&by_text));
+        assert!(!is_unexpected_eof_io(&IoError::new(
+            ErrorKind::ConnectionReset,
+            "reset"
+        )));
+        assert!(!is_unexpected_eof_io(&IoError::new(
+            ErrorKind::TimedOut,
+            "timeout"
+        )));
+    }
+
+    // 无 Content-Length（上游 chunked / 边缘改写）时用 expect_size 收满即停：
+    // 对端故意既不关连接也不发 close_notify，依赖 EOF 的旧实现会一直等到超时。
+    #[tokio::test]
+    async fn no_content_length_uses_expect_size_without_eof() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 8192];
+            let mut got = Vec::new();
+            loop {
+                let n = sock.read(&mut buf).await.unwrap();
+                got.extend_from_slice(&buf[..n]);
+                if got.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            sock.write_all(b"HTTP/1.1 200 OK\r\n\r\nhello")
+                .await
+                .unwrap();
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        });
+        let dest = std::env::temp_dir().join(format!("cfp-nocl-test-{}", std::process::id()));
+        let _ = std::fs::remove_file(&dest);
+        let r = download_within(
+            std::time::Duration::from_secs(10),
+            &format!("http://127.0.0.1:{}/mcp/x", addr.port()),
+            &dest,
+            Some(5),
+            None,
+            1 << 20,
+            None,
+        )
+        .await;
+        assert!(
+            r.is_ok(),
+            "expect_size 收满就应成功，不等 EOF：{:?}",
+            r.err()
+        );
+        assert_eq!(r.unwrap().bytes, 5);
+        assert_eq!(std::fs::read(&dest).unwrap(), b"hello");
+        let _ = std::fs::remove_file(&dest);
+        server.abort();
+    }
+
+    // chunked：收到 0-size 终止块即结束，不读 trailer、不等对端关连接。
+    #[tokio::test]
+    async fn chunked_stops_at_terminator_without_eof() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 8192];
+            let mut got = Vec::new();
+            loop {
+                let n = sock.read(&mut buf).await.unwrap();
+                got.extend_from_slice(&buf[..n]);
+                if got.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            sock.write_all(
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n",
+            )
+            .await
+            .unwrap();
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        });
+        let dest = std::env::temp_dir().join(format!("cfp-chunk-test-{}", std::process::id()));
+        let _ = std::fs::remove_file(&dest);
+        let r = download_within(
+            std::time::Duration::from_secs(10),
+            &format!("http://127.0.0.1:{}/mcp/x", addr.port()),
+            &dest,
+            Some(5),
+            None,
+            1 << 20,
+            None,
+        )
+        .await;
+        assert!(r.is_ok(), "终止块收全就应成功：{:?}", r.err());
+        assert_eq!(r.unwrap().bytes, 5);
+        assert_eq!(std::fs::read(&dest).unwrap(), b"hello");
+        let _ = std::fs::remove_file(&dest);
+        server.abort();
+    }
+
+    // 真实截断仍要失败，且错误必须给出 written / expected，而不是一条裸 rustls 文本。
+    #[tokio::test]
+    async fn truncated_body_error_reports_written_and_expected() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 8192];
+            let mut got = Vec::new();
+            loop {
+                let n = sock.read(&mut buf).await.unwrap();
+                got.extend_from_slice(&buf[..n]);
+                if got.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let _ = sock.write_all(b"HTTP/1.1 200 OK\r\n\r\nhel").await;
+            // sock drop → 干净 FIN，模拟 body 未收全就结束
+        });
+        let dest = std::env::temp_dir().join(format!("cfp-trunc-test-{}", std::process::id()));
+        let _ = std::fs::remove_file(&dest);
+        let r = download_within(
+            std::time::Duration::from_secs(10),
+            &format!("http://127.0.0.1:{}/mcp/x", addr.port()),
+            &dest,
+            Some(5),
+            None,
+            1 << 20,
+            None,
+        )
+        .await;
+        let msg = r.err().expect("截断必须失败").to_string();
+        assert!(
+            msg.contains("written=3") && msg.contains("expected=5"),
+            "实际: {msg}"
+        );
+        assert!(!dest.exists(), "失败必须清掉半截文件");
+        server.abort();
+    }
+
+    // Content-Length 存在、expect_size 为 None 时，截断也必须失败（review P2-01）：
+    // EOF 归一后不能再依赖 rustls 的 UnexpectedEof 兜底。
+    #[tokio::test]
+    async fn content_length_alone_detects_truncated_body() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 8192];
+            let mut got = Vec::new();
+            loop {
+                let n = sock.read(&mut buf).await.unwrap();
+                got.extend_from_slice(&buf[..n]);
+                if got.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let _ = sock
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhel")
+                .await;
+        });
+        let dest = std::env::temp_dir().join(format!("cfp-clonly-test-{}", std::process::id()));
+        let _ = std::fs::remove_file(&dest);
+        let r = download_within(
+            std::time::Duration::from_secs(10),
+            &format!("http://127.0.0.1:{}/mcp/x", addr.port()),
+            &dest,
+            None,
+            None,
+            1 << 20,
+            None,
+        )
+        .await;
+        let msg = r.err().expect("CL 存在时截断必须失败").to_string();
+        assert!(
+            msg.contains("written=3") && msg.contains("expected=5"),
+            "实际: {msg}"
+        );
+        assert!(!dest.exists(), "失败必须清掉半截文件");
+        server.abort();
+    }
+
+    // 非 chunked 且既无 Content-Length 又无 expect_size：直接拒绝，不靠 EOF 猜长度。
+    #[tokio::test]
+    async fn non_chunked_without_any_length_is_rejected() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 8192];
+            let mut got = Vec::new();
+            loop {
+                let n = sock.read(&mut buf).await.unwrap();
+                got.extend_from_slice(&buf[..n]);
+                if got.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let _ = sock.write_all(b"HTTP/1.1 200 OK\r\n\r\nhello").await;
+        });
+        let dest = std::env::temp_dir().join(format!("cfp-nolen-test-{}", std::process::id()));
+        let _ = std::fs::remove_file(&dest);
+        let r = download_within(
+            std::time::Duration::from_secs(10),
+            &format!("http://127.0.0.1:{}/mcp/x", addr.port()),
+            &dest,
+            None,
+            None,
+            1 << 20,
+            None,
+        )
+        .await;
+        assert!(
+            r.err()
+                .expect("无长度判据必须拒绝")
+                .to_string()
+                .contains("download length unknown"),
+            "错误信息应说明长度未知"
+        );
+        assert!(!dest.exists(), "拒绝时不应写出临时文件");
+        server.abort();
+    }
+
+    // 上游多发字节也必须失败：不能静默裁剪到声明长度后判成功（review P3）。
+    // 两种时序都测：头 + 全部 body 一次到齐（pending 超长）、body 分两次到齐（chunk 超长）。
+    #[tokio::test]
+    async fn oversized_body_is_rejected_instead_of_truncated() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for split in [false, true] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let mut buf = vec![0u8; 8192];
+                let mut got = Vec::new();
+                loop {
+                    let n = sock.read(&mut buf).await.unwrap();
+                    got.extend_from_slice(&buf[..n]);
+                    if got.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                // 无 Content-Length，实际 13 字节 > expect_size=5
+                if split {
+                    let _ = sock.write_all(b"HTTP/1.1 200 OK\r\n\r\nhel").await;
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    let _ = sock.write_all(b"lo-extra").await;
+                } else {
+                    let _ = sock.write_all(b"HTTP/1.1 200 OK\r\n\r\nhello-extra").await;
+                }
+            });
+            let dest = std::env::temp_dir().join(format!("cfp-over-test-{}", std::process::id()));
+            let _ = std::fs::remove_file(&dest);
+            let r = download_within(
+                std::time::Duration::from_secs(10),
+                &format!("http://127.0.0.1:{}/mcp/x", addr.port()),
+                &dest,
+                Some(5),
+                None,
+                1 << 20,
+                None,
+            )
+            .await;
+            let msg = r.err().expect("超长必须失败").to_string();
+            assert!(
+                msg.contains("exceeds declared length") && msg.contains("expected=5"),
+                "split={split} 实际: {msg}"
+            );
+            let _ = std::fs::remove_file(&dest);
+            server.abort();
+        }
     }
 
     #[test]

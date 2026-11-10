@@ -1015,6 +1015,30 @@ test('前端：Agent 更新后等推送回传版本号，不再 2.5s 轮询 /api
   assert.match(app, /pushAlive/, '仅当推送停摆时才回退 REST');
 });
 
+// 批量更新与单台共用异步 job：POST 返回 202 只是「已下发」。早期实现直接 ok += 1，
+// 于是在任务还在跑或已失败时就报「成功 N 台」，机器版本却没变。
+test('前端：批量 Agent 更新按 job 终态统计成功，不把 202 accepted 当成功', () => {
+  const root = nodePath.join(nodePath.dirname(fileURLToPath(import.meta.url)), '..');
+  const app = nodeFs.readFileSync(nodePath.join(root, 'public/app.js'), 'utf8');
+  const start = app.indexOf('async function batchUpdateAgent()');
+  assert.ok(start > 0, '未找到 batchUpdateAgent');
+  const fn = app.slice(start, app.indexOf('// ---------- 卡片拖拽排序', start));
+  assert.match(fn, /await waitJob\(result\.job_id\)/, '每台提交后须轮询 /api/jobs/:id 到终态');
+  assert.match(fn, /job\.status !== 'succeeded'/, '只有 succeeded 才能计入成功');
+  assert.match(fn, /server\.updateJobTimeout/, '轮询窗口用尽必须计入失败');
+  // 「提交即成功」的旧逻辑：紧跟 POST 就累加，或成功计数出现在 waitJob 之前
+  assert.doesNotMatch(fn, /agent-update`, \{ method: 'POST' \}\);\s*ok \+= 1/,
+    '不得在未确认任务终态前累加成功数');
+  const waitAt = fn.indexOf('await waitJob(');
+  const okAt = fn.indexOf('ok += 1;', waitAt);
+  assert.ok(waitAt > 0 && okAt > waitAt, '终态成功分支里才允许累加成功数');
+  // 新增的失败文案必须真的注册，否则界面上只会显示 key 名
+  const i18n = loadCfI18n();
+  for (const key of ['server.updateNoJob', 'server.updateJobTimeout']) {
+    assert.notEqual(i18n.t(key), key, `${key} 缺少中文翻译`);
+  }
+});
+
 // 服务器列表的列清单必须单一来源：auth.js 导出 SERVER_LIST_COLS，PanelDO 复用它。
 // 两份拷贝一旦漂移，PanelDO 会静默少列（buildList 某字段变 undefined），
 // 而「不要 SELECT *」这个初衷会以「漏列」的形式重新出问题。

@@ -132,6 +132,8 @@
     'server.installedWaiting': 'Agent 已安装 {build}，等待服务重新上线...',
     'server.updatedTo': '「{name}」Agent 已更新到 {target}',
     'server.updateFailed': 'Agent 更新失败：{err}',
+    'server.updateNoJob': '更新接口未返回任务 ID，无法确认更新结果',
+    'server.updateJobTimeout': '更新任务未在预期时间内返回最终结果，请稍后在服务器列表或审计记录中确认',
     'server.updateAgent': '更新 Agent',
     'server.updating': '更新中...',
     'server.updatable': '↻ 可更新',

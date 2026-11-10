@@ -2419,6 +2419,53 @@ test('upload job：超长字节被拒且不留半截对象；下载 URL 绑定 j
   assert.equal(notRunning.status, 409, '非 running 状态不得下载');
 });
 
+// 资产代理必须总是给出 Content-Length：Agent 手写 HTTP/1.1 靠它判 body 结束，
+// 上游不给 CL 时客户端只能读到 EOF，经不发 close_notify 的代理会触发 rustls UnexpectedEof。
+test('资产代理：无条件回传 Content-Length，并校验实际流长度', async () => {
+  const env = makeEnv();
+  const token = await login(env);
+  await addServer(env, token, { name: 'asset-host' });
+  const now = Math.floor(Date.now() / 1000);
+  const size = 5;
+  const buildId = '2026.11.09-1349-cea811de';
+  const platform = 'linux-x86_64';
+  const jobId = 'job_asset_proxy_test';
+  await env.DB.prepare(`INSERT INTO operation_jobs
+    (id, kind, status, user_id, username, server_id, build_id, platform, size_bytes, asset_url, created_at, deadline_at, expires_at)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+    .bind(jobId, 'agent_update', 'running', 1, 'admin', 1, buildId, platform, size,
+      'https://github.com/yanghuan/cf-panel/releases/download/x/cf-panel-agent',
+      now, now + 200, now + 86400).run();
+  const sign = await I.signJobToken('asset', jobId, 1, `${buildId}|${platform}|${size}`, env, 600);
+  const url = `https://panel.local/mcp/agent-update-asset?id=${jobId}&server_id=1&token=${encodeURIComponent(sign)}`;
+  const bytes = (arr) => new ReadableStream({
+    start(c) { c.enqueue(new Uint8Array(arr)); c.close(); },
+  });
+  const originalFetch = globalThis.fetch;
+  try {
+    // 1) 上游无 Content-Length：仍按 job.size_bytes 回传，body 完整
+    globalThis.fetch = async () => ({ ok: true, status: 200, headers: new Headers(), body: bytes([1, 2, 3, 4, 5]) });
+    const ok = await worker.fetch(new Request(url), env);
+    assert.equal(ok.status, 200);
+    assert.equal(ok.headers.get('content-length'), String(size), '无上游 CL 也要回传 job.size_bytes');
+    assert.equal((await ok.arrayBuffer()).byteLength, size);
+
+    // 2) 上游 CL 与 manifest 不符：前置拒绝，不把错误大小的资产发给 Agent
+    globalThis.fetch = async () => ({
+      ok: true, status: 200, headers: new Headers({ 'content-length': '2' }), body: bytes([1, 2]),
+    });
+    assert.equal((await worker.fetch(new Request(url), env)).status, 502);
+
+    // 3) 上游实际字节比声明短：响应流必须报错，不能静默留下截断文件
+    globalThis.fetch = async () => ({ ok: true, status: 200, headers: new Headers(), body: bytes([1, 2, 3]) });
+    const short = await worker.fetch(new Request(url), env);
+    assert.equal(short.headers.get('content-length'), String(size));
+    await assert.rejects(() => short.arrayBuffer());
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 // ---------------- 阶段 D：cron 清理 ----------------
 test('cron 维护：过期任务收敛为 expired、TTL 到期删行、R2 孤儿对象回收', async () => {
   const { runJobMaintenance } = await import('../src/index.js');

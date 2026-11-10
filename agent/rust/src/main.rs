@@ -723,26 +723,28 @@ async fn run_control(
                 log("control channel closed");
                 // 存活 <10s 的"成功连接"（服务端立即关闭/反代错误/服务端 bug）
                 // 同样指数退避，防秒断时每 ~3s 重连风暴（28,800 次/天放大 Worker/D1）
-                if started.elapsed().as_secs() < MIN_UPTIME_RESET_SECS {
-                    backoff = (backoff * 2).min(RETRY_MAX_SECS);
-                } else {
-                    backoff = RETRY_INITIAL_SECS;
-                }
+                backoff = reconnect_backoff(started.elapsed().as_secs(), backoff);
             }
             Err(e) => {
-                log(format!("control channel error: {e}"));
+                // rustls 把「对端不发 close_notify 就关 TLS」判成 UnexpectedEof。
+                // 对常驻控制通道这只是普通断线（xray 等 TUN/MITM 代理常见）：
+                // 不当异常打日志；退避仍按连接存活时长算，短命连接照样防风暴（review P1-01）。
+                if is_tls_unexpected_eof(e.as_ref()) {
+                    log(
+                        "control channel closed without TLS close_notify (peer proxy); reconnecting",
+                    );
+                } else {
+                    log(format!("control channel error: {e}"));
+                }
                 if is_auth_error(e.as_ref()) {
                     log("auth failed (401): retrying slowly");
                     backoff = AUTH_FAIL_SECS;
                 } else if e.downcast_ref::<Superseded>().is_some() {
                     log("superseded by another instance: retrying slowly");
                     backoff = SUPERSEDED_SECS;
-                } else if started.elapsed().as_secs() >= MIN_UPTIME_RESET_SECS {
-                    // 健康连接存活 ≥10s 后被重置（代理空闲超时/网络抖动）：连接本身没问题，
-                    // 快速重连（不翻倍）；否则退避单调膨胀到 300s，表现为"长时间重连不上"
-                    backoff = RETRY_INITIAL_SECS;
                 } else {
-                    backoff = (backoff * 2).min(RETRY_MAX_SECS);
+                    // 健康长连接快速重连；短命连接（含握手期）指数退避防重连风暴
+                    backoff = reconnect_backoff(started.elapsed().as_secs(), backoff);
                 }
             }
         }
@@ -764,6 +766,35 @@ fn is_auth_error(e: &(dyn Error + Send + Sync + 'static)) -> bool {
         return resp.status().as_u16() == 401;
     }
     false
+}
+
+/// 判断是否为「对端未发 TLS close_notify 就关连接」这类不干净收尾。
+/// 与下载器不同，这里**只看错误文本**：tokio-rustls 的 TLS 握手失败
+/// （"tls handshake eof"）同样是 ErrorKind::UnexpectedEof，但那是真实连接错误，
+/// 必须保留错误日志与退避，不能被当成普通断线吞掉（review P1-01）。
+fn is_tls_unexpected_eof(e: &(dyn Error + Send + Sync + 'static)) -> bool {
+    let text = e
+        .downcast_ref::<std::io::Error>()
+        .map(|io| io.to_string())
+        .or_else(
+            || match e.downcast_ref::<tokio_tungstenite::tungstenite::Error>() {
+                Some(tokio_tungstenite::tungstenite::Error::Io(io)) => Some(io.to_string()),
+                _ => None,
+            },
+        )
+        .unwrap_or_else(|| e.to_string());
+    text.contains("without sending TLS close_notify") || text.contains("unexpected-eof")
+}
+
+/// 连接结束后的重连退避：健康长连接（≥10s）快速重连；短命连接（含握手期）
+/// 仍指数退避，防「每 ~3s 重连风暴、放大 Worker/D1」。
+/// 正常关闭、普通错误、不干净 TLS 收尾三条路径共用同一判据。
+fn reconnect_backoff(elapsed_secs: u64, current: u64) -> u64 {
+    if elapsed_secs >= MIN_UPTIME_RESET_SECS {
+        RETRY_INITIAL_SECS
+    } else {
+        (current * 2).min(RETRY_MAX_SECS)
+    }
 }
 
 async fn control_conn(
@@ -2127,6 +2158,46 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn control_channel_treats_unexpected_tls_eof_as_plain_disconnect() {
+        use std::io::{Error as IoError, ErrorKind};
+        let eof = IoError::new(
+            ErrorKind::UnexpectedEof,
+            "peer closed connection without sending TLS close_notify: https://docs.rs/rustls/latest/rustls/manual/_03_howto/index.html#unexpected-eof",
+        );
+        assert!(is_tls_unexpected_eof(&eof));
+        let wrapped: Box<dyn Error + Send + Sync> =
+            Box::new(tokio_tungstenite::tungstenite::Error::Io(eof));
+        assert!(
+            is_tls_unexpected_eof(wrapped.as_ref()),
+            "tungstenite::Error::Io 包装后仍要认得"
+        );
+        let reset = IoError::new(ErrorKind::ConnectionReset, "connection reset by peer");
+        assert!(!is_tls_unexpected_eof(&reset), "其它 IO 错误不得被吞掉");
+        // TLS 握手 EOF 也是 UnexpectedEof，但属于真实连接错误：不得当普通断线
+        let handshake = IoError::new(ErrorKind::UnexpectedEof, "tls handshake eof");
+        assert!(!is_tls_unexpected_eof(&handshake));
+    }
+
+    #[test]
+    fn reconnect_backoff_keeps_storm_protection_for_short_lived_connections() {
+        assert_eq!(
+            reconnect_backoff(MIN_UPTIME_RESET_SECS, 64),
+            RETRY_INITIAL_SECS,
+            "健康长连接被代理掐断后应快速重连"
+        );
+        assert_eq!(
+            reconnect_backoff(0, RETRY_INITIAL_SECS),
+            (RETRY_INITIAL_SECS * 2).min(RETRY_MAX_SECS),
+            "短命连接仍须指数退避，防重连风暴"
+        );
+        assert_eq!(
+            reconnect_backoff(0, RETRY_MAX_SECS),
+            RETRY_MAX_SECS,
+            "退避不得超过上限"
+        );
+    }
 
     #[test]
     fn validate_wss_accepts_wss() {

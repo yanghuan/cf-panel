@@ -8,8 +8,16 @@
 //      DNS 与 TLS 也都有现成封装（dns::resolve / build_rustls_config）。
 //
 // 只支持 GET：这两个端点（upload download / agent-update-asset）都是只读下载。
-// 关键约束：**必须处理 Content-Length 与 chunked 两种响应**——Worker 端我们显式设了
-// Content-Length，但 Cloudflare 对某些路径可能改写为 chunked，硬编码一种会偶发解析错位。
+//
+// 长度契约（与 Worker 端 src/routes.js 的资产代理成对看）：
+//   - Worker 用 FixedLengthStream(job.size_bytes) 给流一个已知长度，响应无条件带
+//     Content-Length。裸写「显式 CL + 未知长度流」会被 Workers 改写成 chunked 并把
+//     CL 丢掉（scripts/e2e.mjs step9 实证），那样客户端只能靠 EOF 判断结束。
+//   - 但节点与面板之间可能还有透明代理（xray 一类 MITM），它可能再次改写响应头，
+//     或在 body 结束时直接关 TLS 而不发 close_notify。所以本模块仍须同时支持
+//     Content-Length 与 chunked，以 body_len = content_length.or(expect_size) 收尾，
+//     把 rustls 的 UnexpectedEof 归一成干净 EOF，再由长度 / SHA-256 裁决完整性。
+//   - 结论：不要依赖「读到 EOF」判成功，也不要把 CL 或 chunked 当成唯一格式。
 use std::error::Error;
 use std::io::Write as _;
 use std::path::Path;
